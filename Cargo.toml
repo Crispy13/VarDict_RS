@@ -1,0 +1,25 @@
+[package]
+name = "vardict_rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+lto = 'thin'
+debug = "line-tables-only"
+
+[profile.debug-release]
+inherits = "release"
+debug = true
+
+[profile.deploy]
+inherits = "release"
+lto = true
+codegen-units = 1
+debug = false
