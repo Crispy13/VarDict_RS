@@ -1,10 +1,62 @@
 use std::collections::HashMap;
 
-pub struct VariantRealigner {}
+use anyhow::{Error, anyhow};
+use crackle_kit::tracing::{Level, event};
+
+use crate::{
+    data::patterns::{BEGIN_MINUS_NUMBER, UP_NUMBER_END, get_cap_group},
+    variants::{var_utils::get_variants_from_map, variants::Variant},
+};
+
+pub struct VariantRealigner {
+    non_insertion_vars: HashMap<i64, HashMap<String, Variant>>,
+    ref_coverage: HashMap<i64, usize>,
+}
 
 impl VariantRealigner {
-    fn realign_del(&self, pos_to_del_count: &HashMap<i64, HashMap<String, usize>>) {
-        
+    fn realign_del(
+        &mut self,
+        bam_parameters: &[&str],
+        pos_to_del_count: &HashMap<i64, HashMap<String, usize>>,
+    ) -> Result<(), Error> {
+        let bams: &[&str] = todo!();
+
+        let sorted_pos_to_del = fill_and_sort_tmp(pos_to_del_count);
+
+        let mut last_pos = 0;
+        for tpl in sorted_pos_to_del {
+            let p = tpl.pos;
+            last_pos = p;
+
+            let vn = tpl.desc_string;
+            let del_cnt = tpl.count;
+
+            event!(
+                Level::INFO,
+                "  Realigndel for: {p} {vn} {del_cnt} cov: {}",
+                self.ref_coverage.get(&p).copied().unwrap_or(0)
+            );
+
+            let var = get_variants_from_map(&mut self.non_insertion_vars, p, vn);
+
+            let mut del_len = 0;
+
+            match BEGIN_MINUS_NUMBER.captures(vn) {
+                Some(cap) => {
+                    del_len = get_cap_group!(cap, 1)?.as_str().parse::<i64>()?;
+                }
+                None => {}
+            }
+
+            match UP_NUMBER_END.captures(vn) {
+                Some(cap) => {
+                    del_len += get_cap_group!(cap, 1)?.as_str().parse::<i64>()?;
+                }
+                None => {}
+            }
+        }
+
+        todo!()
     }
 }
 

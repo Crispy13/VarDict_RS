@@ -4,8 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-
-
+anyhow = "1.0.100"
+crackle-kit = { git = "https://github.com/Crispy13/crackle-kit", features = [
+    "tracing",
+] }
+regex = "1.12.2"
 
 [profile.dev]
 incremental = true
