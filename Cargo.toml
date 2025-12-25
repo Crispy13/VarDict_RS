@@ -9,6 +9,8 @@ crackle-kit = { git = "https://github.com/Crispy13/crackle-kit", features = [
     "tracing",
 ] }
 regex = "1.12.2"
+rust-htslib = { git = "https://github.com/Crispy13/rust-htslib.git", branch = "dev" }
+smallvec = "1.15.1"
 
 [profile.dev]
 incremental = true

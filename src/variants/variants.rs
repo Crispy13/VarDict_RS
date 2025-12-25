@@ -9,3 +9,12 @@ impl Variant {
     }
 }
 
+
+
+pub(crate) struct VarDesc {
+    
+}
+
+impl VarDesc {
+    
+}

@@ -54,6 +54,15 @@ impl VariantRealigner {
                 }
                 None => {}
             }
+
+            let mut extrains = String::new();
+            let mut extra = String::new();
+            let mut inv5 = String::new();
+            let mut inv3 = String::new();
+
+            
+
+
         }
 
         todo!()
