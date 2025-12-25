@@ -1,12 +1,21 @@
+use std::sync::Arc;
+
 use anyhow::{Error, anyhow};
 use crackle_kit::tracing::{Level, event};
 use rust_htslib::bam::{Record, Writer, record::CigarStringView};
 
-use crate::utils::aligner::Aligner;
+use crate::{
+    data::{reference::Reference, region::Region}, mods::cigar_modifier::CigarModifier,
+    scopedata::global_read_only_scope::GlobalReadOnlyScope, utils::aligner::Aligner,
+};
 
 pub struct CigarParser {
     query_seq_buf: Vec<u8>,
     aligner: Aligner,
+    instance: Arc<GlobalReadOnlyScope>,
+    reference: Reference,
+    max_read_len: usize,
+    region: Region,
 }
 
 impl CigarParser {
@@ -36,6 +45,35 @@ impl CigarParser {
                 0
             }
         };
+
+        let query_qual = record.qual();
+        let is_mate_on_the_same_contig = record.tid() == record.mtid();
+        let nm = tot_nm;
+        let direction = record.is_reverse();
+
+        if self.instance.amplicon_based_calling {
+            todo!()
+        }
+
+        let mut pos = 0;
+        let mut read_pos_including_softclip = 0;
+        let mut read_pos_excluding_softclip = 0;
+
+        if self.instance.conf.perform_local_realignment {
+            // Modify the CIGAR for potential mis-alignment for indels at the end of reads to softclipping and let VarDict's
+            // algorithm to figure out indels
+
+            let cigar_modifier = CigarModifier::new(
+                record.query_alignment_start(),
+                cigar,
+                query_seq,
+                query_qual,
+                &self.reference,
+                ins_del_len,
+                self.max_read_len,
+                &self.region,
+            );
+        }
 
         todo!()
     }
