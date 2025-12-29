@@ -119,6 +119,7 @@ impl_get_with_int_range!(i32);
 impl_get_with_int_range!(i64);
 impl_get_with_int_single!(i32);
 impl_get_with_int_single!(i64);
+
 pub(crate) trait BytesExt {
     fn try_as_str(&self) -> Result<&str, Utf8Error>;
 }

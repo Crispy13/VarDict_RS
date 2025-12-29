@@ -35,3 +35,17 @@ pub(crate) fn get_variants_from_map<'a>(
     // //    the caller from invalidating the pointer while holding the reference.
     // unsafe { &*var_ptr }
 }
+
+#[inline]
+pub(crate) fn is_has_and_not_equals(
+    b: u8,
+    contig_ref_seq: &[u8],
+    index: usize,
+) -> bool {
+    match contig_ref_seq.get(index) {
+        Some(&rb) => b != rb,
+        None => {
+            false
+        },
+    }
+}

@@ -18,6 +18,7 @@ use crate::{
     data::{reference::Reference, region::Region},
     scopedata::global_read_only_scope::{INSTANCE, instance},
     utils::{BytesExt, SliceExt, SliceExt2},
+    variants::var_utils::is_has_and_not_equals,
 };
 
 pub struct CigarModifier<'a> {
@@ -99,7 +100,8 @@ impl<'a> CigarModifier<'a> {
 
                 if let Some(poss) = self.ref_data.seed.get(rc_seed) {
                     if poss.len() == 1
-                        && ((cigar_pos - poss.get(0).copied().unwrap() as u32) as usize)
+                        && ((cigar_pos as i32 - poss.get(0).copied().unwrap() as i32).abs()
+                            as usize)
                             < 2 * self.max_read_length
                     {
                         cigar_vec.pop_front().unwrap();
@@ -123,13 +125,167 @@ impl<'a> CigarModifier<'a> {
         {
             let l = l as usize;
             if !instance().conf.chimeric_filter && l >= Configuration::SEED_2 as usize {
-                let softclip_seq = self
-                    .query_sequence
-                    .get_with_int(-(l as i32)..)?;
+                let softclip_seq = self.query_sequence.get_with_int(-(l as i32)..)?;
 
                 let seq = self.rev_complementor.reverse_complement(softclip_seq);
                 let rc_seed = seq.get_with_int(-(Configuration::SEED_2)..)?;
 
+                if let Some(poss) = self.ref_data.seed.get(rc_seed) {
+                    if poss.len() == 1
+                        && ((cigar_pos as i32 - poss.get(0).copied().unwrap() as i32).abs()
+                            as usize)
+                            < 2 * self.max_read_length
+                    {
+                        cigar_vec.pop_back().unwrap();
+                        self.query_sequence = self.query_sequence.get_with_int(0..-(l as i32))?;
+                        self.query_quality = self.query_quality.get_with_int(0..-(l as i32))?;
+
+                        event!(
+                            Level::INFO,
+                            "{} at 3' is a chimeric at {} by SEED {}",
+                            self.query_sequence.try_as_str()?,
+                            cigar_pos,
+                            Configuration::SEED_2,
+                        )
+                    }
+                }
+            }
+        }
+
+        while flag && self.indel > 0 {
+            flag = false;
+
+            // check read starts with softclip then insertion or deletion.
+            match (cigar_vec.get(0), cigar_vec.get(1)) {
+                (Some(&Cigar::SoftClip(sl)), Some(c2 @ (&Cigar::Ins(idl) | &Cigar::Del(idl)))) => {
+                    let tslen = sl + if matches!(c2, Cigar::Ins(_)) { idl } else { 0 };
+                    cigar_pos += if matches!(c2, Cigar::Del(_)) { idl } else { 0 };
+
+                    cigar_vec.pop_front().unwrap();
+                    *cigar_vec.front_mut().unwrap() = Cigar::SoftClip(tslen);
+
+                    flag = true;
+                }
+                _ => {}
+            }
+
+            let mut cigar_vec_iter = cigar_vec.iter().rev();
+
+            match (cigar_vec_iter.next(), cigar_vec_iter.next()) {
+                (Some(&Cigar::SoftClip(sl)), Some(c2 @ (&Cigar::Ins(idl) | &Cigar::Del(idl)))) => {
+                    let tslen = sl + if matches!(c2, Cigar::Ins(_)) { idl } else { 0 };
+
+                    cigar_vec.pop_back().unwrap();
+                    *cigar_vec.back_mut().unwrap() = Cigar::SoftClip(tslen);
+
+                    flag = true;
+                }
+                _ => {}
+            }
+
+            match (cigar_vec.get(0), cigar_vec.get(1), cigar_vec.get(2)) {
+                (
+                    Some(&Cigar::SoftClip(sl)),
+                    Some(&Cigar::Match(ml)),
+                    Some(c3 @ (&Cigar::Ins(idl) | &Cigar::Del(idl))),
+                ) => {
+                    if ml <= 10 {
+                        let tslen = sl + ml + if matches!(c3, Cigar::Ins(_)) { idl } else { 0 };
+                        cigar_pos += ml + if matches!(c3, Cigar::Del(_)) { idl } else { 0 };
+
+                        cigar_vec.drain(..2);
+                        *cigar_vec.front_mut().unwrap() = Cigar::SoftClip(tslen);
+
+                        flag = true;
+                    }
+                }
+                _ => {}
+            }
+
+            let mut cigar_vec_iter = cigar_vec.iter().rev();
+            match (
+                cigar_vec_iter.next(),
+                cigar_vec_iter.next(),
+                cigar_vec_iter.next(),
+            ) {
+                (
+                    Some(&Cigar::SoftClip(sl)),
+                    Some(&Cigar::Match(ml)),
+                    Some(c3 @ (&Cigar::Ins(idl) | &Cigar::Del(idl))),
+                ) => {
+                    if ml <= 10 {
+                        let tslen = sl + ml + if matches!(c3, Cigar::Ins(_)) { idl } else { 0 };
+                        cigar_pos += ml + if matches!(c3, Cigar::Del(_)) { idl } else { 0 };
+
+                        cigar_vec.drain(..2);
+                        *cigar_vec.back_mut().unwrap() = Cigar::SoftClip(tslen);
+
+                        flag = true;
+                    }
+                }
+                _ => {}
+            }
+
+            match (cigar_vec.get(0), cigar_vec.get(1), cigar_vec.get(2)) {
+                (
+                    Some(&Cigar::Match(ml1)),
+                    Some(c_id @ (&Cigar::Ins(idl) | &Cigar::Del(idl))),
+                    Some(&Cigar::Match(mut ml2)),
+                ) => {
+                    let mut tslen = ml1
+                        + if matches!(c_id, Cigar::Ins(_)) {
+                            idl
+                        } else {
+                            0
+                        };
+                    cigar_pos += ml1
+                        + if matches!(c_id, Cigar::Del(_)) {
+                            idl
+                        } else {
+                            0
+                        };
+
+                    let mut tn = 0;
+                    while tn < ml2
+                        && is_has_and_not_equals(
+                            self.query_sequence
+                                .get_or_err((tslen + tn) as usize)
+                                .copied()?,
+                            &self.ref_data.ref_seq,
+                            (cigar_pos + tn) as usize,
+                        )
+                    {
+                        tn += 1;
+                    }
+
+                    tslen += tn;
+                    ml2 -= tn;
+                    cigar_pos += tn;
+
+                    cigar_vec.pop_front().unwrap();
+                    *cigar_vec.get_mut(0).unwrap() = Cigar::SoftClip(tslen);
+                    *cigar_vec.get_mut(1).unwrap() = Cigar::Match(ml2);
+
+                    flag = true;
+                }
+                _ => {}
+            }
+
+            let mut cigar_vec_iter = cigar_vec.iter().rev();
+            match (cigar_vec_iter.next(), cigar_vec_iter.next()) {
+                (Some(&Cigar::Match(ml)), Some(c_id @ (&Cigar::Ins(idl) | &Cigar::Del(idl)))) => {
+                    let tslen = ml
+                        + if matches!(c_id, Cigar::Ins(_)) {
+                            idl
+                        } else {
+                            0
+                        };
+
+                    *cigar_vec.back_mut().unwrap() = Cigar::SoftClip(tslen);
+
+                    flag = true;
+                }
+                _ => {}
             }
         }
 
