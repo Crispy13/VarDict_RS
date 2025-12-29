@@ -1,5 +1,10 @@
 use anyhow::{Error, anyhow};
-use std::{ops::Range, slice::SliceIndex};
+use std::{
+    fmt::Debug,
+    ops::{Range, RangeFrom},
+    slice::SliceIndex,
+    str::Utf8Error,
+};
 
 pub mod aligner;
 
@@ -27,11 +32,24 @@ pub trait SliceExt<I: SliceIndex<Self> + Clone> {
     fn get_or_err(&self, index: I) -> Result<&I::Output, Error>;
 }
 
-impl<T> SliceExt<Range<usize>> for [T] {
-    fn get_or_err(
-        &self,
-        index: Range<usize>,
-    ) -> Result<&<Range<usize> as SliceIndex<[T]>>::Output, Error> {
+// impl<T> SliceExt<Range<usize>> for [T] {
+//     fn get_or_err(
+//         &self,
+//         index: Range<usize>,
+//     ) -> Result<&<Range<usize> as SliceIndex<[T]>>::Output, Error> {
+//         match self.get(index.clone()) {
+//             Some(v) => Ok(v),
+//             None => Err(anyhow!(
+//                 "Indexing failed: idx:{:?} target_len:{}",
+//                 index,
+//                 self.len()
+//             )),
+//         }
+//     }
+// }
+
+impl<T, I: SliceIndex<Self> + Clone + Debug> SliceExt<I> for [T] {
+    fn get_or_err(&self, index: I) -> Result<&<I as SliceIndex<[T]>>::Output, Error> {
         match self.get(index.clone()) {
             Some(v) => Ok(v),
             None => Err(anyhow!(
@@ -40,5 +58,172 @@ impl<T> SliceExt<Range<usize>> for [T] {
                 self.len()
             )),
         }
+    }
+}
+
+pub trait SliceExt2<I> {
+    type Output: ?Sized;
+
+    fn get_with_int(&self, index: I) -> Result<&Self::Output, Error>;
+}
+
+macro_rules! impl_get_with_int_range {
+    ($ty:ty) => {
+        impl<T> SliceExt2<Range<$ty>> for [T] {
+            type Output = [T];
+
+            fn get_with_int(&self, index: Range<$ty>) -> Result<&Self::Output, Error> {
+                let start = index.start;
+                let end = index.end;
+
+                let start_us = if start < 0 {
+                    (<$ty>::try_from(self.len())? + start) as usize
+                } else {
+                    start as usize
+                };
+
+                let end_us = if end < 0 {
+                    (<$ty>::try_from(self.len())? + end) as usize
+                } else {
+                    end as usize
+                };
+
+                self.get_or_err(start_us..end_us)
+            }
+        }
+    };
+}
+
+macro_rules! impl_get_with_int_single {
+    ($ty:ty) => {
+        impl<T> SliceExt2<RangeFrom<$ty>> for [T] {
+            type Output = [T];
+
+            /// Index the slice from `index` to the end.
+            fn get_with_int(&self, index: RangeFrom<$ty>) -> Result<&Self::Output, Error> {
+                let start = index.start;
+
+                let start_us = if start < 0 {
+                    (<$ty>::try_from(self.len())? + start) as usize
+                } else {
+                    start as usize
+                };
+
+                self.get_or_err(start_us..)
+            }
+        }
+    };
+}
+
+impl_get_with_int_range!(i32);
+impl_get_with_int_range!(i64);
+impl_get_with_int_single!(i32);
+impl_get_with_int_single!(i64);
+pub(crate) trait BytesExt {
+    fn try_as_str(&self) -> Result<&str, Utf8Error>;
+}
+
+impl BytesExt for &[u8] {
+    fn try_as_str(&self) -> Result<&str, Utf8Error> {
+        str::from_utf8(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_positive_range_i32() {
+        let data = [10, 20, 30, 40, 50];
+        // Standard slice: 1 to 4 -> [20, 30, 40]
+        let res = data.get_with_int(1..4i32).unwrap();
+        assert_eq!(res, &[20, 30, 40]);
+    }
+
+    #[test]
+    fn test_negative_range_i32() {
+        let data = [10, 20, 30, 40, 50];
+        // Python: data[-3:-1] -> [30, 40]
+        let res = data.get_with_int(-3..-1i32).unwrap();
+        assert_eq!(res, &[30, 40]);
+    }
+
+    #[test]
+    fn test_mixed_range_i32() {
+        let data = [10, 20, 30, 40, 50];
+        // Python: data[1:-1] -> [20, 30, 40]
+        let res = data.get_with_int(1..-1i32).unwrap();
+        assert_eq!(res, &[20, 30, 40]);
+    }
+
+    #[test]
+    fn test_range_from_positive_i32() {
+        let data = [10, 20, 30, 40, 50];
+        // Python: data[2:] -> [30, 40, 50]
+        let res = data.get_with_int(2i32..).unwrap();
+        assert_eq!(res, &[30, 40, 50]);
+    }
+
+    #[test]
+    fn test_range_from_negative_i32() {
+        let data = [10, 20, 30, 40, 50];
+        // Python: data[-2:] -> [40, 50]
+        let res = data.get_with_int(-2i32..).unwrap();
+        assert_eq!(res, &[40, 50]);
+    }
+
+    #[test]
+    fn test_i64_indexing() {
+        let data = [1, 2, 3, 4, 5];
+        // Check that i64 works the same way
+        let res = data.get_with_int(-2i64..).unwrap();
+        assert_eq!(res, &[4, 5]);
+    }
+
+    #[test]
+    fn test_out_of_bounds_errors() {
+        let data = [1, 2, 3];
+
+        // Positive OOB
+        assert!(data.get_with_int(0..5i32).is_err());
+
+        // Negative OOB (Start before 0)
+        // len=3. -4 implies index -1.
+        // -4 + 3 = -1, which is < 0. Your current logic (start_us) handles this via casting?
+        // Let's trace your code: (-4 + 3) as usize -> -1 as usize -> HUGE number.
+        // get_or_err(HUGE..) will return Err. So this is safe.
+        assert!(data.get_with_int(-4i32..).is_err());
+    }
+
+    #[test]
+    fn test_empty_slice() {
+        let data: [i32; 0] = [];
+        // 0..0 is valid for empty slice
+        assert_eq!(data.get_with_int(0..0i32).unwrap(), &[]);
+
+        // 0..1 is OOB
+        assert!(data.get_with_int(0..1i32).is_err());
+
+        // -1.. is OOB (len 0 + -1 = -1)
+        assert!(data.get_with_int(-1i32..).is_err());
+    }
+
+    #[test]
+    fn test_full_range_logic() {
+        let data = [1, 2, 3];
+        // 0..-0 (Python style) -> 0..3
+        // In your logic: end < 0 check?
+        // Wait, -0 is just 0. So end=0.
+        // 0..0 returns empty slice.
+        // Note: In Python list[0:-0] is empty. Correct.
+        assert_eq!(data.get_with_int(0..0i32).unwrap(), &[]);
+    }
+
+    #[test]
+    fn test_usize_as() {
+        let data = [1, 2, 3];
+        let l = 2 as usize;
+        assert_eq!(data.get_with_int(-(l as i32)..).unwrap(), &[2, 3]);
     }
 }

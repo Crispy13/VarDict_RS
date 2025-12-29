@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Error, anyhow};
-use crackle_kit::tracing::{Level, event};
+use crackle_kit::{data::bases::rev_comp::RevComplementor, tracing::{Level, event}};
 use rust_htslib::bam::{Record, Writer, record::CigarStringView};
 
 use crate::{
@@ -16,6 +16,7 @@ pub struct CigarParser {
     reference: Reference,
     max_read_len: usize,
     region: Region,
+    rev_complementor: RevComplementor,
 }
 
 impl CigarParser {
@@ -72,6 +73,7 @@ impl CigarParser {
                 ins_del_len,
                 self.max_read_len,
                 &self.region,
+                &mut self.rev_complementor,
             );
         }
 

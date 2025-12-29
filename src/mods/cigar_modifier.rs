@@ -4,6 +4,10 @@ use std::{
 };
 
 use anyhow::{Error, anyhow};
+use crackle_kit::{
+    data::bases::rev_comp::RevComplementor,
+    tracing::{Level, event},
+};
 use rust_htslib::bam::{
     Record,
     record::{Cigar, CigarString, CigarStringView},
@@ -12,7 +16,8 @@ use rust_htslib::bam::{
 use crate::{
     conf::Configuration,
     data::{reference::Reference, region::Region},
-    scopedata::global_read_only_scope::{INSTANCE, instance}, utils::SliceExt,
+    scopedata::global_read_only_scope::{INSTANCE, instance},
+    utils::{BytesExt, SliceExt, SliceExt2},
 };
 
 pub struct CigarModifier<'a> {
@@ -25,6 +30,7 @@ pub struct CigarModifier<'a> {
     indel: u32,
     max_read_length: usize,
     region: &'a Region,
+    rev_complementor: &'a mut RevComplementor,
 }
 
 impl<'a> CigarModifier<'a> {
@@ -37,6 +43,7 @@ impl<'a> CigarModifier<'a> {
         indel: u32,
         max_read_length: usize,
         region: &'a Region,
+        rev_complementor: &'a mut RevComplementor,
     ) -> Self {
         Self {
             align_start_pos,
@@ -48,6 +55,7 @@ impl<'a> CigarModifier<'a> {
             indel,
             max_read_length,
             region,
+            rev_complementor,
         }
     }
 
@@ -77,6 +85,7 @@ impl<'a> CigarModifier<'a> {
             *cigar_vec.back_mut().unwrap() = Cigar::SoftClip(*l);
         }
 
+        // if the length Soft clip of 5' end greater or equal to 10:
         if let Some(Cigar::SoftClip(l)) = cigar_vec
             .front()
             .copied()
@@ -84,7 +93,43 @@ impl<'a> CigarModifier<'a> {
         {
             let l = l as usize;
             if !instance().conf.chimeric_filter && l >= Configuration::SEED_2 as usize {
-                let subseq = self.query_sequence.get_or_err(0..l)?;
+                let softclip_seq = self.query_sequence.get_or_err(0..l)?;
+                let seq = self.rev_complementor.reverse_complement(softclip_seq);
+                let rc_seed = seq.get_or_err(0..Configuration::SEED_2 as usize)?;
+
+                if let Some(poss) = self.ref_data.seed.get(rc_seed) {
+                    if poss.len() == 1
+                        && ((cigar_pos - poss.get(0).copied().unwrap() as u32) as usize)
+                            < 2 * self.max_read_length
+                    {
+                        cigar_vec.pop_front().unwrap();
+                        self.query_sequence = self.query_sequence.get_or_err(0..l)?;
+                        self.query_quality = self.query_quality.get_or_err(0..l)?;
+
+                        event!(
+                            Level::INFO,
+                            "{} at 5' is a chimeric at {} by SEED {}",
+                            self.query_sequence.try_as_str()?,
+                            cigar_pos,
+                            Configuration::SEED_2,
+                        )
+                    }
+                }
+            }
+        } else if let Some(Cigar::SoftClip(l)) = cigar_vec
+            .back()
+            .copied()
+            .and_then(|c| if c.len() >= 10 { Some(c) } else { None })
+        {
+            let l = l as usize;
+            if !instance().conf.chimeric_filter && l >= Configuration::SEED_2 as usize {
+                let softclip_seq = self
+                    .query_sequence
+                    .get_with_int(-(l as i32)..)?;
+
+                let seq = self.rev_complementor.reverse_complement(softclip_seq);
+                let rc_seed = seq.get_with_int(-(Configuration::SEED_2)..)?;
+
             }
         }
 
