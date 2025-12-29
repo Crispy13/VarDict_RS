@@ -295,6 +295,55 @@ impl<'a> CigarModifier<'a> {
 
         todo!()
     }
+
+    fn two_dels_ins_to_complex(
+        &self,
+        cigar_pos_r: &mut u32,
+        cigar_vd: &VecDeque<Cigar>,
+        si_and_c_lens: (usize, [u32; 7]), // Cigars: M D M I M D M
+        flag: bool,
+    ) {
+        let cigar_pos = *cigar_pos_r;
+        // length of both matched sequences and insertion
+        let (si, c_lens) = si_and_c_lens;
+        let tslen = c_lens[2] + c_lens[3] + c_lens[4];
+
+        // length of deletions and internal matched sequences
+        let dlen = c_lens[1] + c_lens[2] + c_lens[4] + c_lens[5];
+
+        // length of internal matched sequences
+        let mid = c_lens[2] + c_lens[4];
+
+        // offset of first deletion in the reference sequence
+        let mut refoff = cigar_pos + c_lens[0];
+
+        // offset of first deletion in the read
+        let mut rdoff = c_lens[0];
+
+        // offset of first deletion in the read corrected by possibly matching bases
+        let rdoff_corrected = c_lens[0];
+
+        let rm = c_lens[6];
+
+        if si > 0 { // If the complex is not at start of CIGAR string
+            for cigar in (0..si).map(|i| cigar_vd[i]) {
+                match cigar {
+                    Cigar::Match(l) => {
+                        refoff += l;
+                        rdoff += l;
+                    }
+                    Cigar::RefSkip(l) | Cigar::Del(l) => {
+                        refoff += l;
+                    }
+                    Cigar::SoftClip(l) | Cigar::Ins(l)=> {
+                        rdoff += l;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+    }
 }
 
 // Returns the index 'i' where the pattern starts
