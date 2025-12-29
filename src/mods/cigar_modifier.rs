@@ -287,8 +287,46 @@ impl<'a> CigarModifier<'a> {
                 }
                 _ => {}
             }
+
+            match cigar_vec {
+                _ => {}
+            }
         }
 
         todo!()
     }
+}
+
+// Returns the index 'i' where the pattern starts
+fn find_m_dmi_mdm(cigar: &VecDeque<Cigar>) -> Option<(usize, [u32; 7])> {
+    // We need at least 7 elements
+    if cigar.len() < 7 {
+        return None;
+    }
+
+    // Loop through valid start positions
+    for i in 0..cigar.len() - 6 {
+        // Use pattern matching on references
+        match (
+            &cigar[i],
+            &cigar[i + 1],
+            &cigar[i + 2],
+            &cigar[i + 3],
+            &cigar[i + 4],
+            &cigar[i + 5],
+            &cigar[i + 6],
+        ) {
+            (
+                &Cigar::Match(i1), // 1
+                &Cigar::Del(i2),   // 2
+                &Cigar::Match(i3), // 3
+                &Cigar::Ins(i4),   // 4
+                &Cigar::Match(i5), // 5
+                &Cigar::Del(i6),   // 6
+                &Cigar::Match(i7), // 7
+            ) => return Some((i, [i1, i2, i3, i4, i5, i6, i7])), // FOUND IT!
+            _ => continue,
+        }
+    }
+    None
 }
