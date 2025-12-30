@@ -42,7 +42,7 @@ pub(crate) fn is_has_and_not_equals(
     contig_ref_seq: &[u8],
     index: usize,
 ) -> bool {
-    match contig_ref_seq.get(index) {
+    match contig_ref_seq.get(index.into()) {
         Some(&rb) => b != rb,
         None => {
             false
