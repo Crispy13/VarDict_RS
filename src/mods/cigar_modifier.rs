@@ -297,7 +297,11 @@ impl<'a> CigarModifier<'a> {
                 flag = self.three_indels(cigar_pos, &mut cigar_vec, si_and_cigars, flag)?;
             }
 
-            if let Some(si_and_cigars) = find_d_m_di_i(&cigar_vec) {}
+            if let Some(si_and_cigars) = find_d_m_di_i(&cigar_vec) {
+                flag = self.combine_to_close_to_correct(&mut cigar_vec, si_and_cigars, flag)?;
+            }
+
+            if let Some(si_and_cigars) = find_d_i_m_id_i(&cigar_vec) {}
         }
 
         todo!()
@@ -658,6 +662,7 @@ impl<'a> CigarModifier<'a> {
     }
 
     fn combine_to_close_to_correct(
+        &self,
         cigar_vd: &mut VecDeque<Cigar>,
         si_and_cigars: (usize, [Cigar; 3], Option<Cigar>),
         mut flag: bool,
@@ -690,6 +695,53 @@ impl<'a> CigarModifier<'a> {
                 oth => {
                     unreachable!("{oth:?}")
                 }
+            }
+
+            cigar_vd[si] = Cigar::Del(dlen as u32);
+            cigar_vd[si + 1] = Cigar::Ins(ilen as u32);
+
+            cigar_vd.drain(si + 2..si + drain_end_off);
+
+            flag = true;
+        }
+
+        Ok(flag)
+    }
+
+    fn combine_to_close_to_one(
+        &self,
+        cigar_vd: &mut VecDeque<Cigar>,
+        si_and_cigars: (usize, [Cigar; 3], Option<Cigar>),
+        mut flag: bool,
+    ) -> Result<bool, Error> {
+        let (si, cigars, opt_i) = si_and_cigars;
+
+        let g2 = cigars[0].len() as i32;
+        let g3 = cigars[1].len() as i32;
+        let g4 = cigars[2].len() as i32;
+
+        if g3 <= 15 {
+            let mut drain_end_off = 3;
+
+            //length of matched sequence and deletion
+            let mut dlen = g3;
+            //length of first insertion and matched sequence
+            let mut ilen = g2 + g3;
+
+            match cigars[2] {
+                Cigar::Ins(_) => {
+                    ilen += g4;
+                }
+                Cigar::Del(_) => {
+                    dlen += g4;
+
+                    //last insertion string
+                    if let Some(c) = opt_i {
+                        ilen += c.len() as i32;
+                        drain_end_off += 1;
+                    }
+                }
+                _ => {}
             }
 
             cigar_vd[si] = Cigar::Del(dlen as u32);
@@ -838,6 +890,49 @@ fn find_d_m_di_i(cigar: &VecDeque<Cigar>) -> Option<(usize, [Cigar; 3], Option<C
 
     None
 }
+
+fn find_d_i_m_id_i(cigar: &VecDeque<Cigar>) -> Option<(usize, [Cigar; 3], Option<Cigar>)> {
+    // We need at least 4 elements
+    if cigar.len() < 4 {
+        return None;
+    }
+
+    // Loop through valid start positions
+    for i in 0..cigar.len() - 3 {
+        let c1 = cigar[i];
+        match c1 {
+            Cigar::Del(_) | Cigar::HardClip(_) => {
+                continue;
+            }
+            _ => {}
+        }
+
+        // Use pattern matching on references
+        match (&cigar[i + 1], &cigar[i + 2], &cigar[i + 3]) {
+            (
+                &c2 @ Cigar::Ins(_),                   // 1
+                &c3 @ Cigar::Match(_),                 // 2
+                &c4 @ (Cigar::Ins(_) | Cigar::Del(_)), // 3
+            ) => {
+                return Some((
+                    i+1,
+                    [c2, c3, c4],
+                    cigar.get(i + 4).copied().and_then(|c| {
+                        if matches!(c, Cigar::Ins(_)) {
+                            Some(c)
+                        } else {
+                            None
+                        }
+                    }),
+                ));
+            }
+            _ => continue,
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
