@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::variants::variants::Variant;
+use crate::{utils::SliceExt, variants::variants::Variant};
 
 pub(crate) fn get_variants_from_map<'a>(
     var_map: &'a mut HashMap<i64, HashMap<String, Variant>>,
@@ -44,7 +44,6 @@ pub(crate) fn is_has_and_not_equals(b: u8, contig_ref_seq: &[u8], index: usize) 
     }
 }
 
-
 #[inline]
 pub(crate) fn is_has_and_equals(b: u8, contig_ref_seq: &[u8], index: usize) -> bool {
     match contig_ref_seq.get(index) {
@@ -54,8 +53,25 @@ pub(crate) fn is_has_and_equals(b: u8, contig_ref_seq: &[u8], index: usize) -> b
 }
 
 #[inline]
+pub(crate) fn is_has_and_equals_ref_and_seq_base(
+    contig_ref_seq: &[u8],
+    index1: usize,
+    seq: &[u8],
+    index2: usize,
+) -> bool {
+    match contig_ref_seq.get(index1) {
+        Some(&rb) => rb == *seq.get(index2).unwrap(),
+        None => false,
+    }
+}
+
+#[inline]
 /// Check the bases of the two indices are the same
-pub(crate) fn is_has_and_equals_two_index(index1: usize, contig_ref_seq: &[u8], index2: usize) -> bool {
+pub(crate) fn is_has_and_equals_two_index(
+    index1: usize,
+    contig_ref_seq: &[u8],
+    index2: usize,
+) -> bool {
     contig_ref_seq
         .get(index1)
         .and_then(|b1| contig_ref_seq.get(index2).and_then(|b2| Some(b1 == b2)))

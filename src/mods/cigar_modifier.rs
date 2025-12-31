@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
 };
 
 use anyhow::{Error, anyhow};
@@ -18,7 +18,7 @@ use crate::{
     data::{reference::Reference, region::Region},
     scopedata::global_read_only_scope::{INSTANCE, instance},
     utils::{BytesExt, SliceExt, SliceExt2},
-    variants::var_utils::{is_has_and_equals, is_has_and_not_equals},
+    variants::var_utils::{is_has_and_equals, is_has_and_equals_ref_and_seq_base, is_has_and_not_equals},
 };
 
 pub struct CigarModifier<'a> {
@@ -309,26 +309,96 @@ impl<'a> CigarModifier<'a> {
                 let (si, cigars) = si_and_cigars;
                 let dlen = (cigars[0].len() + cigars[1].len()) as i32;
                 cigar_vec[si] = Cigar::Del(dlen as u32);
-                cigar_vec.remove(si+1).unwrap();
+                cigar_vec.remove(si + 1).unwrap();
 
                 flag = true;
             }
 
             if let Some(si_and_cigars) = find_i_i(&cigar_vec) {
                 let (si, cigars) = si_and_cigars;
-                let ilen= (cigars[0].len() + cigars[1].len()) as i32;
+                let ilen = (cigars[0].len() + cigars[1].len()) as i32;
                 cigar_vec[si] = Cigar::Ins(ilen as u32);
-                cigar_vec.remove(si+1).unwrap();
+                cigar_vec.remove(si + 1).unwrap();
 
-                flag=true;
-            }        
+                flag = true;
+            }
         }
 
-        let cigar_iter_rev = cigar_vec.iter().rev();
+        todo!()
+    }
+
+    fn capture_mis_softly_ms(
+        &self,
+        cigar_pos: u32,
+        cigar_vd: &mut VecDeque<Cigar>,
+    ) -> Result<(), Error> {
+        let mut cigar_iter_rev = cigar_vd.iter().rev();
         match (cigar_iter_rev.next(), cigar_iter_rev.next()) {
             (Some(&Cigar::SoftClip(sl)), Some(&Cigar::Match(ml))) => {
+                let mch = ml as i32;
+                let soft = sl as i32;
+
+                // offset of soft-clipped sequence in the reference string (position + length of
+                // matched)
+                let mut refoff = (cigar_pos + ml) as i32;
+
+                // offset of soft-clipped sequence in the read
+                let mut rdoff = ml as i32;
+
+                for &cigar in cigar_iter_rev {
+                    match cigar {
+                        Cigar::Match(l) => {
+                            refoff += l as i32;
+                            rdoff += l as i32;
+                        }
+                        Cigar::RefSkip(l) | Cigar::Del(l) => {
+                            refoff += l as i32;
+                        }
+                        Cigar::SoftClip(l) | Cigar::Ins(l) => {
+                            rdoff += l as i32;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // number of bases after refoff/rdoff that match in reference and read sequences
+                let rn = 0;
+
+                let rn_set = HashSet::new();
+
+                while rn < soft
+                    && is_has_and_equals_ref_and_seq_base(
+                        &self.ref_data.ref_seq,
+                        (refoff + rn) as usize,
+                        self.query_sequence,
+                        (rdoff + rn) as usize,
+                    )
+                    && self.query_quality.get_or_err((rdoff + rn) as usize)? - 33
+                        > Configuration::LOW_QUAL as u8
+                {
+                    rn += 1;
+                }
+                
+                if rn > 0 {
+                    mch += rn;
+                    soft -= rn;
+
+                    if soft > 0 {
+                        cigar_vd[cigar_vd.len()-1] = Cigar::SoftClip(soft as u32);
+                        cigar_vd[cigar_vd.len()-2] = Cigar::SoftClip(mch as u32);
+                    } else {
+                        cigar_vd.pop_back().unwrap();
+                        cigar_vd[cigar_vd.len()-1] = Cigar::Match(mch as u32);
+                    }
+                    rn = 0;
+                }
+
+                if soft > 0 {
+                    
+                }
                 
             }
+            _ => {}
         }
 
         todo!()
