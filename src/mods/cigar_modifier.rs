@@ -301,7 +301,34 @@ impl<'a> CigarModifier<'a> {
                 flag = self.combine_to_close_to_correct(&mut cigar_vec, si_and_cigars, flag)?;
             }
 
-            if let Some(si_and_cigars) = find_d_i_m_id_i(&cigar_vec) {}
+            if let Some(si_and_cigars) = find_d_i_m_id_i(&cigar_vec) {
+                flag = self.combine_to_close_to_one(&mut cigar_vec, si_and_cigars, flag)?;
+            }
+
+            if let Some(si_and_cigars) = find_d_d(&cigar_vec) {
+                let (si, cigars) = si_and_cigars;
+                let dlen = (cigars[0].len() + cigars[1].len()) as i32;
+                cigar_vec[si] = Cigar::Del(dlen as u32);
+                cigar_vec.remove(si+1).unwrap();
+
+                flag = true;
+            }
+
+            if let Some(si_and_cigars) = find_i_i(&cigar_vec) {
+                let (si, cigars) = si_and_cigars;
+                let ilen= (cigars[0].len() + cigars[1].len()) as i32;
+                cigar_vec[si] = Cigar::Ins(ilen as u32);
+                cigar_vec.remove(si+1).unwrap();
+
+                flag=true;
+            }        
+        }
+
+        let cigar_iter_rev = cigar_vec.iter().rev();
+        match (cigar_iter_rev.next(), cigar_iter_rev.next()) {
+            (Some(&Cigar::SoftClip(sl)), Some(&Cigar::Match(ml))) => {
+                
+            }
         }
 
         todo!()
@@ -915,7 +942,7 @@ fn find_d_i_m_id_i(cigar: &VecDeque<Cigar>) -> Option<(usize, [Cigar; 3], Option
                 &c4 @ (Cigar::Ins(_) | Cigar::Del(_)), // 3
             ) => {
                 return Some((
-                    i+1,
+                    i + 1,
                     [c2, c3, c4],
                     cigar.get(i + 4).copied().and_then(|c| {
                         if matches!(c, Cigar::Ins(_)) {
@@ -930,6 +957,46 @@ fn find_d_i_m_id_i(cigar: &VecDeque<Cigar>) -> Option<(usize, [Cigar; 3], Option
         }
     }
 
+    None
+}
+
+fn find_d_d(cigar: &VecDeque<Cigar>) -> Option<(usize, [Cigar; 2])> {
+    // We need at least 2 elements
+    if cigar.len() < 2 {
+        return None;
+    }
+
+    // Loop through valid start positions
+    for i in 0..cigar.len() - 1 {
+        // Use pattern matching on references
+        match (&cigar[i], &cigar[i + 1]) {
+            (
+                &c1 @ Cigar::Del(_), // 1
+                &c2 @ Cigar::Del(_), // 2
+            ) => return Some((i, [c1, c2])),
+            _ => continue,
+        }
+    }
+    None
+}
+
+fn find_i_i(cigar: &VecDeque<Cigar>) -> Option<(usize, [Cigar; 2])> {
+    // We need at least 2 elements
+    if cigar.len() < 2 {
+        return None;
+    }
+
+    // Loop through valid start positions
+    for i in 0..cigar.len() - 1 {
+        // Use pattern matching on references
+        match (&cigar[i], &cigar[i + 1]) {
+            (
+                &c1 @ Cigar::Ins(_), // 1
+                &c2 @ Cigar::Ins(_), // 2
+            ) => return Some((i, [c1, c2])),
+            _ => continue,
+        }
+    }
     None
 }
 
