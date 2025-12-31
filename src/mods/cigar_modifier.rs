@@ -288,9 +288,16 @@ impl<'a> CigarModifier<'a> {
                 _ => {}
             }
 
-            match cigar_vec {
-                _ => {}
+            if let Some(si_and_c_lens) = find_m_dmi_mdm(&cigar_vec) {
+                flag =
+                    self.two_dels_ins_to_complex(cigar_pos, &mut cigar_vec, si_and_c_lens, flag)?;
+            } else if let Some(si_and_c_lens) = find_m_dm_dm_dm(&cigar_vec) {
+                flag = self.three_deletions(cigar_pos, &mut cigar_vec, si_and_c_lens, flag)?;
+            } else if let Some(si_and_cigars) = find_m_id_m_id_m_id_m(&cigar_vec) {
+                flag = self.three_indels(cigar_pos, &mut cigar_vec, si_and_cigars, flag)?;
             }
+
+            if let Some(si_and_cigars) = find_d_m_di_i(&cigar_vec) {}
         }
 
         todo!()
@@ -367,31 +374,327 @@ impl<'a> CigarModifier<'a> {
 
             // 1. Overwrite the first slot with the new extended Match
             cigar_vd[si] = Cigar::Match(rdoff_corrected as u32);
-            
+
             // 2. Overwrite the next slots based on the logic
             if tslen <= 0 {
                 // Result: M, D, M (3 items total)
                 dlen -= tslen;
                 rm += tslen;
-                
+
                 cigar_vd[si + 1] = Cigar::Del(dlen as u32);
                 cigar_vd[si + 2] = Cigar::Match(rm as u32);
-                
-                // We used 3 slots. We originally had 7. 
+
+                // We used 3 slots. We originally had 7.
                 // We need to remove the remaining 4 items (7 - 3 = 4).
                 // Remove indices from si+3 up to si+7
-                cigar_vd.drain(si + 3 .. si + 7);
-                
+                cigar_vd.drain(si + 3..si + 7);
             } else {
                 // Result: M, D, I, M (4 items total)
                 cigar_vd[si + 1] = Cigar::Del(dlen as u32);
                 cigar_vd[si + 2] = Cigar::Ins(tslen as u32);
                 cigar_vd[si + 3] = Cigar::Match(rm as u32);
-                
+
                 // We used 4 slots. We originally had 7.
                 // We need to remove the remaining 3 items (7 - 4 = 3).
-                cigar_vd.drain(si + 4 .. si + 7);
+                cigar_vd.drain(si + 4..si + 7);
             }
+
+            flag = true;
+        }
+
+        Ok(flag)
+    }
+
+    fn three_deletions(
+        &self,
+        cigar_pos: u32,
+        cigar_vd: &mut VecDeque<Cigar>,
+        si_and_c_lens: (usize, [u32; 7]), // Cigars: M D M D M D M
+        mut flag: bool,
+    ) -> Result<bool, Error> {
+        let (si, c_lens) = si_and_c_lens;
+
+        //length of both matched sequences and insertion
+        let mut tslen = (c_lens[2] + c_lens[4]) as i32;
+
+        //length of deletions and internal matched sequences
+        let mut dlen = (c_lens[1] + c_lens[2] + c_lens[3] + c_lens[4] + c_lens[5]) as i32;
+
+        //length of internal matched sequences
+        let mid = (c_lens[2] + c_lens[4]) as i32;
+
+        //offset of first deletion in the reference sequence
+        let mut refoff = (cigar_pos + c_lens[0]) as i32;
+
+        //offset of first deletion in the read
+        let mut rdoff = (c_lens[0]) as i32;
+
+        //offset of first deletion in the read corrected by possibly matching bases
+        let mut rdoff_corrected = (c_lens[0]) as i32;
+
+        let mut rm = c_lens[6] as i32;
+
+        if si > 0 {
+            // If the complex is not at start of CIGAR string
+            for cigar in (0..si).map(|i| cigar_vd[i]) {
+                match cigar {
+                    Cigar::Match(l) => {
+                        refoff += l as i32;
+                        rdoff += l as i32;
+                    }
+                    Cigar::RefSkip(l) | Cigar::Del(l) => {
+                        refoff += l as i32;
+                    }
+                    Cigar::SoftClip(l) | Cigar::Ins(l) => {
+                        rdoff += l as i32;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        //number of bases after refoff/rdoff that match in reference and read
+        let mut rn = 0;
+        while rdoff + rn < self.query_sequence.len() as i32
+            && is_has_and_equals(
+                self.query_sequence
+                    .get_or_err((rdoff + rn) as usize)
+                    .copied()?,
+                &self.ref_data.ref_seq,
+                (refoff + rn) as usize,
+            )
+        {
+            rn += 1;
+        }
+
+        rdoff_corrected += rn;
+        dlen -= rn;
+        tslen -= rn;
+
+        if mid <= 15 {
+            //If length of internal matched sequences is no more than 15, replace M-D-M-I-M-D complex with M-D-I
+
+            // 1. Overwrite the first slot with the new extended Match
+            cigar_vd[si] = Cigar::Match(rdoff_corrected as u32);
+
+            // 2. Overwrite the next slots based on the logic
+            if tslen <= 0 {
+                // Result: M, D, M (3 items total)
+                dlen -= tslen;
+                rm += tslen;
+
+                cigar_vd[si + 1] = Cigar::Del(dlen as u32);
+                cigar_vd[si + 2] = Cigar::Match(rm as u32);
+
+                // We used 3 slots. We originally had 7.
+                // We need to remove the remaining 4 items (7 - 3 = 4).
+                // Remove indices from si+3 up to si+7
+                cigar_vd.drain(si + 3..si + 7);
+            } else {
+                // Result: M, D, I, M (4 items total)
+                cigar_vd[si + 1] = Cigar::Del(dlen as u32);
+                cigar_vd[si + 2] = Cigar::Ins(tslen as u32);
+                cigar_vd[si + 3] = Cigar::Match(rm as u32);
+
+                // We used 4 slots. We originally had 7.
+                // We need to remove the remaining 3 items (7 - 4 = 3).
+                cigar_vd.drain(si + 4..si + 7);
+            }
+
+            flag = true;
+        }
+
+        Ok(flag)
+    }
+
+    fn three_indels(
+        &self,
+        cigar_pos: u32,
+        cigar_vd: &mut VecDeque<Cigar>,
+        si_and_cigars: (usize, [Cigar; 7]), // Cigars: M D M D M D M
+        mut flag: bool,
+    ) -> Result<bool, Error> {
+        let (si, cigars) = si_and_cigars;
+
+        let mut tslen = (cigars[2].len() + cigars[4].len()) as i32;
+        let mut dlen = (cigars[2].len() + cigars[4].len()) as i32;
+
+        match cigars[1] {
+            Cigar::Ins(l) => {
+                tslen += l as i32;
+            }
+            Cigar::Del(l) => {
+                dlen += l as i32;
+            }
+            _ => {}
+        }
+        match cigars[3] {
+            Cigar::Ins(l) => {
+                tslen += l as i32;
+            }
+            Cigar::Del(l) => {
+                dlen += l as i32;
+            }
+            _ => {}
+        }
+        match cigars[5] {
+            Cigar::Ins(l) => {
+                tslen += l as i32;
+            }
+            Cigar::Del(l) => {
+                dlen += l as i32;
+            }
+            _ => {}
+        }
+
+        let mid = (cigars[2].len() + cigars[4].len()) as i32;
+
+        let mut refoff = (cigar_pos + cigars[0].len()) as i32;
+        let mut rdoff = (cigars[0].len()) as i32;
+        let mut rdoff_corrected = cigars[0].len() as i32;
+        let mut rm = cigars[6].len() as i32;
+
+        if si > 0 {
+            // If the complex is not at start of CIGAR string
+            for cigar in (0..si).map(|i| cigar_vd[i]) {
+                match cigar {
+                    Cigar::Match(l) => {
+                        refoff += l as i32;
+                        rdoff += l as i32;
+                    }
+                    Cigar::RefSkip(l) | Cigar::Del(l) => {
+                        refoff += l as i32;
+                    }
+                    Cigar::SoftClip(l) | Cigar::Ins(l) => {
+                        rdoff += l as i32;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut rn = 0;
+        while rdoff + rn < self.query_sequence.len() as i32
+            && is_has_and_equals(
+                self.query_sequence
+                    .get_or_err((rdoff + rn) as usize)
+                    .copied()?,
+                &self.ref_data.ref_seq,
+                (refoff + rn) as usize,
+            )
+        {
+            rn += 1;
+        }
+
+        rdoff_corrected += rn;
+        dlen -= rn;
+        tslen -= rn;
+
+        if mid <= 15 {
+            let mut drain_off = 0;
+            // 1. Overwrite the first slot with the new extended Match
+            cigar_vd[si] = Cigar::Match(rdoff_corrected as u32);
+
+            // 2. Overwrite the next slots based on the logic
+            if tslen <= 0 {
+                // Result: M, D, M (3 items total)
+                dlen -= tslen;
+                rm += tslen;
+
+                if dlen == 0 {
+                    rdoff_corrected = rdoff_corrected + rm;
+                    cigar_vd[si] = Cigar::Match(rdoff_corrected as u32);
+
+                    drain_off = 1;
+                } else if dlen < 0 {
+                    tslen = -dlen;
+                    rm += dlen;
+
+                    if rm < 0 {
+                        rdoff_corrected = rdoff_corrected + rm;
+                        cigar_vd[si] = Cigar::Match(rdoff_corrected as u32);
+                        cigar_vd[si + 1] = Cigar::Ins(tslen as u32);
+
+                        drain_off = 2;
+                    } else {
+                        cigar_vd[si + 1] = Cigar::Ins(tslen as u32);
+                        cigar_vd[si + 2] = Cigar::Match(rm as u32);
+
+                        drain_off = 3;
+                    }
+                } else {
+                    cigar_vd[si + 1] = Cigar::Del(dlen as u32);
+                    cigar_vd[si + 2] = Cigar::Match(rm as u32);
+
+                    drain_off = 3;
+                }
+            } else {
+                if dlen == 0 {
+                    cigar_vd[si + 1] = Cigar::Ins(tslen as u32);
+                    cigar_vd[si + 2] = Cigar::Match(rm as u32);
+
+                    drain_off = 3;
+                } else if dlen < 0 {
+                    rm += dlen;
+                    cigar_vd[si + 1] = Cigar::Ins(tslen as u32);
+                    cigar_vd[si + 2] = Cigar::Match(rm as u32);
+
+                    drain_off = 3;
+                } else {
+                    cigar_vd[si + 1] = Cigar::Del(dlen as u32);
+                    cigar_vd[si + 2] = Cigar::Ins(tslen as u32);
+                    cigar_vd[si + 3] = Cigar::Match(rm as u32);
+
+                    drain_off = 4;
+                }
+            }
+
+            cigar_vd.drain(si + drain_off..si + 7);
+
+            flag = true;
+        }
+
+        Ok(flag)
+    }
+
+    fn combine_to_close_to_correct(
+        cigar_vd: &mut VecDeque<Cigar>,
+        si_and_cigars: (usize, [Cigar; 3], Option<Cigar>),
+        mut flag: bool,
+    ) -> Result<bool, Error> {
+        let (si, cigars, opt_i) = si_and_cigars;
+        let g1 = cigars[0].len() as i32; // D
+        let g2 = cigars[1].len() as i32; // M
+        let g3 = cigars[2].len() as i32; // DI
+
+        if g2 <= 15 {
+            //length of both deletions and matched sequence
+            let mut dlen = g1 + g2;
+
+            //matched sequence length
+            let mut ilen = g2;
+
+            let mut drain_end_off = 4;
+            match opt_i {
+                Some(Cigar::Ins(l)) => {
+                    ilen += g3;
+                }
+                Some(Cigar::Del(l)) => {
+                    dlen += g3;
+                    ilen += l as i32;
+                }
+                Some(c) => {
+                    unreachable!()
+                }
+                None => {
+                    drain_end_off = 3;
+                }
+            }
+
+            cigar_vd[si] = Cigar::Del(dlen as u32);
+            cigar_vd[si + 1] = Cigar::Ins(ilen as u32);
+
+            cigar_vd.drain(si..si + drain_end_off);
 
             flag = true;
         }
@@ -432,4 +735,109 @@ fn find_m_dmi_mdm(cigar: &VecDeque<Cigar>) -> Option<(usize, [u32; 7])> {
         }
     }
     None
+}
+
+// Returns the index 'i' where the pattern starts
+fn find_m_id_m_id_m_id_m(cigar: &VecDeque<Cigar>) -> Option<(usize, [Cigar; 7])> {
+    // We need at least 7 elements
+    if cigar.len() < 7 {
+        return None;
+    }
+
+    // Loop through valid start positions
+    for i in 0..cigar.len() - 6 {
+        // Use pattern matching on references
+        match (
+            &cigar[i],
+            &cigar[i + 1],
+            &cigar[i + 2],
+            &cigar[i + 3],
+            &cigar[i + 4],
+            &cigar[i + 5],
+            &cigar[i + 6],
+        ) {
+            (
+                &c1 @ Cigar::Match(i1),                  // 1
+                &c2 @ (Cigar::Ins(i2) | Cigar::Del(i2)), // 2
+                &c3 @ Cigar::Match(i3),                  // 3
+                &c4 @ (Cigar::Ins(i4) | Cigar::Del(i4)), // 4
+                &c5 @ Cigar::Match(i5),                  // 5
+                &c6 @ (Cigar::Ins(i6) | Cigar::Del(i6)), // 4
+                &c7 @ Cigar::Match(i7),                  // 7
+            ) => return Some((i, [c1, c2, c3, c4, c5, c6, c7])), // FOUND IT!
+            _ => continue,
+        }
+    }
+    None
+}
+
+fn find_m_dm_dm_dm(cigar: &VecDeque<Cigar>) -> Option<(usize, [u32; 7])> {
+    // We need at least 7 elements
+    if cigar.len() < 7 {
+        return None;
+    }
+
+    // Loop through valid start positions
+    for i in 0..cigar.len() - 6 {
+        // Use pattern matching on references
+        match (
+            &cigar[i],
+            &cigar[i + 1],
+            &cigar[i + 2],
+            &cigar[i + 3],
+            &cigar[i + 4],
+            &cigar[i + 5],
+            &cigar[i + 6],
+        ) {
+            (
+                &Cigar::Match(i1), // 1
+                &Cigar::Del(i2),   // 2
+                &Cigar::Match(i3), // 3
+                &Cigar::Del(i4),   // 4
+                &Cigar::Match(i5), // 5
+                &Cigar::Del(i6),   // 4
+                &Cigar::Match(i7), // 7
+            ) => return Some((i, [i1, i2, i3, i4, i5, i6, i7])), // FOUND IT!
+            _ => continue,
+        }
+    }
+    None
+}
+
+fn find_d_m_di_i(cigar: &VecDeque<Cigar>) -> Option<(usize, [Cigar; 3], Option<Cigar>)> {
+    // We need at least 7 elements
+    if cigar.len() < 3 {
+        return None;
+    }
+
+    // Loop through valid start positions
+    for i in 0..cigar.len() - 2 {
+        // Use pattern matching on references
+        match (&cigar[i], &cigar[i + 1], &cigar[i + 2]) {
+            (
+                &c1 @ Cigar::Del(_),                   // 1
+                &c2 @ Cigar::Match(_),                 // 2
+                &c3 @ (Cigar::Ins(_) | Cigar::Del(_)), // 3
+            ) => {
+                return Some((
+                    i,
+                    [c1, c2, c3],
+                    cigar.get(i + 3).copied().and_then(|c| {
+                        if matches!(c, Cigar::Ins(_)) {
+                            Some(c)
+                        } else {
+                            None
+                        }
+                    }),
+                ));
+            }
+            _ => continue,
+        }
+    }
+
+    None
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
 }
