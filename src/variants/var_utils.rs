@@ -37,15 +37,27 @@ pub(crate) fn get_variants_from_map<'a>(
 }
 
 #[inline]
-pub(crate) fn is_has_and_not_equals(
-    b: u8,
-    contig_ref_seq: &[u8],
-    index: usize,
-) -> bool {
-    match contig_ref_seq.get(index.into()) {
+pub(crate) fn is_has_and_not_equals(b: u8, contig_ref_seq: &[u8], index: usize) -> bool {
+    match contig_ref_seq.get(index) {
         Some(&rb) => b != rb,
-        None => {
-            false
-        },
+        None => false,
     }
+}
+
+
+#[inline]
+pub(crate) fn is_has_and_equals(b: u8, contig_ref_seq: &[u8], index: usize) -> bool {
+    match contig_ref_seq.get(index) {
+        Some(&rb) => b == rb,
+        None => false,
+    }
+}
+
+#[inline]
+/// Check the bases of the two indices are the same
+pub(crate) fn is_has_and_equals_two_index(index1: usize, contig_ref_seq: &[u8], index2: usize) -> bool {
+    contig_ref_seq
+        .get(index1)
+        .and_then(|b1| contig_ref_seq.get(index2).and_then(|b2| Some(b1 == b2)))
+        .unwrap_or(false)
 }
