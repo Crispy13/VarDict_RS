@@ -674,27 +674,28 @@ impl<'a> CigarModifier<'a> {
             //matched sequence length
             let mut ilen = g2;
 
-            let mut drain_end_off = 4;
-            match opt_i {
-                Some(Cigar::Ins(l)) => {
+            let mut drain_end_off = 3;
+            match cigars[2] {
+                Cigar::Ins(l) => {
                     ilen += g3;
                 }
-                Some(Cigar::Del(l)) => {
+                Cigar::Del(l) => {
                     dlen += g3;
-                    ilen += l as i32;
+
+                    if let Some(c) = opt_i {
+                        ilen += c.len() as i32;
+                        drain_end_off += 1;
+                    }
                 }
-                Some(c) => {
-                    unreachable!()
-                }
-                None => {
-                    drain_end_off = 3;
+                oth => {
+                    unreachable!("{oth:?}")
                 }
             }
 
             cigar_vd[si] = Cigar::Del(dlen as u32);
             cigar_vd[si + 1] = Cigar::Ins(ilen as u32);
 
-            cigar_vd.drain(si..si + drain_end_off);
+            cigar_vd.drain(si + 2..si + drain_end_off);
 
             flag = true;
         }
