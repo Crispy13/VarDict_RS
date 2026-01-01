@@ -66,6 +66,19 @@ pub(crate) fn is_has_and_equals_ref_and_seq_base(
 }
 
 #[inline]
+pub(crate) fn is_has_and_not_equals_ref_and_seq_base(
+    contig_ref_seq: &[u8],
+    index1: usize,
+    seq: &[u8],
+    index2: usize,
+) -> bool {
+    match contig_ref_seq.get(index1) {
+        Some(&rb) => rb != *seq.get(index2).unwrap(),
+        None => false,
+    }
+}
+
+#[inline]
 /// Check the bases of the two indices are the same
 pub(crate) fn is_has_and_equals_two_index(
     index1: usize,
@@ -76,4 +89,32 @@ pub(crate) fn is_has_and_equals_two_index(
         .get(index1)
         .and_then(|b1| contig_ref_seq.get(index2).and_then(|b2| Some(b1 == b2)))
         .unwrap_or(false)
+}
+
+pub(crate) struct HomoPolymerChecker(u8);
+
+impl HomoPolymerChecker {
+    pub(crate) fn new() -> Self {
+        Self(0)
+    }
+
+    pub(crate) fn record_base(&mut self, b: u8) {
+        let bit = match b.to_ascii_lowercase() {
+            b'a' => 0b1,
+            b'c' => 0b10,
+            b'g' => 0b100,
+            b't' => 0b1000,
+            b'n' => 0b10000,
+            _ => panic!("Invalid base: {}", b as char),
+        };
+
+        self.0 |= bit
+    }
+
+    pub(crate) fn is_homopolymer(&self) -> bool {
+        if self.0 == 0 {
+            panic!("No base is recorded.")
+        }
+        self.0.count_ones() == 1
+    }
 }
