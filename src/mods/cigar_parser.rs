@@ -13,7 +13,7 @@ use rust_htslib::bam::{
 use crate::{
     data::{reference::Reference, region::Region},
     mods::cigar_modifier::CigarModifier,
-    scopedata::global_read_only_scope::GlobalReadOnlyScope,
+    scopedata::global_read_only_scope::{GlobalReadOnlyScope, instance},
     utils::aligner::Aligner,
 };
 
@@ -26,6 +26,7 @@ pub struct CigarParser {
     max_read_len: usize,
     region: Region,
     rev_complementor: RevComplementor,
+    discordant_count: usize,
 }
 
 impl CigarParser {
@@ -99,6 +100,46 @@ impl CigarParser {
             align_start_pos = record.query_alignment_start();
         }
 
+        self.clean_up_cigar(record);
+
+        let offset = 0;
+
+        //determine discordant reads
+        if record.tid() != record.mtid() {
+            self.discordant_count += 1;
+        }
+
+        //Ignore reads that are softclipped at both ends and both greater than 10 bp
+        match cigar.0.as_slice() {
+            [Cigar::SoftClip(sl1), .., Cigar::SoftClip(sl2)] if *sl1 >= 10 && *sl2 >= 10 => {
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        // Only match and insertion counts toward read length
+        // For total length, including soft-clipped bases
+        let read_match_ins_len = get_match_insertion_length(&cigar);
+
+        if instance().conf.min_match != 0 && read_match_ins_len < instance().conf.min_match as usize
+        {
+            return Ok(());
+        }
+
+        // The total length, including soft-clipped bases
+        let read_len_including_softclips = get_soft_clipped_length(&cigar);
+        self.max_read_len = read_len_including_softclips.max(self.max_read_len);
+
+        // If supplementary alignment is present
+        if instance().conf.sam_filter != 0 && record.is_supplementary() {
+            return Ok(()); // Ignore the supplementary for now so that it won't skew the coverage
+        }
+
+        // Skip sites that are not in region of interest in CRISPR mode
+        if self.skip_sites_out_region_of_interest(cigar.as_slice(), align_start_pos) {
+            return Ok(());
+        }
+
         todo!()
     }
 
@@ -149,6 +190,29 @@ impl CigarParser {
             record.set_cigar(Some(&CigarString(new_cigar_vec)));
         }
     }
+
+    fn skip_sites_out_region_of_interest(&self, cigars: &[Cigar], align_start_pos: usize) -> bool {
+        let cut_site = instance().conf.crispr_cutting_site;
+        let filter_bp = instance().conf.crispr_cutting_site;
+
+        if cut_site != 0 {
+            //The total aligned length, excluding soft-clipped bases and insertions
+            let rlen3 = cigars
+                .iter()
+                .map(|cigar| match cigar {
+                    Cigar::Match(l) | Cigar::Del(l) | Cigar::Equal(l) | Cigar::Diff(l) => *l,
+                    _ => 0,
+                })
+                .sum::<u32>();
+
+            if filter_bp != 0 {
+                return !(cut_site - align_start_pos as i32 > filter_bp
+                    && align_start_pos as i32 + rlen3 as i32 - cut_site > filter_bp);
+            }
+        }
+
+        false
+    }
 }
 
 macro_rules! get_cached_cigar_or_make {
@@ -173,4 +237,26 @@ fn get_ins_del_len(cigar: &CigarStringView) -> u32 {
             _ => None,
         })
         .sum::<u32>()
+}
+
+#[inline]
+fn get_match_insertion_length(cigar: &CigarStringView) -> usize {
+    cigar
+        .iter()
+        .map(|c| match c {
+            Cigar::Match(l) | Cigar::Ins(l) => *l as usize,
+            _ => 0,
+        })
+        .sum::<usize>()
+}
+
+#[inline]
+fn get_soft_clipped_length(cigar: &CigarStringView) -> usize {
+    cigar
+        .iter()
+        .map(|c| match c {
+            Cigar::Match(l) | Cigar::Ins(l) | Cigar::SoftClip(l) => *l as usize,
+            _ => 0,
+        })
+        .sum::<usize>()
 }
