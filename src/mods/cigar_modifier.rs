@@ -15,21 +15,21 @@ use rust_htslib::bam::{
 
 use crate::{
     conf::Configuration,
-    data::{reference::Reference, region::Region},
+    data::{ModifiedCigar, reference::Reference, region::Region},
     scopedata::global_read_only_scope::{INSTANCE, instance},
     utils::{BytesExt, SliceExt, SliceExt2},
     variants::var_utils::{
-        is_has_and_equals, is_has_and_equals_ref_and_seq_base, is_has_and_not_equals,
-        is_has_and_not_equals_ref_and_seq_base,
+        HomoPolymerChecker, is_has_and_equals, is_has_and_equals_ref_and_seq_base,
+        is_has_and_not_equals, is_has_and_not_equals_ref_and_seq_base,
     },
 };
 
-pub struct CigarModifier<'a> {
+pub struct CigarModifier<'a, 'b> {
     align_start_pos: usize,
     cigar_str: Cow<'a, CigarStringView>,
     original_cigar: &'a CigarStringView,
-    query_sequence: &'a [u8],
-    query_quality: &'a [u8],
+    query_sequence: &'b [u8],
+    query_quality: &'b [u8],
     ref_data: &'a Reference,
     indel: u32,
     max_read_length: usize,
@@ -37,12 +37,12 @@ pub struct CigarModifier<'a> {
     rev_complementor: &'a mut RevComplementor,
 }
 
-impl<'a> CigarModifier<'a> {
+impl<'a, 'b> CigarModifier<'a, 'b> {
     pub(crate) fn new(
         align_start_pos: usize,
         cigar_str: &'a CigarStringView,
-        query_sequence: &'a [u8],
-        query_quality: &'a [u8],
+        query_sequence: &'b [u8],
+        query_quality: &'b [u8],
         ref_data: &'a Reference,
         indel: u32,
         max_read_length: usize,
@@ -67,15 +67,15 @@ impl<'a> CigarModifier<'a> {
         &self.ref_data.ref_seq
     }
 
-    pub fn modify_cigar(&mut self) -> Result<(), Error> {
+    pub fn modify_cigar(&mut self) -> Result<ModifiedCigar<'b>, Error> {
         let mut flag = true;
 
         let mut cigar_vec = VecDeque::from_iter(self.cigar_str.0.iter().copied());
-        let mut cigar_pos = self.cigar_str.pos() as u32;
+        let mut align_start_pos = self.cigar_str.pos() as u32;
 
         // if CIGAR starts with deletion cut it off
         if let Some(Cigar::Del(l)) = cigar_vec.front() {
-            cigar_pos += *l;
+            align_start_pos += *l;
             cigar_vec.pop_front().unwrap();
         }
 
@@ -107,7 +107,7 @@ impl<'a> CigarModifier<'a> {
 
                 if let Some(poss) = self.ref_data.seed.get(rc_seed) {
                     if poss.len() == 1
-                        && ((cigar_pos as i32 - poss.get(0).copied().unwrap() as i32).abs()
+                        && ((align_start_pos as i32 - poss.get(0).copied().unwrap() as i32).abs()
                             as usize)
                             < 2 * self.max_read_length
                     {
@@ -119,7 +119,7 @@ impl<'a> CigarModifier<'a> {
                             Level::INFO,
                             "{} at 5' is a chimeric at {} by SEED {}",
                             self.query_sequence.try_as_str()?,
-                            cigar_pos,
+                            align_start_pos,
                             Configuration::SEED_2,
                         )
                     }
@@ -139,7 +139,7 @@ impl<'a> CigarModifier<'a> {
 
                 if let Some(poss) = self.ref_data.seed.get(rc_seed) {
                     if poss.len() == 1
-                        && ((cigar_pos as i32 - poss.get(0).copied().unwrap() as i32).abs()
+                        && ((align_start_pos as i32 - poss.get(0).copied().unwrap() as i32).abs()
                             as usize)
                             < 2 * self.max_read_length
                     {
@@ -151,7 +151,7 @@ impl<'a> CigarModifier<'a> {
                             Level::INFO,
                             "{} at 3' is a chimeric at {} by SEED {}",
                             self.query_sequence.try_as_str()?,
-                            cigar_pos,
+                            align_start_pos,
                             Configuration::SEED_2,
                         )
                     }
@@ -166,7 +166,7 @@ impl<'a> CigarModifier<'a> {
             match (cigar_vec.get(0), cigar_vec.get(1)) {
                 (Some(&Cigar::SoftClip(sl)), Some(c2 @ (&Cigar::Ins(idl) | &Cigar::Del(idl)))) => {
                     let tslen = sl + if matches!(c2, Cigar::Ins(_)) { idl } else { 0 };
-                    cigar_pos += if matches!(c2, Cigar::Del(_)) { idl } else { 0 };
+                    align_start_pos += if matches!(c2, Cigar::Del(_)) { idl } else { 0 };
 
                     cigar_vec.pop_front().unwrap();
                     *cigar_vec.front_mut().unwrap() = Cigar::SoftClip(tslen);
@@ -190,7 +190,6 @@ impl<'a> CigarModifier<'a> {
                 _ => {}
             }
 
-            
             match (cigar_vec.get(0), cigar_vec.get(1), cigar_vec.get(2)) {
                 (
                     Some(&Cigar::SoftClip(sl)),
@@ -199,7 +198,7 @@ impl<'a> CigarModifier<'a> {
                 ) => {
                     if ml <= 10 {
                         let tslen = sl + ml + if matches!(c3, Cigar::Ins(_)) { idl } else { 0 };
-                        cigar_pos += ml + if matches!(c3, Cigar::Del(_)) { idl } else { 0 };
+                        align_start_pos += ml + if matches!(c3, Cigar::Del(_)) { idl } else { 0 };
 
                         cigar_vec.drain(..2);
                         *cigar_vec.front_mut().unwrap() = Cigar::SoftClip(tslen);
@@ -224,9 +223,9 @@ impl<'a> CigarModifier<'a> {
                 ) => {
                     if ml <= 10 {
                         let tslen = sl + ml + if matches!(c3, Cigar::Ins(_)) { idl } else { 0 };
-                        cigar_pos += ml + if matches!(c3, Cigar::Del(_)) { idl } else { 0 };
+                        align_start_pos += ml + if matches!(c3, Cigar::Del(_)) { idl } else { 0 };
 
-                        cigar_vec.drain(cigar_vec.len()-2..);
+                        cigar_vec.drain(cigar_vec.len() - 2..);
                         *cigar_vec.back_mut().unwrap() = Cigar::SoftClip(tslen);
 
                         flag = true;
@@ -248,7 +247,7 @@ impl<'a> CigarModifier<'a> {
                         } else {
                             0
                         };
-                    cigar_pos += ml1
+                    align_start_pos += ml1
                         + if matches!(c_id, Cigar::Del(_)) {
                             idl
                         } else {
@@ -262,7 +261,7 @@ impl<'a> CigarModifier<'a> {
                                 .get_or_err((tslen + tn) as usize)
                                 .copied()?,
                             &self.ref_data.ref_seq,
-                            (cigar_pos + tn) as usize,
+                            (align_start_pos + tn) as usize,
                         )
                     {
                         tn += 1;
@@ -270,7 +269,7 @@ impl<'a> CigarModifier<'a> {
 
                     tslen += tn;
                     ml2 -= tn;
-                    cigar_pos += tn;
+                    align_start_pos += tn;
 
                     cigar_vec.pop_front().unwrap();
                     *cigar_vec.get_mut(0).unwrap() = Cigar::SoftClip(tslen);
@@ -284,14 +283,16 @@ impl<'a> CigarModifier<'a> {
             // NUMBER_IorD_DIGIT_M_END
             let mut cigar_vec_iter = cigar_vec.iter().rev();
             match (cigar_vec_iter.next(), cigar_vec_iter.next()) {
-                (Some(&Cigar::Match(ml)), Some(c_id @ (&Cigar::Ins(idl) | &Cigar::Del(idl)))) if ml < 10 => {
+                (Some(&Cigar::Match(ml)), Some(c_id @ (&Cigar::Ins(idl) | &Cigar::Del(idl))))
+                    if ml < 10 =>
+                {
                     let tslen = ml
                         + if matches!(c_id, Cigar::Ins(_)) {
                             idl
                         } else {
                             0
                         };
-                    
+
                     cigar_vec.pop_back().unwrap();
                     *cigar_vec.back_mut().unwrap() = Cigar::SoftClip(tslen);
 
@@ -302,11 +303,11 @@ impl<'a> CigarModifier<'a> {
 
             if let Some(si_and_c_lens) = find_m_dmi_mdm(&cigar_vec) {
                 flag =
-                    self.two_dels_ins_to_complex(cigar_pos, &mut cigar_vec, si_and_c_lens, flag)?;
+                    self.two_dels_ins_to_complex(align_start_pos, &mut cigar_vec, si_and_c_lens, flag)?;
             } else if let Some(si_and_c_lens) = find_m_dm_dm_dm(&cigar_vec) {
-                flag = self.three_deletions(cigar_pos, &mut cigar_vec, si_and_c_lens, flag)?;
+                flag = self.three_deletions(align_start_pos, &mut cigar_vec, si_and_c_lens, flag)?;
             } else if let Some(si_and_cigars) = find_m_id_m_id_m_id_m(&cigar_vec) {
-                flag = self.three_indels(cigar_pos, &mut cigar_vec, si_and_cigars, flag)?;
+                flag = self.three_indels(align_start_pos, &mut cigar_vec, si_and_cigars, flag)?;
             }
 
             if let Some(si_and_cigars) = find_d_m_di_i(&cigar_vec) {
@@ -336,199 +337,145 @@ impl<'a> CigarModifier<'a> {
             }
         }
 
-        // self.capture_mis_softly_ms(cigar_pos, &mut cigar_vec)?;
-
-        todo!()
-    }
-
-    fn capture_mis_softly_ms_or_capture_mis_softly3_mismatches(
-        &self,
-        cigar_pos: u32,
-        cigar_vd: &mut VecDeque<Cigar>,
-    ) -> Result<(), Error> {
-        let mut cigar_iter_rev = cigar_vd.iter().rev();
+        let mut cigar_iter_rev = cigar_vec.iter().rev();
         match (cigar_iter_rev.next(), cigar_iter_rev.next()) {
             (Some(&Cigar::SoftClip(sl)), Some(&Cigar::Match(ml))) => {
-                // capture_mis_softly_ms
-                let mut mch = ml as i32;
-                let mut soft = sl as i32;
-
-                // offset of soft-clipped sequence in the reference string (position + length of
-                // matched)
-                let mut refoff = (cigar_pos + ml) as i32;
-
-                // offset of soft-clipped sequence in the read
-                let mut rdoff = ml as i32;
-
-                for &cigar in cigar_iter_rev {
-                    match cigar {
-                        Cigar::Match(l) => {
-                            refoff += l as i32;
-                            rdoff += l as i32;
-                        }
-                        Cigar::RefSkip(l) | Cigar::Del(l) => {
-                            refoff += l as i32;
-                        }
-                        Cigar::SoftClip(l) | Cigar::Ins(l) => {
-                            rdoff += l as i32;
-                        }
-                        _ => {}
-                    }
-                }
-
-                // number of bases after refoff/rdoff that match in reference and read sequences
-                let mut rn = 0;
-
-                let mut rn_set = HashSet::new();
-
-                while rn < soft
-                    && is_has_and_equals_ref_and_seq_base(
-                        &self.ref_data.ref_seq,
-                        (refoff + rn) as usize,
-                        self.query_sequence,
-                        (rdoff + rn) as usize,
-                    )
-                    && self.query_quality.get_or_err((rdoff + rn) as usize)? - 33
-                        > Configuration::LOW_QUAL as u8
-                {
-                    rn += 1;
-                }
-
-                if rn > 0 {
-                    mch += rn;
-                    soft -= rn;
-
-                    if soft > 0 {
-                        *cigar_vd.get_mut(cigar_vd.len() - 1).unwrap() =
-                            Cigar::SoftClip(soft as u32);
-                        *cigar_vd.get_mut(cigar_vd.len() - 2).unwrap() =
-                            Cigar::Match(mch as u32);
-                    } else {
-                        cigar_vd.pop_back().unwrap();
-                        *cigar_vd.get_mut(cigar_vd.len() - 1).unwrap() = Cigar::Match(mch as u32);
-                    }
-                    rn = 0;
-                }
-
-                if soft > 0 {
-                    while rn + 1 < soft
-                        && is_has_and_equals_ref_and_seq_base(
-                            &self.ref_data.ref_seq,
-                            (refoff + rn + 1) as usize,
-                            self.query_sequence,
-                            (rdoff + rn + 1) as usize,
-                        )
-                        && self.query_quality.get_or_err((rdoff + rn + 1) as usize)? - 33
-                            > Configuration::LOW_QUAL as u8
-                    {
-                        rn += 1;
-                        rn_set.insert(
-                            self.ref_data
-                                .ref_seq
-                                .get_or_err((refoff + rn + 1) as usize)?,
-                        );
-                    }
-
-                    let rn_nt = rn_set.len();
-
-                    if rn > 4 && rn_nt > 1 {
-                        mch += rn + 1;
-                        soft -= rn + 1;
-
-                        let cigar_vd_len = cigar_vd.len();
-                        if soft > 0 {
-                            cigar_vd[cigar_vd_len - 1] = Cigar::SoftClip(soft as u32);
-                            cigar_vd[cigar_vd_len - 2] = Cigar::Match(mch as u32);
-                        } else {
-                            cigar_vd.pop_back().unwrap();
-                            cigar_vd[cigar_vd_len - 1] = Cigar::Match(mch as u32);
-                        }
-                    }
-
-                    if rn == 0 {
-                        let mut rrn = 0;
-                        let mut rmch = 0;
-
-                        while rrn < mch && rn < mch {
-                            if self
-                                .ref_data
-                                .ref_seq
-                                .get((refoff - rrn - 1) as usize)
-                                .is_none()
-                            {
-                                break;
-                            }
-
-                            if rrn < rdoff
-                                && is_has_and_not_equals_ref_and_seq_base(
-                                    &self.ref_data.ref_seq,
-                                    (refoff - rrn - 1) as usize,
-                                    self.query_sequence,
-                                    (rdoff - rrn - 1) as usize,
-                                )
-                            {
-                                rn = rrn + 1;
-                                rmch = 0;
-                            } else if rrn < rdoff
-                                && is_has_and_equals_ref_and_seq_base(
-                                    &self.ref_data.ref_seq,
-                                    (refoff - rrn - 1) as usize,
-                                    self.query_sequence,
-                                    (rdoff - rrn - 1) as usize,
-                                )
-                            {
-                                rmch += 1;
-                            }
-
-                            rrn += 1;
-
-                            // Stop at three consecure matches
-                            if rmch >= 3 {
-                                break;
-                            }
-                        }
-
-                        if rn > 0 && rn < mch {
-                            soft += rn;
-                            mch -= rn;
-                            *cigar_vd.get_mut(cigar_vd.len() - 1).unwrap() =
-                                Cigar::SoftClip(soft as u32);
-                            *cigar_vd.get_mut(cigar_vd.len() - 1).unwrap() =
-                                Cigar::Match(mch as u32);
-                        }
-                    }
-                }
+                self.capture_mis_softly3_ms(align_start_pos, &mut cigar_vec, sl, ml)?;
             }
             (Some(&Cigar::Match(ml)), _) => {
-                // capture_mis_softly3_mismatches
-                let mut mch = ml as i32;
-                let mut refoff = (cigar_pos + ml) as i32;
-                let mut rdoff = mch;
+                self.capture_mis_softly3_mismatches(align_start_pos, &mut cigar_vec, ml)?;
+            }
+            _ => {}
+        }
 
-                // If the complex is not at start of CIGAR string
-                for cigar in cigar_iter_rev.copied() {
-                    match cigar {
-                        Cigar::Match(l) => {
-                            refoff += l as i32;
-                            rdoff += l as i32;
-                        }
-                        Cigar::RefSkip(l) | Cigar::Del(l) => {
-                            refoff += l as i32;
-                        }
-                        Cigar::SoftClip(l) | Cigar::Ins(l) => {
-                            rdoff += l as i32;
-                        }
-                        _ => {}
-                    }
+        match (cigar_vec.get(0), cigar_vec.get(1)) {
+            (Some(&Cigar::SoftClip(sl)), Some(&Cigar::Match(ml))) => {
+                self.combine_dig_s_dig_m(&mut align_start_pos, &mut cigar_vec, sl, ml)?;
+            }
+            (Some(&Cigar::Match(ml)), _) => {
+                self.combine_begin_dig_m(&mut align_start_pos, &mut cigar_vec, ml)?;
+            }
+            _ => {}
+        }
+
+        let mc = ModifiedCigar::new(
+            align_start_pos as usize,
+            cigar_vec,
+            self.query_sequence,
+            self.query_quality,
+        );
+
+        Ok(mc)
+    }
+
+    fn capture_mis_softly3_ms(
+        &self,
+        align_start_pos: u32,
+        cigar_vd: &mut VecDeque<Cigar>,
+        sl: u32,
+        ml: u32,
+    ) -> Result<(), Error> {
+        // capture_mis_softly_ms
+        let mut mch = ml as i32;
+        let mut soft = sl as i32;
+
+        // offset of soft-clipped sequence in the reference string (position + length of
+        // matched)
+        let mut refoff = (align_start_pos + ml) as i32;
+
+        // offset of soft-clipped sequence in the read
+        let mut rdoff = ml as i32;
+
+        for &cigar in cigar_vd.iter().take(cigar_vd.len().saturating_sub(2)) {
+            match cigar {
+                Cigar::Match(l) => {
+                    refoff += l as i32;
+                    rdoff += l as i32;
                 }
+                Cigar::RefSkip(l) | Cigar::Del(l) => {
+                    refoff += l as i32;
+                }
+                Cigar::SoftClip(l) | Cigar::Ins(l) => {
+                    rdoff += l as i32;
+                }
+                _ => {}
+            }
+        }
 
-                let mut rn = 0;
+        // number of bases after refoff/rdoff that match in reference and read sequences
+        let mut rn = 0;
+
+        let mut homopolymer_checker = HomoPolymerChecker::new();
+
+        while rn < soft
+            && is_has_and_equals_ref_and_seq_base(
+                &self.ref_data.ref_seq,
+                (refoff + rn) as usize,
+                self.query_sequence,
+                (rdoff + rn) as usize,
+            )
+            && self.query_quality.get_or_err((rdoff + rn) as usize)? - 33
+                > Configuration::LOW_QUAL as u8
+        {
+            rn += 1;
+        }
+
+        if rn > 0 {
+            mch += rn;
+            soft -= rn;
+
+            if soft > 0 {
+                *cigar_vd.get_mut(cigar_vd.len() - 1).unwrap() = Cigar::SoftClip(soft as u32);
+                *cigar_vd.get_mut(cigar_vd.len() - 2).unwrap() = Cigar::Match(mch as u32);
+            } else {
+                cigar_vd.pop_back().unwrap();
+                *cigar_vd.get_mut(cigar_vd.len() - 1).unwrap() = Cigar::Match(mch as u32);
+            }
+            rn = 0;
+        }
+
+        if soft > 0 {
+            while rn + 1 < soft
+                && is_has_and_equals_ref_and_seq_base(
+                    &self.ref_data.ref_seq,
+                    (refoff + rn + 1) as usize,
+                    self.query_sequence,
+                    (rdoff + rn + 1) as usize,
+                )
+                && self.query_quality.get_or_err((rdoff + rn + 1) as usize)? - 33
+                    > Configuration::LOW_QUAL as u8
+            {
+                rn += 1;
+                homopolymer_checker.record_base(
+                    self.ref_data
+                        .ref_seq
+                        .get_or_err((refoff + rn + 1) as usize)
+                        .copied()?,
+                );
+            }
+
+            if rn > 4 && !homopolymer_checker.is_homopolymer() {
+                mch += rn + 1;
+                soft -= rn + 1;
+
+                let cigar_vd_len = cigar_vd.len();
+                if soft > 0 {
+                    cigar_vd[cigar_vd_len - 1] = Cigar::SoftClip(soft as u32);
+                    cigar_vd[cigar_vd_len - 2] = Cigar::Match(mch as u32);
+                } else {
+                    cigar_vd.pop_back().unwrap();
+                    cigar_vd[cigar_vd_len - 1] = Cigar::Match(mch as u32);
+                }
+            }
+
+            if rn == 0 {
                 let mut rrn = 0;
                 let mut rmch = 0;
 
                 while rrn < mch && rn < mch {
                     if self
-                        .contig_ref_seq()
+                        .ref_data
+                        .ref_seq
                         .get((refoff - rrn - 1) as usize)
                         .is_none()
                     {
@@ -537,7 +484,7 @@ impl<'a> CigarModifier<'a> {
 
                     if rrn < rdoff
                         && is_has_and_not_equals_ref_and_seq_base(
-                            self.contig_ref_seq(),
+                            &self.ref_data.ref_seq,
                             (refoff - rrn - 1) as usize,
                             self.query_sequence,
                             (rdoff - rrn - 1) as usize,
@@ -547,7 +494,7 @@ impl<'a> CigarModifier<'a> {
                         rmch = 0;
                     } else if rrn < rdoff
                         && is_has_and_equals_ref_and_seq_base(
-                            self.contig_ref_seq(),
+                            &self.ref_data.ref_seq,
                             (refoff - rrn - 1) as usize,
                             self.query_sequence,
                             (rdoff - rrn - 1) as usize,
@@ -564,13 +511,92 @@ impl<'a> CigarModifier<'a> {
                     }
                 }
 
-                mch -= rn;
-                if rn > 0 && rn <= 3 {
+                if rn > 0 && rn < mch {
+                    soft += rn;
+                    mch -= rn;
+                    *cigar_vd.get_mut(cigar_vd.len() - 1).unwrap() = Cigar::SoftClip(soft as u32);
                     *cigar_vd.get_mut(cigar_vd.len() - 1).unwrap() = Cigar::Match(mch as u32);
-                    cigar_vd.push_back(Cigar::SoftClip(rn as u32));
                 }
             }
-            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn capture_mis_softly3_mismatches(
+        &self,
+        align_start_pos: u32,
+        cigar_vd: &mut VecDeque<Cigar>,
+        ml: u32,
+    ) -> Result<(), Error> {
+        // capture_mis_softly3_mismatches
+        let mut mch = ml as i32;
+        let mut refoff = (align_start_pos + ml) as i32;
+        let mut rdoff = mch;
+
+        // If the complex is not at start of CIGAR string
+        for &cigar in cigar_vd.iter().take(cigar_vd.len().saturating_sub(1)) {
+            match cigar {
+                Cigar::Match(l) => {
+                    refoff += l as i32;
+                    rdoff += l as i32;
+                }
+                Cigar::RefSkip(l) | Cigar::Del(l) => {
+                    refoff += l as i32;
+                }
+                Cigar::SoftClip(l) | Cigar::Ins(l) => {
+                    rdoff += l as i32;
+                }
+                _ => {}
+            }
+        }
+
+        let mut rn = 0;
+        let mut rrn = 0;
+        let mut rmch = 0;
+
+        while rrn < mch && rn < mch {
+            if self
+                .contig_ref_seq()
+                .get((refoff - rrn - 1) as usize)
+                .is_none()
+            {
+                break;
+            }
+
+            if rrn < rdoff
+                && is_has_and_not_equals_ref_and_seq_base(
+                    self.contig_ref_seq(),
+                    (refoff - rrn - 1) as usize,
+                    self.query_sequence,
+                    (rdoff - rrn - 1) as usize,
+                )
+            {
+                rn = rrn + 1;
+                rmch = 0;
+            } else if rrn < rdoff
+                && is_has_and_equals_ref_and_seq_base(
+                    self.contig_ref_seq(),
+                    (refoff - rrn - 1) as usize,
+                    self.query_sequence,
+                    (rdoff - rrn - 1) as usize,
+                )
+            {
+                rmch += 1;
+            }
+
+            rrn += 1;
+
+            // Stop at three consecure matches
+            if rmch >= 3 {
+                break;
+            }
+        }
+
+        mch -= rn;
+        if rn > 0 && rn <= 3 {
+            *cigar_vd.get_mut(cigar_vd.len() - 1).unwrap() = Cigar::Match(mch as u32);
+            cigar_vd.push_back(Cigar::SoftClip(rn as u32));
         }
 
         Ok(())
@@ -578,7 +604,7 @@ impl<'a> CigarModifier<'a> {
 
     fn two_dels_ins_to_complex(
         &self,
-        cigar_pos: u32,
+        align_start_pos: u32,
         cigar_vd: &mut VecDeque<Cigar>,
         si_and_c_lens: (usize, [u32; 7]), // Cigars: M D M I M D M
         mut flag: bool,
@@ -594,7 +620,7 @@ impl<'a> CigarModifier<'a> {
         let mid = (c_lens[2] + c_lens[4]) as i32;
 
         // offset of first deletion in the reference sequence
-        let mut refoff = (cigar_pos + c_lens[0]) as i32;
+        let mut refoff = (align_start_pos + c_lens[0]) as i32;
 
         // offset of first deletion in the read
         let mut rdoff = c_lens[0] as i32;
@@ -680,7 +706,7 @@ impl<'a> CigarModifier<'a> {
 
     fn three_deletions(
         &self,
-        cigar_pos: u32,
+        align_start_pos: u32,
         cigar_vd: &mut VecDeque<Cigar>,
         si_and_c_lens: (usize, [u32; 7]), // Cigars: M D M D M D M
         mut flag: bool,
@@ -697,7 +723,7 @@ impl<'a> CigarModifier<'a> {
         let mid = (c_lens[2] + c_lens[4]) as i32;
 
         //offset of first deletion in the reference sequence
-        let mut refoff = (cigar_pos + c_lens[0]) as i32;
+        let mut refoff = (align_start_pos + c_lens[0]) as i32;
 
         //offset of first deletion in the read
         let mut rdoff = (c_lens[0]) as i32;
@@ -782,7 +808,7 @@ impl<'a> CigarModifier<'a> {
 
     fn three_indels(
         &self,
-        cigar_pos: u32,
+        align_start_pos: u32,
         cigar_vd: &mut VecDeque<Cigar>,
         si_and_cigars: (usize, [Cigar; 7]), // Cigars: M D M D M D M
         mut flag: bool,
@@ -822,7 +848,7 @@ impl<'a> CigarModifier<'a> {
 
         let mid = (cigars[2].len() + cigars[4].len()) as i32;
 
-        let mut refoff = (cigar_pos + cigars[0].len()) as i32;
+        let mut refoff = (align_start_pos + cigars[0].len()) as i32;
         let mut rdoff = (cigars[0].len()) as i32;
         let mut rdoff_corrected = cigars[0].len() as i32;
         let mut rm = cigars[6].len() as i32;
@@ -1022,6 +1048,198 @@ impl<'a> CigarModifier<'a> {
         }
 
         Ok(flag)
+    }
+
+    fn combine_dig_s_dig_m(
+        &self,
+        cigar_pos: &mut u32,
+        cigar_vd: &mut VecDeque<Cigar>,
+        sl: u32,
+        ml: u32,
+    ) -> Result<(), Error> {
+        //length of matched sequence
+        let mut mch = ml as i32;
+        //length of soft-clipping
+        let mut soft = sl as i32;
+
+        //number of bases before matched sequence that match in reference and read sequences
+        let mut rn = 0;
+        let mut homop = HomoPolymerChecker::new();
+
+        while rn < soft
+            && is_has_and_equals_ref_and_seq_base(
+                self.contig_ref_seq(),
+                ((*cigar_pos as i32) - rn - 1) as usize,
+                self.query_sequence,
+                (soft - rn - 1) as usize,
+            )
+            && self.query_quality.get_or_err((soft - rn - 1) as usize)? - 33
+                > Configuration::LOW_QUAL as u8
+        {
+            rn += 1;
+        }
+
+        if rn > 0 {
+            mch += rn;
+            soft -= rn;
+
+            if soft > 0 {
+                cigar_vd[0] = Cigar::SoftClip(soft as u32);
+                cigar_vd[1] = Cigar::Match(mch as u32);
+            } else {
+                cigar_vd.pop_front().unwrap();
+                cigar_vd[0] = Cigar::Match(mch as u32);
+            }
+
+            *cigar_pos -= rn as u32;
+            rn = 0;
+        }
+
+        if soft > 0 {
+            while rn + 1 < soft
+                && is_has_and_equals_ref_and_seq_base(
+                    self.contig_ref_seq(),
+                    ((*cigar_pos as i32) - rn - 2) as usize,
+                    self.query_sequence,
+                    (soft - rn - 2) as usize,
+                )
+                && self.query_quality.get_or_err((soft - rn - 2) as usize)? - 33
+                    > Configuration::LOW_QUAL as u8
+            {
+                rn += 1;
+                homop.record_base(
+                    self.contig_ref_seq()
+                        .get_or_err(((*cigar_pos as i32) - rn - 2) as usize)
+                        .copied()?,
+                );
+            }
+
+            if (rn > 4 && !homop.is_homopolymer())
+                || is_has_and_equals_ref_and_seq_base(
+                    self.contig_ref_seq(),
+                    ((*cigar_pos as i32) - 1) as usize,
+                    self.query_sequence,
+                    (soft - 1) as usize,
+                )
+            {
+                mch += rn + 1;
+                soft -= rn + 1;
+
+                if soft > 0 {
+                    cigar_vd[0] = Cigar::SoftClip(soft as u32);
+                    cigar_vd[1] = Cigar::Match(mch as u32);
+                } else {
+                    cigar_vd.pop_back().unwrap();
+                    cigar_vd[0] = Cigar::Match(mch as u32);
+                }
+
+                *cigar_pos -= rn as u32 + 1;
+            }
+
+            if rn == 0 {
+                let mut rrn = 0;
+                let mut rmch = 0;
+
+                while rrn < mch && rn < mch {
+                    if self
+                        .contig_ref_seq()
+                        .get((*cigar_pos as i32 + rrn) as usize)
+                        .is_none()
+                    {
+                        break;
+                    }
+
+                    if is_has_and_not_equals_ref_and_seq_base(
+                        self.contig_ref_seq(),
+                        (*cigar_pos as i32 + rrn) as usize,
+                        self.query_sequence,
+                        (soft + rrn) as usize,
+                    ) {
+                        rn = rrn + 1;
+                        rmch = 0;
+                    } else if is_has_and_equals_ref_and_seq_base(
+                        self.contig_ref_seq(),
+                        (*cigar_pos as i32 + rrn) as usize,
+                        self.query_sequence,
+                        (soft + rrn) as usize,
+                    ) {
+                        rmch += 1;
+                    }
+
+                    rrn += 1;
+
+                    if rmch >= 3 {
+                        break;
+                    }
+                }
+
+                if rn > 0 && rn < mch {
+                    soft += rn;
+                    mch -= rn;
+
+                    cigar_vd[0] = Cigar::SoftClip(soft as u32);
+                    cigar_vd[1] = Cigar::Match(mch as u32);
+
+                    *cigar_pos += rn as u32;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn combine_begin_dig_m(
+        &self,
+        cigar_pos: &mut u32,
+        cigar_vd: &mut VecDeque<Cigar>,
+        ml: u32,
+    ) -> Result<(), Error> {
+        let mut mch = ml as i32;
+        let mut rn = 0;
+        let mut rrn = 0;
+        let mut rmch = 0;
+
+        while rrn < mch && rn < mch {
+            if self
+                .contig_ref_seq()
+                .get((*cigar_pos as i32 + rrn) as usize)
+                .is_none()
+            {
+                break;
+            }
+
+            if is_has_and_not_equals_ref_and_seq_base(
+                self.contig_ref_seq(),
+                (*cigar_pos as i32 + rrn) as usize,
+                self.query_sequence,
+                (rrn) as usize,
+            ) {
+                rn = rrn + 1;
+                rmch = 0;
+            } else if is_has_and_equals_ref_and_seq_base(
+                self.contig_ref_seq(),
+                (*cigar_pos as i32 + rrn) as usize,
+                self.query_sequence,
+                (rrn) as usize,
+            ) {
+                rmch += 1;
+            }
+
+            rrn += 1;
+
+            if rmch >= 3 {
+                break;
+            }
+        }
+
+        if rn > 0 && rn <= 3 {
+            mch -= rn;
+            cigar_vd[0] = Cigar::Match(mch as u32);
+            cigar_vd.push_front(Cigar::SoftClip(rn as u32));
+            *cigar_pos += rn as u32;
+        }
+
+        Ok(())
     }
 }
 
