@@ -112,8 +112,8 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                             < 2 * self.max_read_length
                     {
                         cigar_vec.pop_front().unwrap();
-                        self.query_sequence = self.query_sequence.get_or_err(0..l)?;
-                        self.query_quality = self.query_quality.get_or_err(0..l)?;
+                        self.query_sequence = self.query_sequence.get_or_err(l..)?;
+                        self.query_quality = self.query_quality.get_or_err(l..)?;
 
                         event!(
                             Level::INFO,

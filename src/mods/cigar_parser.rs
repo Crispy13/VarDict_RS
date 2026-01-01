@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
 use anyhow::{Error, anyhow};
 use crackle_kit::{
@@ -7,7 +7,7 @@ use crackle_kit::{
 };
 use rust_htslib::bam::{
     Record, Writer,
-    record::{CigarString, CigarStringView},
+    record::{Cigar, CigarString, CigarStringView},
 };
 
 use crate::{
@@ -32,8 +32,7 @@ impl CigarParser {
     fn parse_cigar(&mut self, record: &mut Record) -> Result<(), Error> {
         self.query_seq_buf
             .extend(record.seq().into_decoded_base_iter());
-        self.query_qual_buf
-            .extend(record.qual());
+        self.query_qual_buf.extend(record.qual());
 
         let mut query_seq = self.query_seq_buf.as_slice();
         let mut query_qual = self.query_qual_buf.as_slice();
@@ -60,7 +59,6 @@ impl CigarParser {
             }
         };
 
-        
         let is_mate_on_the_same_contig = record.tid() == record.mtid();
         let nm = tot_nm;
         let direction = record.is_reverse();
@@ -94,14 +92,62 @@ impl CigarParser {
             align_start_pos = mc.align_start_pos;
             cigar = CigarString(mc.cigar.into_iter().collect::<Vec<_>>())
                 .into_view(mc.align_start_pos as i64);
-            
+
             query_qual = mc.query_qual;
             query_seq = mc.query_seq;
+        } else {
+            align_start_pos = record.query_alignment_start();
         }
 
-        
-
         todo!()
+    }
+
+    fn clean_up_cigar(&self, record: &mut Record) {
+        record.cache_cigar_if_empty();
+        let cigar_vec = record.cigar_cached().unwrap().0.as_slice();
+
+        if cigar_vec.len() > 0 {
+            let mut no_matches_yet = true;
+
+            // find start index of leading part (non matches)
+            let leading_part_idx = cigar_vec
+                .iter()
+                .rposition(|c| c.consumes_read_bases() && c.consumes_reference_bases())
+                .unwrap_or(0);
+
+            let new_cigar_vec = cigar_vec
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, &cigar)| {
+                    if no_matches_yet {
+                        match cigar {
+                            Cigar::Ins(l) => Some(Cigar::SoftClip(l)),
+                            Cigar::HardClip(_) => None, // remove hard clip
+                            cigar
+                                if cigar.consumes_read_bases()
+                                    && cigar.consumes_reference_bases() =>
+                            {
+                                no_matches_yet = false;
+                                Some(cigar)
+                            }
+                            oth => Some(oth),
+                        }
+                    } else {
+                        if i <= leading_part_idx {
+                            Some(cigar)
+                        } else {
+                            match cigar {
+                                Cigar::Ins(l) => Some(Cigar::SoftClip(l)),
+                                Cigar::HardClip(_) => None, // remove hard clip
+                                oth => Some(oth),
+                            }
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            record.set_cigar(Some(&CigarString(new_cigar_vec)));
+        }
     }
 }
 

@@ -764,7 +764,7 @@ checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 [[package]]
 name = "rust-htslib"
 version = "0.51.0"
-source = "git+https://github.com/Crispy13/rust-htslib.git?branch=dev#f765163772f9c2b89277fa15973230e82c935574"
+source = "git+https://github.com/Crispy13/rust-htslib.git?branch=dev#9770032a254fc7daf33697f7eedefe8838821aea"
 dependencies = [
  "bio-types",
  "byteorder",
