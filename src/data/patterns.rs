@@ -20,3 +20,9 @@ pub(crate) static BEGIN_MINUS_NUMBER: LazyLock<Regex> =
 
 pub(crate) static UP_NUMBER_END: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\^(\d+)$").unwrap());
+
+pub(crate) static SA_CIGAR_D_S_3CLIP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\d\dS$").unwrap());
+
+pub(crate) static SA_CIGAR_D_S_5CLIP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\d\d+S$").unwrap());

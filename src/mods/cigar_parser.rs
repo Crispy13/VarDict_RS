@@ -16,10 +16,14 @@ use rust_htslib::bam::{
 };
 
 use crate::{
-    data::{reference::Reference, region::Region},
+    data::{
+        patterns::{SA_CIGAR_D_S_3CLIP, SA_CIGAR_D_S_5CLIP},
+        reference::Reference,
+        region::Region,
+    },
     mods::cigar_modifier::CigarModifier,
     scopedata::global_read_only_scope::{GlobalReadOnlyScope, instance},
-    utils::aligner::Aligner,
+    utils::{BytesExt, aligner::Aligner},
 };
 
 type SplicingKey = (i64, i64);
@@ -197,16 +201,23 @@ impl CigarParser {
         query_quality: &[u8],
         nm: usize,
         is_reverse: bool,
-        pos:i64,
+        pos: i64,
         total_length_including_soft_clipped: usize,
         ci: usize,
-    ) {
+        cigar_len: u32,
+    ) -> Result<(), Error> {
         //First record in CIGAR
         if ci == 0 {
             // 5' soft clipped
             // Ignore large soft clip due to chimeric reads in library construction
-            
+            if !instance().conf.chimeric_filter {
+                if cigar_len >= 20
+                    && let Some(sa_tag_val) = record.aux_option(b"SA")?
+                {}
+            }
         }
+
+        todo!()
     }
 
     /// N in CIGAR - skipped region from reference
@@ -389,4 +400,58 @@ fn are_reads_overlap(record: &Record, adj_pos: i64, pos: i64, mate_pos: i64) -> 
     } else {
         adj_pos as i64 >= mate_pos && record.mpos() <= record.reference_end()
     }
+}
+
+/// Check if read is chimeric and contains SA tag
+fn is_read_chimeric_with_sa(
+    record: &Record,
+    pos: i64,
+    sa_tag_val: &str,
+    is_reverse: bool,
+    is_5side: bool,
+    max_read_len: usize,
+    cigar: &CigarStringView,
+) -> Result<bool, Error> {
+    let mut sa_tag_split = sa_tag_val.split(",");
+
+    let mut get_next = || {
+        sa_tag_split
+            .next()
+            .ok_or_else(|| anyhow!("Failed to parse SA tag: {}", sa_tag_val))
+    };
+
+    let sa_chr = get_next()?;
+    let sa_pos = get_next()?.parse::<i64>()?;
+    let sa_dir = get_next()?;
+    let sa_cigar = get_next()?;
+    let sa_dir_is_forward = sa_dir == "+";
+
+    let cap_opt = if is_5side {
+        SA_CIGAR_D_S_5CLIP.captures(sa_cigar)
+    } else {
+        SA_CIGAR_D_S_3CLIP.captures(sa_cigar)
+    };
+
+    let is_chimeric_with_sa = (is_reverse && sa_dir_is_forward)
+        || (!is_reverse && !sa_dir_is_forward)
+            && sa_chr == record.contig()
+            && (sa_pos - pos).abs() < 2 * max_read_len as i64
+            && cap_opt.is_some();
+
+    if is_chimeric_with_sa {
+        event!(
+            Level::INFO,
+            "{} {} {} {} {} is ignored as chimeric with SA: {},{},{}",
+            record.qname().try_as_str()?,
+            record.contig(),
+            pos,
+            record.mapq(),
+            cigar,
+            sa_pos,
+            sa_dir,
+            sa_cigar,
+        )
+    }
+
+    Ok(is_chimeric_with_sa)
 }
