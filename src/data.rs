@@ -11,7 +11,7 @@ pub mod region;
 pub(crate) type VariantMap = HashMap<String, Variant>;
 
 pub(crate) struct ModifiedCigar<'a> {
-    pub(crate) align_start_pos: usize,
+    pub(crate) align_start_pos: i64,
     pub(crate) cigar: VecDeque<Cigar>,
     pub(crate) query_seq: &'a [u8],
     pub(crate) query_qual: &'a [u8],
@@ -19,7 +19,7 @@ pub(crate) struct ModifiedCigar<'a> {
 
 impl<'a> ModifiedCigar<'a> {
     pub(crate) fn new(
-        align_start_pos: usize,
+        align_start_pos: i64,
         cigar: VecDeque<Cigar>,
         query_seq: &'a [u8],
         query_qual: &'a [u8],

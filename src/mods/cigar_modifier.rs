@@ -25,7 +25,7 @@ use crate::{
 };
 
 pub struct CigarModifier<'a, 'b> {
-    align_start_pos: usize,
+    pos: i64,
     cigar_str: Cow<'a, CigarStringView>,
     original_cigar: &'a CigarStringView,
     query_sequence: &'b [u8],
@@ -39,7 +39,7 @@ pub struct CigarModifier<'a, 'b> {
 
 impl<'a, 'b> CigarModifier<'a, 'b> {
     pub(crate) fn new(
-        align_start_pos: usize,
+        pos: i64,
         cigar_str: &'a CigarStringView,
         query_sequence: &'b [u8],
         query_quality: &'b [u8],
@@ -50,7 +50,7 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
         rev_complementor: &'a mut RevComplementor,
     ) -> Self {
         Self {
-            align_start_pos,
+            pos,
             cigar_str: Cow::Borrowed(cigar_str),
             original_cigar: cigar_str,
             query_sequence,
@@ -71,11 +71,11 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
         let mut flag = true;
 
         let mut cigar_vec = VecDeque::from_iter(self.cigar_str.0.iter().copied());
-        let mut align_start_pos = self.cigar_str.pos() as u32;
+        let mut ref_start_pos = self.cigar_str.pos() as u32;
 
         // if CIGAR starts with deletion cut it off
         if let Some(Cigar::Del(l)) = cigar_vec.front() {
-            align_start_pos += *l;
+            ref_start_pos += *l;
             cigar_vec.pop_front().unwrap();
         }
 
@@ -107,7 +107,7 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
 
                 if let Some(poss) = self.ref_data.seed.get(rc_seed) {
                     if poss.len() == 1
-                        && ((align_start_pos as i32 - poss.get(0).copied().unwrap() as i32).abs()
+                        && ((ref_start_pos as i32 - poss.get(0).copied().unwrap() as i32).abs()
                             as usize)
                             < 2 * self.max_read_length
                     {
@@ -119,7 +119,7 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                             Level::INFO,
                             "{} at 5' is a chimeric at {} by SEED {}",
                             self.query_sequence.try_as_str()?,
-                            align_start_pos,
+                            ref_start_pos,
                             Configuration::SEED_2,
                         )
                     }
@@ -139,7 +139,7 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
 
                 if let Some(poss) = self.ref_data.seed.get(rc_seed) {
                     if poss.len() == 1
-                        && ((align_start_pos as i32 - poss.get(0).copied().unwrap() as i32).abs()
+                        && ((ref_start_pos as i32 - poss.get(0).copied().unwrap() as i32).abs()
                             as usize)
                             < 2 * self.max_read_length
                     {
@@ -151,7 +151,7 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                             Level::INFO,
                             "{} at 3' is a chimeric at {} by SEED {}",
                             self.query_sequence.try_as_str()?,
-                            align_start_pos,
+                            ref_start_pos,
                             Configuration::SEED_2,
                         )
                     }
@@ -166,7 +166,7 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
             match (cigar_vec.get(0), cigar_vec.get(1)) {
                 (Some(&Cigar::SoftClip(sl)), Some(c2 @ (&Cigar::Ins(idl) | &Cigar::Del(idl)))) => {
                     let tslen = sl + if matches!(c2, Cigar::Ins(_)) { idl } else { 0 };
-                    align_start_pos += if matches!(c2, Cigar::Del(_)) { idl } else { 0 };
+                    ref_start_pos += if matches!(c2, Cigar::Del(_)) { idl } else { 0 };
 
                     cigar_vec.pop_front().unwrap();
                     *cigar_vec.front_mut().unwrap() = Cigar::SoftClip(tslen);
@@ -198,7 +198,7 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                 ) => {
                     if ml <= 10 {
                         let tslen = sl + ml + if matches!(c3, Cigar::Ins(_)) { idl } else { 0 };
-                        align_start_pos += ml + if matches!(c3, Cigar::Del(_)) { idl } else { 0 };
+                        ref_start_pos += ml + if matches!(c3, Cigar::Del(_)) { idl } else { 0 };
 
                         cigar_vec.drain(..2);
                         *cigar_vec.front_mut().unwrap() = Cigar::SoftClip(tslen);
@@ -223,7 +223,7 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                 ) => {
                     if ml <= 10 {
                         let tslen = sl + ml + if matches!(c3, Cigar::Ins(_)) { idl } else { 0 };
-                        align_start_pos += ml + if matches!(c3, Cigar::Del(_)) { idl } else { 0 };
+                        ref_start_pos += ml + if matches!(c3, Cigar::Del(_)) { idl } else { 0 };
 
                         cigar_vec.drain(cigar_vec.len() - 2..);
                         *cigar_vec.back_mut().unwrap() = Cigar::SoftClip(tslen);
@@ -247,7 +247,7 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                         } else {
                             0
                         };
-                    align_start_pos += ml1
+                    ref_start_pos += ml1
                         + if matches!(c_id, Cigar::Del(_)) {
                             idl
                         } else {
@@ -261,7 +261,7 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                                 .get_or_err((tslen + tn) as usize)
                                 .copied()?,
                             &self.ref_data.ref_seq,
-                            (align_start_pos + tn) as usize,
+                            (ref_start_pos + tn) as usize,
                         )
                     {
                         tn += 1;
@@ -269,7 +269,7 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
 
                     tslen += tn;
                     ml2 -= tn;
-                    align_start_pos += tn;
+                    ref_start_pos += tn;
 
                     cigar_vec.pop_front().unwrap();
                     *cigar_vec.get_mut(0).unwrap() = Cigar::SoftClip(tslen);
@@ -303,11 +303,11 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
 
             if let Some(si_and_c_lens) = find_m_dmi_mdm(&cigar_vec) {
                 flag =
-                    self.two_dels_ins_to_complex(align_start_pos, &mut cigar_vec, si_and_c_lens, flag)?;
+                    self.two_dels_ins_to_complex(ref_start_pos, &mut cigar_vec, si_and_c_lens, flag)?;
             } else if let Some(si_and_c_lens) = find_m_dm_dm_dm(&cigar_vec) {
-                flag = self.three_deletions(align_start_pos, &mut cigar_vec, si_and_c_lens, flag)?;
+                flag = self.three_deletions(ref_start_pos, &mut cigar_vec, si_and_c_lens, flag)?;
             } else if let Some(si_and_cigars) = find_m_id_m_id_m_id_m(&cigar_vec) {
-                flag = self.three_indels(align_start_pos, &mut cigar_vec, si_and_cigars, flag)?;
+                flag = self.three_indels(ref_start_pos, &mut cigar_vec, si_and_cigars, flag)?;
             }
 
             if let Some(si_and_cigars) = find_d_m_di_i(&cigar_vec) {
@@ -340,26 +340,26 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
         let mut cigar_iter_rev = cigar_vec.iter().rev();
         match (cigar_iter_rev.next(), cigar_iter_rev.next()) {
             (Some(&Cigar::SoftClip(sl)), Some(&Cigar::Match(ml))) => {
-                self.capture_mis_softly3_ms(align_start_pos, &mut cigar_vec, sl, ml)?;
+                self.capture_mis_softly3_ms(ref_start_pos, &mut cigar_vec, sl, ml)?;
             }
             (Some(&Cigar::Match(ml)), _) => {
-                self.capture_mis_softly3_mismatches(align_start_pos, &mut cigar_vec, ml)?;
+                self.capture_mis_softly3_mismatches(ref_start_pos, &mut cigar_vec, ml)?;
             }
             _ => {}
         }
 
         match (cigar_vec.get(0), cigar_vec.get(1)) {
             (Some(&Cigar::SoftClip(sl)), Some(&Cigar::Match(ml))) => {
-                self.combine_dig_s_dig_m(&mut align_start_pos, &mut cigar_vec, sl, ml)?;
+                self.combine_dig_s_dig_m(&mut ref_start_pos, &mut cigar_vec, sl, ml)?;
             }
             (Some(&Cigar::Match(ml)), _) => {
-                self.combine_begin_dig_m(&mut align_start_pos, &mut cigar_vec, ml)?;
+                self.combine_begin_dig_m(&mut ref_start_pos, &mut cigar_vec, ml)?;
             }
             _ => {}
         }
 
         let mc = ModifiedCigar::new(
-            align_start_pos as usize,
+            ref_start_pos as i64,
             cigar_vec,
             self.query_sequence,
             self.query_quality,

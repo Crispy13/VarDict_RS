@@ -1127,6 +1127,7 @@ name = "vardict_rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bio-types",
  "crackle-kit",
  "regex",
  "rust-htslib",

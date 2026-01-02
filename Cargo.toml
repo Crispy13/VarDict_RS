@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+bio-types = "1.0.4"
 crackle-kit = { git = "https://github.com/Crispy13/crackle-kit", features = [
     "tracing",
 ] }

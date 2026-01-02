@@ -3,6 +3,11 @@ pub(crate) struct Configuration {
     pub(crate) chimeric_filter: bool,
     pub(crate) min_match: i32,
 
+    pub(crate) disable_sv: bool,
+
+    pub(crate) unique_mode_alignment_enabled: bool,
+    pub(crate) unique_mode_second_in_pair_enabled: bool,
+
     /// The hexical to filter reads.
     pub(crate) sam_filter: u32,
 
@@ -20,6 +25,9 @@ impl Default for Configuration {
             sam_filter: 0x504,
             crispr_cutting_site: 0,
             crispr_filtering_bp: 0,
+            disable_sv: false,
+            unique_mode_alignment_enabled: false,
+            unique_mode_second_in_pair_enabled: false,
         }
     }
 }
