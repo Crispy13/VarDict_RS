@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Error, anyhow};
 use crackle_kit::{
-    data::bases::rev_comp::RevComplementor,
+    data::bases::{comp::complement_base, rev_comp::RevComplementor},
     tracing::{Level, event},
 };
 use rust_htslib::bam::{
@@ -16,6 +16,7 @@ use rust_htslib::bam::{
 };
 
 use crate::{
+    conf::Configuration,
     data::{
         patterns::{SA_CIGAR_D_S_3CLIP, SA_CIGAR_D_S_5CLIP},
         reference::Reference,
@@ -38,6 +39,10 @@ pub struct CigarParser {
     rev_complementor: RevComplementor,
     discordant_count: usize,
     splice_count: HashMap<SplicingKey, Vec<usize>>,
+    read_pos_including_softclip: i64,
+    read_pos_excluding_softclip: i64,
+    start: i64,
+    offset: usize,
 }
 
 impl CigarParser {
@@ -80,8 +85,8 @@ impl CigarParser {
         }
 
         let mut pos = 0;
-        let mut read_pos_including_softclip = 0;
-        let mut read_pos_excluding_softclip = 0;
+        self.read_pos_including_softclip = 0;
+        self.read_pos_excluding_softclip = 0;
 
         if self.instance.conf.perform_local_realignment {
             // Modify the CIGAR for potential mis-alignment for indels at the end of reads to softclipping and let VarDict's
@@ -167,7 +172,7 @@ impl CigarParser {
 
         let mpos = record.mpos();
         let adj_pos = pos;
-        let offset = 0;
+        self.offset = 0;
 
         'process_cigar: {
             //Loop over CIGAR records
@@ -179,7 +184,7 @@ impl CigarParser {
                 //Letter from CIGAR
                 match c {
                     Cigar::RefSkip(l) => {
-                        self.process_not_matched(&mut adj_pos, &mut offset, l);
+                        self.process_not_matched(l);
                     }
                     Cigar::SoftClip(l) => {}
                     _ => {}
@@ -193,6 +198,7 @@ impl CigarParser {
     /// Process CIGAR soft-clipped part. Will ignore large soft-clips and create Variations for mis-softclipping reads
     /// due to alignment
     fn process_soft_clip(
+        &mut self,
         contig: &str,
         record: &Record,
         query_sequence: &[u8],
@@ -205,6 +211,8 @@ impl CigarParser {
         total_length_including_soft_clipped: usize,
         ci: usize,
         cigar_len: u32,
+        max_read_len: usize,
+        cigar: &CigarStringView,
     ) -> Result<(), Error> {
         //First record in CIGAR
         if ci == 0 {
@@ -213,8 +221,71 @@ impl CigarParser {
             if !instance().conf.chimeric_filter {
                 if cigar_len >= 20
                     && let Some(sa_tag_val) = record.aux_option(b"SA")?
-                {}
+                {
+                    if is_read_chimeric_with_sa(
+                        record,
+                        pos,
+                        sa_tag_val.try_get_str()?,
+                        is_reverse,
+                        true,
+                        max_read_len,
+                        cigar,
+                    )? {
+                        self.read_pos_including_softclip += cigar_len as i64;
+                        self.offset = 0;
+
+                        // Had to reset the start due to softclipping adjustment
+                        self.start = 0;
+
+                        return Ok(());
+                    }
+                    // trying to detect chimeric reads even when there's no supplementary
+                    // alignment from aligner
+                } else if cigar_len >= Configuration::SEED_1 as u32 {
+                    let ref_seed_map = &self.reference.seed;
+                    let rev_comp_seq = record
+                        .seq()
+                        .into_decoded_base_iter()
+                        .rev()
+                        .map(complement_base)
+                        // .take(Configuration::SEED_1 as usize)
+                        .collect::<Vec<_>>();
+
+                    if let Some(poss) = ref_seed_map.get(
+                        rev_comp_seq
+                            .get(0..(rev_comp_seq.len().min(Configuration::SEED_1 as usize)))
+                            .unwrap(),
+                    ) {
+                        if poss.len() == 1
+                            && self.start - poss.get(0).unwrap() < 2 * self.max_read_len as i64
+                        {
+                            self.read_pos_including_softclip += cigar_len as i64;
+                            self.offset = 0;
+                            // Had to reset the start due to softclipping adjustment
+                            self.start = pos;
+
+                            event!(
+                                Level::INFO,
+                                "{} at 5' is a chimeric at {} by SEED {}",
+                                rev_comp_seq.as_slice().try_as_str()?,
+                                self.start,
+                                Configuration::SEED_1,
+                            )
+                        }
+                    }
+                }
             }
+            // Align softclipped but matched sequences due to mis-softclipping
+            /*
+            Conditions:
+            1). segment length > 1
+            2). start between 0 and chromosome length,
+            3). reference genome is known at this position
+            4). reference and read bases match
+            5). read quality is more than 10
+             */
+
+            
         }
 
         todo!()
@@ -222,16 +293,16 @@ impl CigarParser {
 
     /// N in CIGAR - skipped region from reference
     /// Skip the region and add string start-end to %SPLICE
-    fn process_not_matched(&mut self, adj_pos: &mut i64, offset: &mut i32, cigar_len: u32) {
-        let key = (*adj_pos - 1, *adj_pos + cigar_len as i64 - 1);
+    fn process_not_matched(&mut self, cigar_len: u32) {
+        let key = (self.start - 1, self.start + cigar_len as i64 - 1);
 
         self.splice_count
             .entry(key)
             .and_modify(|v| v[0] += 1)
             .or_insert_with(|| vec![1]);
 
-        *adj_pos += cigar_len as i64;
-        *offset = 0;
+        self.start += cigar_len as i64;
+        self.offset = 0;
     }
 
     fn clean_up_cigar(&self, record: &mut Record) {

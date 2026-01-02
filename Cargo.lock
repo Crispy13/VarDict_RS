@@ -158,7 +158,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 [[package]]
 name = "crackle-kit"
 version = "0.1.0"
-source = "git+https://github.com/Crispy13/crackle-kit#47eea2d1a4d148936615899c82e9d532e797dfe5"
+source = "git+https://github.com/Crispy13/crackle-kit#6a3e210a805b098da1f10754a3402682c0f9c0da"
 dependencies = [
  "anyhow",
  "tracing",
@@ -764,7 +764,7 @@ checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 [[package]]
 name = "rust-htslib"
 version = "0.51.0"
-source = "git+https://github.com/Crispy13/rust-htslib.git?branch=dev#9770032a254fc7daf33697f7eedefe8838821aea"
+source = "git+https://github.com/Crispy13/rust-htslib.git?branch=dev#6456862c099157eb14262a327886018cf8f6abda"
 dependencies = [
  "bio-types",
  "byteorder",
