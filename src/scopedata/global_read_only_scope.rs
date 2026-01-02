@@ -1,4 +1,4 @@
-use std::sync::{LazyLock, OnceLock};
+use std::{collections::HashMap, sync::{LazyLock, OnceLock}};
 
 use crate::conf::Configuration;
 
@@ -12,5 +12,7 @@ pub(crate) fn instance() -> &'static GlobalReadOnlyScope {
 }
 pub(crate) struct GlobalReadOnlyScope {
     pub(crate) amplicon_based_calling: bool,
+    pub(crate) chr_lens: HashMap<String, usize>,
     pub(crate) conf: Configuration,
+
 }

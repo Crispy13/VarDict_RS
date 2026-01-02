@@ -1,20 +1,20 @@
 use std::collections::HashMap;
 
-use crate::{utils::SliceExt, variants::variants::Variant};
+use crate::{utils::SliceExt, variants::variants::{VarDesc, Variant}};
 
 pub(crate) fn get_variants_from_map<'a>(
-    var_map: &'a mut HashMap<i64, HashMap<String, Variant>>,
+    var_map: &'a mut HashMap<i64, HashMap<VarDesc, Variant>>,
     start: i64,
-    desc_string: &str,
-) -> &'a Variant {
+    var_desc: &VarDesc,
+) -> &'a mut Variant {
     let pos_map = var_map
         .entry(start)
         .or_insert_with(|| HashMap::with_capacity(1));
 
-    if pos_map.contains_key(desc_string) {
-        pos_map.get(desc_string).unwrap()
+    if pos_map.contains_key(var_desc) {
+        pos_map.get_mut(var_desc).unwrap()
     } else {
-        pos_map.entry(desc_string.to_string()).or_default()
+        pos_map.entry(var_desc.clone()).or_default()
     }
 
     // // Get a raw pointer to avoid the borrow checker blocking the 'None' branch

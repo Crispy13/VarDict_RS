@@ -24,7 +24,11 @@ use crate::{
     },
     mods::cigar_modifier::CigarModifier,
     scopedata::global_read_only_scope::{GlobalReadOnlyScope, instance},
-    utils::{BytesExt, aligner::Aligner},
+    utils::{BytesExt, SliceExt, aligner::Aligner},
+    variants::{
+        var_utils::{get_variants_from_map, is_has_and_equals},
+        variants::{VarDesc, Variant},
+    },
 };
 
 type SplicingKey = (i64, i64);
@@ -43,6 +47,8 @@ pub struct CigarParser {
     read_pos_excluding_softclip: i64,
     start: i64,
     offset: usize,
+
+    non_insertion_vars: HashMap<i64, HashMap<VarDesc, Variant>>,
 }
 
 impl CigarParser {
@@ -152,7 +158,7 @@ impl CigarParser {
         }
 
         // Skip sites that are not in region of interest in CRISPR mode
-        if self.skip_sites_out_region_of_interest(cigar.as_slice(), pos) {
+        if self.skip_sites_out_region_of_interest(cigar.as_slice()) {
             return Ok(());
         }
 
@@ -210,7 +216,7 @@ impl CigarParser {
         pos: i64,
         total_length_including_soft_clipped: usize,
         ci: usize,
-        cigar_len: u32,
+        cigar_len: &mut u32,
         max_read_len: usize,
         cigar: &CigarStringView,
     ) -> Result<(), Error> {
@@ -219,7 +225,7 @@ impl CigarParser {
             // 5' soft clipped
             // Ignore large soft clip due to chimeric reads in library construction
             if !instance().conf.chimeric_filter {
-                if cigar_len >= 20
+                if *cigar_len >= 20
                     && let Some(sa_tag_val) = record.aux_option(b"SA")?
                 {
                     if is_read_chimeric_with_sa(
@@ -231,7 +237,7 @@ impl CigarParser {
                         max_read_len,
                         cigar,
                     )? {
-                        self.read_pos_including_softclip += cigar_len as i64;
+                        self.read_pos_including_softclip += *cigar_len as i64;
                         self.offset = 0;
 
                         // Had to reset the start due to softclipping adjustment
@@ -241,7 +247,7 @@ impl CigarParser {
                     }
                     // trying to detect chimeric reads even when there's no supplementary
                     // alignment from aligner
-                } else if cigar_len >= Configuration::SEED_1 as u32 {
+                } else if *cigar_len >= Configuration::SEED_1 as u32 {
                     let ref_seed_map = &self.reference.seed;
                     let rev_comp_seq = record
                         .seq()
@@ -259,7 +265,7 @@ impl CigarParser {
                         if poss.len() == 1
                             && self.start - poss.get(0).unwrap() < 2 * self.max_read_len as i64
                         {
-                            self.read_pos_including_softclip += cigar_len as i64;
+                            self.read_pos_including_softclip += *cigar_len as i64;
                             self.offset = 0;
                             // Had to reset the start due to softclipping adjustment
                             self.start = pos;
@@ -277,15 +283,48 @@ impl CigarParser {
             }
             // Align softclipped but matched sequences due to mis-softclipping
             /*
-            Conditions:
-            1). segment length > 1
-            2). start between 0 and chromosome length,
-            3). reference genome is known at this position
-            4). reference and read bases match
-            5). read quality is more than 10
-             */
+                Conditions:
+                1). segment length > 1
+                2). start between 0 and chromosome length,
+                3). reference genome is known at this position
+                4). reference and read bases match
+                5). read quality is more than 10
+            */
+            while *cigar_len >= 1
+                && self.start > 1
+                && self.start - 1 <= *instance().chr_lens.get(contig).unwrap() as i64
+                && is_has_and_equals(
+                    query_sequence
+                        .get_or_err(*cigar_len as usize - 1)
+                        .copied()?,
+                    self.contig_ref_seq(),
+                    (self.start - 1) as usize,
+                )
+                && query_quality.get_or_err(*cigar_len as usize - 1)? - 33 > 10
+            {
+                //create variant if it is not present
+                let ref_b = self
+                    .contig_ref_seq()
+                    .get_or_err(self.start as usize - 1)
+                    .copied()?;
 
-            
+                let var = get_variants_from_map(
+                    &mut self.non_insertion_vars,
+                    self.start,
+                    &VarDesc::SNV { ref_base: ref_b },
+                );
+                //add count
+                add_cnt(
+                    var,
+                    is_reverse,
+                    *cigar_len as usize,
+                    query_sequence
+                        .get_or_err(*cigar_len as usize - 1)
+                        .copied()?,
+                    mapq,
+                    nm,
+                );
+            }
         }
 
         todo!()
@@ -353,7 +392,7 @@ impl CigarParser {
         }
     }
 
-    fn skip_sites_out_region_of_interest(&self, cigars: &[Cigar], align_start_pos: usize) -> bool {
+    fn skip_sites_out_region_of_interest(&self, cigars: &[Cigar]) -> bool {
         let cut_site = instance().conf.crispr_cutting_site;
         let filter_bp = instance().conf.crispr_cutting_site;
 
@@ -368,8 +407,8 @@ impl CigarParser {
                 .sum::<u32>();
 
             if filter_bp != 0 {
-                return !(cut_site - align_start_pos as i32 > filter_bp
-                    && align_start_pos as i32 + rlen3 as i32 - cut_site > filter_bp);
+                return !(cut_site - self.start as i32 > filter_bp
+                    && self.start as i32 + rlen3 as i32 - cut_site > filter_bp);
             }
         }
 
@@ -402,6 +441,10 @@ impl CigarParser {
         }
 
         false
+    }
+
+    fn contig_ref_seq(&self) -> &Vec<u8> {
+        &self.reference.ref_seq
     }
 }
 
@@ -525,4 +568,20 @@ fn is_read_chimeric_with_sa(
     }
 
     Ok(is_chimeric_with_sa)
+}
+
+/// Increment variant counters.
+fn add_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: u8, mapq: u8, nm: usize) {
+    var.alt_depth += 1;
+    var.inc_dir(is_reverse);
+    var.mean_pos += read_pos as f64;
+    var.mean_qual += bq as f64;
+    var.mean_mapq += mapq as f64;
+    var.nm += nm as f64;
+
+    if bq as f64 >= instance().conf.goodq {
+        var.high_qual_read_cnt += 1;
+    } else {
+        var.low_qual_read_cnt += 1;
+    }
 }

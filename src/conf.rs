@@ -14,6 +14,9 @@ pub(crate) struct Configuration {
     pub(crate) crispr_cutting_site: i32,
     pub(crate) crispr_filtering_bp: i32,
     // pub(crate) seed_2: i32,
+
+    /// The phred score for a base to be considered a good call
+    pub(crate) goodq: f64,
 }
 
 impl Default for Configuration {
