@@ -20,7 +20,7 @@ impl Default for Configuration {
     fn default() -> Self {
         Self {
             perform_local_realignment: Default::default(),
-            chimeric_filter: Default::default(),
+            chimeric_filter: false,
             min_match: 0,
             sam_filter: 0x504,
             crispr_cutting_site: 0,
