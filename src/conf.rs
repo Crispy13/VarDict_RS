@@ -31,6 +31,7 @@ impl Default for Configuration {
             disable_sv: false,
             unique_mode_alignment_enabled: false,
             unique_mode_second_in_pair_enabled: false,
+            goodq: 22.5,
         }
     }
 }

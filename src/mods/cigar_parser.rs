@@ -1,6 +1,7 @@
 use bio_types::genome::AbstractInterval;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    ops::AddAssign,
     sync::Arc,
 };
 
@@ -43,12 +44,20 @@ pub struct CigarParser {
     rev_complementor: RevComplementor,
     discordant_count: usize,
     splice_count: HashMap<SplicingKey, Vec<usize>>,
-    read_pos_including_softclip: i64,
-    read_pos_excluding_softclip: i64,
+
+    /// keep track the read position (offset), including softclipped
+    read_pos_including_softclip: usize,
+
+    /// keep track the position (offset) in the alignment, excluding softclipped
+    read_pos_excluding_softclip: usize,
+
+    /// ref start position
     start: i64,
     offset: usize,
 
     non_insertion_vars: HashMap<i64, HashMap<VarDesc, Variant>>,
+
+    ref_coverage: HashMap<i64, usize>,
 }
 
 impl CigarParser {
@@ -237,7 +246,7 @@ impl CigarParser {
                         max_read_len,
                         cigar,
                     )? {
-                        self.read_pos_including_softclip += *cigar_len as i64;
+                        self.read_pos_including_softclip += *cigar_len as usize;
                         self.offset = 0;
 
                         // Had to reset the start due to softclipping adjustment
@@ -265,7 +274,7 @@ impl CigarParser {
                         if poss.len() == 1
                             && self.start - poss.get(0).unwrap() < 2 * self.max_read_len as i64
                         {
-                            self.read_pos_including_softclip += *cigar_len as i64;
+                            self.read_pos_including_softclip += *cigar_len as usize;
                             self.offset = 0;
                             // Had to reset the start due to softclipping adjustment
                             self.start = pos;
@@ -308,7 +317,7 @@ impl CigarParser {
                     .get_or_err(self.start as usize - 1)
                     .copied()?;
 
-                let var = get_variants_from_map(
+                let var: &mut Variant = get_variants_from_map(
                     &mut self.non_insertion_vars,
                     self.start,
                     &VarDesc::SNV { ref_base: ref_b },
@@ -324,6 +333,37 @@ impl CigarParser {
                     mapq,
                     nm,
                 );
+                //increase coverage
+                inc_cnt(&mut self.ref_coverage, self.start - 1, 1);
+
+                self.start -= 1;
+                *cigar_len -= 1;
+            }
+
+            if *cigar_len > 0 { //If there remains a soft-clipped sequence at the beginning (not everything was matched)
+                let mut read_qual_sum = 0;
+                let mut num_high_qual_base = 0;
+                let mut num_low_qual_base = 0;
+
+                // Loop over remaining soft-clipped sequence
+                for si in (0..*cigar_len as usize).rev() {
+                    // Stop if unknown base (N - any of ATGC) is found
+                    if query_sequence.get_or_err(si).copied()? == b'N' {
+                        break;
+                    }
+
+                    // base quality
+                    let bq = query_quality.get_or_err(si)? - 33;
+                    if bq <= 12 {
+                        num_low_qual_base += 1;
+                        break; //Stop if a low-quality base is found
+                    }
+
+                    read_qual_sum += bq;
+                    num_high_qual_base += 1;
+                }
+
+                
             }
         }
 
@@ -548,7 +588,7 @@ fn is_read_chimeric_with_sa(
 
     let is_chimeric_with_sa = (is_reverse && sa_dir_is_forward)
         || (!is_reverse && !sa_dir_is_forward)
-            && sa_chr == record.contig()
+            && sa_chr == record.contig() // TODO: Shouldn't two chromosomes are different?
             && (sa_pos - pos).abs() < 2 * max_read_len as i64
             && cap_opt.is_some();
 
@@ -584,4 +624,13 @@ fn add_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: u8, mapq: u
     } else {
         var.low_qual_read_cnt += 1;
     }
+}
+
+/// Increase count for given key
+#[inline]
+fn inc_cnt(coverage_map: &mut HashMap<i64, usize>, pos: i64, depth: usize) {
+    coverage_map
+        .entry(pos)
+        .and_modify(|v| v.add_assign(depth))
+        .or_insert_with(|| depth);
 }
