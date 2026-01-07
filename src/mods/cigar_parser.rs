@@ -518,12 +518,17 @@ impl CigarParser {
                     break;
                 }
 
-                let b = query_sequence.get_or_err(si as usize)?;
-                let idx = *cigar_len - 1 - si;
+                let b = query_sequence.get_or_err(si as usize).copied()?;
+                let idx = *cigar_len - 1 - si; // distannce from start of match.
                 let cnts = sclip
                     .nt
                     .entry(idx as i64)
                     .or_insert_with(|| NucBaseMap::default());
+
+                // increase count of current base.
+                *cnts.get_mut(b).unwrap() += 1;
+
+                
             }
         }
 

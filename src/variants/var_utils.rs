@@ -1,6 +1,11 @@
 use std::collections::HashMap;
 
-use crate::{utils::SliceExt, variants::variants::{VarDesc, Variant}};
+use crackle_kit::nuc_base_map::NucBaseMap;
+
+use crate::{
+    utils::SliceExt,
+    variants::variants::{SoftClip, VarDesc, Variant},
+};
 
 pub(crate) fn get_variants_from_map<'a>(
     var_map: &'a mut HashMap<i64, HashMap<VarDesc, Variant>>,
@@ -34,6 +39,16 @@ pub(crate) fn get_variants_from_map<'a>(
     // // 3. The returned reference lifetime 'a is tied to the map, preventing
     // //    the caller from invalidating the pointer while holding the reference.
     // unsafe { &*var_ptr }
+}
+
+/// Get `Variant` from `SoftClip.seq` field
+fn get_variation_from_seq(softclip: &mut SoftClip, idx: usize, base: u8) -> &mut Variant {
+    softclip
+        .seq
+        .entry(idx)
+        .or_insert_with(|| NucBaseMap::default())
+        .get_checked_or_insert_with(base, || Variant::default())
+        .unwrap()
 }
 
 #[inline]

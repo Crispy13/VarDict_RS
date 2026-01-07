@@ -59,7 +59,7 @@ pub(crate) struct SoftClip {
 
     /// Map of position of high quality base in the base sequence (from SAM record)
     /// to base on this position and it's variation
-    seq: BTreeMap<i64, NucBaseMap<Variant>>,
+    pub(crate) seq: BTreeMap<usize, NucBaseMap<Variant>>,
 
     /// The consensus sequence in soft-clipped reads.
     consensus_seq: Vec<u8>,

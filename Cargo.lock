@@ -158,7 +158,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 [[package]]
 name = "crackle-kit"
 version = "0.1.0"
-source = "git+https://github.com/Crispy13/crackle-kit#f7cde9981e59aa90ae16c2105fcc722f7129f878"
+source = "git+https://github.com/Crispy13/crackle-kit#fc8d71c35957ed1e692e9a744d1d7c60f941433b"
 dependencies = [
  "anyhow",
  "tracing",
