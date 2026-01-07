@@ -1,6 +1,6 @@
 use bio_types::genome::AbstractInterval;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ops::AddAssign,
     sync::Arc,
 };
@@ -8,6 +8,7 @@ use std::{
 use anyhow::{Error, anyhow};
 use crackle_kit::{
     data::bases::{comp::complement_base, rev_comp::RevComplementor},
+    nuc_base_map::NucBaseMap,
     tracing::{Level, event},
 };
 use rust_htslib::bam::{
@@ -28,7 +29,7 @@ use crate::{
     utils::{BytesExt, SliceExt, aligner::Aligner},
     variants::{
         var_utils::{get_variants_from_map, is_has_and_equals},
-        variants::{VarDesc, Variant},
+        variants::{SoftClip, VarDesc, Variant},
     },
 };
 
@@ -51,13 +52,16 @@ pub struct CigarParser {
     /// keep track the position (offset) in the alignment, excluding softclipped
     read_pos_excluding_softclip: usize,
 
-    /// ref start position
+    /// ref start position of the current read
     start: i64,
     offset: usize,
 
     non_insertion_vars: HashMap<i64, HashMap<VarDesc, Variant>>,
 
     ref_coverage: HashMap<i64, usize>,
+
+    soft_clips5_end: HashMap<i64, SoftClip>,
+    soft_clips3_end: HashMap<i64, SoftClip>,
 }
 
 impl CigarParser {
@@ -327,9 +331,7 @@ impl CigarParser {
                     var,
                     is_reverse,
                     *cigar_len as usize,
-                    query_sequence
-                        .get_or_err(*cigar_len as usize - 1)
-                        .copied()?,
+                    query_quality.get_or_err(*cigar_len as usize - 1).copied()?,
                     mapq,
                     nm,
                 );
@@ -340,8 +342,9 @@ impl CigarParser {
                 *cigar_len -= 1;
             }
 
-            if *cigar_len > 0 { //If there remains a soft-clipped sequence at the beginning (not everything was matched)
-                let mut read_qual_sum = 0;
+            if *cigar_len > 0 {
+                //If there remains a soft-clipped sequence at the beginning (not everything was matched)
+                let mut read_qual_sum = 0_usize;
                 let mut num_high_qual_base = 0;
                 let mut num_low_qual_base = 0;
 
@@ -359,11 +362,9 @@ impl CigarParser {
                         break; //Stop if a low-quality base is found
                     }
 
-                    read_qual_sum += bq;
+                    read_qual_sum += bq as usize;
                     num_high_qual_base += 1;
                 }
-
-                
             }
         }
 
@@ -485,6 +486,48 @@ impl CigarParser {
 
     fn contig_ref_seq(&self) -> &Vec<u8> {
         &self.reference.ref_seq
+    }
+
+    /// Process soft clip on 5' if it is has high quality reads
+    fn sclip5_high_quality_processing(
+        &mut self,
+        query_sequence: &[u8],
+        mapq: u8,
+        query_quality: &[u8],
+        num_mismatch: usize,
+        is_reverse: bool,
+        read_qual_sum: usize,
+        num_high_qual_base: usize,
+        num_low_qual_base: usize,
+        cigar_len: &mut u32,
+    ) -> Result<(), Error> {
+        // If we have at least 1 high-quality soft-clipped base of region of interest
+        if num_high_qual_base >= 1
+            && num_high_qual_base > num_low_qual_base
+            && self.start as usize >= self.region.start
+            && self.start as usize <= self.region.end
+        {
+            //add record to $sclip5
+            let sclip = self
+                .soft_clips5_end
+                .entry(self.start)
+                .or_insert_with(|| SoftClip::default());
+
+            for si in 0..*cigar_len {
+                if !(*cigar_len - si <= num_high_qual_base as u32) {
+                    break;
+                }
+
+                let b = query_sequence.get_or_err(si as usize)?;
+                let idx = *cigar_len - 1 - si;
+                let cnts = sclip
+                    .nt
+                    .entry(idx as i64)
+                    .or_insert_with(|| NucBaseMap::default());
+            }
+        }
+
+        todo!()
     }
 }
 
