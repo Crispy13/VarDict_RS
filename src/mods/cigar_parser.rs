@@ -26,9 +26,9 @@ use crate::{
     },
     mods::cigar_modifier::CigarModifier,
     scopedata::global_read_only_scope::{GlobalReadOnlyScope, instance},
-    utils::{BytesExt, SliceExt, aligner::Aligner},
+    utils::{BytesExt, SliceExt, SliceExt2, aligner::Aligner},
     variants::{
-        var_utils::{get_variants_from_map, is_has_and_equals},
+        var_utils::{get_variants_from_map, get_variation_from_seq, is_has_and_equals},
         variants::{SoftClip, VarDesc, Variant},
     },
 };
@@ -224,7 +224,7 @@ impl CigarParser {
         mapq: u8,
         contig_ref_seq: &[u8],
         query_quality: &[u8],
-        nm: usize,
+        num_mismatch: usize,
         is_reverse: bool,
         pos: i64,
         total_length_including_soft_clipped: usize,
@@ -265,16 +265,17 @@ impl CigarParser {
                     let rev_comp_seq = record
                         .seq()
                         .into_decoded_base_iter()
+                        .take(*cigar_len as usize)
                         .rev()
                         .map(complement_base)
                         // .take(Configuration::SEED_1 as usize)
                         .collect::<Vec<_>>();
 
-                    if let Some(poss) = ref_seed_map.get(
-                        rev_comp_seq
-                            .get(0..(rev_comp_seq.len().min(Configuration::SEED_1 as usize)))
-                            .unwrap(),
-                    ) {
+                    if let Some(poss) =
+                        ref_seed_map.get(rev_comp_seq.get_or_err(
+                            0..(rev_comp_seq.len().min(Configuration::SEED_1 as usize)),
+                        )?)
+                    {
                         if poss.len() == 1
                             && self.start - poss.get(0).unwrap() < 2 * self.max_read_len as i64
                         {
@@ -333,7 +334,7 @@ impl CigarParser {
                     *cigar_len as usize,
                     query_quality.get_or_err(*cigar_len as usize - 1).copied()?,
                     mapq,
-                    nm,
+                    num_mismatch,
                 );
                 //increase coverage
                 inc_cnt(&mut self.ref_coverage, self.start - 1, 1);
@@ -364,6 +365,79 @@ impl CigarParser {
 
                     read_qual_sum += bq as usize;
                     num_high_qual_base += 1;
+                }
+
+                self.sclip5_high_quality_processing(
+                    query_sequence,
+                    mapq,
+                    query_quality,
+                    num_mismatch,
+                    is_reverse,
+                    read_qual_sum,
+                    num_high_qual_base,
+                    num_low_qual_base,
+                    cigar_len,
+                )?;
+            }
+
+            *cigar_len = cigar.get(ci).unwrap().len();
+        } else if ci == cigar.len() - 1 {
+            // 3' soft clip
+            // Ignore large soft clip due to chimeric reads in library construction
+            if !instance().conf.chimeric_filter {
+                if *cigar_len >= 20
+                    && let Some(sa_tag_val) = record.aux_option(b"SA")?
+                {
+                    if is_read_chimeric_with_sa(
+                        record,
+                        pos,
+                        sa_tag_val.try_get_str()?,
+                        is_reverse,
+                        false,
+                        max_read_len,
+                        cigar,
+                    )? {
+                        self.read_pos_including_softclip += *cigar_len as usize;
+                        self.offset = 0;
+
+                        // Had to reset the start due to softclipping adjustment
+                        self.start = pos;
+
+                        return Ok(());
+                    }
+                } else if *cigar_len >= Configuration::SEED_1 as u32 {
+                    let ref_seed_map = &self.reference.seed;
+                    let rev_comp_seq = record
+                        .seq()
+                        .into_decoded_base_iter()
+                        .rev()
+                        .take(*cigar_len as usize)
+                        .map(complement_base)
+                        // .take(Configuration::SEED_1 as usize)
+                        .collect::<Vec<_>>();
+
+
+                    // TODO: Start from here.
+                    if let Some(poss) = ref_seed_map
+                        .get(rev_comp_seq.get_with_int(-(Configuration::SEED_1 as i32)..)?)
+                    {
+                        if poss.len() == 1
+                            && self.start - poss.get(0).unwrap() < 2 * self.max_read_len as i64
+                        {
+                            self.read_pos_including_softclip += *cigar_len as usize;
+                            self.offset = 0;
+                            // Had to reset the start due to softclipping adjustment
+                            self.start = pos;
+
+                            event!(
+                                Level::INFO,
+                                "{} at 5' is a chimeric at {} by SEED {}",
+                                rev_comp_seq.as_slice().try_as_str()?,
+                                self.start,
+                                Configuration::SEED_1,
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -513,7 +587,7 @@ impl CigarParser {
                 .entry(self.start)
                 .or_insert_with(|| SoftClip::default());
 
-            for si in 0..*cigar_len {
+            for si in (0..*cigar_len).rev() {
                 if !(*cigar_len - si <= num_high_qual_base as u32) {
                     break;
                 }
@@ -528,11 +602,28 @@ impl CigarParser {
                 // increase count of current base.
                 *cnts.get_mut(b).unwrap() += 1;
 
-                
+                let seq_var = get_variation_from_seq(sclip, idx as usize, b);
+                add_cnt(
+                    seq_var,
+                    is_reverse,
+                    si as usize - (*cigar_len as usize - num_high_qual_base),
+                    *query_quality.get_or_err(si as usize)? - 33,
+                    mapq,
+                    num_mismatch,
+                );
             }
+
+            add_cnt(
+                &mut sclip.var,
+                is_reverse,
+                *cigar_len as usize,
+                (read_qual_sum / num_high_qual_base) as u8,
+                mapq,
+                num_mismatch,
+            );
         }
 
-        todo!()
+        Ok(())
     }
 }
 

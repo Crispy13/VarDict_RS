@@ -506,9 +506,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
-version = "0.2.179"
+version = "0.2.180"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5a2d376baa530d1238d133232d15e239abad80d05838b4b59354e5268af431f"
+checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
 
 [[package]]
 name = "libdeflate-sys"
@@ -764,7 +764,7 @@ checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 [[package]]
 name = "rust-htslib"
 version = "0.51.0"
-source = "git+https://github.com/Crispy13/rust-htslib.git?branch=dev#6456862c099157eb14262a327886018cf8f6abda"
+source = "git+https://github.com/Crispy13/rust-htslib.git?branch=dev#eb5facaecdae29b63aa359a4bca006a02027e9dd"
 dependencies = [
  "bio-types",
  "byteorder",

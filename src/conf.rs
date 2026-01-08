@@ -1,5 +1,9 @@
 pub(crate) struct Configuration {
     pub(crate) perform_local_realignment: bool,
+
+    /// Indicate to turn off chimeric reads filtering.  Chimeric reads are artifacts from library construction,
+    /// where a read can be split into two segments, each will be aligned within 1-2 read length distance,
+    /// but in opposite direction.
     pub(crate) chimeric_filter: bool,
     pub(crate) min_match: i32,
 

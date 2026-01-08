@@ -51,7 +51,7 @@ impl VarDesc {}
 
 #[derive(Default)]
 pub(crate) struct SoftClip {
-    var: Variant,
+    pub(crate) var: Variant,
 
     /// Map of position(offset) of high quality base in the base sequence (from SAM record)
     /// to base on this position and it's count

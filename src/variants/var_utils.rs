@@ -42,7 +42,7 @@ pub(crate) fn get_variants_from_map<'a>(
 }
 
 /// Get `Variant` from `SoftClip.seq` field
-fn get_variation_from_seq(softclip: &mut SoftClip, idx: usize, base: u8) -> &mut Variant {
+pub(crate) fn get_variation_from_seq(softclip: &mut SoftClip, idx: usize, base: u8) -> &mut Variant {
     softclip
         .seq
         .entry(idx)
