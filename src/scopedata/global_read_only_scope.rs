@@ -10,6 +10,8 @@ pub(crate) static INSTANCE: OnceLock<GlobalReadOnlyScope> = OnceLock::new();
 pub(crate) fn instance() -> &'static GlobalReadOnlyScope {
     INSTANCE.get().unwrap()
 }
+
+#[derive(Default)]
 pub(crate) struct GlobalReadOnlyScope {
     pub(crate) amplicon_based_calling: bool,
     pub(crate) chr_lens: HashMap<String, usize>,

@@ -55,6 +55,8 @@ pub struct CigarParser {
     /// ref start position of the current read
     start: i64,
     offset: usize,
+
+    cigar: CigarStringView,
     cigar_len: u32,
 
     non_insertion_vars: HashMap<i64, HashMap<VarDesc, Variant>>,
@@ -63,6 +65,32 @@ pub struct CigarParser {
 
     soft_clips5_end: HashMap<i64, SoftClip>,
     soft_clips3_end: HashMap<i64, SoftClip>,
+}
+
+impl Default for CigarParser {
+    fn default() -> Self {
+        Self {
+            query_seq_buf: Default::default(),
+            query_qual_buf: Default::default(),
+            aligner: Default::default(),
+            instance: Default::default(),
+            reference: Default::default(),
+            max_read_len: Default::default(),
+            region: Default::default(),
+            discordant_count: Default::default(),
+            splice_count: Default::default(),
+            read_pos_including_softclip: Default::default(),
+            read_pos_excluding_softclip: Default::default(),
+            start: Default::default(),
+            offset: Default::default(),
+            cigar_len: Default::default(),
+            non_insertion_vars: Default::default(),
+            ref_coverage: Default::default(),
+            soft_clips5_end: Default::default(),
+            soft_clips3_end: Default::default(),
+            rev_complementor: RevComplementor::new(),
+        }
+    }
 }
 
 impl CigarParser {
@@ -141,7 +169,7 @@ impl CigarParser {
 
         self.clean_up_cigar(record);
 
-        let offset = 0;
+        let mut offset = 0;
 
         //determine discordant reads
         if record.tid() != record.mtid() {
@@ -180,11 +208,7 @@ impl CigarParser {
         }
 
         // true if mate is in forward forection
-        let mate_direction = if !record.is_mate_reverse() {
-            false
-        } else {
-            true
-        };
+        let mate_is_reverse = record.is_mate_reverse();
 
         if record.is_paired() && record.is_mate_unmapped() {
             // TODO
@@ -210,7 +234,7 @@ impl CigarParser {
                     Cigar::RefSkip(l) => {
                         self.process_not_matched(l);
                     }
-                    Cigar::SoftClip(l) => self.process_soft_clip(
+                    Cigar::SoftClip(_) => self.process_soft_clip(
                         // &self.region.chrom,
                         record,
                         query_seq,
@@ -225,10 +249,23 @@ impl CigarParser {
                         // self.max_read_len,
                         &cigar,
                     )?,
+                    Cigar::HardClip(_) => {
+                        // hard clipping - skip
+                        offset = 0;
+                    }
+                    Cigar::Ins(_) => {
+                        offset = 0;
+                    }
                     _ => {}
                 }
             }
         }
+
+        // return buf resource to self.
+        query_qual_buf.clear();
+        query_seq_buf.clear();
+        self.query_qual_buf.insert(query_qual_buf);
+        self.query_seq_buf.insert(query_seq_buf);
 
         todo!()
     }
@@ -578,6 +615,32 @@ impl CigarParser {
         self.start = pos; // Had to reset the start due to softclipping adjustment
 
         Ok(())
+    }
+
+    /// Process CIGAR deletions part. Will ignore indels next to introns and create
+    /// Variations for deletions
+    fn process_deletion(
+        &mut self,
+        query_sequence: &[u8],
+        mapq: u8,
+        contig_ref_seq: &[u8],
+        query_quality: &[u8],
+        nm: usize,
+        is_reverse: bool,
+        read_len_including_match_ins: usize,
+        ci: usize,
+    ) -> Result<usize, Error> {
+        // Ignore deletions right after introns at exon edge in RNA-seq
+        if skip_indel_next_to_intron(&self.cigar, ci)? {
+            self.read_pos_excluding_softclip += self.cigar_len as usize;
+
+            return Ok(ci);
+        }
+
+        // $s description string of deleted segment
+        
+
+        todo!()
     }
 
     /// N in CIGAR - skipped region from reference
@@ -969,4 +1032,20 @@ fn inc_cnt(coverage_map: &mut HashMap<i64, usize>, pos: i64, depth: usize) {
         .entry(pos)
         .and_modify(|v| v.add_assign(depth))
         .or_insert_with(|| depth);
+}
+
+/// Skip the insertions and deletions that are right after or before introns
+/// (they indicate of aligner problem)
+fn skip_indel_next_to_intron(cigar: &CigarStringView, ci: usize) -> Result<bool, Error> {
+    // if the current cigar is not the last item.
+    // and the next cigar is ref skip
+    // or
+    // the current cigar is not the first one and the previous one is refskip
+    if (ci > 0 && matches!(cigar.get_or_err(ci - 1)?, Cigar::RefSkip(_)))
+        || (ci < cigar.len() - 1 && matches!(cigar.get_or_err(ci + 1)?, Cigar::RefSkip(_)))
+    {
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }

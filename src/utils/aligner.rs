@@ -3,6 +3,12 @@ pub(crate) enum Aligner {
     Star,
 }
 
+impl Default for Aligner {
+    fn default() -> Self {
+        Self::BWA
+    }
+}
+
 impl Aligner {
     pub(crate) fn nm_tag(&self) -> &'static [u8; 2]  {
         match self {

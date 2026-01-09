@@ -45,6 +45,10 @@ impl Variant {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) enum VarDesc {
     SNV { ref_base: u8 },
+    Del {
+        len: u32,
+        
+    }
 }
 
 impl VarDesc {}

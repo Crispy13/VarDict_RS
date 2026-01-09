@@ -302,8 +302,12 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
             }
 
             if let Some(si_and_c_lens) = find_m_dmi_mdm(&cigar_vec) {
-                flag =
-                    self.two_dels_ins_to_complex(ref_start_pos, &mut cigar_vec, si_and_c_lens, flag)?;
+                flag = self.two_dels_ins_to_complex(
+                    ref_start_pos,
+                    &mut cigar_vec,
+                    si_and_c_lens,
+                    flag,
+                )?;
             } else if let Some(si_and_c_lens) = find_m_dm_dm_dm(&cigar_vec) {
                 flag = self.three_deletions(ref_start_pos, &mut cigar_vec, si_and_c_lens, flag)?;
             } else if let Some(si_and_cigars) = find_m_id_m_id_m_id_m(&cigar_vec) {
@@ -1462,5 +1466,33 @@ fn find_i_i(cigar: &VecDeque<Cigar>) -> Option<(usize, [Cigar; 2])> {
 
 #[cfg(test)]
 mod tests {
+    use crate::{mods::cigar_parser::CigarParser, scopedata::global_read_only_scope::GlobalReadOnlyScope};
+
     use super::*;
+
+    #[test]
+    fn find_offset() {
+        let conf = Configuration {
+            goodq: 23.0,
+            vext: 3,
+            ..Default::default()
+        };
+
+        INSTANCE.get_or_init(|| GlobalReadOnlyScope {
+            conf,
+            ..Default::default()
+        });
+
+        let ref_pos = 1;
+        let read_pos = 2;
+        let cigar_len = 3;
+        let query_sequence = "ACGTACGT";
+        let query_quality = "<<<<<<<<";
+        // let ref_cov = HashMap::new();
+        let ref_seq = "AA";
+
+        let cigar_parser = CigarParser::default();
+
+        todo!()
+    }
 }

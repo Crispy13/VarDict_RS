@@ -21,6 +21,9 @@ pub(crate) struct Configuration {
 
     /// The phred score for a base to be considered a good call
     pub(crate) goodq: f64,
+
+    /// Extension of bp to look for mismatches after insertion or deletion
+    pub(crate) vext: i32,
 }
 
 impl Default for Configuration {

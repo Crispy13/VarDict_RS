@@ -1,4 +1,4 @@
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Region {
     pub(crate) chrom: String,
     pub(crate) start: usize,
