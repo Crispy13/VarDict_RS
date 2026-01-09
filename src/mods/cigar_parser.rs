@@ -35,8 +35,8 @@ use crate::{
 
 type SplicingKey = (i64, i64);
 pub struct CigarParser {
-    query_seq_buf: Vec<u8>,
-    query_qual_buf: Vec<u8>,
+    query_seq_buf: Option<Vec<u8>>,
+    query_qual_buf: Option<Vec<u8>>,
     aligner: Aligner,
     instance: Arc<GlobalReadOnlyScope>,
     reference: Reference,
@@ -55,6 +55,7 @@ pub struct CigarParser {
     /// ref start position of the current read
     start: i64,
     offset: usize,
+    cigar_len: u32,
 
     non_insertion_vars: HashMap<i64, HashMap<VarDesc, Variant>>,
 
@@ -66,12 +67,15 @@ pub struct CigarParser {
 
 impl CigarParser {
     fn parse_cigar(&mut self, record: &mut Record) -> Result<(), Error> {
-        self.query_seq_buf
-            .extend(record.seq().into_decoded_base_iter());
-        self.query_qual_buf.extend(record.qual());
+        let mut query_seq_buf = self.query_seq_buf.take().unwrap();
+        let mut query_qual_buf = self.query_qual_buf.take().unwrap();
 
-        let mut query_seq = self.query_seq_buf.as_slice();
-        let mut query_qual = self.query_qual_buf.as_slice();
+        query_seq_buf.extend(record.seq().into_decoded_base_iter());
+        query_qual_buf.extend(record.qual());
+
+        let mut query_seq = query_seq_buf.as_slice();
+        let mut query_qual = query_qual_buf.as_slice();
+
         let mapping_quality = record.mapq();
 
         record.cache_cigar_if_empty();
@@ -97,7 +101,7 @@ impl CigarParser {
 
         let is_mate_on_the_same_contig = record.tid() == record.mtid();
         let nm = tot_nm;
-        let direction = record.is_reverse();
+        let is_reverse = record.is_reverse();
 
         if self.instance.amplicon_based_calling {
             todo!()
@@ -195,17 +199,32 @@ impl CigarParser {
 
         'process_cigar: {
             //Loop over CIGAR records
-            for c in cigar.iter().copied() {
-                if self.skip_overlapping_reads(record, adj_pos, pos, direction, mpos) {
+            for (ci, c) in cigar.iter().copied().enumerate() {
+                if self.skip_overlapping_reads(record, adj_pos, pos, is_reverse, mpos) {
                     break;
                 }
 
+                self.cigar_len = c.len();
                 //Letter from CIGAR
                 match c {
                     Cigar::RefSkip(l) => {
                         self.process_not_matched(l);
                     }
-                    Cigar::SoftClip(l) => {}
+                    Cigar::SoftClip(l) => self.process_soft_clip(
+                        // &self.region.chrom,
+                        record,
+                        query_seq,
+                        mapping_quality,
+                        query_qual,
+                        nm as usize,
+                        is_reverse,
+                        pos,
+                        read_len_including_softclips,
+                        ci,
+                        // &mut self.cigar_len,
+                        // self.max_read_len,
+                        &cigar,
+                    )?,
                     _ => {}
                 }
             }
@@ -218,21 +237,21 @@ impl CigarParser {
     /// due to alignment
     fn process_soft_clip(
         &mut self,
-        contig: &str,
         record: &Record,
         query_sequence: &[u8],
         mapq: u8,
-        contig_ref_seq: &[u8],
         query_quality: &[u8],
         num_mismatch: usize,
         is_reverse: bool,
         pos: i64,
         total_length_including_soft_clipped: usize,
         ci: usize,
-        cigar_len: &mut u32,
-        max_read_len: usize,
         cigar: &CigarStringView,
     ) -> Result<(), Error> {
+        let mut cigar_len = &mut self.cigar_len;
+        let contig = self.region.chrom.as_str();
+        let max_read_len = self.max_read_len;
+
         //First record in CIGAR
         if ci == 0 {
             // 5' soft clipped
@@ -290,7 +309,9 @@ impl CigarParser {
                                 rev_comp_seq.as_slice().try_as_str()?,
                                 self.start,
                                 Configuration::SEED_1,
-                            )
+                            );
+
+                            return Ok(());
                         }
                     }
                 }
@@ -311,14 +332,15 @@ impl CigarParser {
                     query_sequence
                         .get_or_err(*cigar_len as usize - 1)
                         .copied()?,
-                    self.contig_ref_seq(),
+                    &self.reference.ref_seq,
                     (self.start - 1) as usize,
                 )
                 && query_quality.get_or_err(*cigar_len as usize - 1)? - 33 > 10
             {
                 //create variant if it is not present
                 let ref_b = self
-                    .contig_ref_seq()
+                    .reference
+                    .ref_seq
                     .get_or_err(self.start as usize - 1)
                     .copied()?;
 
@@ -332,7 +354,7 @@ impl CigarParser {
                     var,
                     is_reverse,
                     *cigar_len as usize,
-                    query_quality.get_or_err(*cigar_len as usize - 1).copied()?,
+                    query_quality.get_or_err(*cigar_len as usize - 1).copied()? - 33,
                     mapq,
                     num_mismatch,
                 );
@@ -367,17 +389,22 @@ impl CigarParser {
                     num_high_qual_base += 1;
                 }
 
-                self.sclip5_high_quality_processing(
-                    query_sequence,
-                    mapq,
-                    query_quality,
-                    num_mismatch,
-                    is_reverse,
-                    read_qual_sum,
-                    num_high_qual_base,
-                    num_low_qual_base,
-                    cigar_len,
-                )?;
+                {
+                    let cigar_len = self.cigar_len;
+                    self.sclip5_high_quality_processing(
+                        query_sequence,
+                        mapq,
+                        query_quality,
+                        num_mismatch,
+                        is_reverse,
+                        read_qual_sum,
+                        num_high_qual_base,
+                        num_low_qual_base,
+                        cigar_len,
+                    )?;
+                }
+
+                cigar_len = &mut self.cigar_len;
             }
 
             *cigar_len = cigar.get(ci).unwrap().len();
@@ -416,7 +443,6 @@ impl CigarParser {
                         // .take(Configuration::SEED_1 as usize)
                         .collect::<Vec<_>>();
 
-
                     // TODO: Start from here.
                     if let Some(poss) = ref_seed_map
                         .get(rev_comp_seq.get_with_int(-(Configuration::SEED_1 as i32)..)?)
@@ -431,18 +457,127 @@ impl CigarParser {
 
                             event!(
                                 Level::INFO,
-                                "{} at 5' is a chimeric at {} by SEED {}",
+                                "{} at 3' is a chimeric at {} by SEED {}",
                                 rev_comp_seq.as_slice().try_as_str()?,
                                 self.start,
                                 Configuration::SEED_1,
-                            )
+                            );
+                            return Ok(());
                         }
                     }
                 }
             }
+
+            /*
+            Conditions:
+            1). read position is less than sequence length
+            2). reference base is defined for start
+            3). reference base at start matches read base at n
+            4). read quality is more than 10
+             */
+
+            while self.read_pos_including_softclip < query_sequence.len()
+                && is_has_and_equals(
+                    query_sequence
+                        .get_or_err(self.read_pos_including_softclip)
+                        .copied()?,
+                    &self.reference.ref_seq,
+                    (self.start) as usize,
+                )
+                && query_quality.get_or_err(self.read_pos_including_softclip)? - 33 > 10
+            {
+                //Initialize entry if not present
+                let ref_b = self
+                    .reference
+                    .ref_seq
+                    .get_or_err(self.start as usize - 1)
+                    .copied()?;
+
+                let var: &mut Variant = get_variants_from_map(
+                    &mut self.non_insertion_vars,
+                    self.start,
+                    &VarDesc::SNV { ref_base: ref_b },
+                );
+                //add count
+                add_cnt(
+                    var,
+                    is_reverse,
+                    total_length_including_soft_clipped - self.read_pos_excluding_softclip,
+                    query_quality
+                        .get_or_err(self.read_pos_including_softclip)
+                        .copied()?
+                        - 33,
+                    mapq,
+                    num_mismatch,
+                );
+                // Add coverage
+                inc_cnt(&mut self.ref_coverage, self.start, 1);
+                self.read_pos_including_softclip += 1;
+                self.read_pos_excluding_softclip += 1;
+                self.start += 1;
+                *cigar_len -= 1;
+            }
+
+            // If there remains a soft-clipped sequence at the end (not everything was
+            // matched)
+            if query_sequence.len() - self.read_pos_including_softclip > 0 {
+                let mut read_qual_sum = 0;
+                let mut num_high_qual_base = 0;
+                let mut num_low_qual_base = 0;
+                for si in 0..*cigar_len {
+                    // Loop over remaining soft-clipped sequence
+                    // Stop if unknown base (N - any of ATGC) is found
+
+                    // At this point, self.read_pos_including_softclip is start offset of soft clip. why?
+                    if query_sequence
+                        .get_or_err(self.read_pos_including_softclip + si as usize)
+                        .copied()?
+                        == b'N'
+                    {
+                        break;
+                    }
+
+                    let base_quality = query_quality
+                        .get_or_err(self.read_pos_including_softclip + si as usize)?
+                        - 33;
+
+                    if base_quality <= 12 {
+                        num_low_qual_base += 1;
+                    }
+                    // Stop if a low-quality base is found
+                    if num_low_qual_base > 1 {
+                        break;
+                    }
+
+                    read_qual_sum += base_quality as usize;
+                    num_high_qual_base += 1;
+                }
+
+                {
+                    let cigar_len = self.cigar_len;
+                    self.sclip3_high_quality_processing(
+                        query_sequence,
+                        mapq,
+                        query_quality,
+                        num_mismatch,
+                        is_reverse,
+                        read_qual_sum,
+                        num_high_qual_base,
+                        num_low_qual_base,
+                        cigar_len,
+                    )?;
+                }
+
+                cigar_len = &mut self.cigar_len;
+            }
         }
 
-        todo!()
+        // Move read position by m (length of segment in CIGAR)
+        self.read_pos_including_softclip += *cigar_len as usize;
+        self.offset = 0;
+        self.start = pos; // Had to reset the start due to softclipping adjustment
+
+        Ok(())
     }
 
     /// N in CIGAR - skipped region from reference
@@ -573,7 +708,7 @@ impl CigarParser {
         read_qual_sum: usize,
         num_high_qual_base: usize,
         num_low_qual_base: usize,
-        cigar_len: &mut u32,
+        cigar_len: u32,
     ) -> Result<(), Error> {
         // If we have at least 1 high-quality soft-clipped base of region of interest
         if num_high_qual_base >= 1
@@ -587,13 +722,13 @@ impl CigarParser {
                 .entry(self.start)
                 .or_insert_with(|| SoftClip::default());
 
-            for si in (0..*cigar_len).rev() {
-                if !(*cigar_len - si <= num_high_qual_base as u32) {
+            for si in (0..cigar_len).rev() {
+                if !(cigar_len - si <= num_high_qual_base as u32) {
                     break;
                 }
 
                 let b = query_sequence.get_or_err(si as usize).copied()?;
-                let idx = *cigar_len - 1 - si; // distannce from start of match.
+                let idx = cigar_len - 1 - si; // distannce from start of match.
                 let cnts = sclip
                     .nt
                     .entry(idx as i64)
@@ -606,7 +741,7 @@ impl CigarParser {
                 add_cnt(
                     seq_var,
                     is_reverse,
-                    si as usize - (*cigar_len as usize - num_high_qual_base),
+                    si as usize - (cigar_len as usize - num_high_qual_base),
                     *query_quality.get_or_err(si as usize)? - 33,
                     mapq,
                     num_mismatch,
@@ -616,7 +751,69 @@ impl CigarParser {
             add_cnt(
                 &mut sclip.var,
                 is_reverse,
-                *cigar_len as usize,
+                cigar_len as usize,
+                (read_qual_sum / num_high_qual_base) as u8,
+                mapq,
+                num_mismatch,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Process soft clip on 3' if it is has high quality reads
+    fn sclip3_high_quality_processing(
+        &mut self,
+        query_sequence: &[u8],
+        mapq: u8,
+        query_quality: &[u8],
+        num_mismatch: usize,
+        is_reverse: bool,
+        read_qual_sum: usize,
+        num_high_qual_base: usize,
+        num_low_qual_base: usize,
+        cigar_len: u32,
+    ) -> Result<(), Error> {
+        // If we have at least 1 high-quality soft-clipped base of region of interest
+        if num_high_qual_base >= 1
+            && num_high_qual_base > num_low_qual_base
+            && self.start as usize >= self.region.start
+            && self.start as usize <= self.region.end
+        {
+            //add record to $sclip5
+            let sclip = self
+                .soft_clips3_end
+                .entry(self.start)
+                .or_insert_with(|| SoftClip::default());
+
+            for si in (0..num_high_qual_base) {
+                let b = query_sequence
+                    .get_or_err(self.read_pos_including_softclip + si as usize)
+                    .copied()?;
+                let idx = si; // distannce from start of match.
+                let cnts = sclip
+                    .nt
+                    .entry(idx as i64)
+                    .or_insert_with(|| NucBaseMap::default());
+
+                // increase count of current base.
+                *cnts.get_mut(b).unwrap() += 1;
+
+                let seq_var = get_variation_from_seq(sclip, idx as usize, b);
+                add_cnt(
+                    seq_var,
+                    is_reverse,
+                    num_high_qual_base - si,
+                    *query_quality.get_or_err(self.read_pos_including_softclip + si)? - 33,
+                    mapq,
+                    num_mismatch,
+                );
+            }
+
+            add_cnt(
+                &mut sclip.var,
+                is_reverse,
+                cigar_len as usize,
                 (read_qual_sum / num_high_qual_base) as u8,
                 mapq,
                 num_mismatch,
