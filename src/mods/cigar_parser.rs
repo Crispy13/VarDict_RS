@@ -1,4 +1,5 @@
 use bio_types::genome::AbstractInterval;
+use smallvec::SmallVec;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ops::AddAssign,
@@ -25,11 +26,12 @@ use crate::{
         region::Region,
     },
     mods::cigar_modifier::CigarModifier,
+    prelude::SmallVecBytes,
     scopedata::global_read_only_scope::{GlobalReadOnlyScope, instance},
     utils::{BytesExt, SliceExt, SliceExt2, aligner::Aligner},
     variants::{
         var_utils::{get_variants_from_map, get_variation_from_seq, is_has_and_equals},
-        variants::{SoftClip, VarDesc, Variant},
+        variants::{InsOrDelLen, SoftClip, VarDesc, Variant},
     },
 };
 
@@ -622,14 +624,14 @@ impl CigarParser {
     /// Variations for deletions
     fn process_deletion(
         &mut self,
-        query_sequence: &[u8],
+        query_seq: &[u8],
         mapq: u8,
         contig_ref_seq: &[u8],
-        query_quality: &[u8],
+        query_qual: &[u8],
         nm: usize,
         is_reverse: bool,
         read_len_including_match_ins: usize,
-        ci: usize,
+        mut ci: usize,
     ) -> Result<usize, Error> {
         // Ignore deletions right after introns at exon edge in RNA-seq
         if skip_indel_next_to_intron(&self.cigar, ci)? {
@@ -637,6 +639,27 @@ impl CigarParser {
 
             return Ok(ci);
         }
+
+        let mut var_desc = VarDesc::Del {
+            len: self.cigar_len,
+            match_seq: SmallVec::new(),
+            ins_or_del_len: InsOrDelLen::None,
+            mismatch_seq: SmallVec::new(),
+        };
+
+        let mut seq_to_append_if_next_matched = SmallVecBytes::new();
+        let quality_of_last_segment_before_del = query_qual
+            .get_or_err(self.read_pos_including_softclip - 1)
+            .copied()?;
+
+        let mut qual_seg = SmallVecBytes::new();
+
+        // For multiple indels within $VEXT bp
+        // offset for reference position if next segment is matched
+        let mut ref_offset = 0;
+        // offset for read position if next segment is matched
+        let mut read_offset = 0;
+        let mut nmoff = 0;
 
         /*
          * Condition:
@@ -652,12 +675,325 @@ impl CigarParser {
             let n_cigar = self.cigar.get(ci + 1).unwrap();
             let nn_cigar = self.cigar.get(ci + 2).unwrap();
 
-            let mlen = n_cigar.len();
-            let indel_len = nn_cigar.len();
+            let mlen = n_cigar.len() as usize;
+            let indel_len = nn_cigar.len() as usize;
             let begin = self.read_pos_including_softclip;
+
+            append_segments(
+                query_seq,
+                query_qual,
+                &self.cigar,
+                ci,
+                &mut var_desc,
+                &mut qual_seg,
+                begin,
+                mlen,
+                indel_len,
+                false,
+            );
+
+            // add length of next segment to both read and reference offsets
+            // add length of next-next segment to reference position (for insertion) or to
+            // read position(for deletion)
+            ref_offset += mlen
+                + if matches!(nn_cigar, Cigar::Del(_)) {
+                    indel_len
+                } else {
+                    0
+                };
+            read_offset += mlen
+                + if matches!(nn_cigar, Cigar::Ins(_)) {
+                    indel_len
+                } else {
+                    0
+                };
+
+            if is_next_after_num_matched(&self.cigar, ci, 3) {
+                let mut vsn = 0;
+                let tn = self.read_pos_including_softclip + read_offset;
+                let ts = self.start as usize + ref_offset + self.cigar_len as usize;
+
+                let nnn_cigar_len = self.cigar.get(ci + 3).unwrap().len();
+
+                let mut vi = 0;
+                while vsn <= instance().conf.vext as usize && vi < nnn_cigar_len as usize {
+                    let b = *query_seq.get_or_err(tn + vi)?;
+                    let q = *query_qual.get_or_err(tn + vi)? - 33;
+
+                    if b == b'N' {
+                        break;
+                    }
+
+                    if (q as f64) < instance().conf.goodq {
+                        break;
+                    }
+
+                    if is_has_and_equals(b'N', self.contig_ref_seq(), ts + vi) {
+                        break;
+                    }
+
+                    match self.contig_ref_seq().get(ts + vi).copied() {
+                        Some(ref_b) => {
+                            if b != ref_b {
+                                self.offset = vi + 1;
+                                nmoff += 1;
+                                vsn = 0;
+                            } else {
+                                vsn += 1;
+                            }
+                        }
+                        None => {}
+                    };
+
+                    vi += 1;
+                }
+
+                if self.offset != 0 {
+                    seq_to_append_if_next_matched
+                        .extend_from_slice(query_seq.get_or_err(tn..(tn + self.offset))?);
+                    qual_seg.extend_from_slice(query_qual.get_or_err(tn..(tn + self.offset))?);
+                }
+            }
+            // skip next 2 CIGAR segments
+            ci += 2;
+        } else if is_next_ins(&self.cigar, ci) {
+            /*
+             * Condition:
+             * 1). CIGAR string has next entry
+             * 2). next CIGAR segment is an insertion
+             */
+            let ins_len = self.cigar.get(ci + 1).unwrap().len() as usize;
+
+            // Append '^' + next segment (inserted) to var_desc
+            if let VarDesc::Del { ins_or_del_len, .. } = &mut var_desc {
+                *ins_or_del_len = InsOrDelLen::InsSeq(
+                    query_seq
+                        .get_or_err(
+                            self.read_pos_including_softclip
+                                ..self.read_pos_including_softclip + ins_len,
+                        )?
+                        .into(),
+                );
+            }
+
+            // Append next segment to quality string
+            qual_seg.extend_from_slice(
+                query_qual.get_or_err(
+                    self.read_pos_including_softclip..self.read_pos_including_softclip + ins_len,
+                )?,
+            );
+
+            // Shift read position by length of insertion
+            read_offset += ins_len;
+
+            if is_next_after_num_matched(&self.cigar, ci, 2) {
+                let mlen = self.cigar.get(ci + 2).unwrap().len() as usize;
+                let mut vsn = 0;
+                let tn = self.read_pos_including_softclip + read_offset;
+                let ts = self.start as usize + self.cigar_len as usize;
+
+                let mut vi = 0;
+                while vsn <= instance().conf.vext as usize && vi < mlen {
+                    let seq_ch = *query_seq.get_or_err(tn + vi)?;
+                    if seq_ch == b'N' {
+                        break;
+                    }
+                    if ((*query_qual.get_or_err(tn + vi)? - 33) as f64)
+                        < instance().conf.goodq
+                    {
+                        break;
+                    }
+                    match self.contig_ref_seq().get(ts + vi).copied() {
+                        Some(ref_ch) => {
+                            if ref_ch == b'N' {
+                                break;
+                            }
+                            if seq_ch != ref_ch {
+                                self.offset = vi + 1;
+                                nmoff += 1;
+                                vsn = 0;
+                            } else {
+                                vsn += 1;
+                            }
+                        }
+                        None => {}
+                    }
+                    vi += 1;
+                }
+
+                if self.offset != 0 {
+                    seq_to_append_if_next_matched
+                        .extend_from_slice(query_seq.get_or_err(tn..tn + self.offset)?);
+                    qual_seg.extend_from_slice(query_qual.get_or_err(tn..tn + self.offset)?);
+                }
+            }
+            // skip next CIGAR segment
+            ci += 1;
+        } else if is_next_matched(&self.cigar, ci) {
+            /*
+             * Condition:
+             * 1). CIGAR string has next entry
+             * 2). next CIGAR segment is matched
+             */
+            let mlen = self.cigar.get(ci + 1).unwrap().len() as usize;
+            let mut vsn = 0;
+
+            // Loop over next CIGAR segment (no more than conf.vext bases ahead)
+            let mut vi = 0;
+            while vsn <= instance().conf.vext as usize && vi < mlen {
+                let seq_ch = *query_seq.get_or_err(self.read_pos_including_softclip + vi)?;
+                // If base is unknown, exit loop
+                if seq_ch == b'N' {
+                    break;
+                }
+                // If base quality is less than GOODQ, exit loop
+                if ((*query_qual.get_or_err(self.read_pos_including_softclip + vi)? - 33) as f64)
+                    < instance().conf.goodq
+                {
+                    break;
+                }
+                // If reference sequence has base at this position
+                let ref_pos = self.start as usize + self.cigar_len as usize + vi;
+                match self.contig_ref_seq().get(ref_pos).copied() {
+                    Some(ref_ch) => {
+                        if ref_ch == b'N' {
+                            break;
+                        }
+                        if seq_ch != ref_ch {
+                            self.offset = vi + 1;
+                            nmoff += 1;
+                            vsn = 0;
+                        } else {
+                            vsn += 1;
+                        }
+                    }
+                    None => {}
+                }
+                vi += 1;
+            }
+
+            // If next CIGAR segment has good matching base
+            if self.offset != 0 {
+                // Append first offset bases of next segment to ss and q
+                seq_to_append_if_next_matched.extend_from_slice(
+                    query_seq.get_or_err(
+                        self.read_pos_including_softclip
+                            ..self.read_pos_including_softclip + self.offset,
+                    )?,
+                );
+                qual_seg.extend_from_slice(
+                    query_qual.get_or_err(
+                        self.read_pos_including_softclip
+                            ..self.read_pos_including_softclip + self.offset,
+                    )?,
+                );
+            }
         }
 
-        todo!()
+        // Append '&' and seq_to_append_if_next_matched to var_desc if offset > 0
+        if self.offset > 0 {
+            if let VarDesc::Del { mismatch_seq, .. } = &mut var_desc {
+                mismatch_seq.extend_from_slice(&seq_to_append_if_next_matched);
+            }
+        }
+
+        // Quality of first matched base after deletion
+        // Append best of q1 and q2
+        if self.read_pos_including_softclip + self.offset >= query_qual.len() {
+            qual_seg.push(quality_of_last_segment_before_del);
+        } else {
+            let quality_after_del =
+                *query_qual.get_or_err(self.read_pos_including_softclip + self.offset)?;
+            qual_seg.push(quality_of_last_segment_before_del.max(quality_after_del));
+        }
+
+        // If reference position is inside region of interest
+        if self.start >= self.region.start as i64 && self.start <= self.region.end as i64 {
+            self.add_variation_for_deletion(
+                mapq,
+                nm,
+                is_reverse,
+                read_len_including_match_ins,
+                &var_desc,
+                &qual_seg,
+                nmoff,
+            );
+        }
+
+        // Adjust reference position by cigar_len + offset + ref_offset
+        self.start += self.cigar_len as i64 + self.offset as i64 + ref_offset as i64;
+
+        // Adjust read position by offset + read_offset
+        self.read_pos_including_softclip += self.offset + read_offset;
+        self.read_pos_excluding_softclip += self.offset + read_offset;
+
+        Ok(ci)
+    }
+
+    /// Add variation record for a deletion
+    fn add_variation_for_deletion(
+        &mut self,
+        mapq: u8,
+        nm: usize,
+        is_reverse: bool,
+        read_len_including_match_ins: usize,
+        var_desc: &VarDesc,
+        qual_seg: &[u8],
+        nmoff: usize,
+    ) {
+        // Get or create variation structure for this deletion
+        let var = get_variants_from_map(&mut self.non_insertion_vars, self.start, var_desc);
+
+        // Increment direction count
+        var.inc_dir(is_reverse);
+
+        // Increase variant count
+        var.alt_depth += 1;
+
+        // Minimum of positions from start of read and end of read
+        // Java: tp = n < rlen1 - n ? n + 1 : rlen1 - n
+        let from_start = self.read_pos_excluding_softclip;
+        let from_end = read_len_including_match_ins.saturating_sub(self.read_pos_excluding_softclip);
+        let tp = if from_start < from_end {
+            from_start + 1
+        } else {
+            from_end
+        };
+
+        // Average quality of bases in quality segment
+        let tmpq: f64 = if qual_seg.is_empty() {
+            0.0
+        } else {
+            qual_seg.iter().map(|&q| (q - 33) as f64).sum::<f64>() / qual_seg.len() as f64
+        };
+
+        // pstd: true if variant is covered by reads with different positions
+        if !var.pstd && var.pp != 0 && tp != var.pp {
+            var.pstd = true;
+        }
+
+        // qstd: true if variant is covered by reads with different qualities
+        if !var.qstd && var.pq != 0.0 && (tmpq - var.pq).abs() > f64::EPSILON {
+            var.qstd = true;
+        }
+
+        var.mean_pos += tp as f64;
+        var.mean_qual += tmpq;
+        var.mean_mapq += mapq as f64;
+        var.pp = tp;
+        var.pq = tmpq;
+        var.nm += (nm - nmoff) as f64;
+
+        if tmpq >= instance().conf.goodq {
+            var.high_qual_read_cnt += 1;
+        } else {
+            var.low_qual_read_cnt += 1;
+        }
+
+        // Increase coverage count for reference bases missing from the read
+        for i in 0..self.cigar_len as i64 {
+            inc_cnt(&mut self.ref_coverage, self.start + i, 1);
+        }
     }
 
     /// N in CIGAR - skipped region from reference
@@ -1091,11 +1427,14 @@ fn is_followed_by_match_and_indel(cigar: &CigarStringView, ci: usize) -> bool {
 fn append_segments(
     query_seq: &[u8],
     query_qual: &[u8],
+    cigar: &CigarStringView,
     ci: usize,
     var_desc: &mut VarDesc,
-    qual_seg: &mut Vec<u8>,
+    qual_seg: &mut SmallVecBytes,
     begin: usize,
     mlen: usize,
+    indel_len: usize,
+    is_ins: bool,
 ) -> Result<(), Error> {
     let VarDesc::Del {
         len: del_len,
@@ -1118,6 +1457,58 @@ fn append_segments(
     // corresponding
     // to next-next segment otherwise (deletion) append '^' + length of a next-next
     // segment
+    if matches!(cigar.get(ci + 2).unwrap(), Cigar::Ins(_)) {
+        *ins_or_del_len = InsOrDelLen::InsSeq(
+            query_seq
+                .get_or_err(begin + mlen..begin + mlen + indel_len)?
+                .into(),
+        )
+    } else {
+        *ins_or_del_len = InsOrDelLen::DelLen(indel_len);
+    }
 
-    todo!()
+    // if an insertion is two segments ahead, append part of quality string sequence
+    // corresponding to next-next segment otherwise (deletion)
+    // append first quality score of next segment or return empty string
+    // Quality handling
+    if matches!(cigar.get(ci + 2).unwrap(), Cigar::Ins(_)) {
+        // ci+2 is Insertion → always append slice
+        qual_seg.extend_from_slice(query_qual.get_or_err(begin + mlen..begin + mlen + indel_len)?);
+    } else {
+        // ci+2 is Deletion
+        if is_ins {
+            // called from insertion context → single char
+            qual_seg.push(query_qual.get_or_err(begin + mlen).copied()?);
+        }
+        // else: called from deletion context → nothing
+    }
+
+    Ok(())
+}
+
+#[inline]
+fn is_next_after_num_matched(cigar: &CigarStringView, ci: usize, number: usize) -> bool {
+    cigar
+        .get(ci + number)
+        .map_or(false, |c| matches!(c, Cigar::Match(_)))
+}
+
+#[inline]
+fn is_next_ins(cigar: &CigarStringView, ci: usize) -> bool {
+    if !instance().conf.perform_local_realignment {
+        return false
+    }
+
+    cigar.get(ci+1).map_or(false, |c| {
+        matches!(c, Cigar::Ins(_))
+    })
+}
+
+#[inline]
+fn is_next_matched(cigar: &CigarStringView, ci: usize) -> bool {
+    if !instance().conf.perform_local_realignment {
+        return false
+    }
+
+    cigar.get(ci + 1).map_or(false, |c| matches!(c, Cigar::Match(_)))
 }
