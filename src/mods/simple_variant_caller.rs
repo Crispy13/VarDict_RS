@@ -8,16 +8,140 @@
 //! This is a simplified version suitable for Simple Mode only.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use rust_htslib::bam::{Record, record::Cigar};
+use smallvec::SmallVec;
 
 use crate::mods::to_vars_builder::VariationData;
+
+/// Simple variant key for the simple variant caller
+/// 
+/// This is a performance-optimized key type that distinguishes variants
+/// by their full description (ref + alt for SNVs, sequence for indels).
+/// Uses SmallVec for inline storage of short sequences.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub enum SimpleVarKey {
+    /// Single nucleotide variant: ref_base -> alt_base
+    SNV { 
+        ref_base: u8,
+        alt_base: u8,
+    },
+    /// Insertion of sequence after position
+    Ins {
+        /// Inserted sequence
+        seq: SmallVec<[u8; 32]>,
+    },
+    /// Deletion of bases from position
+    Del {
+        /// Length of deletion
+        len: u32,
+        /// Deleted sequence (for representation)
+        seq: SmallVec<[u8; 32]>,
+    },
+    /// Complex variant (MNV or indel combination)
+    Complex {
+        /// Reference allele
+        ref_seq: SmallVec<[u8; 32]>,
+        /// Alternative allele
+        alt_seq: SmallVec<[u8; 32]>,
+    },
+}
+
+impl SimpleVarKey {
+    /// Create SNV from bases
+    pub fn snv(ref_base: u8, alt_base: u8) -> Self {
+        SimpleVarKey::SNV { 
+            ref_base: ref_base.to_ascii_uppercase(),
+            alt_base: alt_base.to_ascii_uppercase(),
+        }
+    }
+
+    /// Create insertion
+    pub fn insertion(seq: &[u8]) -> Self {
+        SimpleVarKey::Ins {
+            seq: seq.iter().map(|b| b.to_ascii_uppercase()).collect(),
+        }
+    }
+
+    /// Create deletion
+    pub fn deletion(len: u32, seq: &[u8]) -> Self {
+        SimpleVarKey::Del {
+            len,
+            seq: seq.iter().map(|b| b.to_ascii_uppercase()).collect(),
+        }
+    }
+
+    /// Create complex variant
+    pub fn complex(ref_seq: &[u8], alt_seq: &[u8]) -> Self {
+        SimpleVarKey::Complex {
+            ref_seq: ref_seq.iter().map(|b| b.to_ascii_uppercase()).collect(),
+            alt_seq: alt_seq.iter().map(|b| b.to_ascii_uppercase()).collect(),
+        }
+    }
+
+    /// Get variant type as string for output
+    pub fn variant_type(&self) -> &'static str {
+        match self {
+            SimpleVarKey::SNV { .. } => "SNV",
+            SimpleVarKey::Ins { .. } => "Insertion",
+            SimpleVarKey::Del { .. } => "Deletion",
+            SimpleVarKey::Complex { .. } => "Complex",
+        }
+    }
+
+    /// Get reference allele string
+    pub fn ref_allele(&self) -> String {
+        match self {
+            SimpleVarKey::SNV { ref_base, .. } => String::from(char::from(*ref_base)),
+            SimpleVarKey::Ins { .. } => String::new(), // Insertions have no ref (or context base)
+            SimpleVarKey::Del { seq, .. } => String::from_utf8_lossy(seq).to_string(),
+            SimpleVarKey::Complex { ref_seq, .. } => String::from_utf8_lossy(ref_seq).to_string(),
+        }
+    }
+
+    /// Get alternative allele string
+    pub fn alt_allele(&self) -> String {
+        match self {
+            SimpleVarKey::SNV { alt_base, .. } => String::from(char::from(*alt_base)),
+            SimpleVarKey::Ins { seq } => format!("+{}", String::from_utf8_lossy(seq)),
+            SimpleVarKey::Del { len, .. } => format!("-{}", len),
+            SimpleVarKey::Complex { alt_seq, .. } => String::from_utf8_lossy(alt_seq).to_string(),
+        }
+    }
+
+    /// Convert to a string representation (for compatibility)
+    pub fn to_key_string(&self) -> String {
+        match self {
+            SimpleVarKey::SNV { ref_base, alt_base } => {
+                format!("{}>{}", char::from(*ref_base), char::from(*alt_base))
+            }
+            SimpleVarKey::Ins { seq } => {
+                format!("+{}", String::from_utf8_lossy(seq))
+            }
+            SimpleVarKey::Del { len, .. } => {
+                format!("-{}", len)
+            }
+            SimpleVarKey::Complex { ref_seq, alt_seq } => {
+                format!("{}>{}",
+                    String::from_utf8_lossy(ref_seq),
+                    String::from_utf8_lossy(alt_seq))
+            }
+        }
+    }
+}
+
+impl fmt::Display for SimpleVarKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.to_key_string())
+    }
+}
 
 /// Result of processing a single read
 #[derive(Debug, Default)]
 pub struct ReadVariations {
-    /// Variations found: (position, variant_key, data)
-    pub variations: Vec<(i64, String, VariationData)>,
+    /// Variations found: (position, SimpleVarKey, data)
+    pub variations: Vec<(i64, SimpleVarKey, VariationData)>,
     /// Positions covered by this read: (position, count=1)
     pub coverage_positions: Vec<i64>,
 }
@@ -119,12 +243,8 @@ impl SimpleVariantCaller {
                             let read_base_upper = read_base.to_ascii_uppercase();
 
                             if ref_base_upper != read_base_upper && read_base_upper != b'N' {
-                                // Found a mismatch (SNV)
-                                let variant_key = format!(
-                                    "{}>{}",
-                                    char::from(ref_base_upper),
-                                    char::from(read_base_upper)
-                                );
+                                // Found a mismatch (SNV) - use SimpleVarKey enum
+                                let var_key = SimpleVarKey::snv(ref_base_upper, read_base_upper);
 
                                 let data = VariationData {
                                     position_in_read: current_read_pos as u32,
@@ -134,7 +254,7 @@ impl SimpleVariantCaller {
                                     read_id: read_name.clone(),
                                 };
 
-                                result.variations.push((current_ref_pos, variant_key, data));
+                                result.variations.push((current_ref_pos, var_key, data));
                             }
                         }
                     }
@@ -149,21 +269,22 @@ impl SimpleVariantCaller {
                     let ins_end = read_pos + *len as usize;
 
                     // Get inserted sequence
-                    let mut ins_seq = String::new();
                     let mut min_qual = u8::MAX;
+                    let mut ins_bytes = Vec::new();
                     for i in ins_start..ins_end {
                         if i >= seq.len() {
                             break;
                         }
                         let base = seq[i];
-                        ins_seq.push(char::from(base.to_ascii_uppercase()));
+                        ins_bytes.push(base.to_ascii_uppercase());
                         if let Some(&q) = qual.get(i) {
                             min_qual = min_qual.min(q);
                         }
                     }
 
                     if min_qual >= self.min_base_quality {
-                        let variant_key = format!("+{}", ins_seq);
+                        // Use SimpleVarKey enum for insertion
+                        let var_key = SimpleVarKey::insertion(&ins_bytes);
 
                         let data = VariationData {
                             position_in_read: ins_start as u32,
@@ -174,7 +295,7 @@ impl SimpleVariantCaller {
                         };
 
                         // Insertion is reported at the position before it
-                        result.variations.push((ref_pos - 1, variant_key, data));
+                        result.variations.push((ref_pos - 1, var_key, data));
                     }
 
                     read_pos += *len as usize;
@@ -184,10 +305,10 @@ impl SimpleVariantCaller {
                 Cigar::Del(len) => {
                     // Deletion: bases in reference not in read
                     // Get the deleted sequence from reference
-                    let mut del_seq = String::new();
+                    let mut del_bytes = Vec::new();
                     for i in 0..(*len as i64) {
                         if let Some(base) = self.get_ref_base(ref_pos + i) {
-                            del_seq.push(char::from(base.to_ascii_uppercase()));
+                            del_bytes.push(base.to_ascii_uppercase());
                         }
                     }
 
@@ -199,7 +320,8 @@ impl SimpleVariantCaller {
                     };
 
                     if flank_qual >= self.min_base_quality {
-                        let variant_key = format!("-{}", del_seq);
+                        // Use SimpleVarKey enum for deletion
+                        let var_key = SimpleVarKey::deletion(*len, &del_bytes);
 
                         let data = VariationData {
                             position_in_read: read_pos as u32,
@@ -209,7 +331,7 @@ impl SimpleVariantCaller {
                             read_id: read_name.clone(),
                         };
 
-                        result.variations.push((ref_pos, variant_key, data));
+                        result.variations.push((ref_pos, var_key, data));
                     }
 
                     ref_pos += *len as i64;
@@ -243,7 +365,7 @@ impl SimpleVariantCaller {
     pub fn process_records<'a, I>(
         &self,
         records: I,
-    ) -> (Vec<(i64, String, VariationData)>, HashMap<i64, usize>)
+    ) -> (Vec<(i64, SimpleVarKey, VariationData)>, HashMap<i64, usize>)
     where
         I: Iterator<Item = &'a Record>,
     {

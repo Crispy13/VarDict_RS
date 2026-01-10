@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use crate::mods::{
     to_vars_builder::{ToVarsBuilder, Variant, VariationData, Vars, VarType},
     output_variant::{SimpleOutputVariant, Region},
+    simple_variant_caller::SimpleVarKey,
 };
 
 /// Pipeline configuration
@@ -146,11 +147,11 @@ impl Pipeline {
 
     /// Process variations and generate output variants
     /// 
-    /// Input: Raw variation data grouped by (position, variant_key)
+    /// Input: Raw variation data grouped by (position, SimpleVarKey)
     /// Output: Formatted output lines ready for writing
     pub fn process_variations(
         &self,
-        variations: Vec<(i64, String, VariationData)>,
+        variations: Vec<(i64, SimpleVarKey, VariationData)>,
         coverage_by_pos: &HashMap<i64, usize>,
         region: &Region,
     ) -> Vec<String> {
@@ -184,9 +185,9 @@ impl Pipeline {
     /// Process and filter variants, returning only those passing thresholds
     pub fn process_and_filter(
         &self,
-        variations: Vec<(i64, String, VariationData)>,
+        variations: Vec<(i64, SimpleVarKey, VariationData)>,
         coverage_by_pos: &HashMap<i64, usize>,
-        region: &Region,
+        _region: &Region,
     ) -> Vec<Variant> {
         let vars_by_position = self.builder.build_variants(variations, coverage_by_pos);
 
@@ -233,7 +234,7 @@ pub fn convert_raw_variant_to_variation_data(
     }
 }
 
-/// Helper to create variation entry from parsed data
+/// Helper to create variation entry from parsed data using SimpleVarKey enum
 pub fn create_variation_entry(
     position: i64,
     ref_base: &str,
@@ -243,8 +244,12 @@ pub fn create_variation_entry(
     mapping_quality: u8,
     is_reverse: bool,
     read_id: &str,
-) -> (i64, String, VariationData) {
-    let variant_key = format!("{}>{}",ref_base, alt_base);
+) -> (i64, SimpleVarKey, VariationData) {
+    let var_key = if ref_base.len() == 1 && alt_base.len() == 1 {
+        SimpleVarKey::snv(ref_base.as_bytes()[0], alt_base.as_bytes()[0])
+    } else {
+        SimpleVarKey::complex(ref_base.as_bytes(), alt_base.as_bytes())
+    };
     let data = convert_raw_variant_to_variation_data(
         position_in_read,
         quality,
@@ -252,10 +257,10 @@ pub fn create_variation_entry(
         is_reverse,
         read_id,
     );
-    (position, variant_key, data)
+    (position, var_key, data)
 }
 
-/// Create insertion variation entry
+/// Create insertion variation entry using SimpleVarKey enum
 pub fn create_insertion_entry(
     position: i64,
     inserted_seq: &str,
@@ -264,8 +269,8 @@ pub fn create_insertion_entry(
     mapping_quality: u8,
     is_reverse: bool,
     read_id: &str,
-) -> (i64, String, VariationData) {
-    let variant_key = format!("+{}", inserted_seq);
+) -> (i64, SimpleVarKey, VariationData) {
+    let var_key = SimpleVarKey::insertion(inserted_seq.as_bytes());
     let data = convert_raw_variant_to_variation_data(
         position_in_read,
         quality,
@@ -273,20 +278,20 @@ pub fn create_insertion_entry(
         is_reverse,
         read_id,
     );
-    (position, variant_key, data)
+    (position, var_key, data)
 }
 
-/// Create deletion variation entry
+/// Create deletion variation entry using SimpleVarKey enum
 pub fn create_deletion_entry(
     position: i64,
-    deletion_length: usize,
+    deleted_seq: &str,
     position_in_read: u32,
     quality: u8,
     mapping_quality: u8,
     is_reverse: bool,
     read_id: &str,
-) -> (i64, String, VariationData) {
-    let variant_key = format!("-{}", deletion_length);
+) -> (i64, SimpleVarKey, VariationData) {
+    let var_key = SimpleVarKey::deletion(deleted_seq.len() as u32, deleted_seq.as_bytes());
     let data = convert_raw_variant_to_variation_data(
         position_in_read,
         quality,
@@ -294,7 +299,7 @@ pub fn create_deletion_entry(
         is_reverse,
         read_id,
     );
-    (position, variant_key, data)
+    (position, var_key, data)
 }
 
 // ============================================================================
@@ -355,7 +360,7 @@ mod tests {
         );
         
         assert_eq!(pos, 1000);
-        assert_eq!(key, "A>T");
+        assert_eq!(key.to_key_string(), "A>T");
         assert_eq!(data.position_in_read, 10);
     }
 
@@ -366,18 +371,18 @@ mod tests {
         );
         
         assert_eq!(pos, 1000);
-        assert_eq!(key, "+ATG");
+        assert_eq!(key.to_key_string(), "+ATG");
         assert!(data.is_reverse);
     }
 
     #[test]
     fn test_create_deletion_entry() {
         let (pos, key, data) = create_deletion_entry(
-            1000, 5, 10, 30, 60, false, "read1"
+            1000, "ACGTG", 10, 30, 60, false, "read1"
         );
         
         assert_eq!(pos, 1000);
-        assert_eq!(key, "-5");
+        assert_eq!(key.to_key_string(), "-5");
         assert_eq!(data.quality, 30);
     }
 
@@ -556,7 +561,7 @@ mod tests {
         let region = Region::new("1", 1, 10, "gene_name");
 
         // Empty variations
-        let variations: Vec<(i64, String, VariationData)> = vec![];
+        let variations: Vec<(i64, SimpleVarKey, VariationData)> = vec![];
         let coverage = HashMap::new();
 
         let output = pipeline.process_variations(variations, &coverage, &region);

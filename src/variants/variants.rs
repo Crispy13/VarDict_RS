@@ -1,7 +1,9 @@
-use std::{borrow::Cow, collections::{BTreeMap, HashMap}};
+use std::collections::{BTreeMap, HashMap};
 
 use crackle_kit::nuc_base_map::NucBaseMap;
 use smallvec::SmallVec;
+
+use crate::prelude::SmallVecBytes;
 
 #[derive(Default)]
 pub(crate) struct Variant {
@@ -54,26 +56,142 @@ impl Variant {
     }
 }
 
-/// Variant Information
+/// Variant Description - used as key in variant maps and for tracking complex variants
+/// 
+/// Uses SmallVec for inline storage of short sequences (most variants are small)
+/// This avoids heap allocation for the common case.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub(crate) enum VarDesc {
-    SNV { ref_base: u8 },
+pub enum VarDesc {
+    /// Single nucleotide variant: ref_base (alt determined from read data)
+    /// Used as key for looking up variants at a position
+    SNV { 
+        ref_base: u8,
+    },
+    /// Insertion of sequence after position
+    Ins {
+        /// Inserted sequence
+        seq: SmallVec<[u8; 32]>,
+    },
+    /// Deletion - complex structure for tracking parsing state
     Del {
         /// Length of deletion
         len: u32,
-        /// Matched sequence after deletion (from D+M+I/D pattern) - the '#' part
-        match_seq: SmallVec<[u8; 32]>,
-        /// For D+M+I: insertion sequence; for D+M+D: deletion length - the '^' part
+        /// Matched sequence following deletion
+        match_seq: SmallVecBytes,
+        /// Insertion or deletion length within complex deletion
         ins_or_del_len: InsOrDelLen,
-        /// Mismatched sequence to append (the '&' part)
-        mismatch_seq: SmallVec<[u8; 32]>,
+        /// Mismatched sequence following deletion
+        mismatch_seq: SmallVecBytes,
+    },
+    /// Complex variant (MNV or indel combination)
+    Complex {
+        /// Reference allele
+        ref_seq: SmallVec<[u8; 32]>,
+        /// Alternative allele
+        alt_seq: SmallVec<[u8; 32]>,
+    },
+}
+
+impl VarDesc {
+    /// Create SNV from ref base (for use as HashMap key)
+    pub fn snv_key(ref_base: u8) -> Self {
+        VarDesc::SNV { 
+            ref_base: ref_base.to_ascii_uppercase(),
+        }
+    }
+
+    /// Create insertion
+    pub fn insertion(seq: &[u8]) -> Self {
+        VarDesc::Ins {
+            seq: seq.iter().map(|b| b.to_ascii_uppercase()).collect(),
+        }
+    }
+
+    /// Create deletion with tracking state
+    pub fn deletion(len: u32) -> Self {
+        VarDesc::Del {
+            len,
+            match_seq: SmallVecBytes::new(),
+            ins_or_del_len: InsOrDelLen::None,
+            mismatch_seq: SmallVecBytes::new(),
+        }
+    }
+
+    /// Create complex variant
+    pub fn complex(ref_seq: &[u8], alt_seq: &[u8]) -> Self {
+        VarDesc::Complex {
+            ref_seq: ref_seq.iter().map(|b| b.to_ascii_uppercase()).collect(),
+            alt_seq: alt_seq.iter().map(|b| b.to_ascii_uppercase()).collect(),
+        }
+    }
+
+    /// Get variant type as string for output
+    pub fn variant_type(&self) -> &'static str {
+        match self {
+            VarDesc::SNV { .. } => "SNV",
+            VarDesc::Ins { .. } => "Insertion",
+            VarDesc::Del { .. } => "Deletion",
+            VarDesc::Complex { .. } => "Complex",
+        }
+    }
+
+    /// Get reference allele string
+    pub fn ref_allele(&self) -> String {
+        match self {
+            VarDesc::SNV { ref_base, .. } => String::from(char::from(*ref_base)),
+            VarDesc::Ins { .. } => String::new(), // Insertions have no ref (or context base)
+            VarDesc::Del { len, .. } => format!("-{}", len),
+            VarDesc::Complex { ref_seq, .. } => String::from_utf8_lossy(ref_seq).to_string(),
+        }
+    }
+
+    /// Get alternative allele string
+    pub fn alt_allele(&self) -> String {
+        match self {
+            VarDesc::SNV { ref_base, .. } => format!("?{}", char::from(*ref_base)), // Alt not stored
+            VarDesc::Ins { seq } => format!("+{}", String::from_utf8_lossy(seq)),
+            VarDesc::Del { len, .. } => format!("-{}", len),
+            VarDesc::Complex { alt_seq, .. } => String::from_utf8_lossy(alt_seq).to_string(),
+        }
+    }
+
+    /// Convert to variant key string (for backward compatibility)
+    pub fn to_key_string(&self) -> String {
+        match self {
+            VarDesc::SNV { ref_base } => {
+                // Only ref_base is stored, alt is determined from read data
+                format!("{}",  char::from(*ref_base))
+            }
+            VarDesc::Ins { seq } => {
+                format!("+{}", String::from_utf8_lossy(seq))
+            }
+            VarDesc::Del { len, .. } => {
+                format!("-{}", len)
+            }
+            VarDesc::Complex { ref_seq, alt_seq } => {
+                format!("{}>{}", 
+                    String::from_utf8_lossy(ref_seq),
+                    String::from_utf8_lossy(alt_seq))
+            }
+        }
     }
 }
 
-impl VarDesc {}
+impl Default for VarDesc {
+    fn default() -> Self {
+        VarDesc::SNV { ref_base: b'N' }
+    }
+}
 
+impl std::fmt::Display for VarDesc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_key_string())
+    }
+}
+
+/// Legacy enum for insertion/deletion length tracking (for complex patterns)
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Default)]
-pub(crate) enum InsOrDelLen {
+pub enum InsOrDelLen {
     #[default]
     None,
     InsSeq(SmallVec<[u8;32]>),

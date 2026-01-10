@@ -14,6 +14,8 @@
 
 use std::collections::HashMap;
 
+use crate::mods::simple_variant_caller::SimpleVarKey;
+
 /// Variant type enumeration
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VarType {
@@ -288,13 +290,15 @@ impl ToVarsBuilder {
     }
 
     /// Group variations by position and variant, then calculate statistics
+    /// 
+    /// Accepts SimpleVarKey enum for performance-optimized variant representation
     pub fn build_variants(
         &self,
-        all_variations: Vec<(i64, String, VariationData)>,
+        all_variations: Vec<(i64, SimpleVarKey, VariationData)>,
         total_coverage_by_pos: &HashMap<i64, usize>,
     ) -> HashMap<i64, Vars> {
         // Group by position
-        let mut by_position: HashMap<i64, Vec<(String, VariationData)>> = HashMap::new();
+        let mut by_position: HashMap<i64, Vec<(SimpleVarKey, VariationData)>> = HashMap::new();
         for (pos, var_key, var_data) in all_variations {
             by_position
                 .entry(pos)
@@ -307,8 +311,8 @@ impl ToVarsBuilder {
         for (position, variants_at_pos) in by_position {
             let coverage = *total_coverage_by_pos.get(&position).unwrap_or(&0);
 
-            // Group by variant key at this position
-            let mut by_variant: HashMap<String, Vec<VariationData>> = HashMap::new();
+            // Group by variant description at this position
+            let mut by_variant: HashMap<SimpleVarKey, Vec<VariationData>> = HashMap::new();
             for (var_key, var_data) in variants_at_pos {
                 by_variant
                     .entry(var_key)
@@ -319,15 +323,20 @@ impl ToVarsBuilder {
             // Calculate statistics for each variant
             let mut variant_list = Vec::new();
             for (var_key, var_data_list) in by_variant {
-                // Determine variant type from the variant key
-                let var_type = infer_variant_type(&var_key);
+                // Determine variant type from SimpleVarKey
+                let var_type = var_key_to_var_type(&var_key);
 
-                let variant = self.calculate_variant_statistics(
+                let mut variant = self.calculate_variant_statistics(
                     &var_data_list,
                     position,
                     coverage,
                     var_type,
                 );
+
+                // Set ref and alt alleles from SimpleVarKey
+                variant.refallele = var_key.ref_allele();
+                variant.varallele = var_key.alt_allele();
+                variant.description_string = var_key.to_key_string();
 
                 variant_list.push(variant);
             }
@@ -514,6 +523,19 @@ fn infer_variant_type(variant_key: &str) -> VarType {
     } else {
         // Fallback for unexpected formats
         VarType::SNV('N')
+    }
+}
+
+/// Convert SimpleVarKey enum to VarType for statistics calculation
+fn var_key_to_var_type(var_key: &SimpleVarKey) -> VarType {
+    match var_key {
+        SimpleVarKey::SNV { alt_base, .. } => VarType::SNV(char::from(*alt_base)),
+        SimpleVarKey::Ins { seq } => VarType::Insertion(String::from_utf8_lossy(seq).to_string()),
+        SimpleVarKey::Del { len, .. } => VarType::Deletion(*len as usize),
+        SimpleVarKey::Complex { ref_seq, alt_seq } => VarType::Complex {
+            insertion: String::from_utf8_lossy(alt_seq).to_string(),
+            deletion: ref_seq.len(),
+        },
     }
 }
 
@@ -922,12 +944,12 @@ mod tests {
     fn test_build_variants_grouping() {
         let builder = ToVarsBuilder::new();
         
-        // Create variations as vector of tuples (position, variant_key, variation_data)
+        // Create variations as vector of tuples (position, SimpleVarKey, variation_data)
         let all_variations = vec![
             // Position 1000: SNV A>T (2 reads)
             (
                 1000i64,
-                "A>T".to_string(),
+                SimpleVarKey::snv(b'A', b'T'),
                 VariationData {
                     position_in_read: 10,
                     quality: 30,
@@ -938,7 +960,7 @@ mod tests {
             ),
             (
                 1000i64,
-                "A>T".to_string(),
+                SimpleVarKey::snv(b'A', b'T'),
                 VariationData {
                     position_in_read: 15,
                     quality: 25,
@@ -950,7 +972,7 @@ mod tests {
             // Position 1000: Insertion +AG (1 read)
             (
                 1000i64,
-                "+AG".to_string(),
+                SimpleVarKey::insertion(b"AG"),
                 VariationData {
                     position_in_read: 20,
                     quality: 28,
@@ -962,7 +984,7 @@ mod tests {
             // Position 1010: SNV C>G (1 read)
             (
                 1010i64,
-                "C>G".to_string(),
+                SimpleVarKey::snv(b'C', b'G'),
                 VariationData {
                     position_in_read: 22,
                     quality: 32,
