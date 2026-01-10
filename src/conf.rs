@@ -39,6 +39,7 @@ impl Default for Configuration {
             unique_mode_alignment_enabled: false,
             unique_mode_second_in_pair_enabled: false,
             goodq: 22.5,
+            vext: 2,
         }
     }
 }

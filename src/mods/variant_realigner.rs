@@ -37,7 +37,8 @@ impl VariantRealigner {
                 self.ref_coverage.get(&p).copied().unwrap_or(0)
             );
 
-            let var = get_variants_from_map(&mut self.non_insertion_vars, p, vn);
+            todo!();
+            // let var = get_variants_from_map(&mut self.non_insertion_vars, p, vn);
 
             let mut del_len = 0;
 

@@ -89,6 +89,7 @@ impl Default for CigarParser {
             soft_clips5_end: Default::default(),
             soft_clips3_end: Default::default(),
             rev_complementor: RevComplementor::new(),
+            cigar: CigarString(vec![]).into_view(0),
         }
     }
 }
@@ -654,8 +655,6 @@ impl CigarParser {
             let mlen = n_cigar.len();
             let indel_len = nn_cigar.len();
             let begin = self.read_pos_including_softclip;
-
-            
         }
 
         todo!()
@@ -1085,4 +1084,40 @@ fn is_followed_by_match_and_indel(cigar: &CigarStringView, ci: usize) -> bool {
                 None => true,
             }
         }
+}
+
+/// Append sequence for deletion or insertion cases to create description string
+/// and quality string.
+fn append_segments(
+    query_seq: &[u8],
+    query_qual: &[u8],
+    ci: usize,
+    var_desc: &mut VarDesc,
+    qual_seg: &mut Vec<u8>,
+    begin: usize,
+    mlen: usize,
+) -> Result<(), Error> {
+    let VarDesc::Del {
+        len: del_len,
+        match_seq,
+        ins_or_del_len,
+        mismatch_seq: _,
+    } = var_desc
+    else {
+        panic!("Not deletion description: {:?}", var_desc)
+    };
+
+    // begin is n + m for insertion and n for deletion
+    // append to s '#' and part of read sequence corresponding to next CIGAR segment
+    // (matched one)
+    match_seq.extend_from_slice(query_seq.get_or_err(begin..(begin + mlen))?);
+    // append quality string of next matched segment from read
+    qual_seg.extend_from_slice(query_qual.get_or_err(begin..(begin + mlen))?);
+
+    // if an insertion is two segments ahead, append '^' + part of sequence
+    // corresponding
+    // to next-next segment otherwise (deletion) append '^' + length of a next-next
+    // segment
+
+    todo!()
 }
