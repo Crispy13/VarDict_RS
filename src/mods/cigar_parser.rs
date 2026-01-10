@@ -637,8 +637,26 @@ impl CigarParser {
             return Ok(ci);
         }
 
-        // $s description string of deleted segment
-        
+        /*
+         * Condition:
+         * 1). CIGAR string has next entry
+         * 2). length of next CIGAR segment is less than conf.vext
+         * 3). next segment is matched
+         * 4). CIGAR string has one more entry after next one
+         * 5). this entry is insertion or deletion
+         */
+
+        if is_followed_by_match_and_indel(&self.cigar, ci) {
+            // `is_followed_by_match_and_indel` proves that there are at least 2 cigar elems next to `ci`.
+            let n_cigar = self.cigar.get(ci + 1).unwrap();
+            let nn_cigar = self.cigar.get(ci + 2).unwrap();
+
+            let mlen = n_cigar.len();
+            let indel_len = nn_cigar.len();
+            let begin = self.read_pos_including_softclip;
+
+            
+        }
 
         todo!()
     }
@@ -1048,4 +1066,23 @@ fn skip_indel_next_to_intron(cigar: &CigarStringView, ci: usize) -> Result<bool,
     } else {
         Ok(false)
     }
+}
+
+fn is_followed_by_match_and_indel(cigar: &CigarStringView, ci: usize) -> bool {
+    if !instance().conf.perform_local_realignment || ci + 2 >= cigar.len() {
+        return false;
+    }
+
+    let n_cigar = cigar.get(ci + 1).unwrap();
+    let nn_cigar = cigar.get(ci + 2).unwrap();
+
+    matches!(n_cigar, &Cigar::Match(l) if l <= instance().conf.vext as u32)
+        && matches!(nn_cigar, Cigar::Ins(_) | Cigar::Del(_))
+        && {
+            match cigar.get(ci + 3) {
+                Some(Cigar::Ins(_) | Cigar::Del(_)) => false,
+                Some(_) => true,
+                None => true,
+            }
+        }
 }
