@@ -7,6 +7,7 @@ use crate::variants::variants::Variant;
 pub(crate) mod patterns;
 pub mod reference;
 pub mod region;
+pub mod bam_reader;
 
 pub(crate) type VariantMap = HashMap<String, Variant>;
 
