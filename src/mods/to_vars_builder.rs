@@ -79,6 +79,14 @@ pub struct Variant {
     pub shift3: i32,   // 3' shift for deletions
     pub nm: f64,       // Edit distance
 
+    // === Quality counts ===
+    pub high_qual_read_cnt: usize,  // Number of high-quality reads
+    pub low_qual_read_cnt: usize,   // Number of low-quality reads
+    
+    // === Reference counts (for non-reference variants at same position) ===
+    pub ref_forward_count: usize,   // Forward reference reads at this position
+    pub ref_reverse_count: usize,   // Reverse reference reads at this position
+    
     // === Genotype ===
     pub genotype: String,
 }
@@ -110,6 +118,10 @@ impl Variant {
             msint: 0.0,
             shift3: 0,
             nm: 0.0,
+            high_qual_read_cnt: 0,
+            low_qual_read_cnt: 0,
+            ref_forward_count: 0,
+            ref_reverse_count: 0,
             genotype: "0/0".to_string(),
         }
     }
@@ -279,12 +291,13 @@ impl ToVarsBuilder {
             variant.high_quality_reads_frequency = high_quality_count as f64 / total_coverage as f64;
         }
 
-        // === Genotype prediction (Simple Mode) ===
-        variant.genotype = determine_genotype(variant.frequency);
-
         // === Reference allele and variant allele ===
         variant.refallele = "N".to_string(); // Placeholder - would be determined from context
         variant.varallele = "N".to_string(); // Placeholder
+
+        // === Genotype prediction (Simple Mode) ===
+        // No anchor base available in this context
+        variant.genotype = determine_genotype(&variant.refallele, &variant.varallele, variant.frequency, None);
 
         variant
     }
@@ -337,6 +350,11 @@ impl ToVarsBuilder {
                 variant.refallele = var_key.ref_allele();
                 variant.varallele = var_key.alt_allele();
                 variant.description_string = var_key.to_key_string();
+
+                // Calculate end position based on reference allele length
+                if variant.refallele.len() > 1 {
+                    variant.end_position = position + variant.refallele.len() as i64 - 1;
+                }
 
                 variant_list.push(variant);
             }
@@ -429,13 +447,73 @@ pub fn check_strand_bias(forward: usize, reverse: usize) -> StrandBiasFlag {
 }
 
 /// Determine genotype from frequency (Simple Mode)
-pub fn determine_genotype(frequency: f64) -> String {
-    if frequency == 0.0 {
-        "0/0".to_string() // Homozygous reference
-    } else if frequency < 0.5 {
-        "0/1".to_string() // Heterozygous
+/// Determine genotype string from reference and variant alleles
+/// Format: "REF/ALT" using actual allele sequences
+/// For reference calls (ref==alt): "REF/REF"
+/// For heterozygous: "REF/ALT"  
+/// For homozygous alternate: "ALT/ALT"
+/// 
+/// Java-compatible format:
+/// - Reference calls: "REF/REF"
+/// - Pure insertions: "REF/+N" where N is the inserted length
+/// - Deletions: "-N<seq>/-N<seq>" format
+/// - Same-length complex: "ALT+REF[1:]/ALT" (extended genotype1)
+/// - Complex with length diff: Java-compatible extended format with anchor
+pub fn determine_genotype(refallele: &str, varallele: &str, frequency: f64, anchor_base: Option<char>) -> String {
+    if refallele == varallele {
+        // Reference call: G→G becomes "G/G"
+        format!("{}/{}", refallele, refallele)
     } else {
-        "1/1".to_string() // Homozygous alternate
+        // Determine if this is an insertion, deletion, or substitution
+        let ref_len = refallele.len();
+        let var_len = varallele.len();
+        
+        if var_len > ref_len && varallele.starts_with(refallele) {
+            // Pure insertion: alt starts with ref and is longer
+            // Format: "REF/+N" where N is the insertion length
+            let ins_len = var_len - ref_len;
+            format!("{}/+{}", refallele, ins_len)
+        } else if ref_len > var_len && refallele.starts_with(varallele) {
+            // Pure deletion: ref starts with alt and is longer
+            // Format: "-N<full_seq>/-N<full_seq>" for homozygous
+            let del_len = ref_len - var_len;
+            let del_notation = format!("-{}{}", del_len, varallele);
+            format!("{}/{}", del_notation, del_notation)
+        } else if ref_len > var_len {
+            // Complex deletion: ref longer than alt but not a prefix match
+            // Format: "-N<alt_seq><ref_from_del_len>/-N<alt_seq>"
+            let del_len = ref_len - var_len;
+            // genotype1 = -N + alt + ref[del_len:] (skip the deleted bases at start)
+            // genotype2 = -N + alt
+            let genotype1 = format!("-{}{}{}", del_len, varallele, &refallele[del_len..]);
+            let genotype2 = format!("-{}{}", del_len, varallele);
+            format!("{}/{}", genotype1, genotype2)
+        } else if ref_len == var_len && ref_len > 1 {
+            // Same-length complex variant (MNV or substitution)
+            // Java extends genotype1 with ref[1:] (reference bases after first char)
+            // genotype1 = varallele + refallele[1:]
+            // genotype2 = varallele
+            let genotype1 = format!("{}{}", varallele, &refallele[1..]);
+            let genotype2 = varallele.to_string();
+            format!("{}/{}", genotype1, genotype2)
+        } else if var_len > ref_len {
+            // Complex insertion: alt longer than ref, not a pure insertion
+            // Java uses +N notation for genotype2
+            // genotype1 = anchor_base + refallele (extended context)
+            // genotype2 = +<varallele_len + 1> (Java counts description length - 1)
+            let genotype1 = if let Some(anchor) = anchor_base {
+                format!("{}{}", anchor, refallele)
+            } else {
+                refallele.to_string()
+            };
+            // Java's +N comes from description string length - 1
+            // For complex insertion with matched sequence, the description is longer
+            let genotype2 = format!("+{}", var_len + 1);
+            format!("{}/{}", genotype1, genotype2)
+        } else {
+            // Single base substitution  
+            format!("{}/{}", varallele, varallele)
+        }
     }
 }
 
@@ -651,18 +729,22 @@ mod tests {
     }
 
     #[test]
-    fn test_determine_genotype_ref() {
-        assert_eq!(determine_genotype(0.0), "0/0");
+    fn test_determine_genotype_ref_call() {
+        // Reference call: G→G should be "G/G"
+        assert_eq!(determine_genotype("G", "G", 1.0, None), "G/G");
     }
 
     #[test]
     fn test_determine_genotype_het() {
-        assert_eq!(determine_genotype(0.3), "0/1");
+        // SNV: single base substitution uses "varallele/varallele" format (matching Java)
+        // Frequency is not used for SNVs - they always use the alt allele format
+        assert_eq!(determine_genotype("C", "T", 0.3, None), "T/T");
     }
 
     #[test]
-    fn test_determine_genotype_alt() {
-        assert_eq!(determine_genotype(0.8), "1/1");
+    fn test_determine_genotype_hom_alt() {
+        // Homozygous alternate: C→T with high frequency should be "T/T"
+        assert_eq!(determine_genotype("C", "T", 0.8, None), "T/T");
     }
 
     #[test]
@@ -859,8 +941,9 @@ mod tests {
         // Verify frequency: 4 variants out of 100 coverage = 4%
         assert!((variant.frequency - 0.04).abs() < 0.001);
 
-        // Verify genotype (4% frequency should be 0/1 - heterozygous)
-        assert_eq!(variant.genotype, "0/1");
+        // Genotype is set to default "N/N" in calculate_variant_statistics
+        // The actual genotype is determined later when full context is available
+        assert_eq!(variant.genotype, "N/N");
 
         // Verify strand bias is balanced (2 forward, 2 reverse)
         assert_eq!(variant.strand_bias_flag, StrandBiasFlag::NoBias);
@@ -915,8 +998,9 @@ mod tests {
         // Verify strong strand bias (11:1 ratio is 11.0 > 10.0)
         assert_eq!(variant.strand_bias_flag, StrandBiasFlag::StrongBias);
 
-        // Verify genotype (12% frequency should be 0/1)
-        assert_eq!(variant.genotype, "0/1");
+        // Genotype is set to default "N/N" in calculate_variant_statistics
+        // The actual genotype is determined later when full context is available
+        assert_eq!(variant.genotype, "N/N");
     }
 
     #[test]

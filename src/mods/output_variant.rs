@@ -127,8 +127,42 @@ pub struct SimpleOutputVariant {
 impl SimpleOutputVariant {
     /// Create a SimpleOutputVariant from a Variant and Region
     pub fn from_variant(variant: &Variant, region: &Region, sample: &str, sv: &str) -> Self {
-        let bias = format_strand_bias(variant.strand_bias_flag);
         let var_type_str = format_var_type(&variant.vartype);
+        
+        // Detect reference call (ref == alt)
+        let is_ref_call = variant.refallele == variant.varallele;
+        
+        // For reference calls: bias should be "0;0" (no bias for ref or var)
+        // For variants: bias is "ref_bias;var_bias" format
+        let bias = if is_ref_call {
+            "0;0".to_string()
+        } else {
+            format_strand_bias(variant.strand_bias_flag)
+        };
+        
+        // For reference calls, counts go to ref_fwd/ref_rev, not var_fwd/var_rev
+        let (variant_coverage, ref_fwd, ref_rev, var_fwd, var_rev, frequency) = if is_ref_call {
+            (
+                0,  // variant_coverage = 0 for ref calls
+                variant.vars_count_on_forward,  // ref counts FROM vars counts
+                variant.vars_count_on_reverse,
+                0,  // var counts = 0
+                0,
+                0.0,  // frequency = 0 for ref calls
+            )
+        } else {
+            (
+                variant.vars_count_on_forward + variant.vars_count_on_reverse,  // Total variant count
+                variant.ref_forward_count,  // Reference forward counts from same position
+                variant.ref_reverse_count,  // Reference reverse counts from same position
+                variant.vars_count_on_forward,
+                variant.vars_count_on_reverse,
+                variant.frequency,
+            )
+        };
+        
+        // For reference calls, vartype should be empty
+        let final_var_type = if is_ref_call { String::new() } else { var_type_str };
 
         SimpleOutputVariant {
             sample: sample.to_string(),
@@ -139,15 +173,15 @@ impl SimpleOutputVariant {
             ref_allele: variant.refallele.clone(),
             var_allele: variant.varallele.clone(),
 
-            total_coverage: variant.position_coverage, // Note: Java has totalPosCoverage
-            variant_coverage: variant.position_coverage,
-            reference_forward_count: 0, // TODO: Need to track reference counts
-            reference_reverse_count: 0,
-            variant_forward_count: variant.vars_count_on_forward,
-            variant_reverse_count: variant.vars_count_on_reverse,
+            total_coverage: variant.position_coverage,
+            variant_coverage,
+            reference_forward_count: ref_fwd,
+            reference_reverse_count: ref_rev,
+            variant_forward_count: var_fwd,
+            variant_reverse_count: var_rev,
 
             genotype: variant.genotype.clone(),
-            frequency: variant.frequency,
+            frequency,
             bias,
 
             pmean: variant.mean_position,
@@ -155,7 +189,16 @@ impl SimpleOutputVariant {
             qual: variant.mean_quality,
             qstd: if variant.has_at_least_2_diff_qualities { 1 } else { 0 },
             mapq: variant.mean_mapping_quality,
-            qratio: 0.0, // TODO: Calculate high/low quality ratio
+            // qratio: high_qual_read_cnt / low_qual_read_cnt (handle divide by zero)
+            // For ref calls with no reads, qratio should be 0; otherwise calculate normally
+            qratio: if variant.low_qual_read_cnt > 0 {
+                variant.high_qual_read_cnt as f64 / variant.low_qual_read_cnt as f64
+            } else if variant.high_qual_read_cnt > 0 {
+                // All reads are high quality - use high_qual_read_cnt / 0.5 as per Java
+                variant.high_qual_read_cnt as f64 * 2.0
+            } else {
+                0.0
+            },
             hifreq: variant.high_quality_reads_frequency,
             extrafreq: 0.0, // Not used in simple mode
 
@@ -163,13 +206,13 @@ impl SimpleOutputVariant {
             msi: variant.msi,
             msint: variant.msint,
             nm: variant.nm,
-            hicnt: 0, // TODO: Track high-quality count
-            hicov: 0, // TODO: Track high-quality coverage
+            hicnt: variant.high_qual_read_cnt,
+            hicov: variant.high_qual_read_cnt, // In simple mode, hicov = hicnt for the variant
 
             left_sequence: if variant.leftseq.is_empty() { "0".to_string() } else { variant.leftseq.clone() },
             right_sequence: if variant.rightseq.is_empty() { "0".to_string() } else { variant.rightseq.clone() },
             region: region.to_region_string(),
-            var_type: var_type_str,
+            var_type: final_var_type,
             duprate: 0.0, // Not used in simple mode
             sv: if sv.is_empty() { "0".to_string() } else { sv.to_string() },
         }
@@ -421,6 +464,10 @@ mod tests {
             msint: 0.0,
             shift3: 0,
             nm: 1.0,
+            high_qual_read_cnt: 10,
+            low_qual_read_cnt: 0,
+            ref_forward_count: 0,
+            ref_reverse_count: 0,
             genotype: "0/1".to_string(),
         };
 

@@ -8,6 +8,7 @@ pub(crate) mod patterns;
 pub mod reference;
 pub mod region;
 pub mod bam_reader;
+pub mod shared_reference;
 
 pub(crate) type VariantMap = HashMap<String, Variant>;
 

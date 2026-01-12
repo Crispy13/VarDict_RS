@@ -5,3 +5,6 @@ pub mod to_vars_builder;
 pub mod output_variant;
 pub mod pipeline;
 pub mod simple_variant_caller;
+pub mod parallel_pipeline;
+pub mod vardict_pipeline;
+pub mod structural_variants_processor;

@@ -5,41 +5,41 @@ use smallvec::SmallVec;
 
 use crate::prelude::SmallVecBytes;
 
-#[derive(Default)]
-pub(crate) struct Variant {
-    pub(crate) alt_depth: usize,
-    pub(crate) alt_depth_fwd: usize,
-    pub(crate) alt_depth_rev: usize,
+#[derive(Default, Debug, Clone)]
+pub struct Variant {
+    pub alt_depth: usize,
+    pub alt_depth_fwd: usize,
+    pub alt_depth_rev: usize,
 
     /// Sum of variant positions in read
-    pub(crate) mean_pos: f64,
+    pub mean_pos: f64,
 
     /// Sum of base qualities for variant
-    pub(crate) mean_qual: f64,
+    pub mean_qual: f64,
 
     /// Sum of mapping qualities for variant
-    pub(crate) mean_mapq: f64,
+    pub mean_mapq: f64,
 
     /// Sum of number of mismatches for variant
-    pub(crate) nm: f64,
+    pub nm: f64,
 
     /// Number of low-quality reads with the variant
-    pub(crate) low_qual_read_cnt: usize,
+    pub low_qual_read_cnt: usize,
 
     /// Number of high-quality reads with the variant
-    pub(crate) high_qual_read_cnt: usize,
+    pub high_qual_read_cnt: usize,
 
     /// Flag: true if variant is covered by reads with different positions
-    pub(crate) pstd: bool,
+    pub pstd: bool,
 
     /// Flag: true if variant is covered by reads with different qualities  
-    pub(crate) qstd: bool,
+    pub qstd: bool,
 
     /// Previous position (for pstd calculation)
-    pub(crate) pp: usize,
+    pub pp: usize,
 
     /// Previous quality (for qstd calculation)
-    pub(crate) pq: f64,
+    pub pq: f64,
 }
 
 impl Variant {
@@ -230,6 +230,24 @@ pub(crate) struct SoftClip {
 }
 
 
+#[derive(Default)]
 struct Mate {
     // TODO: for SV.
+}
+
+impl SoftClip {
+    /// Get the consensus sequence
+    pub fn consensus_seq(&self) -> &[u8] {
+        &self.consensus_seq
+    }
+
+    /// Check if this soft clip has been used
+    pub fn used(&self) -> bool {
+        self.used
+    }
+
+    /// Mark this soft clip as used
+    pub fn mark_used(&mut self) {
+        self.used = true;
+    }
 }

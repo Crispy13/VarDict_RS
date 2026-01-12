@@ -1,29 +1,30 @@
-pub(crate) struct Configuration {
-    pub(crate) perform_local_realignment: bool,
+#[derive(Clone)]
+pub struct Configuration {
+    pub perform_local_realignment: bool,
 
     /// Indicate to turn off chimeric reads filtering.  Chimeric reads are artifacts from library construction,
     /// where a read can be split into two segments, each will be aligned within 1-2 read length distance,
     /// but in opposite direction.
-    pub(crate) chimeric_filter: bool,
-    pub(crate) min_match: i32,
+    pub chimeric_filter: bool,
+    pub min_match: i32,
 
-    pub(crate) disable_sv: bool,
+    pub disable_sv: bool,
 
-    pub(crate) unique_mode_alignment_enabled: bool,
-    pub(crate) unique_mode_second_in_pair_enabled: bool,
+    pub unique_mode_alignment_enabled: bool,
+    pub unique_mode_second_in_pair_enabled: bool,
 
     /// The hexical to filter reads.
-    pub(crate) sam_filter: u32,
+    pub sam_filter: u32,
 
-    pub(crate) crispr_cutting_site: i32,
-    pub(crate) crispr_filtering_bp: i32,
-    // pub(crate) seed_2: i32,
+    pub crispr_cutting_site: i32,
+    pub crispr_filtering_bp: i32,
+    // pub seed_2: i32,
 
     /// The phred score for a base to be considered a good call
-    pub(crate) goodq: f64,
+    pub goodq: f64,
 
     /// Extension of bp to look for mismatches after insertion or deletion
-    pub(crate) vext: i32,
+    pub vext: i32,
 }
 
 impl Default for Configuration {

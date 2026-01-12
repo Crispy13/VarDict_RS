@@ -9,8 +9,6 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 
-use vardict_rs::data::bam_reader::{BamReader, passes_filter};
-use vardict_rs::data::reference::FastaReader;
 use vardict_rs::data::region::Region;
 use vardict_rs::mods::pipeline::{Pipeline, PipelineConfig};
 
@@ -107,6 +105,10 @@ struct Args {
     /// The column for gene name in BED file (default: 4)
     #[arg(short = 'g', long = "col-gene", default_value = "4")]
     col_gene: usize,
+
+    /// Number of threads for parallel processing (default: 1)
+    #[arg(short = 't', long = "threads", default_value = "1")]
+    num_threads: usize,
 }
 
 fn main() -> Result<()> {
@@ -182,33 +184,79 @@ fn main() -> Result<()> {
         println!("{}", pipeline.get_header());
     }
 
-    // Open FASTA reference reader
-    let fasta_reader = FastaReader::open(args.reference.to_str().unwrap())
-        .context("Failed to open reference FASTA file")?;
+    // Always use SharedReference (loaded into memory for fast access)
+    run_variant_calling(&args, config, regions)?;
 
-    // Open BAM reader
-    let mut bam_reader = BamReader::open(args.bam.to_str().unwrap())
-        .context("Failed to open BAM file")?;
+    Ok(())
+}
 
-    // Process each region
-    let mut stdout = io::stdout().lock();
+/// Run variant calling using SharedReference (loaded into memory)
+/// 
+/// SharedReference is the default for both single and multi-threaded modes.
+/// The reference is loaded once and shared across all threads for fast access.
+fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>) -> Result<()> {
+    use vardict_rs::data::shared_reference::load_shared_reference_chroms;
+    use vardict_rs::mods::parallel_pipeline::ParallelPipeline;
+    use vardict_rs::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE};
+    use vardict_rs::conf::Configuration;
+
+    // Initialize GlobalReadOnlyScope (required by VarDictPipeline)
+    let mut conf = Configuration::default();
+    conf.goodq = 22.5;
+    conf.vext = 2;
+    conf.disable_sv = true;
+    conf.perform_local_realignment = true;
+    let mut scope = GlobalReadOnlyScope::default();
+    scope.conf = conf;
+    let _ = INSTANCE.set(scope);
+
+    let num_threads = args.num_threads.max(1);
     
-    for region in &regions {
-        if args.debug {
-            eprintln!("Processing region: {}:{}-{}", region.chr(), region.start(), region.end());
-        }
+    if args.debug {
+        eprintln!("Loading reference genome into memory...");
+    }
 
-        match process_region(&args, &config, region, &sample_name, &mut bam_reader, &fasta_reader) {
-            Ok(output_lines) => {
-                for line in output_lines {
-                    writeln!(stdout, "{}", line)?;
-                }
+    // Get unique chromosomes from regions
+    let chroms: std::collections::HashSet<&str> = regions.iter()
+        .map(|r| r.chr())
+        .collect();
+    let chrom_vec: Vec<&str> = chroms.into_iter().collect();
+
+    // Load only the needed chromosomes for efficiency
+    let reference = load_shared_reference_chroms(
+        args.reference.to_str().unwrap(),
+        &chrom_vec,
+    ).context("Failed to load reference genome")?;
+
+    if args.debug {
+        eprintln!("Loaded {} chromosome(s), {:.2} MB total",
+            reference.num_chromosomes(),
+            reference.total_size() as f64 / 1_048_576.0);
+        if num_threads > 1 {
+            eprintln!("Processing {} regions with {} threads...", regions.len(), num_threads);
+        } else {
+            eprintln!("Processing {} regions...", regions.len());
+        }
+    }
+
+    // Create parallel pipeline (works for single thread too)
+    let pipeline = ParallelPipeline::new(reference, config, num_threads);
+
+    // Process regions
+    let bam_path = args.bam.to_str().unwrap().to_string();
+    let results = pipeline.process_regions(bam_path, regions);
+
+    // Output results
+    let mut stdout = io::stdout().lock();
+    for result in results {
+        if let Some(error) = result.error {
+            if args.debug {
+                eprintln!("Error processing {}:{}-{}: {}",
+                    result.region.chr(), result.region.start(), result.region.end(), error);
             }
-            Err(e) => {
-                if args.debug {
-                    eprintln!("Error processing region {}:{}-{}: {}", 
-                        region.chr(), region.start(), region.end(), e);
-                }
+        } else {
+            for line in result.output_lines {
+                writeln!(stdout, "{}", line)?;
             }
         }
     }
@@ -329,92 +377,6 @@ fn parse_bed_file(path: &PathBuf, args: &Args) -> Result<Vec<Region>> {
     }
 
     Ok(regions)
-}
-
-/// Process a single region and return output lines
-fn process_region(
-    args: &Args,
-    config: &PipelineConfig,
-    region: &Region,
-    _sample_name: &str,
-    bam_reader: &mut BamReader,
-    fasta_reader: &FastaReader,
-) -> Result<Vec<String>> {
-    use vardict_rs::mods::simple_variant_caller::SimpleVariantCaller;
-    use vardict_rs::mods::output_variant::Region as OutputRegion;
-    
-    if args.debug {
-        eprintln!("  Region: {}:{}-{} (gene: {})", 
-            region.chr(), region.start(), region.end(), region.gene());
-    }
-
-    // 1. Fetch reference sequence for this region
-    let ref_seq = fasta_reader.fetch_seq(
-        region.chr(),
-        region.start() as usize,
-        region.end() as usize,
-    )?;
-
-    if args.debug {
-        eprintln!("  Reference length: {} bp", ref_seq.len());
-    }
-
-    // 2. Create variant caller and set reference
-    let mut caller = SimpleVariantCaller::new(
-        config.quality_threshold,
-        config.mapq_threshold,
-    );
-    caller.set_reference(ref_seq, region.start() as i64);
-
-    // 3. Fetch reads from BAM
-    bam_reader.fetch(region.chr(), region.start(), region.end())?;
-
-    // Parse SAM filter
-    let sam_filter: u32 = args.sam_filter.parse().unwrap_or(0x504);
-
-    // 4. Read all records into a vector (needed for processing)
-    let mut records = Vec::new();
-    let mut record = rust_htslib::bam::Record::new();
-    while bam_reader.read(&mut record)? {
-        // Apply SAM flag filter (skip filtered reads)
-        if passes_filter(&record, sam_filter, config.mapq_threshold) {
-            records.push(record.clone());
-        }
-    }
-
-    if args.debug {
-        eprintln!("  Reads in region: {}", records.len());
-    }
-
-    if records.is_empty() {
-        return Ok(vec![]);
-    }
-
-    // 5. Process all records
-    let (variations, coverage) = caller.process_records(records.iter());
-
-    if args.debug {
-        eprintln!("  Variations found: {}", variations.len());
-        eprintln!("  Coverage positions: {}", coverage.len());
-    }
-
-    if variations.is_empty() {
-        return Ok(vec![]);
-    }
-
-    // 6. Create pipeline and process
-    let pipeline = Pipeline::new(config.clone());
-    
-    let output_region = OutputRegion::new(
-        region.chr(),
-        region.start() as i64,
-        region.end() as i64,
-        region.gene(),
-    );
-
-    let output_lines = pipeline.process_variations(variations, &coverage, &output_region);
-
-    Ok(output_lines)
 }
 
 #[cfg(test)]

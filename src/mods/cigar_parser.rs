@@ -62,6 +62,7 @@ pub struct CigarParser {
     cigar_len: u32,
 
     non_insertion_vars: HashMap<i64, HashMap<VarDesc, Variant>>,
+    insertion_vars: HashMap<i64, HashMap<VarDesc, Variant>>,
 
     ref_coverage: HashMap<i64, usize>,
 
@@ -87,6 +88,7 @@ impl Default for CigarParser {
             offset: Default::default(),
             cigar_len: Default::default(),
             non_insertion_vars: Default::default(),
+            insertion_vars: Default::default(),
             ref_coverage: Default::default(),
             soft_clips5_end: Default::default(),
             soft_clips3_end: Default::default(),
@@ -97,7 +99,113 @@ impl Default for CigarParser {
 }
 
 impl CigarParser {
+    /// Create a new CigarParser for processing a region
+    pub fn new(
+        region: Region,
+        reference: Reference,
+        instance: Arc<GlobalReadOnlyScope>,
+    ) -> Self {
+        Self {
+            query_seq_buf: Some(Vec::with_capacity(512)),
+            query_qual_buf: Some(Vec::with_capacity(512)),
+            aligner: Aligner::default(),
+            instance,
+            reference,
+            max_read_len: 0,
+            region,
+            discordant_count: 0,
+            splice_count: HashMap::new(),
+            read_pos_including_softclip: 0,
+            read_pos_excluding_softclip: 0,
+            start: 0,
+            offset: 0,
+            cigar_len: 0,
+            non_insertion_vars: HashMap::new(),
+            insertion_vars: HashMap::new(),
+            ref_coverage: HashMap::new(),
+            soft_clips5_end: HashMap::new(),
+            soft_clips3_end: HashMap::new(),
+            rev_complementor: RevComplementor::new(),
+            cigar: CigarString(vec![]).into_view(0),
+        }
+    }
+
+    /// Process multiple BAM records and accumulate variant data
+    ///
+    /// This is the main entry point for pipeline usage.
+    pub fn process_records<'a, I>(&mut self, records: I) -> Result<(), Error>
+    where
+        I: Iterator<Item = &'a mut Record>,
+    {
+        for record in records {
+            self.parse_cigar(record)?;
+        }
+        Ok(())
+    }
+
+    /// Get the collected non-insertion variants
+    pub fn get_non_insertion_vars(&self) -> &HashMap<i64, HashMap<VarDesc, Variant>> {
+        &self.non_insertion_vars
+    }
+
+    /// Take ownership of the collected non-insertion variants
+    pub fn take_non_insertion_vars(&mut self) -> HashMap<i64, HashMap<VarDesc, Variant>> {
+        std::mem::take(&mut self.non_insertion_vars)
+    }
+
+    /// Get the collected insertion variants
+    pub fn get_insertion_vars(&self) -> &HashMap<i64, HashMap<VarDesc, Variant>> {
+        &self.insertion_vars
+    }
+
+    /// Take ownership of the collected insertion variants
+    pub fn take_insertion_vars(&mut self) -> HashMap<i64, HashMap<VarDesc, Variant>> {
+        std::mem::take(&mut self.insertion_vars)
+    }
+
+    /// Get the reference coverage map
+    pub fn get_ref_coverage(&self) -> &HashMap<i64, usize> {
+        &self.ref_coverage
+    }
+
+    /// Take ownership of the reference coverage map
+    pub fn take_ref_coverage(&mut self) -> HashMap<i64, usize> {
+        std::mem::take(&mut self.ref_coverage)
+    }
+
+    /// Get the 5' soft clips
+    pub fn get_soft_clips_5end(&self) -> &HashMap<i64, SoftClip> {
+        &self.soft_clips5_end
+    }
+
+    /// Take ownership of the 5' soft clips
+    pub fn take_soft_clips_5end(&mut self) -> HashMap<i64, SoftClip> {
+        std::mem::take(&mut self.soft_clips5_end)
+    }
+
+    /// Get the 3' soft clips
+    pub fn get_soft_clips_3end(&self) -> &HashMap<i64, SoftClip> {
+        &self.soft_clips3_end
+    }
+
+    /// Take ownership of the 3' soft clips
+    pub fn take_soft_clips_3end(&mut self) -> HashMap<i64, SoftClip> {
+        std::mem::take(&mut self.soft_clips3_end)
+    }
+
+    /// Get the maximum read length encountered
+    pub fn get_max_read_len(&self) -> usize {
+        self.max_read_len
+    }
+
+    /// Get the discordant read count
+    pub fn get_discordant_count(&self) -> usize {
+        self.discordant_count
+    }
+
     fn parse_cigar(&mut self, record: &mut Record) -> Result<(), Error> {
+        event!(Level::DEBUG, "[parse_cigar] Starting for record at pos {}", record.pos());
+        
         let mut query_seq_buf = self.query_seq_buf.take().unwrap();
         let mut query_qual_buf = self.query_qual_buf.take().unwrap();
 
@@ -111,6 +219,8 @@ impl CigarParser {
 
         record.cache_cigar_if_empty();
         let mut cigar = record.cigar();
+        
+        event!(Level::DEBUG, "[parse_cigar] CIGAR: {:?}", cigar);
 
         let ins_del_len = get_ins_del_len(&cigar);
 
@@ -123,6 +233,7 @@ impl CigarParser {
                 }
 
                 if record.is_unmapped() || cigar.is_empty() {
+                    event!(Level::DEBUG, "[parse_cigar] Early return: unmapped or empty cigar");
                     return Ok(());
                 }
 
@@ -160,14 +271,16 @@ impl CigarParser {
 
             let mc = cigar_modifier.modify_cigar()?;
 
-            pos = mc.align_start_pos;
+            // Convert to 1-based position (BAM is 0-based, Java VarDict uses 1-based)
+            pos = mc.align_start_pos + 1;
             cigar = CigarString(mc.cigar.into_iter().collect::<Vec<_>>())
-                .into_view(mc.align_start_pos as i64);
+                .into_view(mc.align_start_pos as i64 + 1);
 
             query_qual = mc.query_qual;
             query_seq = mc.query_seq;
         } else {
-            pos = record.pos();
+            // Convert to 1-based position (BAM is 0-based, Java VarDict uses 1-based)
+            pos = record.pos() + 1;
         }
 
         self.clean_up_cigar(record);
@@ -223,6 +336,10 @@ impl CigarParser {
         let mpos = record.mpos();
         let adj_pos = pos;
         self.offset = 0;
+        self.start = pos; // Initialize start position from record position
+        
+        // Store cigar in self so helper functions can access it
+        self.cigar = cigar.clone();
 
         'process_cigar: {
             //Loop over CIGAR records
@@ -235,6 +352,8 @@ impl CigarParser {
 
                 self.cigar_len = c.len();
                 //Letter from CIGAR
+                event!(Level::DEBUG, "[parse_cigar] Processing CIGAR op: {:?} at ci={}", c, ci);
+                
                 match c {
                     Cigar::RefSkip(l) => {
                         self.process_not_matched(l);
@@ -260,6 +379,24 @@ impl CigarParser {
                     }
                     Cigar::Ins(_) => {
                         offset = 0;
+                        // Before processing insertion, emit a ref call at the position before the insertion
+                        // Java emits a reference call at the anchor position (position - 1 where insertion occurs)
+                        let anchor_pos = self.start - 1;
+                        event!(Level::DEBUG, "[Ins] Adding ref call at anchor position {} (self.start={})", anchor_pos, self.start);
+                        if anchor_pos >= self.region.start as i64 && anchor_pos <= self.region.end as i64 {
+                            if let Some(ref_base) = self.reference.get(anchor_pos) {
+                                event!(Level::DEBUG, "[Ins] ref_base at {} = {}", anchor_pos, ref_base as char);
+                                let var_desc = VarDesc::SNV { ref_base };
+                                let var = get_variants_from_map(&mut self.non_insertion_vars, anchor_pos, &var_desc);
+                                // For insertion anchor: read_pos is 0 (first position), tp will be 1
+                                // BAM quality is already Phred (not +33 adjusted), so use directly
+                                let bq = query_qual.first().copied().unwrap_or(0);
+                                // Use bq=0 for high quality tracking - insertion anchors don't count as high quality
+                                // The base quality is still recorded for mean_qual calculation
+                                add_cnt_anchor(var, is_reverse, 0, bq, mapping_quality, nm as usize, Some(read_match_ins_len));
+                                inc_cnt(&mut self.ref_coverage, anchor_pos, 1);
+                            }
+                        }
                         ci = self.process_insertion(
                             query_seq,
                             mapping_quality,
@@ -269,6 +406,7 @@ impl CigarParser {
                             pos,
                             read_match_ins_len,
                             ci,
+                            &cigar,
                         )?;
                     }
                     Cigar::Del(_) => {
@@ -290,13 +428,13 @@ impl CigarParser {
                         
                         // Loop over bases of CIGAR segment
                         let mut i = offset;
-                        while i < self.cigar_len as usize {
+                        while i < self.cigar_len as usize && self.read_pos_including_softclip < query_seq.len() {
                             // Flag to trim reads at opt_t_bases from start or end
                             let trim = self.is_trim_at_opt_t_bases(
                                 is_reverse,
                                 read_len_including_softclips,
                             );
-
+                            
                             // variation string. Initialize to first base of the read sequence
                             let ch1 = *query_seq.get_or_err(self.read_pos_including_softclip)?;
                             let mut s = SmallVecBytes::new();
@@ -313,7 +451,7 @@ impl CigarParser {
                             }
 
                             // Sum of qualities for bases
-                            let mut q = (*query_qual.get_or_err(self.read_pos_including_softclip)? - 33) as f64;
+                            let mut q = (*query_qual.get_or_err(self.read_pos_including_softclip)?) as f64;
                             // Number of bases for quality calculation
                             let mut qbases = 1;
                             // Number of bases in insertion for quality calculation
@@ -322,19 +460,28 @@ impl CigarParser {
                             let mut ss = SmallVecBytes::new();
 
                             // Multi-base mismatch detection loop
+                            let mut loop_iterations = 0;
+                            
                             while (self.start + 1) >= self.region.start as i64
                                 && (self.start + 1) <= self.region.end as i64
                                 && (i + 1) < self.cigar_len as usize
+                                && self.read_pos_including_softclip + 1 < query_seq.len()  // Bounds check for read
                                 && q >= instance().conf.goodq
-                                && is_has_and_not_equals(
+                                && self.reference.has_and_not_equals(
+                                    self.start,
                                     *query_seq.get_or_err(self.read_pos_including_softclip)?,
-                                    self.contig_ref_seq(),
-                                    self.start as usize,
                                 )
-                                && *self.contig_ref_seq().get_or_err(self.start as usize)? != b'N'
+                                && !self.reference.has_and_equals(self.start, b'N')
                             {
+                                event!(Level::DEBUG, "[MNV loop] iter={} pos={} read_base={} ref_base={:?} ss_len={}", 
+                                    loop_iterations, self.start, 
+                                    *query_seq.get(self.read_pos_including_softclip).unwrap_or(&b'?') as char,
+                                    self.reference.get(self.start).map(|b| b as char),
+                                    ss.len());
+                                loop_iterations += 1;
                                 // Require higher quality for MNV
-                                if *query_qual.get_or_err(self.read_pos_including_softclip + 1)? - 33
+                                // BAM stores Phred quality directly (no +33 ASCII offset)
+                                if *query_qual.get_or_err(self.read_pos_including_softclip + 1)?
                                     < instance().conf.goodq as u8 + 5
                                 {
                                     break;
@@ -346,16 +493,19 @@ impl CigarParser {
                                     break;
                                 }
                                 
-                                if is_has_and_equals(b'N', self.contig_ref_seq(), (self.start + 1) as usize) {
+                                if self.reference.has_and_equals(self.start + 1, b'N') {
                                     break;
                                 }
 
                                 // Check if base doesn't match reference
-                                let ref_base = *self.contig_ref_seq().get_or_err((self.start + 1) as usize)?;
+                                let ref_base = match self.reference.get(self.start + 1) {
+                                    Some(b) => b,
+                                    None => break,
+                                };
                                 if nuc != ref_base {
                                     // Consecutive mismatch
                                     ss.push(nuc);
-                                    q += (*query_qual.get_or_err(self.read_pos_including_softclip + 1)? - 33) as f64;
+                                    q += (*query_qual.get_or_err(self.read_pos_including_softclip + 1)?) as f64;
                                     qbases += 1;
                                     self.read_pos_including_softclip += 1;
                                     self.read_pos_excluding_softclip += 1;
@@ -370,10 +520,9 @@ impl CigarParser {
                                             break;
                                         }
                                         if self.read_pos_including_softclip + 1 + ssi < query_seq.len()
-                                            && is_has_and_not_equals(
+                                            && self.reference.has_and_not_equals(
+                                                self.start + 1 + ssi as i64,
                                                 *query_seq.get_or_err(self.read_pos_including_softclip + 1 + ssi)?,
-                                                self.contig_ref_seq(),
-                                                (self.start + 1 + ssi as i64) as usize,
                                             )
                                         {
                                             ssn = ssi + 1;
@@ -386,7 +535,8 @@ impl CigarParser {
                                     }
                                     
                                     // Require higher quality for MNV
-                                    if *query_qual.get_or_err(self.read_pos_including_softclip + ssn)? - 33
+                                    // BAM stores Phred quality directly (no +33 ASCII offset)
+                                    if *query_qual.get_or_err(self.read_pos_including_softclip + ssn)?
                                         < instance().conf.goodq as u8 + 5
                                     {
                                         break;
@@ -394,7 +544,7 @@ impl CigarParser {
                                     
                                     for ssi in 1..=ssn {
                                         ss.push(*query_seq.get_or_err(self.read_pos_including_softclip + ssi)?);
-                                        q += (*query_qual.get_or_err(self.read_pos_including_softclip + ssi)? - 33) as f64;
+                                        q += (*query_qual.get_or_err(self.read_pos_including_softclip + ssi)?) as f64;
                                         qbases += 1;
                                     }
                                     self.read_pos_including_softclip += ssn;
@@ -424,7 +574,7 @@ impl CigarParser {
                                 // Extend through end of current segment
                                 while i + 1 < self.cigar_len as usize {
                                     s.push(*query_seq.get_or_err(self.read_pos_including_softclip + 1)?);
-                                    q += (*query_qual.get_or_err(self.read_pos_including_softclip + 1)? - 33) as f64;
+                                    q += (*query_qual.get_or_err(self.read_pos_including_softclip + 1)?) as f64;
                                     qbases += 1;
 
                                     i += 1;
@@ -466,7 +616,7 @@ impl CigarParser {
                                     );
 
                                     for _ in 1..=ins_len {
-                                        q += (*query_qual.get_or_err(self.read_pos_including_softclip + 1)? - 33) as f64;
+                                        q += (*query_qual.get_or_err(self.read_pos_including_softclip + 1)?) as f64;
                                         qibases += 1;
                                     }
 
@@ -490,7 +640,8 @@ impl CigarParser {
                                         s.push(b'&');
                                         s.extend_from_slice(&tseq);
                                         for &bq in &tqual {
-                                            q += (bq - 33) as f64;
+                                            // BAM stores Phred quality directly
+                                            q += bq as f64;
                                             qibases += 1;
                                         }
                                     }
@@ -505,7 +656,7 @@ impl CigarParser {
                             )? {
                                 while i + 1 < self.cigar_len as usize {
                                     s.push(*query_seq.get_or_err(self.read_pos_including_softclip + 1)?);
-                                    q += (*query_qual.get_or_err(self.read_pos_including_softclip + 1)? - 33) as f64;
+                                    q += (*query_qual.get_or_err(self.read_pos_including_softclip + 1)?) as f64;
                                     qbases += 1;
 
                                     i += 1;
@@ -544,7 +695,7 @@ impl CigarParser {
                                 s = final_s;
 
                                 for _ in 1..=next_len {
-                                    q += (*query_qual.get_or_err(self.read_pos_including_softclip + 1)? - 33) as f64;
+                                    q += (*query_qual.get_or_err(self.read_pos_including_softclip + 1)?) as f64;
                                     qibases += 1;
                                 }
                                 
@@ -561,11 +712,15 @@ impl CigarParser {
                                     && pos <= self.region.end as i64
                                     && !s.iter().any(|&b| b == b'N')
                                 {
+                                    event!(Level::DEBUG, "[parse_cigar] Calling add_variation_for_matching_part: pos={}, s={:?}", 
+                                        pos, String::from_utf8_lossy(&s));
+                                    
                                     self.add_variation_for_matching_part(
                                         mapping_quality,
                                         nm as usize,
                                         is_reverse,
                                         read_match_ins_len,
+                                        self.read_pos_excluding_softclip,  // Use current position (after MNV loop, before final +1)
                                         nmoff,
                                         &s,
                                         start_with_deletion,
@@ -575,6 +730,10 @@ impl CigarParser {
                                         ddlen,
                                         pos,
                                     );
+                                } else {
+                                    event!(Level::DEBUG, "[parse_cigar] Skipping variation: pos={} (region: {}-{}), has_N={}, trim={}", 
+                                        pos, self.region.start, self.region.end, 
+                                        s.iter().any(|&b| b == b'N'), trim);
                                 }
                             }
 
@@ -730,7 +889,7 @@ impl CigarParser {
                     &self.reference.ref_seq,
                     (self.start - 1) as usize,
                 )
-                && query_quality.get_or_err(*cigar_len as usize - 1)? - 33 > 10
+                && *query_quality.get_or_err(*cigar_len as usize - 1)? > 10
             {
                 //create variant if it is not present
                 let ref_b = self
@@ -745,13 +904,15 @@ impl CigarParser {
                     &VarDesc::SNV { ref_base: ref_b },
                 );
                 //add count
+                // BAM stores Phred quality directly
                 add_cnt(
                     var,
                     is_reverse,
                     *cigar_len as usize,
-                    query_quality.get_or_err(*cigar_len as usize - 1).copied()? - 33,
+                    query_quality.get_or_err(*cigar_len as usize - 1).copied()?,
                     mapq,
                     num_mismatch,
+                    None,
                 );
                 //increase coverage
                 inc_cnt(&mut self.ref_coverage, self.start - 1, 1);
@@ -773,8 +934,8 @@ impl CigarParser {
                         break;
                     }
 
-                    // base quality
-                    let bq = query_quality.get_or_err(si)? - 33;
+                    // base quality - BAM stores Phred quality directly
+                    let bq = *query_quality.get_or_err(si)?;
                     if bq <= 12 {
                         num_low_qual_base += 1;
                         break; //Stop if a low-quality base is found
@@ -879,7 +1040,7 @@ impl CigarParser {
                     &self.reference.ref_seq,
                     (self.start) as usize,
                 )
-                && query_quality.get_or_err(self.read_pos_including_softclip)? - 33 > 10
+                && *query_quality.get_or_err(self.read_pos_including_softclip)? > 10
             {
                 //Initialize entry if not present
                 let ref_b = self
@@ -893,17 +1054,17 @@ impl CigarParser {
                     self.start,
                     &VarDesc::SNV { ref_base: ref_b },
                 );
-                //add count
+                //add count - BAM stores Phred quality directly
                 add_cnt(
                     var,
                     is_reverse,
                     total_length_including_soft_clipped - self.read_pos_excluding_softclip,
                     query_quality
                         .get_or_err(self.read_pos_including_softclip)
-                        .copied()?
-                        - 33,
+                        .copied()?,
                     mapq,
                     num_mismatch,
+                    None,
                 );
                 // Add coverage
                 inc_cnt(&mut self.ref_coverage, self.start, 1);
@@ -932,9 +1093,9 @@ impl CigarParser {
                         break;
                     }
 
-                    let base_quality = query_quality
-                        .get_or_err(self.read_pos_including_softclip + si as usize)?
-                        - 33;
+                    // BAM stores Phred quality directly
+                    let base_quality = *query_quality
+                        .get_or_err(self.read_pos_including_softclip + si as usize)?;
 
                     if base_quality <= 12 {
                         num_low_qual_base += 1;
@@ -1072,7 +1233,8 @@ impl CigarParser {
                 let mut vi = 0;
                 while vsn <= instance().conf.vext as usize && vi < nnn_cigar_len as usize {
                     let b = *query_seq.get_or_err(tn + vi)?;
-                    let q = *query_qual.get_or_err(tn + vi)? - 33;
+                    // BAM stores Phred quality directly
+                    let q = *query_qual.get_or_err(tn + vi)?;
 
                     if b == b'N' {
                         break;
@@ -1082,11 +1244,11 @@ impl CigarParser {
                         break;
                     }
 
-                    if is_has_and_equals(b'N', self.contig_ref_seq(), ts + vi) {
+                    if self.reference.has_and_equals((ts + vi) as i64, b'N') {
                         break;
                     }
 
-                    match self.contig_ref_seq().get(ts + vi).copied() {
+                    match self.reference.get((ts + vi) as i64) {
                         Some(ref_b) => {
                             if b != ref_b {
                                 self.offset = vi + 1;
@@ -1152,12 +1314,12 @@ impl CigarParser {
                     if seq_ch == b'N' {
                         break;
                     }
-                    if ((*query_qual.get_or_err(tn + vi)? - 33) as f64)
+                    if ((*query_qual.get_or_err(tn + vi)?) as f64)
                         < instance().conf.goodq
                     {
                         break;
                     }
-                    match self.contig_ref_seq().get(ts + vi).copied() {
+                    match self.reference.get((ts + vi) as i64) {
                         Some(ref_ch) => {
                             if ref_ch == b'N' {
                                 break;
@@ -1201,14 +1363,14 @@ impl CigarParser {
                     break;
                 }
                 // If base quality is less than GOODQ, exit loop
-                if ((*query_qual.get_or_err(self.read_pos_including_softclip + vi)? - 33) as f64)
+                if ((*query_qual.get_or_err(self.read_pos_including_softclip + vi)?) as f64)
                     < instance().conf.goodq
                 {
                     break;
                 }
                 // If reference sequence has base at this position
-                let ref_pos = self.start as usize + self.cigar_len as usize + vi;
-                match self.contig_ref_seq().get(ref_pos).copied() {
+                let ref_pos = self.start + self.cigar_len as i64 + vi as i64;
+                match self.reference.get(ref_pos) {
                     Some(ref_ch) => {
                         if ref_ch == b'N' {
                             break;
@@ -1314,11 +1476,11 @@ impl CigarParser {
             from_end
         };
 
-        // Average quality of bases in quality segment
+        // Average quality of bases in quality segment - BAM stores Phred quality directly
         let tmpq: f64 = if qual_seg.is_empty() {
             0.0
         } else {
-            qual_seg.iter().map(|&q| (q - 33) as f64).sum::<f64>() / qual_seg.len() as f64
+            qual_seg.iter().map(|&q| q as f64).sum::<f64>() / qual_seg.len() as f64
         };
 
         // pstd: true if variant is covered by reads with different positions
@@ -1336,7 +1498,7 @@ impl CigarParser {
         var.mean_mapq += mapq as f64;
         var.pp = tp;
         var.pq = tmpq;
-        var.nm += (nm - nmoff) as f64;
+        var.nm += nm.saturating_sub(nmoff) as f64;
 
         if tmpq >= instance().conf.goodq {
             var.high_qual_read_cnt += 1;
@@ -1390,17 +1552,17 @@ impl CigarParser {
                 false
             };
 
-            if has_correct_type && self.contig_ref_seq().get(self.start as usize).is_some() {
+            if has_correct_type && self.reference.get(self.start).is_some() {
                 // Check if there's a mismatch or multi-base mismatch
                 let has_mismatch = !ss.is_empty()
-                    || is_has_and_not_equals(
+                    || self.reference.has_and_not_equals(
+                        self.start,
                         *query_seq.get_or_err(self.read_pos_including_softclip)?,
-                        self.contig_ref_seq(),
-                        self.start as usize,
                     );
 
+                // BAM stores Phred quality directly
                 let has_good_quality = *query_qual.get_or_err(self.read_pos_including_softclip)?
-                    - 33 >= instance().conf.goodq as u8;
+                    >= instance().conf.goodq as u8;
 
                 return Ok(has_mismatch && has_good_quality);
             }
@@ -1427,7 +1589,8 @@ impl CigarParser {
 
         while vsn <= instance().conf.vext as usize && vi < seg_len {
             let b = *query_seq.get_or_err(tn + vi)?;
-            let q = *query_qual.get_or_err(tn + vi)? - 33;
+            // BAM stores Phred quality directly
+            let q = *query_qual.get_or_err(tn + vi)?;
 
             if b == b'N' {
                 break;
@@ -1437,7 +1600,7 @@ impl CigarParser {
                 break;
             }
 
-            match self.contig_ref_seq().get(ts + vi).copied() {
+            match self.reference.get((ts + vi) as i64) {
                 Some(ref_b) => {
                     if b != ref_b {
                         offset = vi + 1;
@@ -1474,6 +1637,14 @@ impl CigarParser {
     }
 
     /// Process insertion in CIGAR
+    /// 
+    /// Java equivalent: processInsertion() in CigarParser.java
+    /// 
+    /// Key logic:
+    /// 1. Get the inserted bases from the read
+    /// 2. If next CIGAR is Match, look for mismatches using vext algorithm
+    /// 3. Combine insertion + following mismatches into complex variant
+    /// 4. Store variant at position `start - 1` (position before insertion)
     fn process_insertion(
         &mut self,
         query_seq: &[u8],
@@ -1481,16 +1652,204 @@ impl CigarParser {
         query_qual: &[u8],
         nm: usize,
         is_reverse: bool,
-        pos: i64,
+        _pos: i64,
         read_len_including_match_ins: usize,
         mut ci: usize,
+        cigar: &CigarStringView,
     ) -> Result<usize, Error> {
-        // For now, simple insertion handling - skip the insertion
         let ins_len = self.cigar_len as usize;
-        self.read_pos_including_softclip += ins_len;
-        self.read_pos_excluding_softclip += ins_len;
         
-        // TODO: Full insertion variant calling like Java
+        event!(Level::DEBUG, "[process_insertion] Called: ci={} ins_len={} start={} read_pos={} cigar_len={}", 
+            ci, ins_len, self.start, self.read_pos_including_softclip, cigar.len());
+        
+        for i in 0..cigar.len() {
+            event!(Level::DEBUG, "[process_insertion] cigar[{}] = {:?}", i, cigar.get(i));
+        }
+        
+        // Get the inserted sequence from the read
+        let ins_seq = query_seq.get_or_err(
+            self.read_pos_including_softclip..self.read_pos_including_softclip + ins_len
+        )?;
+        
+        // Get quality of inserted segment
+        let ins_qual = query_qual.get_or_err(
+            self.read_pos_including_softclip..self.read_pos_including_softclip + ins_len
+        )?;
+        
+        // Build the variant description string
+        let mut desc: SmallVec<[u8; 64]> = SmallVec::new();
+        desc.extend_from_slice(ins_seq);
+        
+        // Build quality string
+        let mut qual_seg: Vec<u8> = ins_qual.to_vec();
+        
+        // Sequence to append if next segment has mismatches
+        let mut ss: Vec<u8> = Vec::new();
+        self.offset = 0;
+        let mut nmoff = 0;
+        
+        // Check if next CIGAR segment is Match - look for mismatches to combine
+        // Note: We always check next match for insertions, regardless of perform_local_realignment
+        let next_is_match = cigar.get(ci + 1)
+            .map_or(false, |c| matches!(c, Cigar::Match(_)));
+        
+        event!(Level::DEBUG, "[process_insertion] next_is_match={} cigar[ci+1]={:?}", 
+            next_is_match, cigar.get(ci + 1));
+        
+        if next_is_match {
+            let mlen = cigar.get(ci + 1).unwrap().len() as usize;
+            let mut vsn = 0;
+            
+            // Position in read after insertion
+            let tn = self.read_pos_including_softclip + ins_len;
+            // Reference position (insertion doesn't consume reference)
+            let ts = self.start;
+            
+            event!(Level::DEBUG, "[process_insertion] Looking for mismatches: ins_len={} mlen={} tn={} ts={}", 
+                ins_len, mlen, tn, ts);
+            
+            // Loop over next CIGAR segment looking for mismatches (Java: findOffset-like logic)
+            let mut vi = 0;
+            while vsn <= instance().conf.vext as usize && vi < mlen {
+                let seq_ch = *query_seq.get_or_err(tn + vi)?;
+                
+                // If base is unknown, exit loop
+                if seq_ch == b'N' {
+                    break;
+                }
+                
+                // If base quality is less than GOODQ, exit loop - BAM stores Phred quality directly
+                let qual = *query_qual.get_or_err(tn + vi)?;
+                if (qual as f64) < instance().conf.goodq {
+                    event!(Level::DEBUG, "[process_insertion] vi={} qual={} < goodq={}, breaking", vi, qual, instance().conf.goodq);
+                    break;
+                }
+                
+                // Check reference base
+                match self.reference.get(ts + vi as i64) {
+                    Some(ref_ch) => {
+                        event!(Level::DEBUG, "[process_insertion] vi={} read={} ref={} at pos {}", 
+                            vi, seq_ch as char, ref_ch as char, ts + vi as i64);
+                        
+                        if ref_ch == b'N' {
+                            break;
+                        }
+                        if seq_ch != ref_ch {
+                            // Mismatch found
+                            self.offset = vi + 1;
+                            nmoff += 1;
+                            vsn = 0;
+                        } else {
+                            vsn += 1;
+                        }
+                    }
+                    None => {
+                        event!(Level::DEBUG, "[process_insertion] vi={} ref not found at pos {}", vi, ts + vi as i64);
+                    }
+                }
+                vi += 1;
+            }
+            
+            event!(Level::DEBUG, "[process_insertion] After loop: offset={} ss_len={} mlen={}", self.offset, ss.len(), mlen);
+            
+            // If mismatches found in following Match segment, append them
+            if self.offset > 0 {
+                ss.extend_from_slice(query_seq.get_or_err(tn..tn + self.offset)?);
+                qual_seg.extend_from_slice(query_qual.get_or_err(tn..tn + self.offset)?);
+                
+                // Increase coverage for positions corresponding to first offset bases
+                for osi in 0..self.offset {
+                    inc_cnt(&mut self.ref_coverage, self.start + osi as i64, 1);
+                }
+                
+                // If we consumed the entire next Match segment, skip it
+                if self.offset == mlen {
+                    ci += 1;
+                    event!(Level::DEBUG, "[process_insertion] Consumed entire Match({}) segment, advancing ci to {}", mlen, ci);
+                }
+            }
+        }
+        
+        // Skip if contains N
+        let full_desc: Vec<u8> = if self.offset > 0 && !ss.is_empty() {
+            // Combine insertion + following mismatches
+            let mut combined = desc.to_vec();
+            combined.extend_from_slice(&ss);
+            combined
+        } else {
+            desc.to_vec()
+        };
+        
+        if full_desc.iter().any(|&b| b == b'N') {
+            self.read_pos_including_softclip += ins_len;
+            self.read_pos_excluding_softclip += ins_len;
+            return Ok(ci);
+        }
+        
+        // Determine variant position and type based on whether mismatches follow
+        // If mismatches found in following Match, create Complex at Match position
+        // Otherwise, create simple Insertion at position before
+        let (variant_pos, var_desc) = if self.offset > 0 && !ss.is_empty() {
+            // Complex variant: insertion + following match bases
+            // Position is the start of the Match segment (self.start)
+            let var_pos = self.start;
+            
+            // Build reference sequence (the bases the Match covers)
+            // Reference length = offset (number of bases consumed from Match)
+            let mut ref_seq: SmallVec<[u8; 32]> = SmallVec::new();
+            for i in 0..self.offset {
+                if let Some(ref_base) = self.reference.get(self.start + i as i64) {
+                    ref_seq.push(ref_base);
+                }
+            }
+            
+            // Alt sequence = inserted bases + match bases
+            let alt_seq: SmallVec<[u8; 32]> = full_desc.iter().copied().collect();
+            
+            (var_pos, VarDesc::Complex { ref_seq, alt_seq })
+        } else {
+            // Simple insertion at position before (start - 1)
+            let insertion_pos = self.start - 1;
+            (insertion_pos, VarDesc::Ins { seq: full_desc.into() })
+        };
+        
+        // Check if variant position is within region of interest
+        if variant_pos >= self.region.start as i64 && variant_pos <= self.region.end as i64 {
+            // Average quality - BAM already stores Phred quality directly (no need for -33)
+            let avg_qual = if !qual_seg.is_empty() {
+                let sum: u32 = qual_seg.iter().map(|&q| q as u32).sum();
+                (sum as f64 / qual_seg.len() as f64) as u8
+            } else {
+                0
+            };
+            
+            // Store the variant
+            // Complex variants go to non_insertion_vars, simple insertions to insertion_vars
+            let var = match &var_desc {
+                VarDesc::Complex { .. } => {
+                    get_variants_from_map(&mut self.non_insertion_vars, variant_pos, &var_desc)
+                }
+                _ => {
+                    get_variants_from_map(&mut self.insertion_vars, variant_pos, &var_desc)
+                }
+            };
+            
+            // Use actual read position for mean_pos calculation
+            // For insertions/complex variants, this is where the variant starts in the read
+            let read_pos = self.read_pos_including_softclip;
+            add_cnt(var, is_reverse, read_pos, avg_qual, mapq, nm.saturating_sub(nmoff), Some(read_len_including_match_ins));
+            
+            // Note: ref_coverage for Complex variants is already updated in the offset loop above (line ~1765)
+            // Do NOT increment here - that would cause double-counting
+        }
+        
+        // Advance read position by insertion length + any offset from following mismatches
+        self.read_pos_including_softclip += ins_len + self.offset;
+        self.read_pos_excluding_softclip += ins_len + self.offset;
+        
+        // Advance reference position by offset (mismatches consumed from following Match)
+        self.start += self.offset as i64;
+        
         Ok(ci)
     }
 
@@ -1501,6 +1860,7 @@ impl CigarParser {
         nm: usize,
         is_reverse: bool,
         read_len_including_match_ins: usize,
+        read_pos: usize,  // Current read position (0-based)
         nmoff: usize,
         s: &[u8],
         start_with_deletion: bool,
@@ -1511,21 +1871,101 @@ impl CigarParser {
         pos: i64,
     ) {
         // Build VarDesc from s string
-        // s format examples: "A", "A&T" (SNV+MNV), "+ATC" (insertion), "-2&AT" (deletion+match), etc.
+        // s format examples: "A", "A&TGC" (MNV), "+ATC" (insertion), "-2&AT" (deletion+match), etc.
         
-        // For now, simple parsing - TODO: full variant parsing
         if s.is_empty() || s.iter().all(|&b| b == b'N') {
             return;
         }
 
         // Average quality
-        let mut avg_qual = q;
-        if qbases + qibases > 0 {
-            avg_qual /= (qbases + qibases) as f64;
+        let avg_qual = if qbases + qibases > 0 {
+            (q / (qbases + qibases) as f64) as u8
+        } else {
+            q as u8
+        };
+        
+        // Check if this is a complex variant (contains & for MNV)
+        if let Some(amp_pos) = s.iter().position(|&b| b == b'&') {
+            // MNV format: first_base&rest_of_mnv
+            // e.g., "A&TGC" means 4-base MNV: A, T, G, C at consecutive positions
+            let first_base = s[0];
+            let rest = &s[amp_pos + 1..]; // TGC
+            
+            // Build the full alt sequence
+            let mut alt_seq: SmallVec<[u8; 32]> = SmallVec::new();
+            alt_seq.push(first_base);
+            alt_seq.extend_from_slice(rest);
+            
+            let mnv_len = alt_seq.len();
+            
+            // Build reference sequence for this MNV using coordinate-translated access
+            let mut ref_seq: SmallVec<[u8; 32]> = SmallVec::new();
+            for offset in 0..mnv_len {
+                if let Some(ref_base) = self.reference.get(pos + offset as i64) {
+                    ref_seq.push(ref_base);
+                } else {
+                    // Reference doesn't cover this position
+                    event!(Level::DEBUG, "[add_variation_for_matching_part] MNV at pos {} extends beyond reference", pos);
+                    return;
+                }
+            }
+            
+            // Create Complex/MNV VarDesc
+            let var_desc = VarDesc::Complex {
+                ref_seq,
+                alt_seq,
+            };
+            
+            // Get or create variant and add count - use read_pos for tp calculation
+            let var = get_variants_from_map(&mut self.non_insertion_vars, pos, &var_desc);
+            add_cnt(var, is_reverse, read_pos, avg_qual, mapq, nm, Some(read_len_including_match_ins));
+            
+            // Update reference coverage for all positions in MNV
+            for offset in 0..mnv_len {
+                inc_cnt(&mut self.ref_coverage, pos + offset as i64, 1);
+            }
+        } else if s.len() == 1 {
+            // Simple base: single base (could be match or SNV)
+            let alt_base = s[0];
+            
+            // Get reference base at this position using coordinate-translated access
+            let ref_base = match self.reference.get(pos) {
+                Some(b) => b,
+                None => {
+                    event!(Level::DEBUG, "[add_variation_for_matching_part] SNV at pos {} not in reference", pos);
+                    return;
+                }
+            };
+            
+            // Create VarDesc keyed by alt_base (the read base)
+            // This stores both matches (alt == ref) and mismatches (alt != ref)
+            let var_desc = VarDesc::SNV { ref_base: alt_base };
+            
+            // Get or create variant and add count - use read_pos for tp calculation
+            let var = get_variants_from_map(&mut self.non_insertion_vars, pos, &var_desc);
+            add_cnt(var, is_reverse, read_pos, avg_qual, mapq, nm, Some(read_len_including_match_ins));
+            
+            // Update reference coverage
+            inc_cnt(&mut self.ref_coverage, pos, 1);
+        } else if s.starts_with(b"+") {
+            // Insertion: +ATC format
+            let ins_seq: SmallVec<[u8; 32]> = s[1..].iter().copied().collect();
+            
+            let var_desc = VarDesc::Ins { seq: ins_seq };
+            
+            // Store insertions in non_insertion_vars (they're distinguished by VarDesc type)
+            // use read_pos for tp calculation
+            let var = get_variants_from_map(&mut self.non_insertion_vars, pos, &var_desc);
+            add_cnt(var, is_reverse, read_pos, avg_qual, mapq, nm, Some(read_len_including_match_ins));
+            
+            inc_cnt(&mut self.ref_coverage, pos, 1);
+        } else if s.starts_with(b"-") {
+            // Deletion: -2 or -2&AT format (deletion with optional following sequence)
+            // This is handled elsewhere in deletion processing, but add fallback
+            // For now, skip complex deletion handling
+        } else {
+            // Unknown format - skip
         }
-
-        // TODO: Parse s into VarDesc and add to variant map
-        // This is a complex part involving SNV, MNV, indel parsing
     }
 
     /// N in CIGAR - skipped region from reference
@@ -1644,6 +2084,26 @@ impl CigarParser {
     fn contig_ref_seq(&self) -> &Vec<u8> {
         &self.reference.ref_seq
     }
+    
+    /// Get a reference base at a genomic position
+    /// Converts genomic position to slice index using region.start()
+    fn ref_base_at(&self, genomic_pos: i64) -> Option<u8> {
+        if genomic_pos < self.region.start() as i64 {
+            return None;
+        }
+        let idx = (genomic_pos - self.region.start() as i64) as usize;
+        self.reference.ref_seq.get(idx).copied()
+    }
+    
+    /// Check if a reference position has a base that equals the given base
+    fn ref_has_and_equals(&self, genomic_pos: i64, base: u8) -> bool {
+        self.ref_base_at(genomic_pos).map_or(false, |b| b == base)
+    }
+    
+    /// Check if a reference position has a base that does NOT equal the given base
+    fn ref_has_and_not_equals(&self, genomic_pos: i64, base: u8) -> bool {
+        self.ref_base_at(genomic_pos).map_or(false, |b| b != base)
+    }
 
     /// Process soft clip on 5' if it is has high quality reads
     fn sclip5_high_quality_processing(
@@ -1686,13 +2146,15 @@ impl CigarParser {
                 *cnts.get_mut(b).unwrap() += 1;
 
                 let seq_var = get_variation_from_seq(sclip, idx as usize, b);
+                // BAM stores Phred quality directly
                 add_cnt(
                     seq_var,
                     is_reverse,
                     si as usize - (cigar_len as usize - num_high_qual_base),
-                    *query_quality.get_or_err(si as usize)? - 33,
+                    *query_quality.get_or_err(si as usize)?,
                     mapq,
                     num_mismatch,
+                    None,
                 );
             }
 
@@ -1703,6 +2165,7 @@ impl CigarParser {
                 (read_qual_sum / num_high_qual_base) as u8,
                 mapq,
                 num_mismatch,
+                None,
             );
         }
 
@@ -1748,13 +2211,15 @@ impl CigarParser {
                 *cnts.get_mut(b).unwrap() += 1;
 
                 let seq_var = get_variation_from_seq(sclip, idx as usize, b);
+                // BAM stores Phred quality directly
                 add_cnt(
                     seq_var,
                     is_reverse,
                     num_high_qual_base - si,
-                    *query_quality.get_or_err(self.read_pos_including_softclip + si)? - 33,
+                    *query_quality.get_or_err(self.read_pos_including_softclip + si)?,
                     mapq,
                     num_mismatch,
+                    None,
                 );
             }
 
@@ -1765,6 +2230,7 @@ impl CigarParser {
                 (read_qual_sum / num_high_qual_base) as u8,
                 mapq,
                 num_mismatch,
+                None,
             );
         }
 
@@ -1895,10 +2361,30 @@ fn is_read_chimeric_with_sa(
 }
 
 /// Increment variant counters.
-fn add_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: u8, mapq: u8, nm: usize) {
+/// read_pos: position in read (excluding soft clips)  
+/// bq: base quality
+/// read_len: optional total read length for calculating tp correctly
+fn add_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: u8, mapq: u8, nm: usize, read_len: Option<usize>) {
     var.alt_depth += 1;
     var.inc_dir(is_reverse);
-    var.mean_pos += read_pos as f64;
+    
+    // Calculate tp: minimum distance from either end of read (like Java)
+    // Java: tp = n < rlen1 - n ? n + 1 : rlen1 - n
+    let tp = if let Some(rlen) = read_len {
+        let from_start = read_pos;
+        let from_end = rlen.saturating_sub(read_pos);
+        if from_start < from_end {
+            from_start + 1
+        } else {
+            from_end
+        }
+    } else {
+        // Fallback if read_len not provided - use read_pos + 1
+        // This is not ideal but maintains backward compatibility
+        read_pos + 1
+    };
+    
+    var.mean_pos += tp as f64;
     var.mean_qual += bq as f64;
     var.mean_mapq += mapq as f64;
     var.nm += nm as f64;
@@ -1908,6 +2394,35 @@ fn add_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: u8, mapq: u
     } else {
         var.low_qual_read_cnt += 1;
     }
+}
+
+/// Increment variant counters for insertion/deletion anchor positions.
+/// These don't count toward high quality reads.
+/// read_pos: position in read (excluding soft clips)  
+/// bq: base quality
+/// read_len: optional total read length for calculating tp correctly
+fn add_cnt_anchor(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: u8, mapq: u8, nm: usize, read_len: Option<usize>) {
+    var.alt_depth += 1;
+    var.inc_dir(is_reverse);
+    
+    // Calculate tp: minimum distance from either end of read (like Java)
+    let tp = if let Some(rlen) = read_len {
+        let from_start = read_pos;
+        let from_end = rlen.saturating_sub(read_pos);
+        if from_start < from_end {
+            from_start + 1
+        } else {
+            from_end
+        }
+    } else {
+        read_pos + 1
+    };
+    
+    var.mean_pos += tp as f64;
+    var.mean_qual += bq as f64;
+    var.mean_mapq += mapq as f64;
+    var.nm += nm as f64;
+    // Note: Don't increment high_qual_read_cnt or low_qual_read_cnt for anchors
 }
 
 /// Increase count for given key
@@ -1922,17 +2437,19 @@ fn inc_cnt(coverage_map: &mut HashMap<i64, usize>, pos: i64, depth: usize) {
 /// Skip the insertions and deletions that are right after or before introns
 /// (they indicate of aligner problem)
 fn skip_indel_next_to_intron(cigar: &CigarStringView, ci: usize) -> Result<bool, Error> {
+    // Handle empty cigar case
+    if cigar.len() == 0 {
+        return Ok(false);
+    }
+    
     // if the current cigar is not the last item.
     // and the next cigar is ref skip
     // or
     // the current cigar is not the first one and the previous one is refskip
-    if (ci > 0 && matches!(cigar.get_or_err(ci - 1)?, Cigar::RefSkip(_)))
-        || (ci < cigar.len() - 1 && matches!(cigar.get_or_err(ci + 1)?, Cigar::RefSkip(_)))
-    {
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    let has_prev_refskip = ci > 0 && cigar.get(ci - 1).map_or(false, |c| matches!(c, Cigar::RefSkip(_)));
+    let has_next_refskip = ci + 1 < cigar.len() && cigar.get(ci + 1).map_or(false, |c| matches!(c, Cigar::RefSkip(_)));
+    
+    Ok(has_prev_refskip || has_next_refskip)
 }
 
 fn is_followed_by_match_and_indel(cigar: &CigarStringView, ci: usize) -> bool {

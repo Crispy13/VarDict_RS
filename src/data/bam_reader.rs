@@ -13,6 +13,29 @@ pub struct BamReader {
     header: bam::Header,
 }
 
+/// Normalize chromosome name to match BAM header
+fn normalize_bam_chrom<'a>(header: &bam::HeaderView, chrom: &'a str) -> Option<String> {
+    // Try exact match first
+    if header.tid(chrom.as_bytes()).is_some() {
+        return Some(chrom.to_string());
+    }
+    
+    // Try with "chr" prefix stripped
+    if let Some(stripped) = chrom.strip_prefix("chr") {
+        if header.tid(stripped.as_bytes()).is_some() {
+            return Some(stripped.to_string());
+        }
+    }
+    
+    // Try with "chr" prefix added
+    let with_chr = format!("chr{}", chrom);
+    if header.tid(with_chr.as_bytes()).is_some() {
+        return Some(with_chr);
+    }
+    
+    None
+}
+
 impl BamReader {
     /// Open an indexed BAM file
     /// 
@@ -26,22 +49,27 @@ impl BamReader {
 
     /// Set the region to query
     /// 
+    /// Handles chromosome name normalization (e.g., "chr20" -> "20" or vice versa)
+    /// 
     /// Arguments:
     /// * `chrom` - Chromosome/contig name
     /// * `start` - Start position (1-based, inclusive)  
     /// * `end` - End position (1-based, inclusive)
     pub fn fetch(&mut self, chrom: &str, start: usize, end: usize) -> Result<()> {
-        // BAM uses 0-based coordinates
+        // Normalize chromosome name to match BAM header
+        let bam_chrom = normalize_bam_chrom(self.reader.header(), chrom)
+            .ok_or_else(|| anyhow!("Chromosome '{}' not found in BAM header (tried with/without 'chr' prefix)", chrom))?;
+        
         let tid = self.reader.header()
-            .tid(chrom.as_bytes())
-            .ok_or_else(|| anyhow!("Chromosome '{}' not found in BAM header", chrom))?;
+            .tid(bam_chrom.as_bytes())
+            .ok_or_else(|| anyhow!("Chromosome '{}' not found in BAM header", bam_chrom))?;
         
         // Convert 1-based to 0-based for BAM
         let begin = (start.saturating_sub(1)) as i64;
         let end = end as i64;
         
         self.reader.fetch((tid, begin, end))
-            .with_context(|| format!("Failed to fetch region {}:{}-{}", chrom, start, end))?;
+            .with_context(|| format!("Failed to fetch region {}:{}-{}", bam_chrom, start, end))?;
         
         Ok(())
     }

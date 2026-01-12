@@ -5,10 +5,76 @@ use anyhow::{Context, Result, anyhow};
 use rust_htslib::faidx;
 
 /// Reference sequence data
-#[derive(Default)]
-pub(crate) struct Reference {
-    pub(crate) ref_seq: Vec<u8>,
-    pub(crate) seed: HashMap<Vec<u8>, Vec<i64>>,
+#[derive(Default, Clone)]
+pub struct Reference {
+    pub ref_seq: Vec<u8>,
+    pub seed: HashMap<Vec<u8>, Vec<i64>>,
+    /// Start position of this reference slice in genomic coordinates (1-based)
+    pub region_start: i64,
+}
+
+impl Reference {
+    /// Create a new Reference from a sequence slice
+    pub fn from_seq(seq: &[u8]) -> Self {
+        Reference {
+            ref_seq: seq.to_vec(),
+            seed: HashMap::new(),
+            region_start: 0,
+        }
+    }
+    
+    /// Create a new Reference from a sequence slice with region start position
+    pub fn from_seq_with_start(seq: &[u8], region_start: i64) -> Self {
+        Reference {
+            ref_seq: seq.to_vec(),
+            seed: HashMap::new(),
+            region_start,
+        }
+    }
+
+    /// Create a new Reference with owned sequence
+    pub fn new(ref_seq: Vec<u8>) -> Self {
+        Reference {
+            ref_seq,
+            seed: HashMap::new(),
+            region_start: 0,
+        }
+    }
+    
+    /// Create a new Reference with owned sequence and region start
+    pub fn new_with_start(ref_seq: Vec<u8>, region_start: i64) -> Self {
+        Reference {
+            ref_seq,
+            seed: HashMap::new(),
+            region_start,
+        }
+    }
+    
+    /// Get the base at a genomic position (0-based or 1-based depending on region_start)
+    /// Returns None if position is out of bounds
+    pub fn get(&self, genomic_pos: i64) -> Option<u8> {
+        if genomic_pos < self.region_start {
+            return None;
+        }
+        let idx = (genomic_pos - self.region_start) as usize;
+        self.ref_seq.get(idx).copied()
+    }
+    
+    /// Get the base at a genomic position as i64 (for compatibility)
+    /// Returns None if position is out of bounds
+    pub fn get_i64(&self, genomic_pos: i64) -> Option<u8> {
+        self.get(genomic_pos)
+    }
+    
+    /// Check if a genomic position contains a specific base
+    pub fn has_and_equals(&self, genomic_pos: i64, base: u8) -> bool {
+        self.get(genomic_pos).map_or(false, |b| b == base)
+    }
+    
+    /// Check if a genomic position does NOT contain a specific base
+    pub fn has_and_not_equals(&self, genomic_pos: i64, base: u8) -> bool {
+        self.get(genomic_pos).map_or(false, |b| b != base)
+    }
 }
 
 /// FASTA file reader with indexed access
@@ -64,6 +130,7 @@ impl FastaReader {
         Ok(Reference {
             ref_seq,
             seed: HashMap::new(), // Seeds computed separately if needed
+            region_start: start as i64,
         })
     }
 }
