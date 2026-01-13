@@ -29,12 +29,58 @@ pub enum VarType {
     Complex { insertion: String, deletion: usize },
 }
 
-/// Strand bias flags (0=none, 1=weak, 2=strong)
+/// Strand bias value (matches Java VarDict format):
+/// - 0: Can't assess (one strand only at low counts ≤12)
+/// - 1: Has strand bias (high counts but fails balance test)  
+/// - 2: No strand bias (balanced, good)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StrandBiasFlag {
-    NoBias = 0,
-    WeakBias = 1,
-    StrongBias = 2,
+pub enum StrandBiasValue {
+    CantAssess = 0,   // Low count, only one strand has reads
+    HasBias = 1,      // High count but imbalanced  
+    NoBias = 2,       // Balanced, no strand bias
+}
+
+impl StrandBiasValue {
+    pub fn as_int(&self) -> i32 {
+        match self {
+            StrandBiasValue::CantAssess => 0,
+            StrandBiasValue::HasBias => 1,
+            StrandBiasValue::NoBias => 2,
+        }
+    }
+}
+
+/// Combined strand bias flag for ref and var (format: "refBias;varBias")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StrandBiasFlag {
+    pub ref_bias: StrandBiasValue,
+    pub var_bias: StrandBiasValue,
+}
+
+impl Default for StrandBiasFlag {
+    fn default() -> Self {
+        StrandBiasFlag {
+            ref_bias: StrandBiasValue::CantAssess,
+            var_bias: StrandBiasValue::CantAssess,
+        }
+    }
+}
+
+impl StrandBiasFlag {
+    /// Create from two bias values
+    pub fn new(ref_bias: StrandBiasValue, var_bias: StrandBiasValue) -> Self {
+        StrandBiasFlag { ref_bias, var_bias }
+    }
+    
+    /// Format as Java-compatible string "refBias;varBias"
+    pub fn to_string(&self) -> String {
+        format!("{};{}", self.ref_bias.as_int(), self.var_bias.as_int())
+    }
+    
+    /// Check if this is the "2;1" pattern (ref good, var has bias)
+    pub fn is_ref_good_var_biased(&self) -> bool {
+        self.ref_bias == StrandBiasValue::NoBias && self.var_bias == StrandBiasValue::HasBias
+    }
 }
 
 /// A single variant with complete statistical information
@@ -109,7 +155,7 @@ impl Variant {
             mean_position: 0.0,
             mean_quality: 0.0,
             mean_mapping_quality: 0.0,
-            strand_bias_flag: StrandBiasFlag::NoBias,
+            strand_bias_flag: StrandBiasFlag::default(),
             is_at_least_at_2_positions: false,
             has_at_least_2_diff_qualities: false,
             leftseq: String::new(),
@@ -128,8 +174,9 @@ impl Variant {
 
     /// Check if this variant passes quality filters (for testing)
     pub fn is_good_var(&self) -> bool {
-        // Simple mode doesn't filter too aggressively
-        self.strand_bias_flag != StrandBiasFlag::StrongBias || self.frequency > 0.1
+        // Simple mode: just check for the "2;1" bias pattern
+        // Don't filter on strand bias alone, use frequency too
+        !self.strand_bias_flag.is_ref_good_var_biased() || self.frequency > 0.2
     }
 }
 
@@ -279,7 +326,14 @@ impl ToVarsBuilder {
         }
 
         // === Strand bias calculation ===
-        variant.strand_bias_flag = check_strand_bias(forward_count, reverse_count);
+        // Calculate variant strand bias from variant read counts
+        let var_bias = check_strand_bias(forward_count, reverse_count);
+        // Reference bias will be set later when we have reference counts
+        // For now, set just the variant bias (ref defaults to CantAssess)
+        variant.strand_bias_flag = StrandBiasFlag {
+            ref_bias: StrandBiasValue::CantAssess,
+            var_bias,
+        };
 
         // === High-quality read filtering (Simple Mode) ===
         let high_quality_count = variations
@@ -429,19 +483,36 @@ pub fn has_at_least_2_distinct_f64(values: &[f64]) -> bool {
     false // All values are essentially the same
 }
 
-/// Calculate strand bias flag based on forward/reverse counts
-/// Simple Mode: Uses simple ratio-based method (NO statistical tests)
-pub fn check_strand_bias(forward: usize, reverse: usize) -> StrandBiasFlag {
-    if forward == 0 || reverse == 0 {
-        StrandBiasFlag::StrongBias // All on one strand
-    } else {
-        let ratio = forward.max(reverse) as f64 / forward.min(reverse) as f64;
-        if ratio > 10.0 {
-            StrandBiasFlag::StrongBias // >90% on one strand
-        } else if ratio > 4.0 {
-            StrandBiasFlag::WeakBias // >80% on one strand
+/// Calculate strand bias value based on forward/reverse counts
+/// Matches Java VarDict's strandBias function exactly:
+/// - For total ≤12: returns 2 if both strands have reads, 0 if only one strand
+/// - For total >12: returns 2 if balanced (both ≥5% AND both ≥minBiasReads), else 1
+pub fn check_strand_bias(forward: usize, reverse: usize) -> StrandBiasValue {
+    let total = forward + reverse;
+    let bias_threshold = 0.05;    // Java: instance().conf.bias = 0.05
+    let min_bias_reads = 2usize;  // Java: instance().conf.minBiasReads = 2
+    
+    // using p=0.01, because prop.test(1,12) = 0.01
+    if total <= 12 {
+        // For low counts, just check if both strands have any reads
+        if forward > 0 && reverse > 0 {
+            StrandBiasValue::NoBias  // 2: both strands represented
         } else {
-            StrandBiasFlag::NoBias // Balanced
+            StrandBiasValue::CantAssess  // 0: only one strand
+        }
+    } else {
+        // For higher counts, check if balanced
+        let fwd_ratio = forward as f64 / total as f64;
+        let rev_ratio = reverse as f64 / total as f64;
+        
+        if fwd_ratio >= bias_threshold 
+            && rev_ratio >= bias_threshold
+            && forward >= min_bias_reads 
+            && reverse >= min_bias_reads 
+        {
+            StrandBiasValue::NoBias  // 2: balanced, no bias
+        } else {
+            StrandBiasValue::HasBias  // 1: strand bias present
         }
     }
 }
@@ -698,33 +769,47 @@ mod tests {
 
     #[test]
     fn test_strand_bias_no_bias() {
+        // 10 forward, 10 reverse - total 20 > 12, both are >= 5% and >= 2 = NoBias (2)
         assert_eq!(
             check_strand_bias(10, 10),
-            StrandBiasFlag::NoBias
+            StrandBiasValue::NoBias
         );
     }
 
     #[test]
-    fn test_strand_bias_weak() {
+    fn test_strand_bias_low_count_both_strands() {
+        // Total <= 12, but both strands have reads = NoBias (2)
         assert_eq!(
-            check_strand_bias(15, 3),  // ratio = 5.0 > 4.0 = weak
-            StrandBiasFlag::WeakBias
+            check_strand_bias(5, 3),
+            StrandBiasValue::NoBias
         );
     }
 
     #[test]
-    fn test_strand_bias_strong() {
+    fn test_strand_bias_low_count_one_strand() {
+        // Total <= 12, only one strand has reads = CantAssess (0)
         assert_eq!(
             check_strand_bias(10, 0),
-            StrandBiasFlag::StrongBias
+            StrandBiasValue::CantAssess
         );
     }
 
     #[test]
-    fn test_strand_bias_strong_ratio() {
+    fn test_strand_bias_high_count_imbalanced() {
+        // Total > 12, but 5/100 = 5% is exactly at threshold, and both have >= 2 reads
+        // Forward: 100/105 = 95.2% >= 5%, Reverse: 5/105 = 4.76% < 5% = HasBias
         assert_eq!(
             check_strand_bias(100, 5),
-            StrandBiasFlag::StrongBias
+            StrandBiasValue::HasBias
+        );
+    }
+
+    #[test]
+    fn test_strand_bias_balanced_high_count() {
+        // Total > 12, both strands >= 5% and >= 2 reads = NoBias
+        assert_eq!(
+            check_strand_bias(15, 5),  // 15/20=75% and 5/20=25%, both >= 5%
+            StrandBiasValue::NoBias
         );
     }
 
@@ -800,7 +885,7 @@ mod tests {
     fn test_variant_new() {
         let v = Variant::new();
         assert_eq!(v.frequency, 0.0);
-        assert_eq!(v.strand_bias_flag, StrandBiasFlag::NoBias);
+        assert_eq!(v.strand_bias_flag, StrandBiasFlag::default());
         assert_eq!(v.genotype, "0/0");
     }
 
@@ -945,8 +1030,9 @@ mod tests {
         // The actual genotype is determined later when full context is available
         assert_eq!(variant.genotype, "N/N");
 
-        // Verify strand bias is balanced (2 forward, 2 reverse)
-        assert_eq!(variant.strand_bias_flag, StrandBiasFlag::NoBias);
+        // Verify strand bias: 2 forward, 2 reverse, total=4 which is <=12
+        // Both strands have reads, so should be NoBias (2)
+        assert_eq!(variant.strand_bias_flag.var_bias, StrandBiasValue::NoBias);
 
         // Verify position mean: (10 + 15 + 20 + 25) / 4 = 17.5
         assert!((variant.mean_position - 17.5).abs() < 0.1);
@@ -957,7 +1043,6 @@ mod tests {
         // Verify mapping quality mean: (60 + 60 + 50 + 50) / 4 = 55.0
         assert!((variant.mean_mapping_quality - 55.0).abs() < 0.1);
     }
-
     #[test]
     fn test_calculate_variant_statistics_biased() {
         let builder = ToVarsBuilder::new();
@@ -995,8 +1080,9 @@ mod tests {
         // Verify frequency: 12 variants out of 100 = 12%
         assert!((variant.frequency - 0.12).abs() < 0.001);
 
-        // Verify strong strand bias (11:1 ratio is 11.0 > 10.0)
-        assert_eq!(variant.strand_bias_flag, StrandBiasFlag::StrongBias);
+        // Verify strand bias: 11 forward, 1 reverse, total=12 which is <=12
+        // Both strands have reads, so should be NoBias (2) per Java logic
+        assert_eq!(variant.strand_bias_flag.var_bias, StrandBiasValue::NoBias);
 
         // Genotype is set to default "N/N" in calculate_variant_statistics
         // The actual genotype is determined later when full context is available
@@ -1250,7 +1336,8 @@ mod tests {
         assert!((variant.mean_mapping_quality - 7.75).abs() < 0.01,
                 "mean_mapping_quality: expected 7.75, got {}", variant.mean_mapping_quality);
         
-        // Check strand bias: 3 forward, 1 reverse -> ratio 3.0 < 4.0 = NoBias
-        assert_eq!(variant.strand_bias_flag, StrandBiasFlag::NoBias);
+        // Check strand bias: 3 forward, 1 reverse, total=4 which is <=12
+        // Both strands have reads, so should be NoBias (2) per Java logic
+        assert_eq!(variant.strand_bias_flag.var_bias, StrandBiasValue::NoBias);
     }
 }

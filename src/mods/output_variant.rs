@@ -66,8 +66,13 @@ impl Region {
 
     /// Format as "chr:start-end"
     pub fn to_region_string(&self) -> String {
-        format!("{}:{}-{}", self.chr, self.start, self.end)
+        format!("{}:{}-{}", normalize_chr_for_output(&self.chr), self.start, self.end)
     }
+}
+
+/// Normalize chromosome name for output to match VarDict Java (drop leading "chr")
+fn normalize_chr_for_output(chr: &str) -> String {
+    chr.strip_prefix("chr").unwrap_or(chr).to_string()
 }
 
 /// Simple Output Variant - 36 column format for Simple Mode
@@ -164,10 +169,11 @@ impl SimpleOutputVariant {
         // For reference calls, vartype should be empty
         let final_var_type = if is_ref_call { String::new() } else { var_type_str };
 
+        let chr = normalize_chr_for_output(&region.chr);
         SimpleOutputVariant {
             sample: sample.to_string(),
             gene: region.gene.clone(),
-            chr: region.chr.clone(),
+            chr: chr.clone(),
             start_position: variant.start_position,
             end_position: variant.end_position,
             ref_allele: variant.refallele.clone(),
@@ -211,7 +217,7 @@ impl SimpleOutputVariant {
 
             left_sequence: if variant.leftseq.is_empty() { "0".to_string() } else { variant.leftseq.clone() },
             right_sequence: if variant.rightseq.is_empty() { "0".to_string() } else { variant.rightseq.clone() },
-            region: region.to_region_string(),
+            region: format!("{}:{}-{}", chr, region.start, region.end),
             var_type: final_var_type,
             duprate: 0.0, // Not used in simple mode
             sv: if sv.is_empty() { "0".to_string() } else { sv.to_string() },
@@ -220,10 +226,11 @@ impl SimpleOutputVariant {
 
     /// Create an empty variant (for positions with no variants)
     pub fn empty(position: i64, region: &Region, sample: &str) -> Self {
+        let chr = normalize_chr_for_output(&region.chr);
         SimpleOutputVariant {
             sample: sample.to_string(),
             gene: region.gene.clone(),
-            chr: region.chr.clone(),
+            chr: chr.clone(),
             start_position: position,
             end_position: position,
             ref_allele: String::new(),
@@ -258,7 +265,7 @@ impl SimpleOutputVariant {
 
             left_sequence: "0".to_string(),
             right_sequence: "0".to_string(),
-            region: region.to_region_string(),
+            region: format!("{}:{}-{}", chr, region.start, region.end),
             var_type: String::new(),
             duprate: 0.0,
             sv: "0".to_string(),
@@ -346,13 +353,9 @@ fn format_f64(value: f64, decimals: usize) -> String {
     }
 }
 
-/// Format strand bias flag as "flag;flag" string
+/// Format strand bias flag as "refBias;varBias" string
 fn format_strand_bias(flag: StrandBiasFlag) -> String {
-    match flag {
-        StrandBiasFlag::NoBias => "0;0".to_string(),
-        StrandBiasFlag::WeakBias => "1;0".to_string(),
-        StrandBiasFlag::StrongBias => "2;0".to_string(),
-    }
+    flag.to_string()
 }
 
 /// Format VarType to string representation
@@ -396,7 +399,7 @@ mod tests {
     #[test]
     fn test_region_to_string() {
         let region = Region::new("chr1", 1000, 2000, "GENE1");
-        assert_eq!(region.to_region_string(), "chr1:1000-2000");
+        assert_eq!(region.to_region_string(), "1:1000-2000");
     }
 
     #[test]
@@ -413,9 +416,11 @@ mod tests {
 
     #[test]
     fn test_format_strand_bias() {
-        assert_eq!(format_strand_bias(StrandBiasFlag::NoBias), "0;0");
-        assert_eq!(format_strand_bias(StrandBiasFlag::WeakBias), "1;0");
-        assert_eq!(format_strand_bias(StrandBiasFlag::StrongBias), "2;0");
+        use crate::mods::to_vars_builder::StrandBiasValue;
+        // Test with new struct format
+        assert_eq!(format_strand_bias(StrandBiasFlag::new(StrandBiasValue::CantAssess, StrandBiasValue::CantAssess)), "0;0");
+        assert_eq!(format_strand_bias(StrandBiasFlag::new(StrandBiasValue::NoBias, StrandBiasValue::NoBias)), "2;2");
+        assert_eq!(format_strand_bias(StrandBiasFlag::new(StrandBiasValue::NoBias, StrandBiasValue::HasBias)), "2;1");
     }
 
     #[test]
@@ -440,6 +445,7 @@ mod tests {
 
     #[test]
     fn test_from_variant() {
+        use crate::mods::to_vars_builder::StrandBiasValue;
         let variant = Variant {
             description_string: "A>T".to_string(),
             refallele: "A".to_string(),
@@ -455,7 +461,7 @@ mod tests {
             mean_position: 25.0,
             mean_quality: 30.0,
             mean_mapping_quality: 60.0,
-            strand_bias_flag: StrandBiasFlag::NoBias,
+            strand_bias_flag: StrandBiasFlag::new(StrandBiasValue::NoBias, StrandBiasValue::NoBias),
             is_at_least_at_2_positions: true,
             has_at_least_2_diff_qualities: true,
             leftseq: "ACGT".to_string(),
@@ -476,7 +482,7 @@ mod tests {
 
         assert_eq!(output.sample, "sample1");
         assert_eq!(output.gene, "BRCA1");
-        assert_eq!(output.chr, "chr1");
+        assert_eq!(output.chr, "1");
         assert_eq!(output.start_position, 1000);
         assert_eq!(output.ref_allele, "A");
         assert_eq!(output.var_allele, "T");
@@ -484,7 +490,7 @@ mod tests {
         assert_eq!(output.variant_reverse_count, 5);
         assert_eq!(output.genotype, "0/1");
         assert!((output.frequency - 0.10).abs() < 0.001);
-        assert_eq!(output.bias, "0;0");
+        assert_eq!(output.bias, "2;2");  // NoBias for both ref and var
         assert_eq!(output.pstd, 1);
         assert_eq!(output.qstd, 1);
         assert_eq!(output.left_sequence, "ACGT");
@@ -515,7 +521,7 @@ mod tests {
         // Check key fields
         assert_eq!(fields[0], "sample1");          // Sample
         assert_eq!(fields[1], "GENE1");            // Gene
-        assert_eq!(fields[2], "chr1");             // Chr
+        assert_eq!(fields[2], "1");                // Chr
         assert_eq!(fields[3], "1500");             // Start
         assert_eq!(fields[5], "A");                // Ref
         assert_eq!(fields[6], "T");                // Alt

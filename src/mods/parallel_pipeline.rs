@@ -400,7 +400,7 @@ fn process_single_region(
         .with_min_frequency(config.min_frequency)
         .with_min_base_quality(config.quality_threshold)
         .with_min_mapping_quality(config.mapq_threshold)
-        .with_pileup(true); // Enable pileup to match Java -p flag behavior
+        .with_pileup(config.pileup); // Use config's pileup setting
     
     // Get GlobalReadOnlyScope instance
     let gros = Arc::new(instance().clone());

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 
+use crackle_kit::tracing_kit::setup_logging_stderr_only_verbose;
 use vardict_rs::data::region::Region;
 use vardict_rs::mods::pipeline::{Pipeline, PipelineConfig};
 
@@ -176,6 +177,7 @@ fn main() -> Result<()> {
         .min_variant_reads(args.min_variant_reads)
         .min_base_quality(args.min_base_quality)
         .min_mapping_quality(args.min_mapping_quality)
+        .pileup(args.pileup)
         .build();
 
     // Print header if requested
@@ -200,16 +202,6 @@ fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>
     use vardict_rs::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE};
     use vardict_rs::conf::Configuration;
 
-    // Initialize GlobalReadOnlyScope (required by VarDictPipeline)
-    let mut conf = Configuration::default();
-    conf.goodq = 22.5;
-    conf.vext = 2;
-    conf.disable_sv = true;
-    conf.perform_local_realignment = true;
-    let mut scope = GlobalReadOnlyScope::default();
-    scope.conf = conf;
-    let _ = INSTANCE.set(scope);
-
     let num_threads = args.num_threads.max(1);
     
     if args.debug {
@@ -227,6 +219,18 @@ fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>
         args.reference.to_str().unwrap(),
         &chrom_vec,
     ).context("Failed to load reference genome")?;
+
+    // Initialize GlobalReadOnlyScope (required by VarDictPipeline)
+    // Must be done AFTER loading reference to populate chr_lens
+    let mut conf = Configuration::default();
+    conf.goodq = 22.5;
+    conf.vext = 2;
+    conf.disable_sv = true;
+    conf.perform_local_realignment = true;
+    let mut scope = GlobalReadOnlyScope::default();
+    scope.conf = conf;
+    scope.chr_lens = reference.get_chromosome_lengths();
+    let _ = INSTANCE.set(scope);
 
     if args.debug {
         eprintln!("Loaded {} chromosome(s), {:.2} MB total",

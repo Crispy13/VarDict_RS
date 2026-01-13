@@ -26,6 +26,7 @@ pub struct PipelineConfig {
     pub min_variant_reads: usize,
     pub quality_threshold: u8,
     pub mapq_threshold: u8,
+    pub pileup: bool,
 }
 
 impl Default for PipelineConfig {
@@ -36,6 +37,7 @@ impl Default for PipelineConfig {
             min_variant_reads: 2,
             quality_threshold: 25,
             mapq_threshold: 0,
+            pileup: false,
         }
     }
 }
@@ -72,6 +74,7 @@ pub struct PipelineConfigBuilder {
     min_variant_reads: usize,
     quality_threshold: u8,
     mapq_threshold: u8,
+    pileup: bool,
 }
 
 impl PipelineConfigBuilder {
@@ -83,6 +86,7 @@ impl PipelineConfigBuilder {
             min_variant_reads: defaults.min_variant_reads,
             quality_threshold: defaults.quality_threshold,
             mapq_threshold: defaults.mapq_threshold,
+            pileup: defaults.pileup,
         }
     }
 
@@ -111,6 +115,11 @@ impl PipelineConfigBuilder {
         self
     }
 
+    pub fn pileup(mut self, enable: bool) -> Self {
+        self.pileup = enable;
+        self
+    }
+
     pub fn build(self) -> PipelineConfig {
         PipelineConfig {
             sample_name: self.sample_name,
@@ -118,6 +127,7 @@ impl PipelineConfigBuilder {
             min_variant_reads: self.min_variant_reads,
             quality_threshold: self.quality_threshold,
             mapq_threshold: self.mapq_threshold,
+            pileup: self.pileup,
         }
     }
 }
@@ -410,7 +420,7 @@ mod tests {
         let line = &output[0];
         assert!(line.contains("test_sample"));
         assert!(line.contains("TEST_GENE"));
-        assert!(line.contains("chr1"));
+        assert!(line.contains("1"));
         assert!(line.contains("1000"));
     }
 

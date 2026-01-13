@@ -158,10 +158,18 @@ impl VarDictPipeline {
         // Fetch reads for this region
         bam_reader.fetch(region.chr(), region.start(), region.end())?;
 
+        // Get SAM filter from instance configuration
+        let sam_filter = instance.conf.sam_filter;
+
         // Collect all records into a vector (needed for mutable iteration)
+        // Apply SAM flag filtering like Java does (default: filter 2nd alignments, unmapped, duplicates)
         let mut records = Vec::new();
         let mut record = Record::new();
         while bam_reader.read(&mut record).unwrap_or(false) {
+            // Skip records that match the filter flags (same as Java's SamView.read())
+            if sam_filter != 0 && (record.flags() & sam_filter as u16) != 0 {
+                continue;
+            }
             records.push(record.clone());
         }
 
@@ -238,7 +246,7 @@ impl VarDictPipeline {
         
         // Process all records
         cigar_parser.process_records(records_vec.iter_mut())?;
-
+        
         // Extract results including soft clips
         Ok(CigarParserOutput {
             non_insertion_vars: cigar_parser.take_non_insertion_vars(),
@@ -348,6 +356,8 @@ impl VarDictPipeline {
         reference: &Reference,
         ref_counts_by_pos: &HashMap<i64, (usize, usize)>,
     ) -> Vars {
+        use crate::mods::to_vars_builder::{check_strand_bias, StrandBiasFlag, StrandBiasValue};
+        
         let total_coverage = ref_coverage.get(&position).copied().unwrap_or(0);
         let actual_ref_base = reference.get(position).unwrap_or(b'N');
         
@@ -388,15 +398,30 @@ impl VarDictPipeline {
             }
         }
         
+        // Calculate reference strand bias (used as first part of "refBias;varBias" flag)
+        let ref_strand_bias = check_strand_bias(ref_fwd_count, ref_rev_count);
+        
         let mut variants = Vec::new();
+        let mut reference_variant_opt = None;
 
         for (desc, raw_var) in var_map {
             let mut variant = self.convert_raw_variant(&desc, &raw_var, position, total_coverage, reference);
             
             // For non-reference variants, set the reference forward/reverse counts
+            // and update strand bias to include ref bias
             if variant.refallele != variant.varallele {
                 variant.ref_forward_count = ref_fwd_count;
                 variant.ref_reverse_count = ref_rev_count;
+                
+                // Update strand bias flag to include reference bias as first part
+                // Java: vref.strandBiasFlag = referenceVariant.strandBiasFlag + ";" + vref.strandBiasFlag
+                variant.strand_bias_flag = StrandBiasFlag::new(
+                    ref_strand_bias,
+                    variant.strand_bias_flag.var_bias,
+                );
+            } else {
+                // This is a reference call - save it as the reference variant
+                reference_variant_opt = Some(variant.clone());
             }
             
             variants.push(variant);
@@ -404,7 +429,7 @@ impl VarDictPipeline {
 
         Vars {
             variants,
-            reference_variant: None,
+            reference_variant: reference_variant_opt,
             sv_flags: Default::default(),
         }
     }
@@ -454,22 +479,29 @@ impl VarDictPipeline {
                 // Check if there are mismatches following the deletion
                 if !mismatch_seq.is_empty() {
                     // Complex variant: deletion + following mismatches
-                    // Build reference sequence (deleted bases + following reference bases)
+                    // Build reference sequence (anchor + deleted bases + following reference bases)
                     let mut ref_seq = Vec::new();
+                    if let Some(b) = reference.get(position) {
+                        ref_seq.push(b);
+                    }
                     for i in 0..(*len as i64) {
-                        if let Some(b) = reference.get(position + i) {
+                        if let Some(b) = reference.get(position + 1 + i) {
                             ref_seq.push(b);
                         }
                     }
                     // Add reference bases for the mismatch positions
                     for i in 0..mismatch_seq.len() {
-                        if let Some(b) = reference.get(position + (*len as i64) + i as i64) {
+                        if let Some(b) = reference.get(position + 1 + (*len as i64) + i as i64) {
                             ref_seq.push(b);
                         }
                     }
                     
-                    // Alt sequence is just the mismatch sequence (deletion removes bases)
-                    let alt_seq: Vec<u8> = mismatch_seq.iter().copied().collect();
+                    // Alt sequence keeps the anchor and then the mismatch sequence
+                    let mut alt_seq: Vec<u8> = Vec::new();
+                    if let Some(b) = reference.get(position) {
+                        alt_seq.push(b);
+                    }
+                    alt_seq.extend_from_slice(mismatch_seq);
                     
                     (
                         VarType::Complex {
@@ -480,16 +512,17 @@ impl VarDictPipeline {
                         String::from_utf8_lossy(&alt_seq).to_string(),
                     )
                 } else {
-                    // Simple deletion: ref allele includes deleted bases
+                    // Simple deletion: ref allele includes anchor base plus deleted bases
                     let mut ref_str = String::new();
-                    if let Some(prev_base) = reference.get(position - 1) {
-                        ref_str.push(prev_base as char);
+                    if let Some(anchor_base) = reference.get(position) {
+                        ref_str.push(anchor_base as char);
                     }
                     for i in 0..(*len as i64) {
-                        if let Some(b) = reference.get(position + i) {
+                        if let Some(b) = reference.get(position + 1 + i) {
                             ref_str.push(b as char);
                         }
                     }
+                    // Alt allele is just the anchor base
                     let var_str = if ref_str.len() > 0 { ref_str[0..1].to_string() } else { String::new() };
                     (
                         VarType::Deletion(*len as usize),
@@ -619,7 +652,13 @@ impl VarDictPipeline {
             mean_position,
             mean_quality,
             mean_mapping_quality,
-            strand_bias_flag: calculate_strand_bias(raw.alt_depth_fwd, raw.alt_depth_rev),
+            strand_bias_flag: {
+                use crate::mods::to_vars_builder::{check_strand_bias, StrandBiasFlag, StrandBiasValue};
+                // Calculate var bias from variant counts
+                let var_bias = check_strand_bias(raw.alt_depth_fwd, raw.alt_depth_rev);
+                // Reference bias will be set later when we have ref counts
+                StrandBiasFlag::new(StrandBiasValue::CantAssess, var_bias)
+            },
             is_at_least_at_2_positions: raw.pstd,
             has_at_least_2_diff_qualities: raw.qstd,
             leftseq,
@@ -930,61 +969,94 @@ impl VarDictPipeline {
     }
 
     /// Quality filter - equivalent to Java Variant.isGoodVar()
-    fn is_good_var(&self, variant: &Variant, _ref_variant: Option<&Variant>) -> bool {
-        use crate::mods::to_vars_builder::StrandBiasFlag;
+    /// 
+    /// Java checks: frequency >= conf.freq, hicnt >= conf.minr, 
+    /// meanPosition >= conf.readPosFilter, meanQuality >= conf.goodq,
+    /// highQualityToLowQualityRatio >= conf.qratio
+    fn is_good_var(&self, variant: &Variant, ref_variant: Option<&Variant>) -> bool {
+        // Check frequency (already checked separately, but kept for completeness)
+        if variant.frequency < self.min_frequency {
+            return false;
+        }
 
-        // Check strand bias
-        if variant.strand_bias_flag == StrandBiasFlag::StrongBias {
-            // Allow high-frequency variants even with strand bias
-            if variant.frequency < 0.1 {
+        // Check high-quality read count (minr = 2 by default)
+        let min_reads = 2;
+        if variant.high_qual_read_cnt < min_reads {
+            return false;
+        }
+
+        // Check mean position (readPosFilter = 5 by default)
+        let read_pos_filter = 5.0;
+        if variant.mean_position < read_pos_filter {
+            return false;
+        }
+
+        // Check mean quality (goodq = 22.5 by default)
+        let goodq = 22.5;
+        if variant.mean_quality < goodq {
+            return false;
+        }
+
+        // Check high-quality to low-quality ratio (qratio = 1.5 by default)
+        let qratio = 1.5;
+        if variant.low_qual_read_cnt > 0 {
+            let ratio = variant.high_qual_read_cnt as f64 / variant.low_qual_read_cnt as f64;
+            if ratio < qratio {
                 return false;
             }
         }
 
-        // Check position variance
-        if !variant.is_at_least_at_2_positions {
-            // Single position variants are suspicious for low frequency
-            if variant.frequency < 0.35 {
-                return false;
+        // Check mapping quality vs reference (Java logic for low-frequency variants)
+        if let Some(ref_var) = ref_variant {
+            if ref_var.high_qual_read_cnt >= min_reads && variant.frequency < 0.25 {
+                let d = variant.mean_mapping_quality + variant.refallele.len() as f64 + variant.varallele.len() as f64;
+                let f = (1.0 + d) / (ref_var.mean_mapping_quality + 1.0);
+                if (d - 2.0 < 5.0 && ref_var.mean_mapping_quality > 20.0) || f < 0.25 {
+                    return false;
+                }
             }
         }
 
-        // Check quality variance
-        if !variant.has_at_least_2_diff_qualities {
-            // Single quality variants are suspicious for low frequency
-            if variant.frequency < 0.35 {
+        // High frequency variants pass without further checks
+        if variant.frequency > 0.30 {
+            return true;
+        }
+
+        // Check mapping quality threshold for low-frequency variants (mapq = 0 by default)
+        // Java: if (meanMappingQuality < instance().conf.mapq) return false;
+        // With default mapq=0, this is effectively a no-op
+        let mapq_threshold = 0.0;
+        if variant.mean_mapping_quality < mapq_threshold {
+            return false;
+        }
+
+        // MSI (microsatellite instability) filters
+        // Java: if (msi >= 15 && frequency <= monomerMsiFrequency(0.005) && msint == 1) return false
+        let monomer_msi_freq = 0.005;
+        if variant.msi >= 15.0 && variant.frequency <= monomer_msi_freq && variant.msint == 1.0 {
+            return false;
+        }
+        // Java: if (msi >= 12 && frequency <= nonMonomerMsiFrequency(0.002) && msint > 1) return false
+        let non_monomer_msi_freq = 0.002;
+        if variant.msi >= 12.0 && variant.frequency <= non_monomer_msi_freq && variant.msint > 1.0 {
+            return false;
+        }
+
+        // Strand bias filter: "2;1" pattern (ref good, var biased) at low frequency for small variants
+        // Java: if (strandBiasFlag.equals("2;1") && frequency < 0.20d)
+        //         if (type == null || type.equals("SNV") || (refallele.length() < 3 && varallele.length() < 3))
+        //           return false
+        if variant.strand_bias_flag.is_ref_good_var_biased() && variant.frequency < 0.20 {
+            let is_small_variant = match &variant.vartype {
+                VarType::SNV(_) => true,
+                _ => variant.refallele.len() < 3 && variant.varallele.len() < 3,
+            };
+            if is_small_variant {
                 return false;
             }
         }
 
         true
-    }
-}
-
-/// Calculate strand bias flag from forward/reverse counts
-fn calculate_strand_bias(forward: usize, reverse: usize) -> crate::mods::to_vars_builder::StrandBiasFlag {
-    use crate::mods::to_vars_builder::StrandBiasFlag;
-
-    let total = forward + reverse;
-    if total == 0 {
-        return StrandBiasFlag::NoBias;
-    }
-
-    // For low counts (1 or 2 reads), strand bias is not meaningful
-    // Java behavior: don't flag bias for low-count variants
-    if total <= 2 {
-        return StrandBiasFlag::NoBias;
-    }
-
-    let forward_ratio = forward as f64 / total as f64;
-
-    // Strong bias: >90% on one strand
-    if forward_ratio > 0.9 || forward_ratio < 0.1 {
-        StrandBiasFlag::StrongBias
-    } else if forward_ratio > 0.75 || forward_ratio < 0.25 {
-        StrandBiasFlag::WeakBias
-    } else {
-        StrandBiasFlag::NoBias
     }
 }
 
@@ -1006,23 +1078,21 @@ mod tests {
     }
 
     #[test]
-    fn test_strand_bias_calculation() {
-        use crate::mods::to_vars_builder::StrandBiasFlag;
+    fn test_strand_bias_using_check_strand_bias() {
+        use crate::mods::to_vars_builder::{check_strand_bias, StrandBiasValue};
 
-        // No reads
-        assert_eq!(calculate_strand_bias(0, 0), StrandBiasFlag::NoBias);
+        // Low count (<=12) - both strands have reads = NoBias (2)
+        assert_eq!(check_strand_bias(5, 5), StrandBiasValue::NoBias);
 
-        // Balanced
-        assert_eq!(calculate_strand_bias(50, 50), StrandBiasFlag::NoBias);
+        // Low count - only one strand = CantAssess (0)
+        assert_eq!(check_strand_bias(10, 0), StrandBiasValue::CantAssess);
 
-        // Weak bias
-        assert_eq!(calculate_strand_bias(80, 20), StrandBiasFlag::WeakBias);
-        assert_eq!(calculate_strand_bias(20, 80), StrandBiasFlag::WeakBias);
+        // High count - balanced = NoBias (2)
+        assert_eq!(check_strand_bias(50, 50), StrandBiasValue::NoBias);
 
-        // Strong bias
-        assert_eq!(calculate_strand_bias(95, 5), StrandBiasFlag::StrongBias);
-        assert_eq!(calculate_strand_bias(5, 95), StrandBiasFlag::StrongBias);
-        assert_eq!(calculate_strand_bias(100, 0), StrandBiasFlag::StrongBias);
+        // High count - imbalanced (95:5, 5/100=5%, 95/100=95%, but 5/100=0.05 fails >= 5% threshold)
+        // Wait, 5/100 = 0.05 = 5%, so exactly at threshold. Let's check 4 vs 96:
+        assert_eq!(check_strand_bias(96, 4), StrandBiasValue::HasBias);  // 4/100 = 4% < 5%
     }
 
     #[test]
@@ -1036,30 +1106,43 @@ mod tests {
 
     #[test]
     fn test_is_good_var_strand_bias() {
+        use crate::mods::to_vars_builder::{StrandBiasFlag, StrandBiasValue};
+        
         let pipeline = VarDictPipeline::new("test");
         
-        // Good variant - no bias, good position/quality variance
+        // Good variant - no bias on both ref and var (2;2)
         let mut good_var = Variant::default();
-        good_var.strand_bias_flag = crate::mods::to_vars_builder::StrandBiasFlag::NoBias;
+        good_var.strand_bias_flag = StrandBiasFlag::new(StrandBiasValue::NoBias, StrandBiasValue::NoBias);
         good_var.is_at_least_at_2_positions = true;
         good_var.has_at_least_2_diff_qualities = true;
         good_var.frequency = 0.3;
+        good_var.high_qual_read_cnt = 5;
+        good_var.mean_position = 10.0;
+        good_var.mean_quality = 30.0;
         assert!(pipeline.is_good_var(&good_var, None));
 
-        // Bad variant - strong bias, low frequency
+        // Bad variant - ref good (2), var has bias (1), low frequency (2;1 pattern)
         let mut bad_var = Variant::default();
-        bad_var.strand_bias_flag = crate::mods::to_vars_builder::StrandBiasFlag::StrongBias;
+        bad_var.strand_bias_flag = StrandBiasFlag::new(StrandBiasValue::NoBias, StrandBiasValue::HasBias);
         bad_var.is_at_least_at_2_positions = true;
         bad_var.has_at_least_2_diff_qualities = true;
-        bad_var.frequency = 0.05; // Low frequency + strong bias = bad
+        bad_var.frequency = 0.05; // Low frequency + "2;1" pattern = bad
+        bad_var.high_qual_read_cnt = 5;
+        bad_var.mean_position = 10.0;
+        bad_var.mean_quality = 30.0;
+        bad_var.refallele = "A".to_string();
+        bad_var.varallele = "G".to_string();
         assert!(!pipeline.is_good_var(&bad_var, None));
 
-        // High frequency can overcome strand bias
+        // High frequency can overcome strand bias (2;1 but freq > 0.20)
         let mut high_freq_bias = Variant::default();
-        high_freq_bias.strand_bias_flag = crate::mods::to_vars_builder::StrandBiasFlag::StrongBias;
+        high_freq_bias.strand_bias_flag = StrandBiasFlag::new(StrandBiasValue::NoBias, StrandBiasValue::HasBias);
         high_freq_bias.is_at_least_at_2_positions = true;
         high_freq_bias.has_at_least_2_diff_qualities = true;
-        high_freq_bias.frequency = 0.5; // High enough to pass despite bias
+        high_freq_bias.frequency = 0.5; // High enough to pass despite 2;1 pattern
+        high_freq_bias.high_qual_read_cnt = 5;
+        high_freq_bias.mean_position = 10.0;
+        high_freq_bias.mean_quality = 30.0;
         assert!(pipeline.is_good_var(&high_freq_bias, None));
     }
 }

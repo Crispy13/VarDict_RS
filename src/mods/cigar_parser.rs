@@ -206,14 +206,12 @@ impl CigarParser {
     fn parse_cigar(&mut self, record: &mut Record) -> Result<(), Error> {
         event!(Level::DEBUG, "[parse_cigar] Starting for record at pos {}", record.pos());
         
-        let mut query_seq_buf = self.query_seq_buf.take().unwrap();
-        let mut query_qual_buf = self.query_qual_buf.take().unwrap();
+        // Build query sequence and quality as owned vectors
+        let query_seq_owned: Vec<u8> = record.seq().into_decoded_base_iter().collect();
+        let query_qual_owned: Vec<u8> = record.qual().to_vec();
 
-        query_seq_buf.extend(record.seq().into_decoded_base_iter());
-        query_qual_buf.extend(record.qual());
-
-        let mut query_seq = query_seq_buf.as_slice();
-        let mut query_qual = query_qual_buf.as_slice();
+        let mut query_seq = query_seq_owned.as_slice();
+        let mut query_qual = query_qual_owned.as_slice();
 
         let mapping_quality = record.mapq();
 
@@ -226,7 +224,12 @@ impl CigarParser {
 
         let tot_nm = match record.aux_option(self.aligner.nm_tag())? {
             Some(rust_htslib::bam::record::Aux::I32(nm)) => nm - ins_del_len as i32,
-            Some(oth) => Err(anyhow!("Got non i32 type for NM tag: {:?}", oth))?,
+            Some(rust_htslib::bam::record::Aux::I8(nm)) => nm as i32 - ins_del_len as i32,
+            Some(rust_htslib::bam::record::Aux::I16(nm)) => nm as i32 - ins_del_len as i32,
+            Some(rust_htslib::bam::record::Aux::U8(nm)) => nm as i32 - ins_del_len as i32,
+            Some(rust_htslib::bam::record::Aux::U16(nm)) => nm as i32 - ins_del_len as i32,
+            Some(rust_htslib::bam::record::Aux::U32(nm)) => nm as i32 - ins_del_len as i32,
+            Some(oth) => Err(anyhow!("Got unexpected type for NM tag: {:?}", oth))?,
             None => {
                 if !cigar.is_empty() {
                     event!(Level::WARN, "No NM tag for mismatches: {:?}", record);
@@ -778,11 +781,7 @@ impl CigarParser {
             }
         }
 
-        // return buf resource to self.
-        query_qual_buf.clear();
-        query_seq_buf.clear();
-        let _ = self.query_qual_buf.insert(query_qual_buf);
-        let _ = self.query_seq_buf.insert(query_seq_buf);
+        // Buffers are now managed by parse_cigar wrapper, no need to restore them here
 
         Ok(())
     }
@@ -1424,7 +1423,11 @@ impl CigarParser {
         }
 
         // If reference position is inside region of interest
-        if self.start >= self.region.start as i64 && self.start <= self.region.end as i64 {
+        // Anchor position is the base immediately before the deleted segment
+        let anchor_pos = self.start - 1;
+
+        // Only record the variant if the anchor falls inside the region of interest
+        if anchor_pos >= self.region.start as i64 && anchor_pos <= self.region.end as i64 {
             self.add_variation_for_deletion(
                 mapq,
                 nm,
@@ -1433,6 +1436,7 @@ impl CigarParser {
                 &var_desc,
                 &qual_seg,
                 nmoff,
+                anchor_pos,
             );
         }
 
@@ -1456,9 +1460,10 @@ impl CigarParser {
         var_desc: &VarDesc,
         qual_seg: &[u8],
         nmoff: usize,
+        anchor_pos: i64,
     ) {
-        // Get or create variation structure for this deletion
-        let var = get_variants_from_map(&mut self.non_insertion_vars, self.start, var_desc);
+        // Get or create variation structure for this deletion using the anchor position
+        let var = get_variants_from_map(&mut self.non_insertion_vars, anchor_pos, var_desc);
 
         // Increment direction count
         var.inc_dir(is_reverse);
@@ -2135,15 +2140,17 @@ impl CigarParser {
                     break;
                 }
 
-                let b = query_sequence.get_or_err(si as usize).copied()?;
-                let idx = cigar_len - 1 - si; // distannce from start of match.
+                let b = query_sequence.get_or_err(si as usize).copied()?.to_ascii_uppercase();
+                let idx = cigar_len - 1 - si; // distance from start of match.
                 let cnts = sclip
                     .nt
                     .entry(idx as i64)
                     .or_insert_with(|| NucBaseMap::default());
 
-                // increase count of current base.
-                *cnts.get_mut(b).unwrap() += 1;
+                // increase count of current base (skip if not A/T/C/G/N)
+                if let Some(cnt) = cnts.get_mut(b) {
+                    *cnt += 1;
+                }
 
                 let seq_var = get_variation_from_seq(sclip, idx as usize, b);
                 // BAM stores Phred quality directly
@@ -2200,15 +2207,18 @@ impl CigarParser {
             for si in (0..num_high_qual_base) {
                 let b = query_sequence
                     .get_or_err(self.read_pos_including_softclip + si as usize)
-                    .copied()?;
-                let idx = si; // distannce from start of match.
+                    .copied()?
+                    .to_ascii_uppercase();
+                let idx = si; // distance from start of match.
                 let cnts = sclip
                     .nt
                     .entry(idx as i64)
                     .or_insert_with(|| NucBaseMap::default());
 
-                // increase count of current base.
-                *cnts.get_mut(b).unwrap() += 1;
+                // increase count of current base (skip if not A/T/C/G/N)
+                if let Some(cnt) = cnts.get_mut(b) {
+                    *cnt += 1;
+                }
 
                 let seq_var = get_variation_from_seq(sclip, idx as usize, b);
                 // BAM stores Phred quality directly
@@ -2384,9 +2394,24 @@ fn add_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: u8, mapq: u
         read_pos + 1
     };
     
+    // pstd: true if variant is covered by reads with different positions
+    // Java: if (!vref.pstd && vref.pp != 0 && tp != vref.pp) { vref.pstd = true; }
+    if !var.pstd && var.pp != 0 && tp != var.pp {
+        var.pstd = true;
+    }
+    
+    // qstd: true if variant is covered by reads with different qualities
+    // Java: if (!vref.qstd && vref.pq != 0 && tmpq != vref.pq) { vref.qstd = true; }
+    let tmpq = bq as f64;
+    if !var.qstd && var.pq != 0.0 && (tmpq - var.pq).abs() > f64::EPSILON {
+        var.qstd = true;
+    }
+    
     var.mean_pos += tp as f64;
-    var.mean_qual += bq as f64;
+    var.mean_qual += tmpq;
     var.mean_mapq += mapq as f64;
+    var.pp = tp;
+    var.pq = tmpq;
     var.nm += nm as f64;
 
     if bq as f64 >= instance().conf.goodq {
@@ -2418,9 +2443,22 @@ fn add_cnt_anchor(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: u8, 
         read_pos + 1
     };
     
+    // pstd: true if variant is covered by reads with different positions
+    if !var.pstd && var.pp != 0 && tp != var.pp {
+        var.pstd = true;
+    }
+    
+    // qstd: true if variant is covered by reads with different qualities
+    let tmpq = bq as f64;
+    if !var.qstd && var.pq != 0.0 && (tmpq - var.pq).abs() > f64::EPSILON {
+        var.qstd = true;
+    }
+    
     var.mean_pos += tp as f64;
-    var.mean_qual += bq as f64;
+    var.mean_qual += tmpq;
     var.mean_mapq += mapq as f64;
+    var.pp = tp;
+    var.pq = tmpq;
     var.nm += nm as f64;
     // Note: Don't increment high_qual_read_cnt or low_qual_read_cnt for anchors
 }

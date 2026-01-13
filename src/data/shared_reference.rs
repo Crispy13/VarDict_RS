@@ -258,6 +258,13 @@ impl SharedReference {
     pub fn num_chromosomes(&self) -> usize {
         self.chromosomes.len()
     }
+
+    /// Get chromosome lengths as a HashMap
+    pub fn get_chromosome_lengths(&self) -> HashMap<String, usize> {
+        self.chromosomes.iter()
+            .map(|(name, data)| (name.clone(), data.length))
+            .collect()
+    }
 }
 
 /// Thread-safe reference handle
