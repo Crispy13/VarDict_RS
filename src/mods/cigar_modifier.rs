@@ -1537,6 +1537,7 @@ mod tests {
     // This test is marked as ignored until the architecture allows easier testing.
     #[test]
     #[ignore = "requires refactoring to make find_offset testable in isolation"]
+    #[should_panic(expected = "Requires architecture changes to test find_offset in isolation")]
     fn find_offset() {
         let conf = Configuration {
             goodq: 23.0,

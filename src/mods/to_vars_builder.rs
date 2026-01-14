@@ -242,8 +242,8 @@ impl ToVarsBuilder {
     }
 
     /// Set base quality threshold
-    pub fn with_quality_threshold(mut self, qual: u8) -> Self {
-        self.quality_threshold = qual;
+    pub fn with_quality_threshold(mut self, qual: f64) -> Self {
+        self.quality_threshold = qual as u8;
         self
     }
 

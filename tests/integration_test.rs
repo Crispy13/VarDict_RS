@@ -403,7 +403,7 @@ fn test_generate_output_for_verification() {
         .sample_name("test_sample".to_string())
         .min_frequency(0.01)
         .min_variant_reads(2)
-        .min_base_quality(25)
+        .min_base_quality(22.5)
         .build();
 
     let pipeline = Pipeline::new(config);
@@ -540,12 +540,12 @@ fn test_real_integration_hard_clip() {
         .sample_name("hard_clip_next_to_del_test1".to_string())
         .min_frequency(0.0)
         .min_variant_reads(1)
-        .min_base_quality(25)
+        .min_base_quality(22.5)
         .build();
     
     // Create variant caller
     let mut caller = SimpleVariantCaller::new(
-        pipeline_config.quality_threshold,
+        pipeline_config.quality_threshold as u8,
         pipeline_config.mapq_threshold,
     );
     caller.set_reference(ref_seq.as_bytes().to_vec(), config.start);
@@ -805,7 +805,7 @@ fn test_vardict_pipeline_hard_clip() {
     // Create VarDictPipeline with pileup mode enabled (test case has -p flag)
     let pipeline = VarDictPipeline::new("hard_clip_next_to_del_test1")
         .with_min_frequency(0.0)
-        .with_min_base_quality(25)
+        .with_min_base_quality(22.5)
         .with_pileup(true);
     
     println!("  Pipeline config: min_freq={}, min_base_qual={}, pileup=true",
@@ -966,7 +966,7 @@ fn test_rust_vs_java_output_comparison() {
     // Create VarDictPipeline
     let pipeline = VarDictPipeline::new("hard_clip_next_to_del_test1")
         .with_min_frequency(0.0)
-        .with_min_base_quality(25)
+        .with_min_base_quality(22.5)
         .with_pileup(true);
     
     // Process through pipeline

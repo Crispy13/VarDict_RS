@@ -24,7 +24,7 @@ pub struct PipelineConfig {
     pub sample_name: String,
     pub min_frequency: f64,
     pub min_variant_reads: usize,
-    pub quality_threshold: u8,
+    pub quality_threshold: f64,
     pub mapq_threshold: u8,
     pub pileup: bool,
 }
@@ -35,7 +35,7 @@ impl Default for PipelineConfig {
             sample_name: "sample".to_string(),
             min_frequency: 0.01,
             min_variant_reads: 2,
-            quality_threshold: 25,
+            quality_threshold: 22.5,
             mapq_threshold: 0,
             pileup: false,
         }
@@ -60,7 +60,7 @@ impl PipelineConfig {
         self
     }
 
-    pub fn with_quality_threshold(mut self, qual: u8) -> Self {
+    pub fn with_quality_threshold(mut self, qual: f64) -> Self {
         self.quality_threshold = qual;
         self
     }
@@ -72,7 +72,7 @@ pub struct PipelineConfigBuilder {
     sample_name: String,
     min_frequency: f64,
     min_variant_reads: usize,
-    quality_threshold: u8,
+    quality_threshold: f64,
     mapq_threshold: u8,
     pileup: bool,
 }
@@ -105,7 +105,7 @@ impl PipelineConfigBuilder {
         self
     }
 
-    pub fn min_base_quality(mut self, qual: u8) -> Self {
+    pub fn min_base_quality(mut self, qual: f64) -> Self {
         self.quality_threshold = qual;
         self
     }
@@ -329,18 +329,18 @@ mod tests {
         let config = PipelineConfig::default();
         assert_eq!(config.sample_name, "sample");
         assert_eq!(config.min_frequency, 0.01);
-        assert_eq!(config.quality_threshold, 25);
+        assert_eq!(config.quality_threshold, 22.5);
     }
 
     #[test]
     fn test_pipeline_config_builder() {
         let config = PipelineConfig::new("my_sample")
             .with_min_frequency(0.05)
-            .with_quality_threshold(25);
+            .with_quality_threshold(22.5);
         
         assert_eq!(config.sample_name, "my_sample");
         assert_eq!(config.min_frequency, 0.05);
-        assert_eq!(config.quality_threshold, 25);
+        assert_eq!(config.quality_threshold, 22.5);
     }
 
     #[test]

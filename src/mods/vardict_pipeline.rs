@@ -22,6 +22,8 @@ use crate::data::bam_reader::BamReader;
 use crate::mods::cigar_parser::CigarParser;
 use crate::mods::output_variant::{SimpleOutputVariant, Region as OutputRegion};
 use crate::mods::structural_variants_processor::{StructuralVariantsProcessor, RealignedVariationData};
+use crate::mods::variant_realigner::VariantRealigner;
+use crate::scopedata::global_read_only_scope::instance;
 use crate::mods::to_vars_builder::{ToVarsBuilder, Variant, VariationData, Vars, VarType, determine_genotype};
 use crate::mods::simple_variant_caller::SimpleVarKey;
 use crate::scopedata::global_read_only_scope::GlobalReadOnlyScope;
@@ -79,7 +81,7 @@ pub struct VarDictPipeline {
     /// Minimum allele frequency
     min_frequency: f64,
     /// Minimum base quality
-    min_base_quality: u8,
+    min_base_quality: f64,
     /// Minimum mapping quality
     min_mapping_quality: u8,
     /// Enable pileup mode (output reference positions too)
@@ -92,7 +94,7 @@ impl VarDictPipeline {
         VarDictPipeline {
             sample_name: sample_name.to_string(),
             min_frequency: 0.01,
-            min_base_quality: 25,
+            min_base_quality: 22.5,
             min_mapping_quality: 0,
             do_pileup: false,
         }
@@ -105,7 +107,7 @@ impl VarDictPipeline {
     }
 
     /// Set minimum base quality threshold
-    pub fn with_min_base_quality(mut self, qual: u8) -> Self {
+    pub fn with_min_base_quality(mut self, qual: f64) -> Self {
         self.min_base_quality = qual;
         self
     }
@@ -190,30 +192,58 @@ impl VarDictPipeline {
     where
         I: Iterator<Item = Record>,
     {
-        // Step 1: Parse CIGAR strings (CigarParser)
-        let cigar_output = self.run_cigar_parser(records, region, reference, instance)?;
+        let start_total = std::time::Instant::now();
         
-        event!(Level::DEBUG, "CigarParser output: {} non_insertion_vars, {} ref_coverage positions",
+        // Step 1: Parse CIGAR strings (CigarParser)
+        let start_cigar = std::time::Instant::now();
+        let cigar_output = self.run_cigar_parser(records, region, reference, instance)?;
+        let elapsed_cigar = start_cigar.elapsed();
+        
+        event!(Level::INFO, "[TIMING] CigarParser: {:.3}s - {} non_insertion_vars, {} ref_coverage positions",
+            elapsed_cigar.as_secs_f64(),
             cigar_output.non_insertion_vars.len(),
             cigar_output.ref_coverage.len());
 
         // Step 2: Realign soft clips and process structural variants
+        let start_realign = std::time::Instant::now();
         let realigned_output = self.run_variant_realigner_and_sv_processor(cigar_output, region, reference)?;
+        let elapsed_realign = start_realign.elapsed();
         
-        event!(Level::DEBUG, "Realigner output: {} non_insertion_vars, {} ref_coverage",
+        event!(Level::INFO, "[TIMING] VariantRealigner+SVProcessor: {:.3}s - {} non_insertion_vars, {} ref_coverage",
+            elapsed_realign.as_secs_f64(),
             realigned_output.non_insertion_vars.len(),
             realigned_output.ref_coverage.len());
 
         // Step 3: Build variant objects with statistics (ToVarsBuilder)
+        let start_tovars = std::time::Instant::now();
         let aligned_vars = self.run_to_vars_builder(realigned_output, reference)?;
+        let elapsed_tovars = start_tovars.elapsed();
         
-        event!(Level::DEBUG, "ToVarsBuilder output: {} variants",
+        event!(Level::INFO, "[TIMING] ToVarsBuilder: {:.3}s - {} variants",
+            elapsed_tovars.as_secs_f64(),
             aligned_vars.aligned_variants.len());
 
         // Step 4: Post-process and generate output (SimplePostProcessor)
+        let start_post = std::time::Instant::now();
         let output_lines = self.run_simple_post_processor(aligned_vars, region)?;
+        let elapsed_post = start_post.elapsed();
         
-        event!(Level::DEBUG, "PostProcessor output: {} lines", output_lines.len());
+        event!(Level::INFO, "[TIMING] PostProcessor: {:.3}s - {} lines",
+            elapsed_post.as_secs_f64(),
+            output_lines.len());
+
+        let elapsed_total = start_total.elapsed();
+        
+        // Log timing summary for regions taking >10ms
+        if elapsed_total.as_millis() > 10 {
+            eprintln!("[REGION] {}:{}-{} total={:.3}s cigar={:.3}s realign={:.3}s tovars={:.3}s post={:.3}s",
+                region.chr(), region.start(), region.end(),
+                elapsed_total.as_secs_f64(),
+                elapsed_cigar.as_secs_f64(),
+                elapsed_realign.as_secs_f64(),
+                elapsed_tovars.as_secs_f64(),
+                elapsed_post.as_secs_f64());
+        }
 
         Ok(output_lines)
     }
@@ -270,7 +300,7 @@ impl VarDictPipeline {
         // For now, we pass through to StructuralVariantsProcessor
         
         // Convert CigarParserOutput to RealignedVariationData for SV processor
-        let sv_input = RealignedVariationData {
+        let mut sv_input = RealignedVariationData {
             non_insertion_variants: input.non_insertion_vars,
             insertion_variants: input.insertion_vars,
             soft_clips_5end: input.soft_clips_5end,
@@ -279,6 +309,13 @@ impl VarDictPipeline {
             max_read_length: input.max_read_len,
             duprate: 0.0,
         };
+
+        // Perform minimal deletion realignment using soft clips when enabled
+        // Re-enable realigner to match Java behavior
+        if instance().conf.perform_local_realignment {
+            let realigner = VariantRealigner::new(reference.ref_seq.clone(), reference.region_start);
+            realigner.process_deletions(&mut sv_input);
+        }
         
         // Run StructuralVariantsProcessor (adjSNV always runs, SV detection is unimplemented)
         let sv_processor = StructuralVariantsProcessor::new(
@@ -443,6 +480,7 @@ impl VarDictPipeline {
         total_coverage: usize,
         reference: &Reference,
     ) -> Variant {
+        let mut position = position;
         let total_count = raw.alt_depth_fwd + raw.alt_depth_rev;
         let frequency = if total_coverage > 0 {
             total_count as f64 / total_coverage as f64
@@ -454,7 +492,7 @@ impl VarDictPipeline {
         let actual_ref_base = reference.get(position).unwrap_or(b'N');
         
         // Determine variant type and alleles based on VarDesc
-        let (var_type, refallele, varallele) = match desc {
+        let (mut var_type, mut refallele, mut varallele) = match desc {
             VarDesc::SNV { ref_base: read_base } => {
                 // read_base is actually the observed read base (alt)
                 // Look up actual reference from Reference struct
@@ -479,30 +517,29 @@ impl VarDictPipeline {
                 // Check if there are mismatches following the deletion
                 if !mismatch_seq.is_empty() {
                     // Complex variant: deletion + following mismatches
-                    // Build reference sequence (anchor + deleted bases + following reference bases)
+                    // For complex variants in VarDict raw output format, we don't use anchor base
+                    // Position is stored as anchor (position - 1), so actual deletion starts at position + 1
+                    let del_start = position + 1;
+                    // Update position to be the actual deletion start for output
+                    position = del_start;
+                    
+                    // Build reference sequence (deleted bases + following reference bases that get replaced)
                     let mut ref_seq = Vec::new();
-                    if let Some(b) = reference.get(position) {
-                        ref_seq.push(b);
-                    }
                     for i in 0..(*len as i64) {
-                        if let Some(b) = reference.get(position + 1 + i) {
+                        if let Some(b) = reference.get(del_start + i) {
                             ref_seq.push(b);
                         }
                     }
-                    // Add reference bases for the mismatch positions
+                    // Add reference bases for the mismatch positions (after the deleted stretch)
                     for i in 0..mismatch_seq.len() {
-                        if let Some(b) = reference.get(position + 1 + (*len as i64) + i as i64) {
+                        if let Some(b) = reference.get(del_start + (*len as i64) + i as i64) {
                             ref_seq.push(b);
                         }
                     }
-                    
-                    // Alt sequence keeps the anchor and then the mismatch sequence
-                    let mut alt_seq: Vec<u8> = Vec::new();
-                    if let Some(b) = reference.get(position) {
-                        alt_seq.push(b);
-                    }
-                    alt_seq.extend_from_slice(mismatch_seq);
-                    
+
+                    // Alt sequence is just the mismatch sequence (no anchor)
+                    let alt_seq: Vec<u8> = mismatch_seq.to_vec();
+
                     (
                         VarType::Complex {
                             insertion: String::from_utf8_lossy(&alt_seq).to_string(),
@@ -512,18 +549,22 @@ impl VarDictPipeline {
                         String::from_utf8_lossy(&alt_seq).to_string(),
                     )
                 } else {
-                    // Simple deletion: ref allele includes anchor base plus deleted bases
+                    // Simple deletion: ref allele includes anchor + deleted bases
                     let mut ref_str = String::new();
                     if let Some(anchor_base) = reference.get(position) {
                         ref_str.push(anchor_base as char);
                     }
-                    for i in 0..(*len as i64) {
-                        if let Some(b) = reference.get(position + 1 + i) {
+                    for i in 1..=(*len as i64) {
+                        if let Some(b) = reference.get(position + i) {
                             ref_str.push(b as char);
                         }
                     }
                     // Alt allele is just the anchor base
-                    let var_str = if ref_str.len() > 0 { ref_str[0..1].to_string() } else { String::new() };
+                    let var_str = if !ref_str.is_empty() {
+                        ref_str[0..1].to_string()
+                    } else {
+                        String::new()
+                    };
                     (
                         VarType::Deletion(*len as usize),
                         ref_str,
@@ -542,6 +583,9 @@ impl VarDictPipeline {
                 )
             }
         };
+
+        // NOTE: Java VarDict does NOT normalize deletion anchors, so we skip that step
+        // to match Java output exactly. Normalization would shift positions and trim shared bases.
 
         // Calculate end position based on reference allele length
         let end_position = if refallele.len() > 1 {
@@ -1068,12 +1112,12 @@ mod tests {
     fn test_pipeline_creation() {
         let pipeline = VarDictPipeline::new("test_sample")
             .with_min_frequency(0.05)
-            .with_min_base_quality(20)
+            .with_min_base_quality(20.0)
             .with_min_mapping_quality(10);
 
         assert_eq!(pipeline.sample_name, "test_sample");
         assert!((pipeline.min_frequency - 0.05).abs() < 0.001);
-        assert_eq!(pipeline.min_base_quality, 20);
+        assert!((pipeline.min_base_quality - 20.0).abs() < 0.001);
         assert_eq!(pipeline.min_mapping_quality, 10);
     }
 

@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 
-use crackle_kit::tracing_kit::setup_logging_stderr_only_verbose;
+use crackle_kit::tracing::level_filters::LevelFilter;
+use crackle_kit::tracing_kit::{setup_logging_stderr_only, setup_logging_stderr_only_verbose};
 use vardict_rs::data::region::Region;
 use vardict_rs::mods::pipeline::{Pipeline, PipelineConfig};
 
@@ -50,9 +51,9 @@ struct Args {
     #[arg(short = 'r', long = "minr", default_value = "2")]
     min_variant_reads: usize,
 
-    /// Minimum base quality for a base to be considered (default: 25)
-    #[arg(short = 'q', long = "qual", default_value = "25")]
-    min_base_quality: u8,
+    /// Minimum base quality for a base to be considered (default: 22.5)
+    #[arg(short = 'q', long = "qual", default_value = "22.5")]
+    min_base_quality: f64,
 
     /// Minimum mapping quality for a read to be considered (default: 0)
     #[arg(short = 'Q', long = "mapq", default_value = "0")]
@@ -110,10 +111,16 @@ struct Args {
     /// Number of threads for parallel processing (default: 1)
     #[arg(short = 't', long = "threads", default_value = "1")]
     num_threads: usize,
+
+    /// Log level
+    #[arg(long, default_value_t = LevelFilter::WARN)]
+    log_level: LevelFilter,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    setup_logging_stderr_only(args.log_level)?;
 
     // Validate input files exist
     if !args.reference.exists() {
@@ -201,7 +208,9 @@ fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>
     use vardict_rs::mods::parallel_pipeline::ParallelPipeline;
     use vardict_rs::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE};
     use vardict_rs::conf::Configuration;
+    use std::time::Instant;
 
+    let start_total = Instant::now();
     let num_threads = args.num_threads.max(1);
     
     if args.debug {
@@ -209,6 +218,7 @@ fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>
     }
 
     // Get unique chromosomes from regions
+    let start_ref_load = Instant::now();
     let chroms: std::collections::HashSet<&str> = regions.iter()
         .map(|r| r.chr())
         .collect();
@@ -219,6 +229,8 @@ fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>
         args.reference.to_str().unwrap(),
         &chrom_vec,
     ).context("Failed to load reference genome")?;
+    
+    let elapsed_ref_load = start_ref_load.elapsed();
 
     // Initialize GlobalReadOnlyScope (required by VarDictPipeline)
     // Must be done AFTER loading reference to populate chr_lens
@@ -233,6 +245,7 @@ fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>
     let _ = INSTANCE.set(scope);
 
     if args.debug {
+        eprintln!("[TIMING] Reference loading: {:.3}s", elapsed_ref_load.as_secs_f64());
         eprintln!("Loaded {} chromosome(s), {:.2} MB total",
             reference.num_chromosomes(),
             reference.total_size() as f64 / 1_048_576.0);
@@ -247,10 +260,13 @@ fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>
     let pipeline = ParallelPipeline::new(reference, config, num_threads);
 
     // Process regions
+    let start_processing = Instant::now();
     let bam_path = args.bam.to_str().unwrap().to_string();
     let results = pipeline.process_regions(bam_path, regions);
+    let elapsed_processing = start_processing.elapsed();
 
     // Output results
+    let start_output = Instant::now();
     let mut stdout = io::stdout().lock();
     for result in results {
         if let Some(error) = result.error {
@@ -263,6 +279,15 @@ fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>
                 writeln!(stdout, "{}", line)?;
             }
         }
+    }
+    let elapsed_output = start_output.elapsed();
+    
+    let elapsed_total = start_total.elapsed();
+    
+    if args.debug {
+        eprintln!("[TIMING] Processing all regions: {:.3}s", elapsed_processing.as_secs_f64());
+        eprintln!("[TIMING] Output writing: {:.3}s", elapsed_output.as_secs_f64());
+        eprintln!("[TIMING] TOTAL execution: {:.3}s", elapsed_total.as_secs_f64());
     }
 
     Ok(())

@@ -1,13 +1,6 @@
-use std::collections::HashMap;
-
-use anyhow::{Error, anyhow};
-use crackle_kit::tracing::{Level, event};
-
 use crate::{
-    data::patterns::{BEGIN_MINUS_NUMBER, UP_NUMBER_END, get_cap_group},
-    prelude::SmallVecBytes,
-    utils::SliceExt,
-    variants::{var_utils::get_variants_from_map, variants::Variant},
+    variants::variants::{InsOrDelLen, SoftClip, VarDesc, Variant},
+    mods::structural_variants_processor::RealignedVariationData,
 };
 
 /// Result of finding 3'/5' end matches between two sequences
@@ -18,12 +11,560 @@ pub struct Match35 {
     pub max_matched_length: usize,
 }
 
+#[derive(Debug, Clone)]
+struct Mismatch {
+    mismatch_sequence: String,
+    mismatch_position: i64,
+    end: u8, // 3 or 5
+}
+
+#[derive(Default, Debug, Clone)]
+struct MismatchResult {
+    mismatches: Vec<Mismatch>,
+    scp: Vec<i64>,
+    nm: usize,
+    misp: i64,
+    misnt: Option<u8>,
+}
+
 pub struct VariantRealigner {
-    non_insertion_vars: HashMap<i64, HashMap<String, Variant>>,
-    ref_coverage: HashMap<i64, usize>,
+    reference_seq: Vec<u8>,
+    ref_start: i64,
 }
 
 impl VariantRealigner {
+    pub fn new(reference_seq: Vec<u8>, ref_start: i64) -> Self {
+        Self {
+            reference_seq,
+            ref_start,
+        }
+    }
+
+    pub fn process_deletions(
+        &self,
+        data: &mut RealignedVariationData,
+    ) {
+        // Collect deletion keys to avoid borrow checker issues while mutating maps
+        let mut del_keys: Vec<(i64, VarDesc)> = Vec::new();
+        for (pos, var_map) in data.non_insertion_variants.iter() {
+            for desc in var_map.keys() {
+                if matches!(desc, VarDesc::Del { .. }) {
+                    del_keys.push((*pos, desc.clone()));
+                }
+            }
+        }
+
+        for (pos, desc) in del_keys {
+            let dellen = match &desc {
+                VarDesc::Del { len, ins_or_del_len, .. } => {
+                    let mut total = *len as i64;
+                    if let crate::variants::variants::InsOrDelLen::DelLen(extra) = ins_or_del_len {
+                        total += *extra as i64;
+                    }
+                    total
+                }
+                _ => 0,
+            };
+
+            let wupseq = self.get_ref_range(pos - 200, pos - 1);
+            let sanpseq = self.get_ref_range(pos + dellen, pos + dellen + 200);
+
+            self.realign_with_softclips_5end(pos, &desc, data, &wupseq);
+            self.realign_with_softclips_3end(pos, &desc, data, &sanpseq);
+
+            // Run mismatch-based realignment similar to Java realigndel
+            self.realign_deletion_mismatches(pos, &desc, data);
+        }
+    }
+
+    fn realign_deletion_mismatches(
+        &self,
+        pos: i64,
+        desc: &VarDesc,
+        data: &mut RealignedVariationData,
+    ) {
+        let (dellen, extra_seq, extrains_len) = match desc {
+            VarDesc::Del {
+                len,
+                ins_or_del_len,
+                mismatch_seq,
+                ..
+            } => {
+                let mut total = *len as i64;
+                if let InsOrDelLen::DelLen(extra) = ins_or_del_len {
+                    total += *extra as i64;
+                }
+                let extra = String::from_utf8_lossy(mismatch_seq).to_string();
+                let extrains_len = match ins_or_del_len {
+                    InsOrDelLen::InsSeq(seq) => seq.len() as i64,
+                    _ => 0,
+                };
+                (total, extra, extrains_len)
+            }
+            _ => return,
+        };
+
+        let mut wupseq = self.get_ref_range(pos - 200, pos - 1);
+        wupseq.extend_from_slice(extra_seq.as_bytes());
+
+        let san_start = pos + dellen + extra_seq.len() as i64 - extrains_len;
+        let mut sanpseq = extra_seq.as_bytes().to_vec();
+        sanpseq.extend_from_slice(&self.get_ref_range(san_start, san_start + 200));
+
+        let r3 = self.find_mm3(pos, &sanpseq, data);
+        let r5 = self.find_mm5(pos + dellen + extra_seq.len() as i64 - extrains_len - 1, &wupseq, data);
+
+        let dcnt = match data
+            .non_insertion_variants
+            .get(&pos)
+            .and_then(|m| m.get(desc))
+        {
+            Some(vref) => vref.alt_depth,
+            None => return,
+        };
+        if dcnt == 0 {
+            return;
+        }
+
+        let mut all_mm = Vec::new();
+        all_mm.extend(r3.mismatches.iter().cloned());
+        all_mm.extend(r5.mismatches.iter().cloned());
+
+        for mm in all_mm {
+            // Only handle simple SNV mismatches for now
+            if mm.mismatch_sequence.len() != 1 {
+                continue;
+            }
+
+            let mm_base = mm.mismatch_sequence.as_bytes()[0].to_ascii_uppercase();
+            let key = VarDesc::SNV { ref_base: mm_base };
+            let tv_snapshot = data
+                .non_insertion_variants
+                .get(&mm.mismatch_position)
+                .and_then(|m| m.get(&key))
+                .cloned();
+            let Some(tv) = tv_snapshot else { continue; };
+
+            if tv.alt_depth == 0 {
+                continue;
+            }
+
+            let mean_qual = tv.mean_qual / tv.alt_depth as f64;
+            if mean_qual < crate::scopedata::global_read_only_scope::instance().conf.goodq {
+                continue;
+            }
+
+            let nm_threshold = if mm.end == 3 { r3.nm } else { r5.nm };
+            let mean_pos = tv.mean_pos / tv.alt_depth as f64;
+            if mean_pos > nm_threshold as f64 + 4.0 {
+                continue;
+            }
+
+            if tv.alt_depth >= dcnt + dellen as usize || (tv.alt_depth as f64 / dcnt as f64) >= 8.0 {
+                continue;
+            }
+
+            if mm.mismatch_position > pos && mm.end == 5 {
+                let f = if mean_pos > 0.0 {
+                    ((mm.mismatch_position - pos) as f64) / mean_pos
+                } else {
+                    1.0
+                };
+                let f = f.clamp(0.0, 1.0);
+                let add = (tv.alt_depth as f64 * f).round() as usize;
+                *data.ref_coverage.entry(pos).or_insert(0) += add;
+            }
+
+            let tv_owned = data
+                .non_insertion_variants
+                .get_mut(&mm.mismatch_position)
+                .and_then(|m| m.remove(&key));
+            let Some(tv_owned) = tv_owned else { continue; };
+
+            if let Some(map) = data.non_insertion_variants.get_mut(&mm.mismatch_position) {
+                if map.is_empty() {
+                    data.non_insertion_variants.remove(&mm.mismatch_position);
+                }
+            }
+
+            if let Some(vref) = data
+                .non_insertion_variants
+                .get_mut(&pos)
+                .and_then(|m| m.get_mut(desc))
+            {
+                adj_cnt(vref, &tv_owned);
+            }
+        }
+
+        if r3.misp != 0 && r3.mismatches.len() == 1 {
+            if let Some(base) = r3.misnt {
+                let key = VarDesc::SNV { ref_base: base };
+                if let Some(map) = data.non_insertion_variants.get_mut(&r3.misp) {
+                    if let Some(var) = map.get(&key) {
+                        if var.alt_depth < dcnt {
+                            map.remove(&key);
+                        }
+                    }
+                    if map.is_empty() {
+                        data.non_insertion_variants.remove(&r3.misp);
+                    }
+                }
+            }
+        }
+
+        if r5.misp != 0 && r5.mismatches.len() == 1 {
+            if let Some(base) = r5.misnt {
+                let key = VarDesc::SNV { ref_base: base };
+                if let Some(map) = data.non_insertion_variants.get_mut(&r5.misp) {
+                    if let Some(var) = map.get(&key) {
+                        if var.alt_depth < dcnt {
+                            map.remove(&key);
+                        }
+                    }
+                    if map.is_empty() {
+                        data.non_insertion_variants.remove(&r5.misp);
+                    }
+                }
+            }
+        }
+
+        for sc5pp in r5.scp {
+            if let Some(tv) = data.soft_clips_5end.get_mut(&sc5pp) {
+                if tv.used() {
+                    continue;
+                }
+                if dcnt <= 2 && tv.var.alt_depth / dcnt > 5 {
+                    continue;
+                }
+                let seq = find_conseq(tv);
+                if seq.is_empty() {
+                    continue;
+                }
+                if Self::is_match_bytes(&seq, &wupseq, -1) {
+                    if sc5pp > pos {
+                        *data.ref_coverage.entry(pos).or_insert(0) += tv.var.alt_depth;
+                    }
+                    if let Some(vref) = data
+                        .non_insertion_variants
+                        .get_mut(&pos)
+                        .and_then(|m| m.get_mut(desc))
+                    {
+                        adj_cnt(vref, &tv.var);
+                    }
+                    tv.mark_used();
+                }
+            }
+        }
+
+        for sc3pp in r3.scp {
+            if let Some(tv) = data.soft_clips_3end.get_mut(&sc3pp) {
+                if tv.used() {
+                    continue;
+                }
+                if dcnt <= 2 && tv.var.alt_depth / dcnt > 5 {
+                    continue;
+                }
+                let seq = find_conseq(tv);
+                if seq.is_empty() {
+                    continue;
+                }
+                let offset = (sc3pp - pos).max(0) as usize;
+                let mseq = if offset < sanpseq.len() {
+                    &sanpseq[offset..]
+                } else {
+                    &sanpseq[sanpseq.len().saturating_sub(1)..]
+                };
+                if Self::is_match_bytes(&seq, mseq, 1) {
+                    if sc3pp <= pos {
+                        *data.ref_coverage.entry(pos).or_insert(0) += tv.var.alt_depth;
+                    }
+                    if let Some(vref) = data
+                        .non_insertion_variants
+                        .get_mut(&pos)
+                        .and_then(|m| m.get_mut(desc))
+                    {
+                        adj_cnt(vref, &tv.var);
+                    }
+                    tv.mark_used();
+                }
+            }
+        }
+    }
+
+    fn realign_with_softclips_5end(
+        &self,
+        pos: i64,
+        desc: &VarDesc,
+        data: &mut RealignedVariationData,
+        wupseq: &[u8],
+    ) {
+        let positions: Vec<i64> = data.soft_clips_5end.keys().cloned().collect();
+        for sc_pos in positions {
+            let Some(sclip) = data.soft_clips_5end.get_mut(&sc_pos) else { continue; };
+            if sclip.used() {
+                continue;
+            }
+
+            let seq = find_conseq(sclip);
+            if seq.is_empty() {
+                continue;
+            }
+
+            if !Self::is_match_bytes(&seq, wupseq, -1) {
+                continue;
+            }
+
+            if let Some(var_map) = data.non_insertion_variants.get_mut(&pos) {
+                if let Some(variant) = var_map.get_mut(desc) {
+                    adj_cnt(variant, &sclip.var);
+                }
+            }
+            if sc_pos > pos {
+                *data.ref_coverage.entry(pos).or_insert(0) += sclip.var.alt_depth;
+            }
+            sclip.mark_used();
+        }
+    }
+
+    fn realign_with_softclips_3end(
+        &self,
+        pos: i64,
+        desc: &VarDesc,
+        data: &mut RealignedVariationData,
+        sanpseq: &[u8],
+    ) {
+        let positions: Vec<i64> = data.soft_clips_3end.keys().cloned().collect();
+        for sc_pos in positions {
+            let Some(sclip) = data.soft_clips_3end.get_mut(&sc_pos) else { continue; };
+            if sclip.used() {
+                continue;
+            }
+
+            let seq = find_conseq(sclip);
+            if seq.is_empty() {
+                continue;
+            }
+
+            if !Self::is_match_bytes(&seq, sanpseq, 1) {
+                continue;
+            }
+
+            if sc_pos <= pos {
+                *data.ref_coverage.entry(pos).or_insert(0) += sclip.var.alt_depth;
+            }
+            if let Some(var_map) = data.non_insertion_variants.get_mut(&pos) {
+                if let Some(variant) = var_map.get_mut(desc) {
+                    adj_cnt(variant, &sclip.var);
+                }
+            }
+            sclip.mark_used();
+        }
+    }
+
+    fn is_match_bytes(seq1: &[u8], seq2: &[u8], dir: i32) -> bool {
+        let s1 = String::from_utf8_lossy(seq1);
+        let s2 = String::from_utf8_lossy(seq2);
+        Self::is_match(&s1, &s2, dir)
+    }
+
+    fn is_has_and_equals(&self, pos: i64, ch: u8) -> bool {
+        self.get_ref_base(pos).map(|b| b == ch).unwrap_or(false)
+    }
+
+    fn is_has_and_not_equals(&self, pos: i64, ch: u8) -> bool {
+        self.get_ref_base(pos).map(|b| b != ch).unwrap_or(false)
+    }
+
+    fn find_mm5(
+        &self,
+        position: i64,
+        wupseq: &[u8],
+        data: &mut RealignedVariationData,
+    ) -> MismatchResult {
+        let seq: Vec<u8> = wupseq
+            .iter()
+            .copied()
+            .filter(|b| *b != b'#' && *b != b'^')
+            .collect();
+
+        let longmm = 3usize;
+        let mut mismatches = Vec::new();
+        let mut n = 0usize;
+        let mut mn = 0usize;
+        let mut mcnt = 0usize;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut sc5p: Vec<i64> = Vec::new();
+
+        while let Some(ch) = char_at_neg(&seq, n as isize) {
+            if self.is_has_and_not_equals(position - n as i64, ch) && mcnt < longmm {
+                buf.insert(0, ch);
+                mismatches.push(Mismatch {
+                    mismatch_sequence: String::from_utf8_lossy(&buf).to_string(),
+                    mismatch_position: position - n as i64,
+                    end: 5,
+                });
+                n += 1;
+                mcnt += 1;
+            } else {
+                break;
+            }
+        }
+
+        sc5p.push(position + 1);
+        let mut misp = 0i64;
+        let mut misnt = None;
+
+        if buf.len() == 1 {
+            while let Some(ch) = char_at_neg(&seq, n as isize) {
+                if self.is_has_and_equals(position - n as i64, ch) {
+                    n += 1;
+                    if n != 0 {
+                        mn += 1;
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            if mn > 1 {
+                let mut n2 = 0usize;
+                while let Some(ch) = char_at_neg(&seq, (n + 1 + n2) as isize) {
+                    if self.is_has_and_equals(position - n as i64 - 1 - n2 as i64, ch) {
+                        n2 += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                if n2 > 2 {
+                    sc5p.push(position - n as i64 - n2 as i64);
+                    misp = position - n as i64;
+                    misnt = char_at_neg(&seq, n as isize);
+                    if let Some(sc) = data.soft_clips_5end.get_mut(&(position - n as i64 - n2 as i64)) {
+                        sc.mark_used();
+                    }
+                    mn += n2;
+                } else {
+                    sc5p.push(position - n as i64);
+                    if let Some(sc) = data.soft_clips_5end.get_mut(&(position - n as i64)) {
+                        sc.mark_used();
+                    }
+                }
+            }
+        }
+
+        MismatchResult {
+            mismatches,
+            scp: sc5p,
+            nm: mn,
+            misp,
+            misnt,
+        }
+    }
+
+    fn find_mm3(
+        &self,
+        p: i64,
+        sanpseq: &[u8],
+        data: &mut RealignedVariationData,
+    ) -> MismatchResult {
+        let seq: Vec<u8> = sanpseq
+            .iter()
+            .copied()
+            .filter(|b| *b != b'#' && *b != b'^')
+            .collect();
+        let longmm = 3usize;
+        let mut mismatches = Vec::new();
+        let mut n = 0usize;
+        let mut mn = 0usize;
+        let mut mcnt = 0usize;
+        let mut sc3p: Vec<i64> = Vec::new();
+        let mut buf: Vec<u8> = Vec::new();
+
+        while n < seq.len() && self.get_ref_base(p + n as i64) == Some(seq[n]) {
+            n += 1;
+        }
+
+        sc3p.push(p + n as i64);
+        let tbp = p + n as i64;
+
+        while mcnt <= longmm && n < seq.len() {
+            let ref_base = self.get_ref_base(p + n as i64);
+            if ref_base.is_none() || ref_base.unwrap() == seq[n] {
+                break;
+            }
+            buf.push(seq[n]);
+            mismatches.push(Mismatch {
+                mismatch_sequence: String::from_utf8_lossy(&buf).to_string(),
+                mismatch_position: tbp,
+                end: 3,
+            });
+            n += 1;
+            mcnt += 1;
+        }
+
+        let mut misp = 0i64;
+        let mut misnt = None;
+
+        if buf.len() == 1 {
+            while n < seq.len() && self.is_has_and_equals(p + n as i64, seq[n]) {
+                n += 1;
+                if n != 0 {
+                    mn += 1;
+                }
+            }
+
+            if mn > 1 {
+                let mut n2 = 0usize;
+                while n + n2 + 1 < seq.len() && self.is_has_and_equals(p + n as i64 + 1 + n2 as i64, seq[n + n2 + 1]) {
+                    n2 += 1;
+                }
+                if n2 > 2 && n + n2 + 1 < seq.len() {
+                    sc3p.push(p + n as i64 + n2 as i64);
+                    misp = p + n as i64;
+                    misnt = Some(seq[n]);
+                    if let Some(sc) = data.soft_clips_3end.get_mut(&(p + n as i64 + n2 as i64)) {
+                        sc.mark_used();
+                    }
+                    mn += n2;
+                } else {
+                    sc3p.push(p + n as i64);
+                    if let Some(sc) = data.soft_clips_3end.get_mut(&(p + n as i64)) {
+                        sc.mark_used();
+                    }
+                }
+            }
+        }
+
+        MismatchResult {
+            mismatches,
+            scp: sc3p,
+            nm: mn,
+            misp,
+            misnt,
+        }
+    }
+
+    fn get_ref_range(&self, start: i64, end: i64) -> Vec<u8> {
+        if start > end {
+            return Vec::new();
+        }
+        let mut seq = Vec::new();
+        for pos in start..=end {
+            if let Some(base) = self.get_ref_base(pos) {
+                seq.push(base);
+            }
+        }
+        seq
+    }
+
+    fn get_ref_base(&self, pos: i64) -> Option<u8> {
+        if pos < self.ref_start {
+            return None;
+        }
+        let idx = (pos - self.ref_start) as usize;
+        self.reference_seq.get(idx).copied()
+    }
     /// Check if a sequence has low complexity (>75% of one base or <3 different bases)
     pub fn is_low_complex_seq(seq: &str) -> bool {
         let len = seq.len();
@@ -200,87 +741,79 @@ impl VariantRealigner {
         }
     }
 
-    fn realign_del(
-        &mut self,
-        bam_parameters: &[&str],
-        pos_to_del_count: &HashMap<i64, HashMap<String, usize>>,
-    ) -> Result<(), Error> {
-        let _bams: &[&str] = bam_parameters;
+}
 
-        let sorted_pos_to_del = fill_and_sort_tmp(pos_to_del_count);
+/// Find consensus sequence from soft clip data (mirrors StructuralVariantsProcessor::find_conseq)
+fn find_conseq(sclip: &SoftClip) -> Vec<u8> {
+    if !sclip.consensus_seq().is_empty() {
+        return sclip.consensus_seq().to_vec();
+    }
 
-        for tpl in sorted_pos_to_del {
-            let p = tpl.pos;
-            let vn = tpl.desc_string;
-            let _del_cnt = tpl.count;
+    let mut seq = Vec::new();
+    let mut total = 0usize;
+    let mut matched = 0usize;
 
-            event!(
-                Level::INFO,
-                "  Realigndel for: {p} {vn} {_del_cnt} cov: {}",
-                self.ref_coverage.get(&p).copied().unwrap_or(0)
-            );
+    for (_pos, base_counts) in &sclip.nt {
+        let mut max_count = 0usize;
+        let mut chosen_base: Option<u8> = None;
+        let mut total_count = 0usize;
 
-            let mut del_len = 0i64;
-
-            if let Some(cap) = BEGIN_MINUS_NUMBER.captures(&vn) {
-                if let Ok(len_str) = get_cap_group!(cap, 1) {
-                    del_len = len_str.as_str().parse::<i64>().unwrap_or(0);
+        for base in [b'A', b'T', b'G', b'C'] {
+            if let Some(&count) = base_counts.get(base) {
+                total_count += count;
+                if count > max_count {
+                    max_count = count;
+                    chosen_base = Some(base);
                 }
             }
-
-            if let Some(cap) = UP_NUMBER_END.captures(&vn) {
-                if let Ok(len_str) = get_cap_group!(cap, 1) {
-                    del_len += len_str.as_str().parse::<i64>().unwrap_or(0);
-                }
-            }
-
-            let _extrains = String::new();
-            let _extra = String::new();
-            let _inv5 = String::new();
-            let _inv3 = String::new();
-
-            // TODO: Complete realign_del logic for simple mode
         }
 
-        Ok(())
+        if total_count > 0 {
+            let ratio = max_count as f64 / total_count as f64;
+            if ratio < 0.8 && (total_count - max_count > 2 || max_count <= total_count - max_count) {
+                break;
+            }
+
+            total += total_count;
+            matched += max_count;
+
+            if let Some(base) = chosen_base {
+                seq.push(base);
+            }
+        }
+    }
+
+    if total > 0 && (matched as f64 / total as f64) > 0.9 {
+        seq
+    } else {
+        Vec::new()
     }
 }
 
-/// Fill and sort temporary tuple structure from hash tables of insertion or deletions
-fn fill_and_sort_tmp(
-    changes: &HashMap<i64, HashMap<String, usize>>,
-) -> Vec<SortPositionDescription> {
-    let mut var_info: Vec<SortPositionDescription> = changes
-        .iter()
-        .flat_map(|(&pos, v)| {
-            v.iter()
-                .map(move |(desc, &cnt)| SortPositionDescription::new(pos, desc.clone(), cnt))
-        })
-        .collect();
-
-    var_info.sort_by(|o1, o2| {
-        o2.count
-            .cmp(&o1.count)
-            .then(o1.pos.cmp(&o2.pos))
-            .then(o2.desc_string.cmp(&o1.desc_string))
-    });
-
-    var_info
+fn adj_cnt(dest: &mut Variant, src: &Variant) {
+    dest.alt_depth += src.alt_depth;
+    dest.high_qual_read_cnt += src.high_qual_read_cnt;
+    dest.low_qual_read_cnt += src.low_qual_read_cnt;
+    dest.mean_pos += src.mean_pos;
+    dest.mean_qual += src.mean_qual;
+    dest.mean_mapq += src.mean_mapq;
+    dest.nm += src.nm;
+    dest.alt_depth_fwd += src.alt_depth_fwd;
+    dest.alt_depth_rev += src.alt_depth_rev;
+    dest.pstd = true;
+    dest.qstd = true;
 }
 
-pub(crate) struct SortPositionDescription {
-    pos: i64,
-    desc_string: String,
-    count: usize,
-}
-
-impl SortPositionDescription {
-    fn new(pos: i64, desc_string: String, count: usize) -> Self {
-        Self {
-            pos,
-            desc_string,
-            count,
-        }
+fn char_at_neg(seq: &[u8], offset_from_end: isize) -> Option<u8> {
+    if offset_from_end < 0 {
+        return None;
+    }
+    let len = seq.len() as isize;
+    let pos = len - 1 - offset_from_end;
+    if pos < 0 || pos >= len {
+        None
+    } else {
+        Some(seq[pos as usize])
     }
 }
 

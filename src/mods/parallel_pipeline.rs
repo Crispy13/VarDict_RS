@@ -279,13 +279,17 @@ impl ParallelPipeline {
 
 /// Worker function to process a chunk of regions using VarDict pipeline
 fn process_region_chunk_vardict<P: AsRef<Path>>(
-    _thread_id: usize,
+    thread_id: usize,
     regions: Vec<Region>,
     reference: SharedReferenceHandle,
     config: PipelineConfig,
     bam_path: P,
     tx: std::sync::mpsc::Sender<RegionResult>,
 ) {
+    use crackle_kit::tracing::{Level, event};
+    
+    let start_thread = std::time::Instant::now();
+    
     // Each thread opens its own BAM reader
     let mut bam_reader = match BamReader::open(bam_path.as_ref().to_str().unwrap()) {
         Ok(reader) => reader,
@@ -334,6 +338,9 @@ fn process_region_chunk_vardict<P: AsRef<Path>>(
         
         let _ = tx.send(result);
     }
+    
+    let elapsed_thread = start_thread.elapsed();
+    event!(Level::INFO, "[TIMING] Thread {} completed in {:.3}s", thread_id, elapsed_thread.as_secs_f64());
 }
 
 
@@ -364,7 +371,7 @@ fn process_region_chunk<P: AsRef<Path>>(
 
     // Create variant caller for this thread
     let caller = SimpleVariantCaller::new(
-        config.quality_threshold,
+        config.quality_threshold as u8,
         config.mapq_threshold,
     );
 
