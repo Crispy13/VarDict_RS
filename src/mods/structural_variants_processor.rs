@@ -98,7 +98,7 @@ impl StructuralVariantsProcessor {
         let positions: Vec<i64> = data.soft_clips_5end.keys().cloned().collect();
 
         for position in positions {
-            let sclip = match data.soft_clips_5end.get(&position) {
+            let sclip = match data.soft_clips_5end.get_mut(&position) {
                 Some(sc) => sc,
                 None => continue,
             };
@@ -182,7 +182,7 @@ impl StructuralVariantsProcessor {
         let positions: Vec<i64> = data.soft_clips_3end.keys().cloned().collect();
 
         for position in positions {
-            let sclip = match data.soft_clips_3end.get(&position) {
+            let sclip = match data.soft_clips_3end.get_mut(&position) {
                 Some(sc) => sc,
                 None => continue,
             };
@@ -260,57 +260,8 @@ impl StructuralVariantsProcessor {
     /// Find consensus sequence from soft clip data
     /// 
     /// Simplified version of Java findconseq()
-    fn find_conseq(&self, sclip: &SoftClip) -> Vec<u8> {
-        // If consensus already computed, return it
-        if !sclip.consensus_seq().is_empty() {
-            return sclip.consensus_seq().to_vec();
-        }
-
-        // Build consensus from nt map
-        let mut seq = Vec::new();
-        let mut total = 0usize;
-        let mut matched = 0usize;
-
-        for (_pos, base_counts) in &sclip.nt {
-            let mut max_count = 0usize;
-            let mut chosen_base: Option<u8> = None;
-            let mut total_count = 0usize;
-
-            // Find the most common base at this position
-            for base in [b'A', b'T', b'G', b'C'] {
-                if let Some(&count) = base_counts.get(base) {
-                    total_count += count;
-                    if count > max_count {
-                        max_count = count;
-                        chosen_base = Some(base);
-                    }
-                }
-            }
-
-            // Check consensus quality thresholds
-            if total_count > 0 {
-                let ratio = max_count as f64 / total_count as f64;
-                
-                // If not enough consensus, stop
-                if ratio < 0.8 && (total_count - max_count > 2 || max_count <= total_count - max_count) {
-                    break;
-                }
-
-                total += total_count;
-                matched += max_count;
-
-                if let Some(base) = chosen_base {
-                    seq.push(base);
-                }
-            }
-        }
-
-        // Validate consensus quality
-        if total > 0 && (matched as f64 / total as f64) > 0.9 {
-            seq
-        } else {
-            Vec::new()
-        }
+    fn find_conseq(&self, sclip: &mut SoftClip) -> Vec<u8> {
+        crate::variants::var_utils::find_conseq(sclip, 0)
     }
 
     /// Get reference base at a position (1-based)

@@ -1,6 +1,9 @@
 use crate::{
-    variants::variants::{InsOrDelLen, SoftClip, VarDesc, Variant},
     mods::structural_variants_processor::RealignedVariationData,
+    variants::{
+        var_utils::find_conseq,
+        variants::{InsOrDelLen, SoftClip, VarDesc, Variant},
+    },
 };
 
 /// Result of finding 3'/5' end matches between two sequences
@@ -236,7 +239,7 @@ impl VariantRealigner {
                 if dcnt <= 2 && tv.var.alt_depth / dcnt > 5 {
                     continue;
                 }
-                let seq = find_conseq(tv);
+                let seq = find_conseq(tv, 0);
                 if seq.is_empty() {
                     continue;
                 }
@@ -264,7 +267,7 @@ impl VariantRealigner {
                 if dcnt <= 2 && tv.var.alt_depth / dcnt > 5 {
                     continue;
                 }
-                let seq = find_conseq(tv);
+                let seq = find_conseq(tv, 0);
                 if seq.is_empty() {
                     continue;
                 }
@@ -305,7 +308,7 @@ impl VariantRealigner {
                 continue;
             }
 
-            let seq = find_conseq(sclip);
+            let seq = find_conseq(sclip, 0);
             if seq.is_empty() {
                 continue;
             }
@@ -340,7 +343,7 @@ impl VariantRealigner {
                 continue;
             }
 
-            let seq = find_conseq(sclip);
+            let seq = find_conseq(sclip, 0);
             if seq.is_empty() {
                 continue;
             }
@@ -741,53 +744,6 @@ impl VariantRealigner {
         }
     }
 
-}
-
-/// Find consensus sequence from soft clip data (mirrors StructuralVariantsProcessor::find_conseq)
-fn find_conseq(sclip: &SoftClip) -> Vec<u8> {
-    if !sclip.consensus_seq().is_empty() {
-        return sclip.consensus_seq().to_vec();
-    }
-
-    let mut seq = Vec::new();
-    let mut total = 0usize;
-    let mut matched = 0usize;
-
-    for (_pos, base_counts) in &sclip.nt {
-        let mut max_count = 0usize;
-        let mut chosen_base: Option<u8> = None;
-        let mut total_count = 0usize;
-
-        for base in [b'A', b'T', b'G', b'C'] {
-            if let Some(&count) = base_counts.get(base) {
-                total_count += count;
-                if count > max_count {
-                    max_count = count;
-                    chosen_base = Some(base);
-                }
-            }
-        }
-
-        if total_count > 0 {
-            let ratio = max_count as f64 / total_count as f64;
-            if ratio < 0.8 && (total_count - max_count > 2 || max_count <= total_count - max_count) {
-                break;
-            }
-
-            total += total_count;
-            matched += max_count;
-
-            if let Some(base) = chosen_base {
-                seq.push(base);
-            }
-        }
-    }
-
-    if total > 0 && (matched as f64 / total as f64) > 0.9 {
-        seq
-    } else {
-        Vec::new()
-    }
 }
 
 fn adj_cnt(dest: &mut Variant, src: &Variant) {

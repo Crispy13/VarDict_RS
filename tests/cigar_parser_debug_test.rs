@@ -57,6 +57,21 @@ fn test_cigar_parser_position_168714() {
     let mut reads_covering_168714 = Vec::new();
     let mut total_reads = 0;
     
+    let mut t_reads_fwd = 0;
+    let mut t_reads_rev = 0;
+    let mut t_reads_fwd_oriented = 0;
+    let mut t_reads_rev_oriented = 0;
+
+    let complement = |base: char| -> char {
+        match base {
+            'A' => 'T',
+            'T' => 'A',
+            'C' => 'G',
+            'G' => 'C',
+            other => other,
+        }
+    };
+
     for result in bam.records() {
         total_reads += 1;
         let record = result.expect("Failed to read record");
@@ -84,32 +99,42 @@ fn test_cigar_parser_position_168714() {
             // But for more complex CIGARs with indels, we need read_pos
             let read_pos_opt = cigar.read_pos(ref_pos_in_read, false, false);
             
-            // Try direct calculation for simple match cigars
-            let base_info = if cigar.len() == 1 && matches!(cigar[0], rust_htslib::bam::record::Cigar::Match(_)) {
-                // Simple case: one Match operation
-                let pos_in_read = ref_pos_in_read as usize;
-                if pos_in_read < seq.len() {
-                    let base = seq.as_bytes()[pos_in_read];
-                    let quality = qual[pos_in_read];
-                    Some((base as char, quality))
-                } else {
-                    None
-                }
-            } else {
-                // Complex CIGAR, use read_pos
-                if let Ok(Some(read_pos)) = read_pos_opt {
-                    let pos_in_read = read_pos as usize;
-                    if pos_in_read < seq.len() {
-                        let base = seq.as_bytes()[pos_in_read];
-                        let quality = qual[pos_in_read];
-                        Some((base as char, quality))
-                    } else {
-                        None
+            // Compute aligned base at 168714 using CIGAR walk
+            let mut ref_pos = start_0based as i64;
+            let mut read_pos = 0usize;
+            let mut aligned_base: Option<(char, u8)> = None;
+            for op in cigar.iter() {
+                match *op {
+                    rust_htslib::bam::record::Cigar::Match(l)
+                    | rust_htslib::bam::record::Cigar::Equal(l)
+                    | rust_htslib::bam::record::Cigar::Diff(l) => {
+                        let l = l as i64;
+                        if ref_pos <= 168713 && 168713 < ref_pos + l {
+                            let offset = (168713 - ref_pos) as usize;
+                            let idx = read_pos + offset;
+                            if idx < seq.len() {
+                                aligned_base = Some((seq.as_bytes()[idx] as char, qual[idx]));
+                            }
+                            break;
+                        }
+                        ref_pos += l;
+                        read_pos += l as usize;
                     }
-                } else {
-                    None
+                    rust_htslib::bam::record::Cigar::Ins(l) => {
+                        read_pos += l as usize;
+                    }
+                    rust_htslib::bam::record::Cigar::Del(l)
+                    | rust_htslib::bam::record::Cigar::RefSkip(l) => {
+                        ref_pos += l as i64;
+                    }
+                    rust_htslib::bam::record::Cigar::SoftClip(l) => {
+                        read_pos += l as usize;
+                    }
+                    rust_htslib::bam::record::Cigar::HardClip(_) | rust_htslib::bam::record::Cigar::Pad(_) => {}
                 }
-            };
+            }
+
+            let base_info = aligned_base;
             
             println!("\n=== Read {} (matches position 168714) ===", reads_covering_168714.len() + 1);
             println!("Name: {}", String::from_utf8_lossy(record.qname()));
@@ -128,6 +153,26 @@ fn test_cigar_parser_position_168714() {
             
             if let Some((base, qual)) = base_info {
                 println!("Base at 168714: {} (qual={})", base, qual);
+                if base == 'T' {
+                    if record.is_reverse() {
+                        t_reads_rev += 1;
+                    } else {
+                        t_reads_fwd += 1;
+                    }
+                }
+
+                let oriented_base = if record.is_reverse() {
+                    complement(base)
+                } else {
+                    base
+                };
+                if oriented_base == 'T' {
+                    if record.is_reverse() {
+                        t_reads_rev_oriented += 1;
+                    } else {
+                        t_reads_fwd_oriented += 1;
+                    }
+                }
             } else {
                 println!("Base at 168714: N/A (not in aligned region)");
             }
@@ -144,6 +189,8 @@ fn test_cigar_parser_position_168714() {
     println!("\n=== Summary ===");
     println!("Total reads fetched: {}", total_reads);
     println!("Reads covering position 168714: {}", reads_covering_168714.len());
+    println!("Reads with T at 168714 (CIGAR-aligned): fwd={}, rev={}", t_reads_fwd, t_reads_rev);
+    println!("Reads with T at 168714 (oriented to reference): fwd={}, rev={}", t_reads_fwd_oriented, t_reads_rev_oriented);
     
     // Now parse these reads with CigarParser
     println!("\n=== Parsing reads with CigarParser ===");
@@ -196,4 +243,5 @@ fn test_cigar_parser_position_168714() {
     println!("Position 168714, C→T: alt_depth=2 (fwd=1, rev=1)");
     println!("\nIf Rust shows alt_depth=1 with only forward or only reverse,");
     println!("then one read is not being counted properly.");
+
 }

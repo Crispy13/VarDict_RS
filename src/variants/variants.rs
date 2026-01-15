@@ -241,6 +241,11 @@ impl SoftClip {
         &self.consensus_seq
     }
 
+    /// Set the consensus sequence
+    pub fn set_consensus_seq(&mut self, seq: Vec<u8>) {
+        self.consensus_seq = seq;
+    }
+
     /// Check if this soft clip has been used
     pub fn used(&self) -> bool {
         self.used

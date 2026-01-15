@@ -207,8 +207,10 @@ impl CigarParser {
         event!(Level::DEBUG, "[parse_cigar] Starting for record at pos {}", record.pos());
         
         // Build query sequence and quality as owned vectors
-        let query_seq_owned: Vec<u8> = record.seq().into_decoded_base_iter().collect();
-        let query_qual_owned: Vec<u8> = record.qual().to_vec();
+        let mut query_seq_owned: Vec<u8> = record.seq().into_decoded_base_iter().collect();
+        let mut query_qual_owned: Vec<u8> = record.qual().to_vec();
+
+        let is_reverse = record.is_reverse();
 
         let mut query_seq = query_seq_owned.as_slice();
         let mut query_qual = query_qual_owned.as_slice();
@@ -246,7 +248,6 @@ impl CigarParser {
 
         let is_mate_on_the_same_contig = record.tid() == record.mtid();
         let nm = tot_nm;
-        let is_reverse = record.is_reverse();
 
         if self.instance.amplicon_based_calling {
             todo!()
@@ -281,6 +282,7 @@ impl CigarParser {
 
             query_qual = mc.query_qual;
             query_seq = mc.query_seq;
+
         } else {
             // Convert to 1-based position (BAM is 0-based, Java VarDict uses 1-based)
             pos = record.pos() + 1;
@@ -393,7 +395,7 @@ impl CigarParser {
                                 let var = get_variants_from_map(&mut self.non_insertion_vars, anchor_pos, &var_desc);
                                 // For insertion anchor: read_pos is 0 (first position), tp will be 1
                                 // BAM quality is already Phred (not +33 adjusted), so use directly
-                                let bq = query_qual.first().copied().unwrap_or(0);
+                                let bq = query_qual.first().copied().unwrap_or(0) as f64;
                                 // Use bq=0 for high quality tracking - insertion anchors don't count as high quality
                                 // The base quality is still recorded for mean_qual calculation
                                 add_cnt_anchor(var, is_reverse, 0, bq, mapping_quality, nm as usize, Some(read_match_ins_len));
@@ -484,8 +486,8 @@ impl CigarParser {
                                 loop_iterations += 1;
                                 // Require higher quality for MNV
                                 // BAM stores Phred quality directly (no +33 ASCII offset)
-                                if *query_qual.get_or_err(self.read_pos_including_softclip + 1)?
-                                    < instance().conf.goodq as u8 + 5
+                                if (*query_qual.get_or_err(self.read_pos_including_softclip + 1)? as f64)
+                                    < instance().conf.goodq + 5.0
                                 {
                                     break;
                                 }
@@ -539,8 +541,8 @@ impl CigarParser {
                                     
                                     // Require higher quality for MNV
                                     // BAM stores Phred quality directly (no +33 ASCII offset)
-                                    if *query_qual.get_or_err(self.read_pos_including_softclip + ssn)?
-                                        < instance().conf.goodq as u8 + 5
+                                    if (*query_qual.get_or_err(self.read_pos_including_softclip + ssn)? as f64)
+                                        < instance().conf.goodq + 5.0
                                     {
                                         break;
                                     }
@@ -717,7 +719,7 @@ impl CigarParser {
                                 {
                                     event!(Level::DEBUG, "[parse_cigar] Calling add_variation_for_matching_part: pos={}, s={:?}", 
                                         pos, String::from_utf8_lossy(&s));
-                                    
+
                                     self.add_variation_for_matching_part(
                                         mapping_quality,
                                         nm as usize,
@@ -908,7 +910,7 @@ impl CigarParser {
                     var,
                     is_reverse,
                     *cigar_len as usize,
-                    query_quality.get_or_err(*cigar_len as usize - 1).copied()?,
+                    query_quality.get_or_err(*cigar_len as usize - 1).copied()? as f64,
                     mapq,
                     num_mismatch,
                     None,
@@ -1060,7 +1062,7 @@ impl CigarParser {
                     total_length_including_soft_clipped - self.read_pos_excluding_softclip,
                     query_quality
                         .get_or_err(self.read_pos_including_softclip)
-                        .copied()?,
+                        .copied()? as f64,
                     mapq,
                     num_mismatch,
                     None,
@@ -1823,9 +1825,9 @@ impl CigarParser {
             // Average quality - BAM already stores Phred quality directly (no need for -33)
             let avg_qual = if !qual_seg.is_empty() {
                 let sum: u32 = qual_seg.iter().map(|&q| q as u32).sum();
-                (sum as f64 / qual_seg.len() as f64) as u8
+                sum as f64 / qual_seg.len() as f64
             } else {
-                0
+                0.0
             };
             
             // Store the variant
@@ -1884,9 +1886,9 @@ impl CigarParser {
 
         // Average quality
         let avg_qual = if qbases + qibases > 0 {
-            (q / (qbases + qibases) as f64) as u8
+            q / (qbases + qibases) as f64
         } else {
-            q as u8
+            q
         };
         
         // Check if this is a complex variant (contains & for MNV)
@@ -2158,7 +2160,7 @@ impl CigarParser {
                     seq_var,
                     is_reverse,
                     si as usize - (cigar_len as usize - num_high_qual_base),
-                    *query_quality.get_or_err(si as usize)?,
+                    *query_quality.get_or_err(si as usize)? as f64,
                     mapq,
                     num_mismatch,
                     None,
@@ -2169,7 +2171,7 @@ impl CigarParser {
                 &mut sclip.var,
                 is_reverse,
                 cigar_len as usize,
-                (read_qual_sum / num_high_qual_base) as u8,
+                read_qual_sum as f64 / num_high_qual_base as f64,
                 mapq,
                 num_mismatch,
                 None,
@@ -2226,7 +2228,7 @@ impl CigarParser {
                     seq_var,
                     is_reverse,
                     num_high_qual_base - si,
-                    *query_quality.get_or_err(self.read_pos_including_softclip + si)?,
+                    *query_quality.get_or_err(self.read_pos_including_softclip + si)? as f64,
                     mapq,
                     num_mismatch,
                     None,
@@ -2237,7 +2239,7 @@ impl CigarParser {
                 &mut sclip.var,
                 is_reverse,
                 cigar_len as usize,
-                (read_qual_sum / num_high_qual_base) as u8,
+                read_qual_sum as f64 / num_high_qual_base as f64,
                 mapq,
                 num_mismatch,
                 None,
@@ -2374,7 +2376,7 @@ fn is_read_chimeric_with_sa(
 /// read_pos: position in read (excluding soft clips)  
 /// bq: base quality
 /// read_len: optional total read length for calculating tp correctly
-fn add_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: u8, mapq: u8, nm: usize, read_len: Option<usize>) {
+fn add_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64, mapq: u8, nm: usize, read_len: Option<usize>) {
     var.alt_depth += 1;
     var.inc_dir(is_reverse);
     
@@ -2402,7 +2404,7 @@ fn add_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: u8, mapq: u
     
     // qstd: true if variant is covered by reads with different qualities
     // Java: if (!vref.qstd && vref.pq != 0 && tmpq != vref.pq) { vref.qstd = true; }
-    let tmpq = bq as f64;
+    let tmpq = bq;
     if !var.qstd && var.pq != 0.0 && (tmpq - var.pq).abs() > f64::EPSILON {
         var.qstd = true;
     }
@@ -2414,7 +2416,7 @@ fn add_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: u8, mapq: u
     var.pq = tmpq;
     var.nm += nm as f64;
 
-    if bq as f64 >= instance().conf.goodq {
+    if bq >= instance().conf.goodq {
         var.high_qual_read_cnt += 1;
     } else {
         var.low_qual_read_cnt += 1;
@@ -2426,7 +2428,7 @@ fn add_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: u8, mapq: u
 /// read_pos: position in read (excluding soft clips)  
 /// bq: base quality
 /// read_len: optional total read length for calculating tp correctly
-fn add_cnt_anchor(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: u8, mapq: u8, nm: usize, read_len: Option<usize>) {
+fn add_cnt_anchor(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64, mapq: u8, nm: usize, read_len: Option<usize>) {
     var.alt_depth += 1;
     var.inc_dir(is_reverse);
     
@@ -2449,7 +2451,7 @@ fn add_cnt_anchor(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: u8, 
     }
     
     // qstd: true if variant is covered by reads with different qualities
-    let tmpq = bq as f64;
+    let tmpq = bq;
     if !var.qstd && var.pq != 0.0 && (tmpq - var.pq).abs() > f64::EPSILON {
         var.qstd = true;
     }

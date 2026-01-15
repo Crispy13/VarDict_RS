@@ -164,14 +164,40 @@ impl VarDictPipeline {
         let sam_filter = instance.conf.sam_filter;
 
         // Collect all records into a vector (needed for mutable iteration)
-        // Apply SAM flag filtering like Java does (default: filter 2nd alignments, unmapped, duplicates)
+        // Apply all preprocessing filters from Java's RecordPreprocessor.preprocessRecord()
         let mut records = Vec::new();
         let mut record = Record::new();
         while bam_reader.read(&mut record).unwrap_or(false) {
-            // Skip records that match the filter flags (same as Java's SamView.read())
+            // 1. Java SamView.read(): Skip records that match the filter flags
+            // if (filter != 0 && (record.getFlags() & filter) != 0)
             if sam_filter != 0 && (record.flags() & sam_filter as u16) != 0 {
                 continue;
             }
+            
+            // 2. Java preprocessRecord line 117: Ignore low mapping quality reads
+            // if (instance().conf.hasMappingQuality() && mappingQuality < instance().conf.mappingQuality)
+            // In Rust: min_mapping_quality defaults to 0, so this only filters when set > 0
+            if self.min_mapping_quality > 0 && record.mapq() < self.min_mapping_quality {
+                continue;
+            }
+            
+            // 3. Java preprocessRecord line 122: Skip not primary alignment reads
+            // if (record.isSecondaryAlignment() && !instance().conf.samfilter.equals("0"))
+            // This ensures secondary alignments are always filtered when samfilter != 0,
+            // even if 0x100 is not set in the samfilter bitmask.
+            const SECONDARY_ALIGNMENT: u16 = 0x100;
+            if (record.flags() & SECONDARY_ALIGNMENT) != 0 && sam_filter != 0 {
+                continue;
+            }
+            
+            // 4. Java preprocessRecord line 124: Skip reads where sequence is not stored in read
+            // if (querySequence.length() == 1 && querySequence.charAt(0) == '*')
+            // In BAM format, missing sequences are represented as empty or single '*'
+            let seq = record.seq();
+            if seq.len() == 0 || (seq.len() == 1 && seq.as_bytes()[0] == b'*') {
+                continue;
+            }
+            
             records.push(record.clone());
         }
 
@@ -232,18 +258,18 @@ impl VarDictPipeline {
             elapsed_post.as_secs_f64(),
             output_lines.len());
 
-        let elapsed_total = start_total.elapsed();
+        // let elapsed_total = start_total.elapsed();
         
-        // Log timing summary for regions taking >10ms
-        if elapsed_total.as_millis() > 10 {
-            eprintln!("[REGION] {}:{}-{} total={:.3}s cigar={:.3}s realign={:.3}s tovars={:.3}s post={:.3}s",
-                region.chr(), region.start(), region.end(),
-                elapsed_total.as_secs_f64(),
-                elapsed_cigar.as_secs_f64(),
-                elapsed_realign.as_secs_f64(),
-                elapsed_tovars.as_secs_f64(),
-                elapsed_post.as_secs_f64());
-        }
+        // // Log timing summary for regions taking >10ms
+        // if elapsed_total.as_millis() > 10 {
+        //     event!(Level::TRACE, "[REGION] {}:{}-{} total={:.3}s cigar={:.3}s realign={:.3}s tovars={:.3}s post={:.3}s",
+        //         region.chr(), region.start(), region.end(),
+        //         elapsed_total.as_secs_f64(),
+        //         elapsed_cigar.as_secs_f64(),
+        //         elapsed_realign.as_secs_f64(),
+        //         elapsed_tovars.as_secs_f64(),
+        //         elapsed_post.as_secs_f64());
+        // }
 
         Ok(output_lines)
     }
