@@ -204,7 +204,7 @@ impl CigarParser {
     }
 
     fn parse_cigar(&mut self, record: &mut Record) -> Result<(), Error> {
-        event!(Level::DEBUG, "[parse_cigar] Starting for record at pos {}", record.pos());
+        event!(Level::DEBUG, "Starting for record at pos {}", record.pos());
         
         // Build query sequence and quality as owned vectors
         let mut query_seq_owned: Vec<u8> = record.seq().into_decoded_base_iter().collect();
@@ -220,7 +220,7 @@ impl CigarParser {
         record.cache_cigar_if_empty();
         let mut cigar = record.cigar();
         
-        event!(Level::DEBUG, "[parse_cigar] CIGAR: {:?}", cigar);
+        event!(Level::DEBUG, "CIGAR: {:?}", cigar);
 
         let ins_del_len = get_ins_del_len(&cigar);
 
@@ -234,11 +234,16 @@ impl CigarParser {
             Some(oth) => Err(anyhow!("Got unexpected type for NM tag: {:?}", oth))?,
             None => {
                 if !cigar.is_empty() {
-                    event!(Level::WARN, "No NM tag for mismatches: {:?}", record);
+                    event!(Level::DEBUG, "No NM tag for mismatches; continuing with NM=0");
                 }
 
-                if record.is_unmapped() || cigar.is_empty() {
-                    event!(Level::DEBUG, "[parse_cigar] Early return: unmapped or empty cigar");
+                let has_alignment = !cigar.is_empty() && record.pos() >= 0;
+                if record.is_unmapped() && !has_alignment {
+                    event!(Level::DEBUG, "Early return: unmapped with no alignment");
+                    return Ok(());
+                }
+                if cigar.is_empty() {
+                    event!(Level::DEBUG, "Early return: empty cigar");
                     return Ok(());
                 }
 
@@ -248,6 +253,16 @@ impl CigarParser {
 
         let is_mate_on_the_same_contig = record.tid() == record.mtid();
         let nm = tot_nm;
+
+        if nm > instance().conf.mismatch {
+            event!(
+                Level::DEBUG,
+                "Skip record due to mismatches: nm={} > {}",
+                nm,
+                instance().conf.mismatch
+            );
+            return Ok(());
+        }
 
         if self.instance.amplicon_based_calling {
             todo!()
@@ -318,9 +333,12 @@ impl CigarParser {
         let read_len_including_softclips = get_soft_clipped_length(&cigar);
         self.max_read_len = read_len_including_softclips.max(self.max_read_len);
 
-        // If supplementary alignment is present
-        if instance().conf.sam_filter != 0 && record.is_supplementary() {
-            return Ok(()); // Ignore the supplementary for now so that it won't skew the coverage
+        // Match Java behavior: only filter supplementary alignments if sam_filter includes 0x800
+        if instance().conf.sam_filter != 0
+            && (instance().conf.sam_filter & 0x800) != 0
+            && record.is_supplementary()
+        {
+            return Ok(());
         }
 
         // Skip sites that are not in region of interest in CRISPR mode
@@ -332,10 +350,9 @@ impl CigarParser {
         let mate_is_reverse = record.is_mate_reverse();
 
         if record.is_paired() && record.is_mate_unmapped() {
-            // TODO
+            // Mate unmapped, potential insertion (SV logic not implemented in simple mode)
         } else if record.mapq() > 10 && !instance().conf.disable_sv {
-            // Consider high mapping quality mates only
-            todo!()
+            // Consider high mapping quality mates only (SV logic not implemented in simple mode)
         }
 
         let mpos = record.mpos();
@@ -357,7 +374,7 @@ impl CigarParser {
 
                 self.cigar_len = c.len();
                 //Letter from CIGAR
-                event!(Level::DEBUG, "[parse_cigar] Processing CIGAR op: {:?} at ci={}", c, ci);
+                event!(Level::DEBUG, "Processing CIGAR op: {:?} at ci={}", c, ci);
                 
                 match c {
                     Cigar::RefSkip(l) => {
@@ -717,7 +734,7 @@ impl CigarParser {
                                     && pos <= self.region.end as i64
                                     && !s.iter().any(|&b| b == b'N')
                                 {
-                                    event!(Level::DEBUG, "[parse_cigar] Calling add_variation_for_matching_part: pos={}, s={:?}", 
+                                    event!(Level::DEBUG, "Calling add_variation_for_matching_part: pos={}, s={:?}", 
                                         pos, String::from_utf8_lossy(&s));
 
                                     self.add_variation_for_matching_part(
@@ -736,7 +753,7 @@ impl CigarParser {
                                         pos,
                                     );
                                 } else {
-                                    event!(Level::DEBUG, "[parse_cigar] Skipping variation: pos={} (region: {}-{}), has_N={}, trim={}", 
+                                    event!(Level::DEBUG, "Skipping variation: pos={} (region: {}-{}), has_N={}, trim={}", 
                                         pos, self.region.start, self.region.end, 
                                         s.iter().any(|&b| b == b'N'), trim);
                                 }
@@ -882,7 +899,7 @@ impl CigarParser {
             */
             while *cigar_len >= 1
                 && self.start > 1
-                && self.start - 1 <= *instance().chr_lens.get(contig).unwrap() as i64
+                && self.start - 1 <= *instance().chr_lens.get(contig).unwrap_or(&0) as i64
                 && is_has_and_equals(
                     query_sequence
                         .get_or_err(*cigar_len as usize - 1)
@@ -2726,5 +2743,298 @@ mod tests {
     #[test]
     fn test_is_begin_atgc_amp_atgcs_end_invalid_char() {
         assert!(!is_begin_atgc_amp_atgcs_end(b"A&ASGT"));
+    }
+
+    #[test]
+    fn test_cigar_parser_mapped_read_ref_loaded_no_indels() {
+        use crate::data::reference::FastaReader;
+        use crate::data::region::Region;
+        use crate::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE, instance};
+        use rust_htslib::bam::{Read, Reader};
+        use std::sync::Arc;
+
+        let conf = Configuration {
+            ..Default::default()
+        };
+
+        let _ = INSTANCE.set(GlobalReadOnlyScope {
+            conf,
+            ..Default::default()
+        });
+
+        let bam_path = "/home/eck/workspace/vardict_rs/test_data/test_168714.bam";
+        let fasta_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/reference/hs37d5.fa";
+
+        let mut reader = Reader::from_path(bam_path).expect("Failed to open test BAM");
+
+        let mut target: Option<Record> = None;
+        for result in reader.records() {
+            let record = result.expect("Failed to read BAM record");
+            let qname = std::str::from_utf8(record.qname()).unwrap_or("");
+            if qname == "SRR098401.7003120" && !record.is_unmapped() {
+                target = Some(record);
+                break;
+            }
+        }
+
+        let record = target.expect("Mapped SRR098401.7003120 read not found");
+        let alignment_start = record.pos() + 1;
+        let read_len = record.seq_len() as i64;
+
+        let region = Region::new("20".to_string(), 168600, 168800, "test_region".to_string());
+        let mut ref_start = region.start.saturating_sub(1200);
+        if ref_start == 0 {
+            ref_start = 1;
+        }
+        let ref_end = region.end + 1200;
+
+        let fasta = FastaReader::open(fasta_path).expect("Failed to open reference FASTA");
+        let reference = fasta
+            .get_reference(region.chr(), ref_start, ref_end)
+            .expect("Failed to fetch reference sequence");
+
+        let instance = Arc::new(instance().clone());
+        let mut parser = CigarParser::new(region, reference, instance);
+
+        let mut records = vec![record];
+        parser
+            .process_records(records.iter_mut())
+            .expect("process_records failed");
+
+        println!("=== Rust CigarParser non_insertion_vars (mapped read) ===");
+        println!(
+            "Alignment start: {}, read length: {}",
+            alignment_start,
+            read_len
+        );
+        println!(
+            "Non-insertion positions: {}",
+            parser.get_non_insertion_vars().len()
+        );
+        for (pos, vars) in parser.get_non_insertion_vars() {
+            if vars.is_empty() {
+                continue;
+            }
+            println!("Position: {}", pos);
+            for (desc, var) in vars {
+                println!("  {:?} -> {:?}", desc, var);
+            }
+        }
+
+        assert!(!parser.reference.ref_seq.is_empty());
+        assert!(parser.get_non_insertion_vars().is_empty());
+        assert!(parser.get_insertion_vars().is_empty());
+        assert!(parser.get_soft_clips_5end().is_empty());
+        assert!(parser.get_soft_clips_3end().is_empty());
+    }
+
+    #[test]
+    fn test_cigar_parser_non_insertion_variants_first_bed_region() {
+        use crate::conf::Configuration;
+        use crate::data::bam_reader::BamReader;
+        use crate::data::reference::FastaReader;
+        use crate::data::region::Region;
+        use crate::mods::vardict_pipeline::VarDictPipeline;
+        use crate::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE, instance};
+        use crate::variants::variants::VarDesc;
+        use std::collections::HashMap;
+        use std::fs::File;
+        use std::io::{BufRead, BufReader};
+        use std::sync::Arc;
+
+        let mut conf = Configuration::default();
+        conf.disable_sv = true;
+        let mut chr_lens = HashMap::new();
+        chr_lens.insert("20".to_string(), 63_025_520);
+
+        let _ = INSTANCE.set(GlobalReadOnlyScope {
+            conf,
+            chr_lens,
+            ..Default::default()
+        });
+
+        let bam_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/input/NA12878.chrom20.ILLUMINA.bwa.CEU.exome.20121211.bam";
+        let bed_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/input/20120518.consensus.annotation.bed.chr20";
+        let fasta_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/reference/hs37d5.fa";
+
+        let file = File::open(bed_path).expect("Failed to open BED file");
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        let mut region_opt = None;
+
+        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+            let trimmed = line.trim();
+            if !trimmed.is_empty()
+                && !trimmed.starts_with('#')
+                && !trimmed.starts_with("track")
+                && !trimmed.starts_with("browser")
+            {
+                let fields: Vec<&str> = trimmed.split('\t').collect();
+                let mut chr = fields.get(0).unwrap().to_string();
+                if chr.starts_with("chr") {
+                    chr = chr.trim_start_matches("chr").to_string();
+                }
+                let mut start: usize = fields.get(1).unwrap().parse().unwrap();
+                let mut end: usize = fields.get(2).unwrap().parse().unwrap();
+                if start < end {
+                    start += 1;
+                }
+                if start == 0 {
+                    start = 1;
+                }
+                if end < start {
+                    std::mem::swap(&mut start, &mut end);
+                }
+                let gene = fields.get(3).unwrap_or(&"").to_string();
+                region_opt = Some(Region::new(chr, start, end, gene));
+                break;
+            }
+            line.clear();
+        }
+
+        let region = region_opt.expect("No BED regions found");
+
+        let mut ref_start = region.start.saturating_sub(1200);
+        if ref_start == 0 {
+            ref_start = 1;
+        }
+        let ref_end = region.end + 1200;
+
+        let fasta = FastaReader::open(fasta_path).expect("Failed to open reference FASTA");
+        let reference = fasta
+            .get_reference(region.chr(), ref_start, ref_end)
+            .expect("Failed to fetch reference sequence");
+
+        let instance = Arc::new(instance().clone());
+        let pipeline = VarDictPipeline::new("test");
+        let sam_filter = 0x504u32;
+        let mut bam_reader = BamReader::open(bam_path).expect("Failed to open BAM");
+        let (mut records, _lines) = pipeline
+            .collect_filtered_records(&region, &mut bam_reader, sam_filter)
+            .expect("Failed to collect filtered reads");
+
+        let mut parser = CigarParser::new(region.clone(), reference, instance);
+        parser
+            .process_records(records.iter_mut())
+            .expect("process_records failed");
+
+        let non_insertion = parser.get_non_insertion_vars();
+
+        assert_variant(
+            non_insertion,
+            68352,
+            b'T',
+            120,
+            78,
+            42,
+            2092.000,
+            4006.000,
+            7169.000,
+            0.000,
+            1,
+            119,
+            true,
+            true,
+            1,
+            31.000,
+        );
+
+        assert_variant(
+            non_insertion,
+            68353,
+            b'G',
+            118,
+            76,
+            42,
+            2121.000,
+            4434.000,
+            7049.000,
+            0.000,
+            2,
+            116,
+            true,
+            true,
+            1,
+            34.000,
+        );
+
+        assert_variant(
+            non_insertion,
+            68359,
+            b'C',
+            120,
+            74,
+            46,
+            2288.000,
+            4269.000,
+            7169.000,
+            0.000,
+            5,
+            115,
+            true,
+            true,
+            1,
+            34.000,
+        );
+
+        assert_variant(
+            non_insertion,
+            68367,
+            b'T',
+            124,
+            70,
+            54,
+            2410.000,
+            4353.000,
+            7378.000,
+            0.000,
+            4,
+            120,
+            true,
+            true,
+            1,
+            30.000,
+        );
+    }
+
+    fn assert_variant(
+        non_insertion: &std::collections::HashMap<i64, std::collections::HashMap<crate::variants::variants::VarDesc, crate::variants::variants::Variant>>,
+        pos: i64,
+        ref_base: u8,
+        alt_depth: usize,
+        alt_depth_fwd: usize,
+        alt_depth_rev: usize,
+        mean_pos: f64,
+        mean_qual: f64,
+        mean_mapq: f64,
+        nm: f64,
+        low_qual_read_cnt: usize,
+        high_qual_read_cnt: usize,
+        pstd: bool,
+        qstd: bool,
+        pp: usize,
+        pq: f64,
+    ) {
+        let vars_at = non_insertion
+            .get(&pos)
+            .unwrap_or_else(|| panic!("Missing position in non_insertion_vars: {}", pos));
+        let key = VarDesc::snv_key(ref_base);
+        let var = vars_at
+            .get(&key)
+            .unwrap_or_else(|| panic!("Missing SNV {:?} at position {}", ref_base as char, pos));
+
+        assert_eq!(var.alt_depth, alt_depth, "alt_depth mismatch at {}", pos);
+        assert_eq!(var.alt_depth_fwd, alt_depth_fwd, "alt_depth_fwd mismatch at {}", pos);
+        assert_eq!(var.alt_depth_rev, alt_depth_rev, "alt_depth_rev mismatch at {}", pos);
+        assert!((var.mean_pos - mean_pos).abs() < 0.001, "mean_pos mismatch at {}", pos);
+        assert!((var.mean_qual - mean_qual).abs() < 0.001, "mean_qual mismatch at {}", pos);
+        assert!((var.mean_mapq - mean_mapq).abs() < 0.001, "mean_mapq mismatch at {}", pos);
+        assert!((var.nm - nm).abs() < 0.001, "nm mismatch at {}", pos);
+        assert_eq!(var.low_qual_read_cnt, low_qual_read_cnt, "low_qual_read_cnt mismatch at {}", pos);
+        assert_eq!(var.high_qual_read_cnt, high_qual_read_cnt, "high_qual_read_cnt mismatch at {}", pos);
+        assert_eq!(var.pstd, pstd, "pstd mismatch at {}", pos);
+        assert_eq!(var.qstd, qstd, "qstd mismatch at {}", pos);
+        assert_eq!(var.pp, pp, "pp mismatch at {}", pos);
+        assert!((var.pq - pq).abs() < 0.001, "pq mismatch at {}", pos);
     }
 }

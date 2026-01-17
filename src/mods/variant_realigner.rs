@@ -776,6 +776,12 @@ fn char_at_neg(seq: &[u8], offset_from_end: isize) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::reference::FastaReader;
+    use crate::data::region::Region;
+    use crate::mods::cigar_parser::CigarParser;
+    use crate::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE, instance};
+    use rust_htslib::bam::{Read, Reader};
+    use std::sync::Arc;
 
     #[test]
     fn test_is_low_complex_seq() {
@@ -826,5 +832,76 @@ mod tests {
         assert_eq!(result5.matched_5_end, 14);
         assert_eq!(result5.matched_3_end, 11);
         assert_eq!(result5.max_matched_length, 10);
+    }
+
+    #[test]
+    fn test_variant_realigner_mapped_read_no_indels() {
+        let conf = crate::conf::Configuration {
+            perform_local_realignment: false,
+            disable_sv: true,
+            ..Default::default()
+        };
+
+        let _ = INSTANCE.set(GlobalReadOnlyScope {
+            conf,
+            ..Default::default()
+        });
+
+        let bam_path = "/home/eck/workspace/vardict_rs/test_data/test_168714.bam";
+        let fasta_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/reference/hs37d5.fa";
+
+        let mut reader = Reader::from_path(bam_path).expect("Failed to open test BAM");
+        let mut target: Option<rust_htslib::bam::Record> = None;
+        for result in reader.records() {
+            let record = result.expect("Failed to read BAM record");
+            let qname = std::str::from_utf8(record.qname()).unwrap_or("");
+            if qname == "SRR098401.7003120" && !record.is_unmapped() {
+                target = Some(record);
+                break;
+            }
+        }
+
+        let record = target.expect("Mapped SRR098401.7003120 read not found");
+
+        let region = Region::new("20".to_string(), 168600, 168800, "test_region".to_string());
+        let mut ref_start = region.start.saturating_sub(1200);
+        if ref_start == 0 {
+            ref_start = 1;
+        }
+        let ref_end = region.end + 1200;
+
+        let fasta = FastaReader::open(fasta_path).expect("Failed to open reference FASTA");
+        let reference = fasta
+            .get_reference(region.chr(), ref_start, ref_end)
+            .expect("Failed to fetch reference sequence");
+
+        let scope_instance = Arc::new(instance().clone());
+        let mut parser = CigarParser::new(region.clone(), reference.clone(), scope_instance);
+
+        let mut records = vec![record];
+        parser
+            .process_records(records.iter_mut())
+            .expect("process_records failed");
+
+        let mut sv_input = crate::mods::structural_variants_processor::RealignedVariationData {
+            non_insertion_variants: parser.take_non_insertion_vars(),
+            insertion_variants: parser.take_insertion_vars(),
+            soft_clips_5end: parser.take_soft_clips_5end(),
+            soft_clips_3end: parser.take_soft_clips_3end(),
+            ref_coverage: parser.take_ref_coverage(),
+            max_read_length: parser.get_max_read_len(),
+            duprate: 0.0,
+        };
+
+        if instance().conf.perform_local_realignment {
+            let realigner = VariantRealigner::new(reference.ref_seq.clone(), reference.region_start);
+            realigner.process_deletions(&mut sv_input);
+        }
+
+        assert!(!reference.ref_seq.is_empty());
+        assert!(sv_input.non_insertion_variants.is_empty());
+        assert!(sv_input.insertion_variants.is_empty());
+        assert!(sv_input.soft_clips_5end.is_empty());
+        assert!(sv_input.soft_clips_3end.is_empty());
     }
 }

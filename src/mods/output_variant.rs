@@ -213,7 +213,7 @@ impl SimpleOutputVariant {
             msint: variant.msint,
             nm: variant.nm,
             hicnt: variant.high_qual_read_cnt,
-            hicov: variant.high_qual_read_cnt, // In simple mode, hicov = hicnt for the variant
+            hicov: variant.hicov,
 
             left_sequence: if variant.leftseq.is_empty() { "0".to_string() } else { variant.leftseq.clone() },
             right_sequence: if variant.rightseq.is_empty() { "0".to_string() } else { variant.rightseq.clone() },
@@ -472,6 +472,7 @@ mod tests {
             nm: 1.0,
             high_qual_read_cnt: 10,
             low_qual_read_cnt: 0,
+            hicov: 90,
             ref_forward_count: 0,
             ref_reverse_count: 0,
             genotype: "0/1".to_string(),

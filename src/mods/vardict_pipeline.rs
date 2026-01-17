@@ -66,55 +66,48 @@ pub struct RealignedOutput {
 /// Final aligned variants data - mirrors Java AlignedVarsData
 #[derive(Debug, Clone, Default)]
 pub struct AlignedVarsData {
-    /// Aligned variants by position
+    /// Variants by position
     pub aligned_variants: HashMap<i64, Vars>,
-    /// Reference coverage
+    /// Reference coverage by position
     pub ref_coverage: HashMap<i64, usize>,
 }
 
-/// VarDict Simple Mode Pipeline
-///
-/// Orchestrates the complete variant calling pipeline following Java VarDict flow.
+/// Main VarDict pipeline configuration
 pub struct VarDictPipeline {
-    /// Sample name for output
-    sample_name: String,
-    /// Minimum allele frequency
-    min_frequency: f64,
-    /// Minimum base quality
-    min_base_quality: f64,
-    /// Minimum mapping quality
-    min_mapping_quality: u8,
-    /// Enable pileup mode (output reference positions too)
-    do_pileup: bool,
+    pub sample_name: String,
+    pub min_frequency: f64,
+    pub min_base_quality: f64,
+    pub min_mapping_quality: u8,
+    pub do_pileup: bool,
 }
 
 impl VarDictPipeline {
-    /// Create a new VarDict pipeline
+    /// Create a new pipeline with default settings
     pub fn new(sample_name: &str) -> Self {
-        VarDictPipeline {
+        Self {
             sample_name: sample_name.to_string(),
             min_frequency: 0.01,
-            min_base_quality: 22.5,
+            min_base_quality: 0.0,
             min_mapping_quality: 0,
             do_pileup: false,
         }
     }
 
-    /// Set minimum allele frequency threshold
-    pub fn with_min_frequency(mut self, freq: f64) -> Self {
-        self.min_frequency = freq;
+    /// Set minimum variant frequency
+    pub fn with_min_frequency(mut self, min_frequency: f64) -> Self {
+        self.min_frequency = min_frequency;
         self
     }
 
-    /// Set minimum base quality threshold
-    pub fn with_min_base_quality(mut self, qual: f64) -> Self {
-        self.min_base_quality = qual;
+    /// Set minimum base quality
+    pub fn with_min_base_quality(mut self, min_base_quality: f64) -> Self {
+        self.min_base_quality = min_base_quality;
         self
     }
 
-    /// Set minimum mapping quality threshold
-    pub fn with_min_mapping_quality(mut self, mapq: u8) -> Self {
-        self.min_mapping_quality = mapq;
+    /// Set minimum mapping quality
+    pub fn with_min_mapping_quality(mut self, min_mapping_quality: u8) -> Self {
+        self.min_mapping_quality = min_mapping_quality;
         self
     }
 
@@ -135,8 +128,6 @@ impl VarDictPipeline {
         bam_reader: &mut BamReader,
         instance: Arc<GlobalReadOnlyScope>,
     ) -> Result<Vec<String>> {
-        // Extend reference loading to include flanking sequence for leftseq/rightseq
-        // VarDict Java loads extra sequence around the region for flanking context
         let flank_size = 20usize; // 20bp flanking for leftseq/rightseq
         let extended_start = if region.start() > flank_size { 
             region.start() - flank_size 
@@ -157,52 +148,81 @@ impl VarDictPipeline {
         };
         let reference = Reference::new_with_start(ref_seq, extended_start as i64);
 
-        // Fetch reads for this region
-        bam_reader.fetch(region.chr(), region.start(), region.end())?;
-
         // Get SAM filter from instance configuration
         let sam_filter = instance.conf.sam_filter;
 
-        // Collect all records into a vector (needed for mutable iteration)
-        // Apply all preprocessing filters from Java's RecordPreprocessor.preprocessRecord()
+        let records = self.collect_filtered_records(region, bam_reader, sam_filter)?.0;
+
+        // Process through the pipeline
+        self.process_region(records.into_iter(), region, &reference, instance)
+    }
+
+    pub(crate) fn collect_filtered_records(
+        &self,
+        region: &Region,
+        bam_reader: &mut BamReader,
+        sam_filter: u32,
+    ) -> Result<(Vec<Record>, Vec<String>)> {
         let mut records = Vec::new();
+        let mut lines = Vec::new();
         let mut record = Record::new();
+
+        bam_reader.fetch(region.chr(), region.start(), region.end())?;
+
         while bam_reader.read(&mut record).unwrap_or(false) {
             // 1. Java SamView.read(): Skip records that match the filter flags
-            // if (filter != 0 && (record.getFlags() & filter) != 0)
-            if sam_filter != 0 && (record.flags() & sam_filter as u16) != 0 {
-                continue;
+            if sam_filter != 0 {
+                if (record.flags() & (sam_filter as u16)) != 0 {
+                    continue;
+                }
             }
-            
+
             // 2. Java preprocessRecord line 117: Ignore low mapping quality reads
-            // if (instance().conf.hasMappingQuality() && mappingQuality < instance().conf.mappingQuality)
-            // In Rust: min_mapping_quality defaults to 0, so this only filters when set > 0
             if self.min_mapping_quality > 0 && record.mapq() < self.min_mapping_quality {
                 continue;
             }
-            
+
             // 3. Java preprocessRecord line 122: Skip not primary alignment reads
-            // if (record.isSecondaryAlignment() && !instance().conf.samfilter.equals("0"))
-            // This ensures secondary alignments are always filtered when samfilter != 0,
-            // even if 0x100 is not set in the samfilter bitmask.
             const SECONDARY_ALIGNMENT: u16 = 0x100;
             if (record.flags() & SECONDARY_ALIGNMENT) != 0 && sam_filter != 0 {
                 continue;
             }
-            
+
             // 4. Java preprocessRecord line 124: Skip reads where sequence is not stored in read
-            // if (querySequence.length() == 1 && querySequence.charAt(0) == '*')
-            // In BAM format, missing sequences are represented as empty or single '*'
             let seq = record.seq();
             if seq.len() == 0 || (seq.len() == 1 && seq.as_bytes()[0] == b'*') {
                 continue;
             }
-            
+
+            let qname = std::str::from_utf8(record.qname()).unwrap_or("");
+            let alignment_start = record.pos() + 1;
+            let mate_start = if record.mpos() >= 0 { record.mpos() + 1 } else { 0 };
+            let cigar = record.cigar().to_string();
+            let seq_bytes = record.seq().as_bytes();
+            let seq_str = String::from_utf8_lossy(&seq_bytes).to_string();
+            let qual_str: String = record
+                .qual()
+                .iter()
+                .map(|q| (*q as u8 + 33) as char)
+                .collect();
+            let mapq = record.mapq();
+
+            lines.push(format!(
+                "FILTERED_READ\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                qname,
+                record.flags(),
+                alignment_start,
+                mate_start,
+                cigar,
+                seq_str,
+                qual_str,
+                mapq
+            ));
+
             records.push(record.clone());
         }
 
-        // Process through the pipeline
-        self.process_region(records.into_iter(), region, &reference, instance)
+        Ok((records, lines))
     }
 
     /// Process a batch of records for a region
@@ -372,6 +392,7 @@ impl VarDictPipeline {
         // First, collect reference forward/reverse counts from all non-insertion positions
         // This allows us to look up reference counts from adjacent positions when needed
         let mut ref_counts_by_pos: HashMap<i64, (usize, usize)> = HashMap::new();
+        let mut hicov_by_pos: HashMap<i64, usize> = HashMap::new();
         
         for (pos, var_map) in &input.non_insertion_vars {
             let actual_ref_base = reference.get(*pos).unwrap_or(b'N');
@@ -383,11 +404,21 @@ impl VarDictPipeline {
                     }
                 }
             }
+
+            let hicov: usize = var_map.values().map(|raw_var| raw_var.high_qual_read_cnt).sum();
+            hicov_by_pos.insert(*pos, hicov);
         }
 
         // Process non-insertion variants
         for (pos, var_map) in input.non_insertion_vars {
-            let vars = self.build_vars_at_position(pos, var_map, &input.ref_coverage, reference, &ref_counts_by_pos);
+            let vars = self.build_vars_at_position(
+                pos,
+                var_map,
+                &input.ref_coverage,
+                reference,
+                &ref_counts_by_pos,
+                &hicov_by_pos,
+            );
             if !vars.variants.is_empty() {
                 aligned_variants.insert(pos, vars);
             }
@@ -395,7 +426,14 @@ impl VarDictPipeline {
 
         // Process insertion variants
         for (pos, var_map) in input.insertion_vars {
-            let vars = self.build_vars_at_position(pos, var_map, &input.ref_coverage, reference, &ref_counts_by_pos);
+            let vars = self.build_vars_at_position(
+                pos,
+                var_map,
+                &input.ref_coverage,
+                reference,
+                &ref_counts_by_pos,
+                &hicov_by_pos,
+            );
             if !vars.variants.is_empty() {
                 aligned_variants.entry(pos)
                     .or_insert_with(Vars::default)
@@ -418,11 +456,13 @@ impl VarDictPipeline {
         ref_coverage: &HashMap<i64, usize>,
         reference: &Reference,
         ref_counts_by_pos: &HashMap<i64, (usize, usize)>,
+        hicov_by_pos: &HashMap<i64, usize>,
     ) -> Vars {
         use crate::mods::to_vars_builder::{check_strand_bias, StrandBiasFlag, StrandBiasValue};
         
         let total_coverage = ref_coverage.get(&position).copied().unwrap_or(0);
         let actual_ref_base = reference.get(position).unwrap_or(b'N');
+        let position_hicov = hicov_by_pos.get(&position).copied().unwrap_or(0);
         
         // First, identify the reference variant and get its forward/reverse counts
         // Reference variant is an SNV where read_base == actual_ref_base
@@ -468,7 +508,14 @@ impl VarDictPipeline {
         let mut reference_variant_opt = None;
 
         for (desc, raw_var) in var_map {
-            let mut variant = self.convert_raw_variant(&desc, &raw_var, position, total_coverage, reference);
+            let mut variant = self.convert_raw_variant(
+                &desc,
+                &raw_var,
+                position,
+                total_coverage,
+                reference,
+                position_hicov,
+            );
             
             // For non-reference variants, set the reference forward/reverse counts
             // and update strand bias to include ref bias
@@ -505,6 +552,7 @@ impl VarDictPipeline {
         position: i64,
         total_coverage: usize,
         reference: &Reference,
+        position_hicov: usize,
     ) -> Variant {
         let mut position = position;
         let total_count = raw.alt_depth_fwd + raw.alt_depth_rev;
@@ -513,6 +561,11 @@ impl VarDictPipeline {
         } else {
             0.0
         };
+
+        let mut hicov = position_hicov;
+        if hicov < raw.high_qual_read_cnt {
+            hicov = raw.high_qual_read_cnt;
+        }
 
         // Look up reference base for this position
         let actual_ref_base = reference.get(position).unwrap_or(b'N');
@@ -668,8 +721,8 @@ impl VarDictPipeline {
         // Don't compute for insertions (alt longer than ref) or ref calls
         // Extract deletion length from description like Java does
         let is_insertion = varallele.len() > refallele.len();
-        let (msi, msint) = if is_ref_call || is_insertion {
-            (0.0, 0.0)
+        let (msi, msint, shift3) = if is_ref_call || is_insertion {
+            (0.0, 0.0, 0)
         } else {
             // Get deletion length from VarDesc, similar to how Java extracts from description string
             match desc {
@@ -679,7 +732,7 @@ impl VarDictPipeline {
                     if del_len > 0 {
                         self.detect_microsatellite(reference, position, del_len)
                     } else {
-                        (0.0, 0.0)
+                        (0.0, 0.0, 0)
                     }
                 }
                 VarDesc::Complex { ref_seq, alt_seq } => {
@@ -699,7 +752,7 @@ impl VarDictPipeline {
                     // SNV: use SNP/MNP MSI calculation
                     self.detect_microsatellite_snp(reference, position)
                 }
-                _ => (0.0, 0.0),
+                _ => (0.0, 0.0, 0),
             }
         };
 
@@ -715,7 +768,11 @@ impl VarDictPipeline {
             position_coverage: total_coverage,
             frequency,
             high_quality_reads_frequency: if total_coverage > 0 {
-                raw.high_qual_read_cnt as f64 / total_coverage as f64
+                if hicov > 0 {
+                    raw.high_qual_read_cnt as f64 / hicov as f64
+                } else {
+                    0.0
+                }
             } else {
                 0.0
             },
@@ -735,10 +792,11 @@ impl VarDictPipeline {
             rightseq,
             msi,
             msint,
-            shift3: 0,
+            shift3,
             nm: nm_mean,
             high_qual_read_cnt: raw.high_qual_read_cnt,
             low_qual_read_cnt: raw.low_qual_read_cnt,
+            hicov,
             ref_forward_count: 0,  // Will be set by build_vars_at_position for non-ref variants
             ref_reverse_count: 0,
             genotype,
@@ -775,10 +833,10 @@ impl VarDictPipeline {
     /// Detect microsatellite instability for a variant
     /// Java-compatible implementation matching findMSI algorithm
     /// For deletions: tseq1 = deleted bases, tseq2 = sequence after
-    /// Returns (msi, msint) where:
+    /// Returns (msi, msint, shift3) where:
     /// - msi: number of repeats (instability score)
     /// - msint: unit length (1 for homopolymer, 2 for dinucleotide, etc.)
-    fn detect_microsatellite(&self, reference: &Reference, position: i64, del_len: usize) -> (f64, f64) {
+    fn detect_microsatellite(&self, reference: &Reference, position: i64, del_len: usize) -> (f64, f64, i32) {
         // Get left sequence (70 bases before position)
         let leftseq = self.get_reference_range(reference, position - 70, position - 1);
         
@@ -787,7 +845,7 @@ impl VarDictPipeline {
         let tseq = self.get_reference_range(reference, position, position + (del_len as i64) - 1 + 70);
         
         if tseq.len() < del_len {
-            return (0.0, 0.0);
+            return (0.0, 0.0, 0);
         }
         
         let tseq1 = &tseq[..del_len.min(tseq.len())];
@@ -812,14 +870,14 @@ impl VarDictPipeline {
             msi = (shift3 as f64) / (del_len as f64);
         }
         
-        (msi, msint)
+        (msi, msint, shift3 as i32)
     }
     
     /// Detect microsatellite instability for SNP/MNP variants
     /// Java-compatible implementation for variants that don't start with + or -
     /// Java: tseq1 = joinRef(ref, position - 30, position + 1)
     ///       tseq2 = joinRef(ref, position + 2, position + 70)
-    fn detect_microsatellite_snp(&self, reference: &Reference, position: i64) -> (f64, f64) {
+    fn detect_microsatellite_snp(&self, reference: &Reference, position: i64) -> (f64, f64, i32) {
         // tseq1 = reference from (position - 30) to (position + 1)
         let tseq1 = self.get_reference_range(reference, (position - 30).max(1), position + 1);
         
@@ -827,9 +885,9 @@ impl VarDictPipeline {
         let tseq2 = self.get_reference_range(reference, position + 2, position + 70);
         
         // Call findMSI with no left sequence
-        let (msi, msint, _) = self.find_msi(&tseq1, &tseq2, None);
+        let (msi, msint, shift3) = self.find_msi(&tseq1, &tseq2, None);
         
-        (msi, msint)
+        (msi, msint, shift3 as i32)
     }
     
     /// Get a range of bases from reference as a string
@@ -949,10 +1007,10 @@ impl VarDictPipeline {
         let mut positions: Vec<i64> = data.aligned_variants.keys().copied().collect();
         positions.sort();
 
-        // Convert to 1-based coordinates for output (BED is 0-based, VarDict output is 1-based)
+        // Output uses the same coordinate base as the parsed regions
         let output_region = OutputRegion {
             chr: region.chr().to_string(),
-            start: region.start() as i64 + 1,  // +1 for 1-based output
+            start: region.start() as i64,
             end: region.end() as i64,
             gene: region.gene().to_string(),
         };
@@ -1167,10 +1225,10 @@ mod tests {
 
     #[test]
     fn test_genotype_determination() {
-        // SNV: single base substitution uses "varallele/varallele" format (matching Java)
-        assert_eq!(determine_genotype("C", "T", 0.9, None), "T/T");
-        assert_eq!(determine_genotype("C", "T", 0.5, None), "T/T");
-        assert_eq!(determine_genotype("C", "T", 0.3, None), "T/T");  // Frequency is not used for SNVs
+        // SNV: single base substitution uses "ref/alt" format (matching Java)
+        assert_eq!(determine_genotype("C", "T", 0.9, None), "C/T");
+        assert_eq!(determine_genotype("C", "T", 0.5, None), "C/T");
+        assert_eq!(determine_genotype("C", "T", 0.3, None), "C/T");  // Frequency is not used for SNVs
         assert_eq!(determine_genotype("G", "G", 1.0, None), "G/G");  // Ref call
     }
 
@@ -1214,5 +1272,138 @@ mod tests {
         high_freq_bias.mean_position = 10.0;
         high_freq_bias.mean_quality = 30.0;
         assert!(pipeline.is_good_var(&high_freq_bias, None));
+    }
+
+    #[test]
+    fn test_record_preprocessor_unmapped_with_alignment_passes() {
+        use crate::data::bam_reader::BamReader;
+
+        let bam_path = "/home/eck/workspace/vardict_rs/test_data/test_168714.bam";
+        let mut bam_reader = BamReader::open(bam_path).expect("Failed to open test BAM");
+
+        bam_reader
+            .fetch("20", 168600, 168800)
+            .expect("Failed to fetch test region");
+
+        let sam_filter = 0x504u32;
+        let min_mapq = 0u8;
+
+        let mut record = rust_htslib::bam::Record::new();
+        let mut unmapped_with_alignment = 0usize;
+        let mut mapped = 0usize;
+        let mut filtered = 0usize;
+
+        while bam_reader.read(&mut record).unwrap_or(false) {
+            let qname = std::str::from_utf8(record.qname()).unwrap_or("");
+            if !qname.contains("SRR098401.7003120") {
+                continue;
+            }
+
+            if sam_filter != 0 {
+                if (record.flags() & (sam_filter as u16)) != 0 {
+                    filtered += 1;
+                    continue;
+                }
+            }
+
+            if min_mapq > 0 && record.mapq() < min_mapq {
+                filtered += 1;
+                continue;
+            }
+
+            const SECONDARY_ALIGNMENT: u16 = 0x100;
+            if (record.flags() & SECONDARY_ALIGNMENT) != 0 && sam_filter != 0 {
+                filtered += 1;
+                continue;
+            }
+
+            let seq = record.seq();
+            if seq.len() == 0 || (seq.len() == 1 && seq.as_bytes()[0] == b'*') {
+                filtered += 1;
+                continue;
+            }
+
+            if record.is_unmapped() && !record.cigar().is_empty() && record.pos() >= 0 {
+                unmapped_with_alignment += 1;
+            } else if !record.is_unmapped() {
+                mapped += 1;
+            }
+        }
+
+        assert_eq!(filtered, 1, "Unmapped read should be filtered by samfilter");
+        assert_eq!(unmapped_with_alignment, 0, "Unmapped read should not be counted");
+        assert_eq!(mapped, 1, "Expected 1 properly mapped read");
+    }
+
+    #[test]
+    fn test_record_preprocessor_dump_all_bed_regions() {
+        use std::fs;
+        use std::io::{BufRead, BufReader, Write};
+        use crate::data::bam_reader::BamReader;
+
+        let bam_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/input/NA12878.chrom20.ILLUMINA.bwa.CEU.exome.20121211.bam";
+        let bed_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/input/20120518.consensus.annotation.bed.chr20";
+
+        let file = fs::File::open(bed_path).expect("Failed to open BED file");
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+
+        let mut bam_reader = BamReader::open(bam_path).expect("Failed to open BAM");
+        let pipeline = VarDictPipeline::new("test");
+        let sam_filter = 0x504u32;
+
+        let out_dir = "/home/eck/workspace/vardict_rs/tmp_compare";
+        let out_path = "/home/eck/workspace/vardict_rs/tmp_compare/rust.preproc.all.txt";
+        fs::create_dir_all(out_dir).expect("Failed to create tmp_compare");
+        let out_file = fs::File::create(out_path).expect("Failed to create rust preproc dump");
+        let mut writer = std::io::BufWriter::new(out_file);
+        let mut total_lines = 0usize;
+
+        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+            let trimmed = line.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with('#')
+                || trimmed.starts_with("track")
+                || trimmed.starts_with("browser")
+            {
+                line.clear();
+                continue;
+            }
+
+            let fields: Vec<&str> = trimmed.split('\t').collect();
+            let mut chr = fields.get(0).unwrap().to_string();
+            if chr.starts_with("chr") {
+                chr = chr.trim_start_matches("chr").to_string();
+            }
+            let mut start: usize = fields.get(1).unwrap().parse().unwrap();
+            let mut end: usize = fields.get(2).unwrap().parse().unwrap();
+            if start < end {
+                start += 1;
+            }
+            if start == 0 {
+                start = 1;
+            }
+            if end < start {
+                std::mem::swap(&mut start, &mut end);
+            }
+            let gene = fields.get(3).unwrap_or(&"").to_string();
+
+            let region = Region::new(chr.clone(), start, end, gene.clone());
+            writeln!(writer, "REGION\t{}\t{}\t{}\t{}", chr, start, end, gene)
+                .expect("Failed to write region line");
+            total_lines += 1;
+
+            let (_records, lines) = pipeline
+                .collect_filtered_records(&region, &mut bam_reader, sam_filter)
+                .expect("Failed to collect filtered reads");
+            for line in lines {
+                writeln!(writer, "{}", line).expect("Failed to write read line");
+                total_lines += 1;
+            }
+
+            line.clear();
+        }
+
+        assert!(total_lines > 0, "Expected at least one kept read across all bed regions");
     }
 }

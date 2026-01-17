@@ -1466,7 +1466,10 @@ fn find_i_i(cigar: &VecDeque<Cigar>) -> Option<(usize, [Cigar; 2])> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{mods::cigar_parser::CigarParser, scopedata::global_read_only_scope::GlobalReadOnlyScope};
+    use crate::{
+        mods::cigar_parser::CigarParser,
+        scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE},
+    };
     use rust_htslib::bam::record::{Cigar, CigarString, CigarStringView};
 
     use super::*;
@@ -1561,5 +1564,67 @@ mod tests {
         // To implement: need to refactor find_offset to accept reference directly
         // or create a proper CigarParser with initialized reference state.
         todo!("Requires architecture changes to test find_offset in isolation")
+    }
+
+    #[test]
+    fn test_cigar_modifier_mapped_read_no_change() {
+        use crate::data::reference::Reference;
+        use crate::data::region::Region;
+        use crackle_kit::data::bases::rev_comp::RevComplementor;
+        use rust_htslib::bam::{Read, Record, Reader};
+
+        let conf = Configuration {
+            chimeric_filter: true,
+            ..Default::default()
+        };
+
+        let _ = INSTANCE.set(GlobalReadOnlyScope {
+            conf,
+            ..Default::default()
+        });
+
+        let bam_path = "/home/eck/workspace/vardict_rs/test_data/test_168714.bam";
+        let mut reader = Reader::from_path(bam_path).expect("Failed to open test BAM");
+
+        let mut target: Option<Record> = None;
+        for result in reader.records() {
+            let record = result.expect("Failed to read BAM record");
+            let qname = std::str::from_utf8(record.qname()).unwrap_or("");
+            if qname == "SRR098401.7003120" && !record.is_unmapped() {
+                target = Some(record);
+                break;
+            }
+        }
+
+        let record = target.expect("Mapped SRR098401.7003120 read not found");
+
+        let ref_seq = vec![b'N'; 500];
+        let reference = Reference::new_with_start(ref_seq, 1);
+        let region = Region::new("20".to_string(), 168600, 168800, "test_region".to_string());
+
+        let mut rev_complementor = RevComplementor::new();
+        let query_seq_owned: Vec<u8> = record.seq().into_decoded_base_iter().collect();
+        let query_qual_owned: Vec<u8> = record.qual().to_vec();
+
+        let cigar_view = record.cigar();
+        let mut modifier = CigarModifier::new(
+            record.pos(),
+            &cigar_view,
+            query_seq_owned.as_slice(),
+            query_qual_owned.as_slice(),
+            &reference,
+            0,
+            query_seq_owned.len(),
+            &region,
+            &mut rev_complementor,
+        );
+
+        let modified = modifier.modify_cigar().expect("modify_cigar failed");
+        let modified_cigar = CigarString(modified.cigar.into_iter().collect()).into_view(0);
+
+        assert_eq!(modified.align_start_pos, record.pos());
+        assert_eq!(cigar_to_string(&modified_cigar), cigar_to_string(&cigar_view));
+        assert_eq!(modified.query_seq, query_seq_owned.as_slice());
+        assert_eq!(modified.query_qual, query_qual_owned.as_slice());
     }
 }

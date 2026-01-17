@@ -61,6 +61,8 @@ fn test_cigar_parser_position_168714() {
     let mut t_reads_rev = 0;
     let mut t_reads_fwd_oriented = 0;
     let mut t_reads_rev_oriented = 0;
+    let mut t_reads_aligned: Vec<(String, u16, u8, String, char, u8, bool)> = Vec::new();
+    let mut t_reads_oriented: Vec<(String, u16, u8, String, char, char, u8, bool)> = Vec::new();
 
     let complement = |base: char| -> char {
         match base {
@@ -159,6 +161,15 @@ fn test_cigar_parser_position_168714() {
                     } else {
                         t_reads_fwd += 1;
                     }
+                    t_reads_aligned.push((
+                        String::from_utf8_lossy(record.qname()).to_string(),
+                        record.flags(),
+                        record.mapq(),
+                        cigar.to_string(),
+                        base,
+                        qual,
+                        record.is_reverse(),
+                    ));
                 }
 
                 let oriented_base = if record.is_reverse() {
@@ -172,6 +183,16 @@ fn test_cigar_parser_position_168714() {
                     } else {
                         t_reads_fwd_oriented += 1;
                     }
+                    t_reads_oriented.push((
+                        String::from_utf8_lossy(record.qname()).to_string(),
+                        record.flags(),
+                        record.mapq(),
+                        cigar.to_string(),
+                        base,
+                        oriented_base,
+                        qual,
+                        record.is_reverse(),
+                    ));
                 }
             } else {
                 println!("Base at 168714: N/A (not in aligned region)");
@@ -191,6 +212,22 @@ fn test_cigar_parser_position_168714() {
     println!("Reads covering position 168714: {}", reads_covering_168714.len());
     println!("Reads with T at 168714 (CIGAR-aligned): fwd={}, rev={}", t_reads_fwd, t_reads_rev);
     println!("Reads with T at 168714 (oriented to reference): fwd={}, rev={}", t_reads_fwd_oriented, t_reads_rev_oriented);
+
+    println!("\n=== Reads with T at 168714 (CIGAR-aligned) ===");
+    for (qname, flags, mapq, cigar, base, qual, is_reverse) in &t_reads_aligned {
+        println!(
+            "{}\tflags=0x{:x}\tmapq={}\tcigar={}\tbase={}\tqual={}\trev={}",
+            qname, flags, mapq, cigar, base, qual, is_reverse
+        );
+    }
+
+    println!("\n=== Reads with T at 168714 (oriented to reference) ===");
+    for (qname, flags, mapq, cigar, base, oriented_base, qual, is_reverse) in &t_reads_oriented {
+        println!(
+            "{}\tflags=0x{:x}\tmapq={}\tcigar={}\tbase={}\toriented={}\tqual={}\trev={}",
+            qname, flags, mapq, cigar, base, oriented_base, qual, is_reverse
+        );
+    }
     
     // Now parse these reads with CigarParser
     println!("\n=== Parsing reads with CigarParser ===");

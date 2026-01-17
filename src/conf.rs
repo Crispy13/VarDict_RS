@@ -25,6 +25,9 @@ pub struct Configuration {
 
     /// Extension of bp to look for mismatches after insertion or deletion
     pub vext: i32,
+
+    /// If set, reads with mismatches more than INT will be filtered and ignored
+    pub mismatch: i32,
 }
 
 impl Default for Configuration {
@@ -41,6 +44,7 @@ impl Default for Configuration {
             unique_mode_second_in_pair_enabled: false,
             goodq: 22.5,
             vext: 2,
+            mismatch: 8,
         }
     }
 }

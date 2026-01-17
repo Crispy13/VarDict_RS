@@ -128,6 +128,7 @@ pub struct Variant {
     // === Quality counts ===
     pub high_qual_read_cnt: usize,  // Number of high-quality reads
     pub low_qual_read_cnt: usize,   // Number of low-quality reads
+    pub hicov: usize,               // Position coverage by high-quality reads
     
     // === Reference counts (for non-reference variants at same position) ===
     pub ref_forward_count: usize,   // Forward reference reads at this position
@@ -166,6 +167,7 @@ impl Variant {
             nm: 0.0,
             high_qual_read_cnt: 0,
             low_qual_read_cnt: 0,
+            hicov: 0,
             ref_forward_count: 0,
             ref_reverse_count: 0,
             genotype: "0/0".to_string(),
@@ -583,7 +585,7 @@ pub fn determine_genotype(refallele: &str, varallele: &str, frequency: f64, anch
             format!("{}/{}", genotype1, genotype2)
         } else {
             // Single base substitution  
-            format!("{}/{}", varallele, varallele)
+            format!("{}/{}", refallele, varallele)
         }
     }
 }
@@ -821,15 +823,15 @@ mod tests {
 
     #[test]
     fn test_determine_genotype_het() {
-        // SNV: single base substitution uses "varallele/varallele" format (matching Java)
-        // Frequency is not used for SNVs - they always use the alt allele format
-        assert_eq!(determine_genotype("C", "T", 0.3, None), "T/T");
+        // SNV: single base substitution uses "ref/alt" format (matching Java)
+        // Frequency is not used for SNVs
+        assert_eq!(determine_genotype("C", "T", 0.3, None), "C/T");
     }
 
     #[test]
     fn test_determine_genotype_hom_alt() {
-        // Homozygous alternate: C→T with high frequency should be "T/T"
-        assert_eq!(determine_genotype("C", "T", 0.8, None), "T/T");
+        // SNV: still uses "ref/alt" format
+        assert_eq!(determine_genotype("C", "T", 0.8, None), "C/T");
     }
 
     #[test]

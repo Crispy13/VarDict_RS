@@ -64,8 +64,12 @@ struct Args {
     print_header: bool,
 
     /// Extension of bp to look for mismatches after indel (default: 2)
-    #[arg(short = 'e', long = "vext", default_value = "2")]
+    #[arg(short = 'X', long = "vext", default_value = "2")]
     vext: i32,
+
+    /// If set, reads with mismatches more than INT will be filtered and ignored (default: 8)
+    #[arg(short = 'm', long = "mismatch", default_value = "8")]
+    mismatch: i32,
 
     /// The hexical to filter reads (samtools style). Default: 0x504
     /// Filters: 2nd alignments, unmapped, duplicates. Use 0 to disable.
@@ -88,9 +92,9 @@ struct Args {
     #[arg(short = 'z', long = "zero")]
     zero_based: bool,
 
-    /// Perform local realignment (default: true, set to false for Ion/PacBio)
-    #[arg(short = 'k', long = "realign", default_value = "true")]
-    local_realignment: bool,
+    /// Perform local realignment (default: 1). Use 0 to disable.
+    #[arg(short = 'k', long = "realign", default_value = "1")]
+    local_realignment: u8,
 
     /// The column for chromosome in BED file (default: 1)
     #[arg(short = 'c', long = "col-chr", default_value = "1")]
@@ -235,10 +239,22 @@ fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>
     // Initialize GlobalReadOnlyScope (required by VarDictPipeline)
     // Must be done AFTER loading reference to populate chr_lens
     let mut conf = Configuration::default();
-    conf.goodq = 22.5;
-    conf.vext = 2;
-    conf.disable_sv = true;
-    conf.perform_local_realignment = true;
+    let sam_filter = if let Some(hex) = args.sam_filter.strip_prefix("0x")
+        .or_else(|| args.sam_filter.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16)
+            .context("Failed to parse sam_filter as hex")?
+    } else {
+        args.sam_filter
+            .parse::<u32>()
+            .context("Failed to parse sam_filter as decimal")?
+    };
+    conf.goodq = args.min_base_quality;
+    conf.vext = args.vext;
+    conf.mismatch = args.mismatch;
+    conf.sam_filter = sam_filter;
+    conf.disable_sv = args.no_sv;
+    conf.perform_local_realignment = args.local_realignment == 1;
     let mut scope = GlobalReadOnlyScope::default();
     scope.conf = conf;
     scope.chr_lens = reference.get_chromosome_lengths();
@@ -262,7 +278,12 @@ fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>
     // Process regions
     let start_processing = Instant::now();
     let bam_path = args.bam.to_str().unwrap().to_string();
-    let results = pipeline.process_regions(bam_path, regions);
+    let use_vardict_pipeline = std::env::var("VARDICT_USE_REAL_PIPELINE").is_ok();
+    let results = if use_vardict_pipeline {
+        pipeline.process_regions_vardict(bam_path, regions)
+    } else {
+        pipeline.process_regions(bam_path, regions)
+    };
     let elapsed_processing = start_processing.elapsed();
 
     // Output results
@@ -299,6 +320,11 @@ fn get_regions(args: &Args) -> Result<Vec<Region>> {
 
     // Check for -R option first
     if let Some(ref region_str) = args.region {
+        let region_path = PathBuf::from(region_str);
+        if region_path.exists() {
+            regions = parse_bed_file(&region_path, args)?;
+            return Ok(regions);
+        }
         let region = parse_region_string(region_str, args.zero_based)?;
         regions.push(region);
         return Ok(regions);
