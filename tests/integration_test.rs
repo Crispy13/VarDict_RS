@@ -767,6 +767,7 @@ fn test_vardict_pipeline_hard_clip() {
     let mut conf = Configuration::default();
     conf.goodq = 22.5;
     conf.vext = 2;
+    conf.mismatch = 8;
     conf.disable_sv = true;
     conf.perform_local_realignment = true;  // Enable local realignment for Del+Match combining
     let mut scope = GlobalReadOnlyScope::default();
@@ -859,6 +860,9 @@ fn test_rust_vs_java_output_comparison() {
     use vardict_rs::conf::Configuration;
     use std::sync::Arc;
     use std::fs;
+    use crackle_kit::tracing::level_filters::LevelFilter;
+
+    let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(LevelFilter::DEBUG);
     
     let testdata_dir = get_testdata_dir();
     
@@ -932,6 +936,7 @@ fn test_rust_vs_java_output_comparison() {
     let mut conf = Configuration::default();
     conf.goodq = 22.5;
     conf.vext = 2;
+    conf.mismatch = 8;
     conf.disable_sv = true;
     conf.perform_local_realignment = true;
     let mut scope = GlobalReadOnlyScope::default();

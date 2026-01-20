@@ -44,7 +44,7 @@ impl Default for Configuration {
             unique_mode_second_in_pair_enabled: false,
             goodq: 22.5,
             vext: 2,
-            mismatch: 8,
+            mismatch: 0,
         }
     }
 }

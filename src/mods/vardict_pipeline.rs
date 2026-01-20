@@ -1010,7 +1010,7 @@ impl VarDictPipeline {
         // Output uses the same coordinate base as the parsed regions
         let output_region = OutputRegion {
             chr: region.chr().to_string(),
-            start: region.start() as i64,
+            start: region.start() as i64 + 1,
             end: region.end() as i64,
             gene: region.gene().to_string(),
         };

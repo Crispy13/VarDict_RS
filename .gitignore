@@ -4,3 +4,5 @@
 VarDictJava
 .github/instructions/instruction.instructions.md
 rust_chr20.var
+test_data/
+tmp_compare/

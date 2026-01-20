@@ -839,6 +839,7 @@ mod tests {
         let conf = crate::conf::Configuration {
             perform_local_realignment: false,
             disable_sv: true,
+            mismatch: 0,
             ..Default::default()
         };
 
