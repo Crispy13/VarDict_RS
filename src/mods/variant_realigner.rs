@@ -80,6 +80,158 @@ impl VariantRealigner {
         }
     }
 
+    /// Adjust MNPs (multi-nucleotide polymorphisms) when there are breakpoints within MNP
+    pub fn adjust_mnp(
+        &self,
+        data: &mut RealignedVariationData,
+        mnp: &std::collections::HashMap<i64, std::collections::HashMap<String, usize>>,
+    ) {
+        let mut tmp: Vec<(i64, String)> = Vec::new();
+        for (pos, desc_map) in mnp {
+            for desc in desc_map.keys() {
+                tmp.push((*pos, desc.clone()));
+            }
+        }
+        tmp.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        for (position, vn) in tmp {
+            let vref_key = VarDesc::Raw { desc: vn.as_bytes().to_vec().into() };
+            let vref_cnt = match data
+                .non_insertion_variants
+                .get(&position)
+                .and_then(|m| m.get(&vref_key))
+            {
+                Some(v) => v.alt_depth,
+                None => continue,
+            };
+
+            let mnt = vn.replacen('&', "", 1);
+            if mnt.len() < 2 {
+                continue;
+            }
+
+            for i in 0..(mnt.len() - 1) {
+                let left = &mnt[..i + 1];
+                let left_desc = if left.len() > 1 {
+                    format!("{}&{}", &left[..1], &left[1..])
+                } else {
+                    left.to_string()
+                };
+                let right = &mnt[i + 1..];
+                let right_desc = if right.len() > 1 {
+                    format!("{}&{}", &right[..1], &right[1..])
+                } else {
+                    right.to_string()
+                };
+
+                let left_key = if left_desc.len() == 1 {
+                    VarDesc::SNV {
+                        ref_base: left_desc.as_bytes()[0],
+                    }
+                } else {
+                    VarDesc::Raw {
+                        desc: left_desc.as_bytes().to_vec().into(),
+                    }
+                };
+
+                if let Some(tref) = data
+                    .non_insertion_variants
+                    .get(&position)
+                    .and_then(|m| m.get(&left_key))
+                    .cloned()
+                {
+                    if tref.alt_depth > 0
+                        && tref.alt_depth < vref_cnt
+                        && tref.mean_pos / tref.alt_depth as f64 <= (i + 1) as f64
+                    {
+                        if let Some(vars_on_pos) = data.non_insertion_variants.get_mut(&position) {
+                            if let Some(vref) = vars_on_pos.get_mut(&vref_key) {
+                                adj_cnt(vref, &tref);
+                            }
+                            vars_on_pos.remove(&left_key);
+                        }
+                    }
+                }
+
+                let right_pos = position + i as i64 + 1;
+                let right_key = if right_desc.len() == 1 {
+                    VarDesc::SNV {
+                        ref_base: right_desc.as_bytes()[0],
+                    }
+                } else {
+                    VarDesc::Raw {
+                        desc: right_desc.as_bytes().to_vec().into(),
+                    }
+                };
+
+                if let Some(tref) = data
+                    .non_insertion_variants
+                    .get(&right_pos)
+                    .and_then(|m| m.get(&right_key))
+                    .cloned()
+                {
+                    if tref.alt_depth < vref_cnt {
+                        if let Some(vars_on_pos) = data.non_insertion_variants.get_mut(&position) {
+                            if let Some(vref) = vars_on_pos.get_mut(&vref_key) {
+                                adj_cnt(vref, &tref);
+                            }
+                        }
+                        *data.ref_coverage.entry(position).or_insert(0) += tref.alt_depth;
+
+                        if let Some(vars_right) = data.non_insertion_variants.get_mut(&right_pos) {
+                            vars_right.remove(&right_key);
+                            if vars_right.is_empty() {
+                                data.non_insertion_variants.remove(&right_pos);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(sc3v) = data.soft_clips_3end.get_mut(&position) {
+                if !sc3v.used() {
+                    let seq = find_conseq(sc3v, 0);
+                    if seq.starts_with(mnt.as_bytes()) {
+                        let tail = &seq[mnt.len()..];
+                        if tail.is_empty()
+                            || self.is_match_ref(tail, position + mnt.len() as i64, 1, 3)
+                        {
+                            if let Some(vars_on_pos) = data.non_insertion_variants.get_mut(&position) {
+                                if let Some(vref) = vars_on_pos.get_mut(&vref_key) {
+                                    adj_cnt(vref, &sc3v.var);
+                                }
+                            }
+                            *data.ref_coverage.entry(position).or_insert(0) += sc3v.var.alt_depth;
+                            sc3v.mark_used();
+                        }
+                    }
+                }
+            }
+
+            let pos_5end = position + mnt.len() as i64;
+            if let Some(sc5v) = data.soft_clips_5end.get_mut(&pos_5end) {
+                if !sc5v.used() {
+                    let mut seq = find_conseq(sc5v, 0);
+                    if !seq.is_empty() && seq.len() >= mnt.len() {
+                        seq.reverse();
+                        if seq.ends_with(mnt.as_bytes()) {
+                            let prefix = &seq[..seq.len() - mnt.len()];
+                            if prefix.is_empty() || self.is_match_ref(prefix, position - 1, -1, 3) {
+                                if let Some(vars_on_pos) = data.non_insertion_variants.get_mut(&position) {
+                                    if let Some(vref) = vars_on_pos.get_mut(&vref_key) {
+                                        adj_cnt(vref, &sc5v.var);
+                                    }
+                                }
+                                *data.ref_coverage.entry(position).or_insert(0) += sc5v.var.alt_depth;
+                                sc5v.mark_used();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn realign_deletion_mismatches(
         &self,
         pos: i64,
@@ -568,6 +720,29 @@ impl VariantRealigner {
         let idx = (pos - self.ref_start) as usize;
         self.reference_seq.get(idx).copied()
     }
+
+    fn is_match_ref(&self, seq: &[u8], position: i64, dir: i64, mm: usize) -> bool {
+        if seq.is_empty() {
+            return false;
+        }
+        let mut mismatches = 0usize;
+        for n in 0..seq.len() {
+            let ref_pos = position + dir * n as i64;
+            let ref_base = match self.get_ref_base(ref_pos) {
+                Some(b) => b,
+                None => return false,
+            };
+            let seq_base = if dir == 1 {
+                seq[n]
+            } else {
+                char_at_neg(seq, n as isize).unwrap_or(b'N')
+            };
+            if seq_base != ref_base {
+                mismatches += 1;
+            }
+        }
+        mismatches <= mm && (mismatches as f64 / seq.len() as f64) < 0.15
+    }
     /// Check if a sequence has low complexity (>75% of one base or <3 different bases)
     pub fn is_low_complex_seq(seq: &str) -> bool {
         let len = seq.len();
@@ -748,6 +923,7 @@ impl VariantRealigner {
 
 fn adj_cnt(dest: &mut Variant, src: &Variant) {
     dest.alt_depth += src.alt_depth;
+    dest.extra_cnt += src.alt_depth;
     dest.high_qual_read_cnt += src.high_qual_read_cnt;
     dest.low_qual_read_cnt += src.low_qual_read_cnt;
     dest.mean_pos += src.mean_pos;

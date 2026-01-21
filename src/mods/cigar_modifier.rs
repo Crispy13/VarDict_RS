@@ -418,7 +418,7 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                 self.query_sequence,
                 (rdoff + rn) as usize,
             )
-            && self.query_quality.get_or_err((rdoff + rn) as usize)? - 33
+            && *self.query_quality.get_or_err((rdoff + rn) as usize)?
                 > Configuration::LOW_QUAL as u8
         {
             rn += 1;
@@ -446,7 +446,7 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                     self.query_sequence,
                     (rdoff + rn + 1) as usize,
                 )
-                && self.query_quality.get_or_err((rdoff + rn + 1) as usize)? - 33
+                && *self.query_quality.get_or_err((rdoff + rn + 1) as usize)?
                     > Configuration::LOW_QUAL as u8
             {
                 rn += 1;
@@ -1077,7 +1077,7 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                 self.query_sequence,
                 (soft - rn - 1) as usize,
             )
-            && self.query_quality.get_or_err((soft - rn - 1) as usize)? - 33
+            && *self.query_quality.get_or_err((soft - rn - 1) as usize)?
                 > Configuration::LOW_QUAL as u8
         {
             rn += 1;
@@ -1107,7 +1107,7 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                     self.query_sequence,
                     (soft - rn - 2) as usize,
                 )
-                && self.query_quality.get_or_err((soft - rn - 2) as usize)? - 33
+                && *self.query_quality.get_or_err((soft - rn - 2) as usize)?
                     > Configuration::LOW_QUAL as u8
             {
                 rn += 1;

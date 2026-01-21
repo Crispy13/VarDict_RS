@@ -104,6 +104,7 @@ pub struct Variant {
     // === Frequencies ===
     pub frequency: f64,
     pub high_quality_reads_frequency: f64,
+    pub extra_frequency: f64,
 
     // === Quality Metrics ===
     pub mean_position: f64,
@@ -136,6 +137,9 @@ pub struct Variant {
     
     // === Genotype ===
     pub genotype: String,
+
+    // === Duplication rate ===
+    pub duprate: f64,
 }
 
 impl Variant {
@@ -153,6 +157,7 @@ impl Variant {
             position_coverage: 0,
             frequency: 0.0,
             high_quality_reads_frequency: 0.0,
+            extra_frequency: 0.0,
             mean_position: 0.0,
             mean_quality: 0.0,
             mean_mapping_quality: 0.0,
@@ -171,6 +176,7 @@ impl Variant {
             ref_forward_count: 0,
             ref_reverse_count: 0,
             genotype: "0/0".to_string(),
+            duprate: 0.0,
         }
     }
 
@@ -180,6 +186,77 @@ impl Variant {
         // Don't filter on strand bias alone, use frequency too
         !self.strand_bias_flag.is_ref_good_var_biased() || self.frequency > 0.2
     }
+
+    /// Adjust complex variant alleles and positions (Java Variant.adjComplex)
+    pub fn adj_complex(&mut self) {
+        if self.varallele.starts_with('<') {
+            return;
+        }
+
+        let mut ref_allele = self.refallele.clone();
+        let mut var_allele = self.varallele.clone();
+
+        let mut n = 0usize;
+        while ref_allele.len().saturating_sub(n) > 1
+            && var_allele.len().saturating_sub(n) > 1
+            && ref_allele.as_bytes()[n] == var_allele.as_bytes()[n]
+        {
+            n += 1;
+        }
+
+        if n > 0 {
+            self.start_position += n as i64;
+            self.refallele = ref_allele[n..].to_string();
+            self.varallele = var_allele[n..].to_string();
+            self.leftseq.push_str(&ref_allele[..n]);
+            self.leftseq = self.leftseq[n..].to_string();
+        }
+
+        ref_allele = self.refallele.clone();
+        var_allele = self.varallele.clone();
+        n = 1;
+        while ref_allele.len().saturating_sub(n) > 0
+            && var_allele.len().saturating_sub(n) > 0
+            && &ref_allele[ref_allele.len() - n..] == &var_allele[var_allele.len() - n..]
+        {
+            n += 1;
+        }
+
+        if n > 1 {
+            self.end_position -= (n - 1) as i64;
+            self.refallele = ref_allele[..ref_allele.len() - (n - 1)].to_string();
+            self.varallele = var_allele[..var_allele.len() - (n - 1)].to_string();
+            let suffix = ref_allele[ref_allele.len() - (n - 1)..].to_string();
+            let right_trim = self.rightseq.len().saturating_sub(n - 1);
+            self.rightseq = format!("{}{}", suffix, &self.rightseq[..right_trim]);
+        }
+    }
+}
+
+/// Java Variant.varType() based on ref/alt alleles
+pub fn var_type_string(refallele: &str, varallele: &str) -> String {
+    if refallele == varallele && refallele.len() == 1 {
+        return String::new();
+    }
+    if refallele.len() == 1 && varallele.len() == 1 {
+        return "SNV".to_string();
+    }
+    if varallele.starts_with('<') && varallele.ends_with('>') && varallele.len() >= 5 {
+        return varallele[1..4].to_string();
+    }
+    if refallele.is_empty() || varallele.is_empty() {
+        return "Complex".to_string();
+    }
+    if refallele.as_bytes()[0] != varallele.as_bytes()[0] {
+        return "Complex".to_string();
+    }
+    if refallele.len() == 1 && varallele.len() > 1 && varallele.starts_with(refallele) {
+        return "Insertion".to_string();
+    }
+    if refallele.len() > 1 && varallele.len() == 1 && refallele.starts_with(varallele) {
+        return "Deletion".to_string();
+    }
+    "Complex".to_string()
 }
 
 impl Default for Variant {

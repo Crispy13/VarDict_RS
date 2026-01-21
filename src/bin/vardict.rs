@@ -258,6 +258,8 @@ fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>
             .context("Failed to parse sam_filter as decimal")?
     };
     conf.goodq = args.min_base_quality;
+    conf.freq = if args.pileup { -1.0 } else { args.min_frequency };
+    conf.minr = if args.pileup { 0 } else { args.min_variant_reads };
     conf.vext = args.vext;
     conf.mismatch = args.mismatch;
     conf.sam_filter = sam_filter;

@@ -296,7 +296,7 @@ fn test_cigar_parser_variant_76749_matches_java() {
 
     let ref_path = "/home/eck/workspace/VarDictJava/tests/integration/reference/hs37d5.fa";
     let bam_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/input/NA12878.chrom20.ILLUMINA.bwa.CEU.exome.20121211.bam";
-    let java_output_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/raw_input/raw.vardict.simple.chr20.nosv.var";
+    let java_output_path = "/home/eck/workspace/vardict_rs/tmp_compare/java.cigarparser.pos76749.txt";
     if !Path::new(ref_path).exists() || !Path::new(bam_path).exists() {
         eprintln!("Missing reference or BAM file");
         return;
@@ -366,60 +366,39 @@ fn test_cigar_parser_variant_76749_matches_java() {
     #[derive(Debug)]
     struct JavaVariantCounts {
         pos: i64,
-        ref_base: u8,
-        alt_base: u8,
-        alt_depth: usize,
-        alt_fwd: usize,
-        alt_rev: usize,
-        ref_fwd: usize,
-        ref_rev: usize,
-        hicov: usize,
+        counts: std::collections::HashMap<u8, (usize, usize, usize)>,
     }
 
     fn extract_java_variant(java_output_path: &str) -> Option<JavaVariantCounts> {
         let content = std::fs::read_to_string(java_output_path).ok()?;
+        let mut counts: std::collections::HashMap<u8, (usize, usize, usize)> =
+            std::collections::HashMap::new();
         for line in content.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 30 {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.is_empty() {
                 continue;
             }
-            let chr = parts.get(2)?;
-            let start = parts.get(3)?;
-            let end = parts.get(4)?;
-            let ref_base = parts.get(5)?;
-            let alt_base = parts.get(6)?;
-            if *chr == "20" && *start == "76749" && *end == "76749" && *ref_base == "A" && *alt_base == "G" {
-                let alt_depth = parts.get(8)?.parse().ok()?;
-                let ref_fwd = parts.get(9)?.parse().ok()?;
-                let ref_rev = parts.get(10)?.parse().ok()?;
-                let alt_fwd = parts.get(11)?.parse().ok()?;
-                let alt_rev = parts.get(12)?.parse().ok()?;
-                let hicov = parts.get(29)?.parse().ok()?;
-
-                return Some(JavaVariantCounts {
-                    pos: 76749,
-                    ref_base: ref_base.as_bytes()[0],
-                    alt_base: alt_base.as_bytes()[0],
-                    alt_depth,
-                    alt_fwd,
-                    alt_rev,
-                    ref_fwd,
-                    ref_rev,
-                    hicov,
-                });
+            if parts.get(0)? == &"VAR" && parts.len() >= 5 {
+                let key = parts.get(1)?;
+                let key_base = key.as_bytes().first().copied()?;
+                let depth: usize = parts.get(2)?.parse().ok()?;
+                let fwd: usize = parts.get(3)?.parse().ok()?;
+                let rev: usize = parts.get(4)?.parse().ok()?;
+                counts.insert(key_base, (depth, fwd, rev));
             }
         }
-        None
+
+        Some(JavaVariantCounts { pos: 76749, counts })
     }
 
     let java_counts = extract_java_variant(java_output_path)
-        .expect("Failed to extract Java variant counts for 20:76749 A>G");
+        .expect("Failed to extract Java variant counts for 20:76749");
 
     println!("Java extracted counts: {:?}", java_counts);
 
     let pos = java_counts.pos;
     let ref_base = reference.get(pos).unwrap_or(b'N');
-    let alt_base = java_counts.alt_base;
+    let alt_base = b'G';
 
     let var_map = parser
         .get_non_insertion_vars()
@@ -429,52 +408,63 @@ fn test_cigar_parser_variant_76749_matches_java() {
     let ref_var = var_map
         .get(&VarDesc::SNV { ref_base })
         .expect("Missing reference variant at 76749");
+    let ref_java = java_counts
+        .counts
+        .get(&ref_base)
+        .expect("Missing ref variant in Java dump at 76749");
+
     let alt_key = VarDesc::SNV { ref_base: alt_base };
-    let alt_var = match var_map.get(&alt_key) {
-        Some(v) => v,
-        None => {
-            println!("Alt variant missing at 76749. Available keys:");
-            for (desc, variant) in var_map.iter() {
-                println!("  {:?}: alt_depth={} fwd={} rev={}", desc, variant.alt_depth, variant.alt_depth_fwd, variant.alt_depth_rev);
-            }
-            println!("Nearby positions with alt base '{}' in non_insertion_vars:", alt_base as char);
-            let start_pos = pos.saturating_sub(5);
-            let end_pos = pos + 5;
-            for p in start_pos..=end_pos {
-                if let Some(nearby_map) = parser.get_non_insertion_vars().get(&p) {
-                    let key = VarDesc::SNV { ref_base: alt_base };
-                    if let Some(variant) = nearby_map.get(&key) {
-                        println!(
-                            "  pos {}: alt_depth={} fwd={} rev={}",
-                            p,
-                            variant.alt_depth,
-                            variant.alt_depth_fwd,
-                            variant.alt_depth_rev
-                        );
+    let java_alt = java_counts.counts.get(&alt_base).copied();
+
+    if let Some((alt_depth, alt_fwd, alt_rev)) = java_alt {
+        let alt_var = match var_map.get(&alt_key) {
+            Some(v) => v,
+            None => {
+                println!("Alt variant missing at 76749. Available keys:");
+                for (desc, variant) in var_map.iter() {
+                    println!("  {:?}: alt_depth={} fwd={} rev={}", desc, variant.alt_depth, variant.alt_depth_fwd, variant.alt_depth_rev);
+                }
+                println!("Nearby positions with alt base '{}' in non_insertion_vars:", alt_base as char);
+                let start_pos = pos.saturating_sub(5);
+                let end_pos = pos + 5;
+                for p in start_pos..=end_pos {
+                    if let Some(nearby_map) = parser.get_non_insertion_vars().get(&p) {
+                        let key = VarDesc::SNV { ref_base: alt_base };
+                        if let Some(variant) = nearby_map.get(&key) {
+                            println!(
+                                "  pos {}: alt_depth={} fwd={} rev={}",
+                                p,
+                                variant.alt_depth,
+                                variant.alt_depth_fwd,
+                                variant.alt_depth_rev
+                            );
+                        }
                     }
                 }
+                panic!("Missing alt variant at 76749");
             }
-            panic!("Missing alt variant at 76749");
-        }
-    };
+        };
 
-    println!("Ref {} counts: alt_depth={} fwd={} rev={}",
-        ref_base as char,
-        ref_var.alt_depth,
-        ref_var.alt_depth_fwd,
-        ref_var.alt_depth_rev,
-    );
-    println!("Alt {} counts: alt_depth={} fwd={} rev={}",
-        alt_base as char,
-        alt_var.alt_depth,
-        alt_var.alt_depth_fwd,
-        alt_var.alt_depth_rev,
-    );
+        println!("Ref {} counts: alt_depth={} fwd={} rev={}",
+            ref_base as char,
+            ref_var.alt_depth,
+            ref_var.alt_depth_fwd,
+            ref_var.alt_depth_rev,
+        );
+        println!("Alt {} counts: alt_depth={} fwd={} rev={}",
+            alt_base as char,
+            alt_var.alt_depth,
+            alt_var.alt_depth_fwd,
+            alt_var.alt_depth_rev,
+        );
 
-    assert_eq!(alt_var.alt_depth, java_counts.alt_depth, "alt_depth mismatch for 76749");
-    assert_eq!(alt_var.alt_depth_fwd, java_counts.alt_fwd, "alt fwd mismatch for 76749");
-    assert_eq!(alt_var.alt_depth_rev, java_counts.alt_rev, "alt rev mismatch for 76749");
+        assert_eq!(alt_var.alt_depth, alt_depth, "alt_depth mismatch for 76749");
+        assert_eq!(alt_var.alt_depth_fwd, alt_fwd, "alt fwd mismatch for 76749");
+        assert_eq!(alt_var.alt_depth_rev, alt_rev, "alt rev mismatch for 76749");
+    } else if var_map.contains_key(&alt_key) {
+        panic!("Rust has alt variant at 76749 but Java dump does not");
+    }
 
-    assert_eq!(ref_var.alt_depth_fwd, java_counts.ref_fwd, "ref fwd mismatch for 76749");
-    assert_eq!(ref_var.alt_depth_rev, java_counts.ref_rev, "ref rev mismatch for 76749");
+    assert_eq!(ref_var.alt_depth_fwd, ref_java.1, "ref fwd mismatch for 76749");
+    assert_eq!(ref_var.alt_depth_rev, ref_java.2, "ref rev mismatch for 76749");
 }

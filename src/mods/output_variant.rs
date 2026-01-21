@@ -43,7 +43,7 @@
 //! 35. Duplicate rate
 //! 36. Structural variant info
 
-use crate::mods::to_vars_builder::{Variant, VarType, StrandBiasFlag};
+use crate::mods::to_vars_builder::{Variant, VarType, StrandBiasFlag, var_type_string};
 
 /// Region information for output
 #[derive(Debug, Clone, Default)]
@@ -132,7 +132,7 @@ pub struct SimpleOutputVariant {
 impl SimpleOutputVariant {
     /// Create a SimpleOutputVariant from a Variant and Region
     pub fn from_variant(variant: &Variant, region: &Region, sample: &str, sv: &str) -> Self {
-        let var_type_str = format_var_type(&variant.vartype);
+        let var_type_str = var_type_string(&variant.refallele, &variant.varallele);
         
         // Detect reference call (ref == alt)
         let is_ref_call = variant.refallele == variant.varallele;
@@ -206,7 +206,7 @@ impl SimpleOutputVariant {
                 0.0
             },
             hifreq: variant.high_quality_reads_frequency,
-            extrafreq: 0.0, // Not used in simple mode
+            extrafreq: variant.extra_frequency,
 
             shift3: variant.shift3,
             msi: variant.msi,
@@ -219,7 +219,7 @@ impl SimpleOutputVariant {
             right_sequence: if variant.rightseq.is_empty() { "0".to_string() } else { variant.rightseq.clone() },
             region: format!("{}:{}-{}", chr, region.start, region.end),
             var_type: final_var_type,
-            duprate: 0.0, // Not used in simple mode
+            duprate: variant.duprate,
             sv: if sv.is_empty() { "0".to_string() } else { sv.to_string() },
         }
     }
@@ -458,6 +458,7 @@ mod tests {
             position_coverage: 100,
             frequency: 0.10,
             high_quality_reads_frequency: 0.08,
+            extra_frequency: 0.0,
             mean_position: 25.0,
             mean_quality: 30.0,
             mean_mapping_quality: 60.0,
@@ -476,6 +477,7 @@ mod tests {
             ref_forward_count: 0,
             ref_reverse_count: 0,
             genotype: "0/1".to_string(),
+            duprate: 0.0,
         };
 
         let region = Region::new("chr1", 900, 1100, "BRCA1");

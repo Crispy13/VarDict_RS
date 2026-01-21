@@ -11,6 +11,9 @@ pub struct Variant {
     pub alt_depth_fwd: usize,
     pub alt_depth_rev: usize,
 
+    /// Adjusted count for indels due to realignment (Java: extracnt)
+    pub extra_cnt: usize,
+
     /// Sum of variant positions in read
     pub mean_pos: f64,
 
@@ -90,6 +93,11 @@ pub enum VarDesc {
         /// Alternative allele
         alt_seq: SmallVec<[u8; 32]>,
     },
+    /// Raw description string (Java-style), e.g. "A&TGC", "-3&AT", etc.
+    Raw {
+        /// Raw description bytes
+        desc: SmallVecBytes,
+    },
 }
 
 impl VarDesc {
@@ -132,6 +140,7 @@ impl VarDesc {
             VarDesc::Ins { .. } => "Insertion",
             VarDesc::Del { .. } => "Deletion",
             VarDesc::Complex { .. } => "Complex",
+            VarDesc::Raw { .. } => "Raw",
         }
     }
 
@@ -142,6 +151,7 @@ impl VarDesc {
             VarDesc::Ins { .. } => String::new(), // Insertions have no ref (or context base)
             VarDesc::Del { len, .. } => format!("-{}", len),
             VarDesc::Complex { ref_seq, .. } => String::from_utf8_lossy(ref_seq).to_string(),
+            VarDesc::Raw { .. } => String::new(),
         }
     }
 
@@ -152,6 +162,7 @@ impl VarDesc {
             VarDesc::Ins { seq } => format!("+{}", String::from_utf8_lossy(seq)),
             VarDesc::Del { len, .. } => format!("-{}", len),
             VarDesc::Complex { alt_seq, .. } => String::from_utf8_lossy(alt_seq).to_string(),
+            VarDesc::Raw { desc } => String::from_utf8_lossy(desc).to_string(),
         }
     }
 
@@ -166,13 +177,42 @@ impl VarDesc {
                 format!("+{}", String::from_utf8_lossy(seq))
             }
             VarDesc::Del { len, .. } => {
-                format!("-{}", len)
+                let mut out = format!("-{}", len);
+                if let VarDesc::Del {
+                    match_seq,
+                    ins_or_del_len,
+                    mismatch_seq,
+                    ..
+                } = self
+                {
+                    if !match_seq.is_empty() {
+                        out.push('#');
+                        out.push_str(&String::from_utf8_lossy(match_seq));
+                    }
+                    match ins_or_del_len {
+                        InsOrDelLen::InsSeq(seq) => {
+                            out.push('^');
+                            out.push_str(&String::from_utf8_lossy(seq));
+                        }
+                        InsOrDelLen::DelLen(n) => {
+                            out.push('^');
+                            out.push_str(&n.to_string());
+                        }
+                        InsOrDelLen::None => {}
+                    }
+                    if !mismatch_seq.is_empty() {
+                        out.push('&');
+                        out.push_str(&String::from_utf8_lossy(mismatch_seq));
+                    }
+                }
+                out
             }
             VarDesc::Complex { ref_seq, alt_seq } => {
                 format!("{}>{}", 
                     String::from_utf8_lossy(ref_seq),
                     String::from_utf8_lossy(alt_seq))
             }
+            VarDesc::Raw { desc } => String::from_utf8_lossy(desc).to_string(),
         }
     }
 }

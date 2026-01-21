@@ -64,6 +64,9 @@ pub struct CigarParser {
     non_insertion_vars: HashMap<i64, HashMap<VarDesc, Variant>>,
     insertion_vars: HashMap<i64, HashMap<VarDesc, Variant>>,
 
+    /// Track MNPs (multi-nucleotide polymorphisms) by position and description string
+    mnp: HashMap<i64, HashMap<String, usize>>,
+
     ref_coverage: HashMap<i64, usize>,
 
     soft_clips5_end: HashMap<i64, SoftClip>,
@@ -89,6 +92,7 @@ impl Default for CigarParser {
             cigar_len: Default::default(),
             non_insertion_vars: Default::default(),
             insertion_vars: Default::default(),
+            mnp: Default::default(),
             ref_coverage: Default::default(),
             soft_clips5_end: Default::default(),
             soft_clips3_end: Default::default(),
@@ -122,6 +126,7 @@ impl CigarParser {
             cigar_len: 0,
             non_insertion_vars: HashMap::new(),
             insertion_vars: HashMap::new(),
+            mnp: HashMap::new(),
             ref_coverage: HashMap::new(),
             soft_clips5_end: HashMap::new(),
             soft_clips3_end: HashMap::new(),
@@ -168,6 +173,10 @@ impl CigarParser {
         std::mem::take(&mut self.insertion_vars)
     }
 
+    pub fn take_mnp(&mut self) -> HashMap<i64, HashMap<String, usize>> {
+        std::mem::take(&mut self.mnp)
+    }
+
     /// Get the reference coverage map
     pub fn get_ref_coverage(&self) -> &HashMap<i64, usize> {
         &self.ref_coverage
@@ -206,6 +215,11 @@ impl CigarParser {
     /// Get the discordant read count
     pub fn get_discordant_count(&self) -> usize {
         self.discordant_count
+    }
+
+    /// Take ownership of splice counts
+    pub fn take_splice_count(&mut self) -> HashMap<SplicingKey, Vec<usize>> {
+        std::mem::take(&mut self.splice_count)
     }
 
     fn parse_cigar(&mut self, record: &mut Record) -> Result<(), Error> {
@@ -286,27 +300,35 @@ impl CigarParser {
         self.read_pos_excluding_softclip = 0;
 
         if self.instance.conf.perform_local_realignment {
+            let region_offset = self.reference.region_start - 1;
+            let local_pos = record.pos() - region_offset;
+            if local_pos < 0 {
+                // Reference slice doesn't cover the read start; skip local realignment for this read.
+                pos = record.pos() + 1;
+            } else {
+                let mut local_cigar = CigarString(record.cigar().iter().copied().collect::<Vec<_>>())
+                    .into_view(local_pos);
             // Modify the CIGAR for potential mis-alignment for indels at the end of reads to softclipping and let VarDict's
             // algorithm to figure out indels
 
-            let mut cigar_modifier = CigarModifier::new(
-                record.pos(),
-                &cigar,
-                query_seq,
-                query_qual,
-                &self.reference,
-                ins_del_len,
-                self.max_read_len,
-                &self.region,
-                &mut self.rev_complementor,
-            );
+                let mut cigar_modifier = CigarModifier::new(
+                    local_pos,
+                    &local_cigar,
+                    query_seq,
+                    query_qual,
+                    &self.reference,
+                    ins_del_len,
+                    self.max_read_len,
+                    &self.region,
+                    &mut self.rev_complementor,
+                );
 
             let mc = cigar_modifier.modify_cigar()?;
 
             // Convert to 1-based position (BAM is 0-based, Java VarDict uses 1-based)
-            pos = mc.align_start_pos + 1;
-            cigar = CigarString(mc.cigar.into_iter().collect::<Vec<_>>())
-                .into_view(mc.align_start_pos as i64 + 1);
+                pos = mc.align_start_pos + self.reference.region_start;
+                cigar = CigarString(mc.cigar.into_iter().collect::<Vec<_>>())
+                    .into_view(pos);
 
             event!(Level::DEBUG, "Modified CIGAR: {:?}", cigar);
             if record.qname() == b"read_1" {
@@ -318,8 +340,9 @@ impl CigarParser {
                 );
             }
 
-            query_qual = mc.query_qual;
-            query_seq = mc.query_seq;
+                query_qual = mc.query_qual;
+                query_seq = mc.query_seq;
+            }
 
         } else {
             // Convert to 1-based position (BAM is 0-based, Java VarDict uses 1-based)
@@ -1987,39 +2010,45 @@ impl CigarParser {
         let nm_adjusted = nm.saturating_sub(nmoff);
         let mut did_add_variant = false;
 
-        // Check if this is a complex variant (contains & for MNV)
-        if let Some(amp_pos) = s.iter().position(|&b| b == b'&') {
-            // MNV format: first_base&rest_of_mnv
-            // e.g., "A&TGC" means 4-base MNV: A, T, G, C at consecutive positions
-            let first_base = s[0];
-            let rest = &s[amp_pos + 1..]; // TGC
-            
-            // Build the full alt sequence
-            let mut alt_seq: SmallVec<[u8; 32]> = SmallVec::new();
-            alt_seq.push(first_base);
-            alt_seq.extend_from_slice(rest);
-            
-            let mnv_len = alt_seq.len();
-            
-            // Build reference sequence for this MNV using coordinate-translated access
-            let mut ref_seq: SmallVec<[u8; 32]> = SmallVec::new();
-            for offset in 0..mnv_len {
-                if let Some(ref_base) = self.reference.get(pos + offset as i64) {
-                    ref_seq.push(ref_base);
-                } else {
-                    // Reference doesn't cover this position
-                    event!(Level::DEBUG, "[add_variation_for_matching_part] MNV at pos {} extends beyond reference", pos);
-                    return;
-                }
-            }
-            
-            // Create Complex/MNV VarDesc
-            let var_desc = VarDesc::Complex {
-                ref_seq,
-                alt_seq,
-            };
-            
-            // Get or create variant and add count - use read_pos for tp calculation
+        // Check if this is an insertion first
+        if s.starts_with(b"+") {
+            // Insertion: +ATC format
+            let ins_seq: SmallVec<[u8; 32]> = s[1..].iter().copied().collect();
+
+            let var_desc = VarDesc::Ins { seq: ins_seq };
+
+            // Store insertions in insertion_vars (Java: addVariationForMatchingPart uses insertionVariants)
+            // use read_pos for tp calculation
+            let var = get_variants_from_map(&mut self.insertion_vars, pos, &var_desc);
+            add_cnt(
+                var,
+                is_reverse,
+                read_pos,
+                avg_qual,
+                mapq,
+                nm_adjusted,
+                Some(read_len_including_match_ins),
+            );
+            did_add_variant = true;
+        } else if s.starts_with(b"-") {
+            // Deletion from matching part: preserve raw description string
+            let var_desc = VarDesc::Raw { desc: s.to_vec().into() };
+
+            let var = get_variants_from_map(&mut self.non_insertion_vars, pos, &var_desc);
+            add_cnt(
+                var,
+                is_reverse,
+                read_pos,
+                avg_qual,
+                mapq,
+                nm_adjusted,
+                Some(read_len_including_match_ins),
+            );
+            did_add_variant = true;
+        } else if s.iter().any(|&b| b == b'&') {
+            // Complex/raw variant (MNV with '&')
+            let var_desc = VarDesc::Raw { desc: s.to_vec().into() };
+
             let var = get_variants_from_map(&mut self.non_insertion_vars, pos, &var_desc);
             add_cnt(
                 var,
@@ -2060,29 +2089,6 @@ impl CigarParser {
                 Some(read_len_including_match_ins),
             );
             did_add_variant = true;
-        } else if s.starts_with(b"+") {
-            // Insertion: +ATC format
-            let ins_seq: SmallVec<[u8; 32]> = s[1..].iter().copied().collect();
-            
-            let var_desc = VarDesc::Ins { seq: ins_seq };
-            
-            // Store insertions in insertion_vars (Java: addVariationForMatchingPart uses insertionVariants)
-            // use read_pos for tp calculation
-            let var = get_variants_from_map(&mut self.insertion_vars, pos, &var_desc);
-            add_cnt(
-                var,
-                is_reverse,
-                read_pos,
-                avg_qual,
-                mapq,
-                nm_adjusted,
-                Some(read_len_including_match_ins),
-            );
-            did_add_variant = true;
-        } else if s.starts_with(b"-") {
-            // Deletion: -2 or -2&AT format (deletion with optional following sequence)
-            // This is handled elsewhere in deletion processing, but add fallback
-            // For now, skip complex deletion handling
         } else {
             // Unknown format - skip
         }
@@ -2104,6 +2110,12 @@ impl CigarParser {
                     inc_cnt(&mut self.ref_coverage, self.start + qi as i64, 1);
                 }
             }
+        }
+
+        if is_begin_atgc_amp_atgcs_end(s) {
+            let desc = String::from_utf8_lossy(s).to_string();
+            let pos_map = self.mnp.entry(pos).or_insert_with(HashMap::new);
+            *pos_map.entry(desc).or_insert(0) += 1;
         }
     }
 

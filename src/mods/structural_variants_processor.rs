@@ -133,9 +133,15 @@ impl StructuralVariantsProcessor {
             if let Some(var_map) = data.non_insertion_variants.get_mut(&prev_pos) {
                 if var_map.contains_key(&var_key) {
                     // Additional check: if seq length > 1, verify second base matches reference
+                    // Java: if reference base is missing, treat as mismatch and skip
                     if seq.len() > 1 {
-                        if let Some(ref_base) = self.get_ref_base(position - 2) {
-                            if ref_base != seq[1] {
+                        match self.get_ref_base(position - 2) {
+                            Some(ref_base) => {
+                                if ref_base != seq[1] {
+                                    continue;
+                                }
+                            }
+                            None => {
                                 continue;
                             }
                         }
@@ -214,9 +220,15 @@ impl StructuralVariantsProcessor {
             if let Some(var_map) = data.non_insertion_variants.get_mut(&position) {
                 if var_map.contains_key(&var_key) {
                     // Additional check: if seq length > 1, verify second base matches reference
+                    // Java: if reference base is missing, treat as mismatch and skip
                     if seq.len() > 1 {
-                        if let Some(ref_base) = self.get_ref_base(position + 1) {
-                            if ref_base != seq[1] {
+                        match self.get_ref_base(position + 1) {
+                            Some(ref_base) => {
+                                if ref_base != seq[1] {
+                                    continue;
+                                }
+                            }
+                            None => {
                                 continue;
                             }
                         }
@@ -290,6 +302,7 @@ fn adj_cnt(
     rev_cnt: usize,
 ) {
     variant.alt_depth += vars_count;
+    variant.extra_cnt += vars_count;
     variant.high_qual_read_cnt += high_qual_cnt;
     variant.low_qual_read_cnt += low_qual_cnt;
     variant.mean_pos += mean_pos;

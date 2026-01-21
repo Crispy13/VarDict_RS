@@ -34,6 +34,27 @@ pub struct Configuration {
     /// The phred score for a base to be considered a good call
     pub goodq: f64,
 
+    /// The threshold for allele frequency. If -p it is set to -1.
+    pub freq: f64,
+
+    /// Minimum number of variant reads
+    pub minr: usize,
+
+    /// The read position filter
+    pub read_pos_filter: f64,
+
+    /// The Qratio of (good_quality_reads)/(bad_quality_reads+0.5)
+    pub qratio: f64,
+
+    /// Mean mapping quality threshold
+    pub mapq: f64,
+
+    /// The variant frequency threshold to determine variant as good in case of monomer MSI
+    pub monomer_msi_frequency: f64,
+
+    /// The variant frequency threshold to determine variant as good in case of non-monomer MSI
+    pub non_monomer_msi_frequency: f64,
+
     /// Extension of bp to look for mismatches after insertion or deletion
     pub vext: i32,
 
@@ -58,6 +79,13 @@ impl Default for Configuration {
             unique_mode_alignment_enabled: false,
             unique_mode_second_in_pair_enabled: false,
             goodq: 22.5,
+            freq: 0.01,
+            minr: 2,
+            read_pos_filter: 5.0,
+            qratio: 1.5,
+            mapq: 0.0,
+            monomer_msi_frequency: 0.25,
+            non_monomer_msi_frequency: 0.1,
             vext: 2,
             mismatch: 0,
         }

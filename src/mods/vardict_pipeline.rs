@@ -24,10 +24,11 @@ use crate::mods::output_variant::{SimpleOutputVariant, Region as OutputRegion};
 use crate::mods::structural_variants_processor::{StructuralVariantsProcessor, RealignedVariationData};
 use crate::mods::variant_realigner::VariantRealigner;
 use crate::scopedata::global_read_only_scope::instance;
-use crate::mods::to_vars_builder::{ToVarsBuilder, Variant, VariationData, Vars, VarType, determine_genotype};
+use crate::mods::to_vars_builder::{ToVarsBuilder, Variant, VariationData, Vars, VarType, determine_genotype, var_type_string};
 use crate::mods::simple_variant_caller::SimpleVarKey;
 use crate::scopedata::global_read_only_scope::GlobalReadOnlyScope;
 use crate::variants::variants::{VarDesc, Variant as RawVariant, SoftClip};
+use std::collections::HashSet;
 
 /// Data produced by CigarParser - mirrors Java VariationData
 #[derive(Default)]
@@ -42,10 +43,14 @@ pub struct CigarParserOutput {
     pub soft_clips_3end: HashMap<i64, SoftClip>,
     /// Reference coverage by position
     pub ref_coverage: HashMap<i64, usize>,
+    /// MNP map (position -> description -> count)
+    pub mnp: HashMap<i64, HashMap<String, usize>>,
     /// Maximum read length seen
     pub max_read_len: usize,
     /// Discordant read count
     pub discordant_count: usize,
+    /// Splice positions ("start-end")
+    pub splice: HashSet<String>,
 }
 
 /// Data after realignment - mirrors Java RealignedVariationData
@@ -61,6 +66,8 @@ pub struct RealignedOutput {
     pub duprate: f64,
     /// Maximum read length
     pub max_read_len: usize,
+    /// Splice positions ("start-end")
+    pub splice: HashSet<String>,
 }
 
 /// Final aligned variants data - mirrors Java AlignedVarsData
@@ -172,7 +179,8 @@ impl VarDictPipeline {
         let mut lines = Vec::new();
         let mut record = Record::new();
 
-        bam_reader.fetch(region.chr(), region.start(), region.end())?;
+        let fetch_start = region.start().saturating_sub(1);
+        bam_reader.fetch(region.chr(), fetch_start, region.end())?;
 
         while bam_reader.read(&mut record).unwrap_or(false) {
             if !self.passes_preprocess(&record, sam_filter) {
@@ -284,6 +292,7 @@ impl VarDictPipeline {
             realigned_output.ref_coverage.len());
 
         let start_tovars = std::time::Instant::now();
+        let splice = realigned_output.splice.clone();
         let aligned_vars = self.run_to_vars_builder(realigned_output, reference)?;
         let elapsed_tovars = start_tovars.elapsed();
 
@@ -292,7 +301,7 @@ impl VarDictPipeline {
             aligned_vars.aligned_variants.len());
 
         let start_post = std::time::Instant::now();
-        let output_lines = self.run_simple_post_processor(aligned_vars, region)?;
+        let output_lines = self.run_simple_post_processor(aligned_vars, region, &splice)?;
         let elapsed_post = start_post.elapsed();
 
         event!(Level::INFO, "[TIMING] PostProcessor: {:.3}s - {} lines",
@@ -348,7 +357,8 @@ impl VarDictPipeline {
             instance,
         );
 
-        bam_reader.fetch(region.chr(), region.start(), region.end())?;
+        let fetch_start = region.start().saturating_sub(1);
+        bam_reader.fetch(region.chr(), fetch_start, region.end())?;
 
         let mut record = Record::new();
         while bam_reader.read(&mut record).unwrap_or(false) {
@@ -363,14 +373,22 @@ impl VarDictPipeline {
     }
 
     fn build_cigar_output(&self, cigar_parser: &mut CigarParser) -> CigarParserOutput {
+        let splice = cigar_parser
+            .take_splice_count()
+            .keys()
+            .map(|(start, end)| format!("{}-{}", start, end))
+            .collect();
+
         CigarParserOutput {
             non_insertion_vars: cigar_parser.take_non_insertion_vars(),
             insertion_vars: cigar_parser.take_insertion_vars(),
             soft_clips_5end: cigar_parser.take_soft_clips_5end(),
             soft_clips_3end: cigar_parser.take_soft_clips_3end(),
             ref_coverage: cigar_parser.take_ref_coverage(),
+            mnp: cigar_parser.take_mnp(),
             max_read_len: cigar_parser.get_max_read_len(),
             discordant_count: cigar_parser.get_discordant_count(),
+            splice,
         }
     }
 
@@ -397,8 +415,10 @@ impl VarDictPipeline {
 
         // Perform minimal deletion realignment using soft clips when enabled
         // Re-enable realigner to match Java behavior
+        let realigner = VariantRealigner::new(reference.ref_seq.clone(), reference.region_start);
+        realigner.adjust_mnp(&mut sv_input, &input.mnp);
+
         if instance().conf.perform_local_realignment {
-            let realigner = VariantRealigner::new(reference.ref_seq.clone(), reference.region_start);
             realigner.process_deletions(&mut sv_input);
         }
         
@@ -416,6 +436,7 @@ impl VarDictPipeline {
             ref_coverage: processed.ref_coverage,
             duprate: processed.duprate,
             max_read_len: processed.max_read_length,
+            splice: input.splice,
         })
     }
 
@@ -448,36 +469,49 @@ impl VarDictPipeline {
             hicov_by_pos.insert(*pos, hicov);
         }
 
-        // Process non-insertion variants
-        for (pos, var_map) in input.non_insertion_vars {
-            let vars = self.build_vars_at_position(
-                pos,
-                var_map,
-                &input.ref_coverage,
-                reference,
-                &ref_counts_by_pos,
-                &hicov_by_pos,
-            );
-            if !vars.variants.is_empty() {
-                aligned_variants.insert(pos, vars);
-            }
-        }
+        let mut non_insertion_vars = input.non_insertion_vars;
+        let mut insertion_vars = input.insertion_vars;
 
-        // Process insertion variants
-        for (pos, var_map) in input.insertion_vars {
-            let vars = self.build_vars_at_position(
-                pos,
-                var_map,
-                &input.ref_coverage,
-                reference,
-                &ref_counts_by_pos,
-                &hicov_by_pos,
-            );
-            if !vars.variants.is_empty() {
-                aligned_variants.entry(pos)
-                    .or_insert_with(Vars::default)
-                    .variants
-                    .extend(vars.variants);
+        let mut positions: Vec<i64> = non_insertion_vars
+            .keys()
+            .chain(insertion_vars.keys())
+            .copied()
+            .collect();
+        positions.sort();
+        positions.dedup();
+
+        for pos in positions {
+            if let Some(var_map) = non_insertion_vars.remove(&pos) {
+                let vars = self.build_vars_at_position(
+                    pos,
+                    var_map,
+                    &input.ref_coverage,
+                    reference,
+                    &mut ref_counts_by_pos,
+                    &hicov_by_pos,
+                    input.duprate,
+                );
+                if !vars.variants.is_empty() {
+                    aligned_variants.insert(pos, vars);
+                }
+            }
+
+            if let Some(var_map) = insertion_vars.remove(&pos) {
+                let vars = self.build_vars_at_position(
+                    pos,
+                    var_map,
+                    &input.ref_coverage,
+                    reference,
+                    &mut ref_counts_by_pos,
+                    &hicov_by_pos,
+                    input.duprate,
+                );
+                if !vars.variants.is_empty() {
+                    aligned_variants.entry(pos)
+                        .or_insert_with(Vars::default)
+                        .variants
+                        .extend(vars.variants);
+                }
             }
         }
 
@@ -494,14 +528,27 @@ impl VarDictPipeline {
         var_map: HashMap<VarDesc, RawVariant>,
         ref_coverage: &HashMap<i64, usize>,
         reference: &Reference,
-        ref_counts_by_pos: &HashMap<i64, (usize, usize)>,
+        ref_counts_by_pos: &mut HashMap<i64, (usize, usize)>,
         hicov_by_pos: &HashMap<i64, usize>,
+        duprate: f64,
     ) -> Vars {
         use crate::mods::to_vars_builder::{check_strand_bias, StrandBiasFlag, StrandBiasValue};
         
-        let total_coverage = ref_coverage.get(&position).copied().unwrap_or(0);
+        let mut total_coverage = ref_coverage.get(&position).copied().unwrap_or(0);
         let actual_ref_base = reference.get(position).unwrap_or(b'N');
         let position_hicov = hicov_by_pos.get(&position).copied().unwrap_or(0);
+
+        let has_amp_insertion = var_map.iter().any(|(desc, _)| match desc {
+            VarDesc::Ins { seq } => seq.iter().any(|&b| b == b'&'),
+            VarDesc::Raw { desc } => desc.starts_with(b"+") && desc.iter().any(|&b| b == b'&'),
+            _ => false,
+        });
+
+        if has_amp_insertion {
+            if let Some(&coverage) = ref_coverage.get(&(position + 1)) {
+                total_coverage = coverage;
+            }
+        }
         
         // First, identify the reference variant and get its forward/reverse counts
         // Reference variant is an SNV where read_base == actual_ref_base
@@ -517,24 +564,20 @@ impl VarDictPipeline {
             }
         }
         
-        // Check if we need to look up reference counts from adjacent positions
-        // This is only needed for insertion variants where the reference is at the anchor position
-        let has_insertion_variant = var_map.iter().any(|(desc, _)| {
-            matches!(desc, VarDesc::Ins { .. }) || 
-            matches!(desc, VarDesc::Complex { ref_seq, alt_seq, .. } if alt_seq.len() > ref_seq.len())
-        });
-        
-        // If we didn't find reference counts at this position, check adjacent positions
-        // This handles cases like complex insertions where the reference is at the anchor position
-        // Java does similar fallback logic in ToVarsBuilder.collectReferenceVariants
-        // Only apply for insertion variants, not for MNVs or deletions
-        if ref_fwd_count == 0 && ref_rev_count == 0 && has_insertion_variant {
-            // Try position - 1 (the anchor for insertions)
-            if let Some(&(fwd, rev)) = ref_counts_by_pos.get(&(position - 1)) {
+        // If reference counts were not found in this var_map (e.g., insertion-only map),
+        // fall back to the non-insertion reference counts at the same position.
+        if ref_fwd_count == 0 && ref_rev_count == 0 {
+            if let Some(&(fwd, rev)) = ref_counts_by_pos.get(&position) {
                 ref_fwd_count = fwd;
                 ref_rev_count = rev;
-            } else if let Some(&(fwd, rev)) = ref_counts_by_pos.get(&(position + 1)) {
-                // Try position + 1 (Java's fallback for some cases)
+            }
+        }
+
+        // Java logic: if total coverage exceeds ref coverage at this position and
+        // there is a reference variant at position+1, use its strand counts.
+        let ref_cov_at_pos = ref_coverage.get(&position).copied().unwrap_or(0);
+        if total_coverage > ref_cov_at_pos {
+            if let Some(&(fwd, rev)) = ref_counts_by_pos.get(&(position + 1)) {
                 ref_fwd_count = fwd;
                 ref_rev_count = rev;
             }
@@ -547,13 +590,49 @@ impl VarDictPipeline {
         let mut reference_variant_opt = None;
 
         for (desc, raw_var) in var_map {
+            let total_count = raw_var.alt_depth_fwd + raw_var.alt_depth_rev;
+            let mut ttcov = total_coverage;
+
+            if total_count > total_coverage
+                && raw_var.extra_cnt > 0
+                && total_count - total_coverage < raw_var.extra_cnt
+            {
+                ttcov = total_count;
+            }
+
+            let is_insertion = matches!(desc, VarDesc::Ins { .. })
+                || matches!(&desc, VarDesc::Raw { desc } if desc.starts_with(b"+"))
+                || matches!(&desc, VarDesc::Complex { ref_seq, alt_seq } if alt_seq.len() > ref_seq.len());
+
+            if is_insertion && ttcov < total_count {
+                ttcov = total_count;
+                if let Some(&next_cov) = ref_coverage.get(&(position + 1)) {
+                    if next_cov > total_count && ttcov < next_cov - total_count {
+                        ttcov = next_cov;
+                        if let Some((ref_fwd, ref_rev)) = ref_counts_by_pos.get_mut(&(position + 1)) {
+                            *ref_fwd = ref_fwd.saturating_sub(raw_var.alt_depth_fwd);
+                            *ref_rev = ref_rev.saturating_sub(raw_var.alt_depth_rev);
+                        }
+                    }
+                }
+                total_coverage = ttcov;
+            }
+
+            let extra_frequency = if raw_var.extra_cnt > 0 && ttcov > 0 {
+                raw_var.extra_cnt as f64 / ttcov as f64
+            } else {
+                0.0
+            };
+
             let mut variant = self.convert_raw_variant(
                 &desc,
                 &raw_var,
                 position,
-                total_coverage,
+                ttcov,
                 reference,
                 position_hicov,
+                extra_frequency,
+                duprate,
             );
             
             // For non-reference variants, set the reference forward/reverse counts
@@ -592,6 +671,8 @@ impl VarDictPipeline {
         total_coverage: usize,
         reference: &Reference,
         position_hicov: usize,
+        extra_frequency: f64,
+        duprate: f64,
     ) -> Variant {
         let mut position = position;
         let total_count = raw.alt_depth_fwd + raw.alt_depth_rev;
@@ -623,82 +704,40 @@ impl VarDictPipeline {
                 )
             }
             VarDesc::Ins { seq } => {
-                let ref_char = actual_ref_base as char;
-                let ins_str = String::from_utf8_lossy(seq);
-                (
-                    VarType::Insertion(ins_str.to_string()),
-                    ref_char.to_string(),
-                    format!("{}{}", ref_char, ins_str),
-                )
+                let desc_str = format!("+{}", String::from_utf8_lossy(seq));
+                let (inferred, ref_str, var_str, start_position) =
+                    self.convert_desc_string_to_alleles(&desc_str, position, reference);
+                position = start_position;
+                (inferred, ref_str, var_str)
             }
-            VarDesc::Del { len, mismatch_seq, .. } => {
-                // Check if there are mismatches following the deletion
-                if !mismatch_seq.is_empty() {
-                    // Complex variant: deletion + following mismatches
-                    // For complex variants in VarDict raw output format, we don't use anchor base
-                    // Position is stored as anchor (position - 1), so actual deletion starts at position + 1
-                    let del_start = position + 1;
-                    // Update position to be the actual deletion start for output
-                    position = del_start;
-                    
-                    // Build reference sequence (deleted bases + following reference bases that get replaced)
-                    let mut ref_seq = Vec::new();
-                    for i in 0..(*len as i64) {
-                        if let Some(b) = reference.get(del_start + i) {
-                            ref_seq.push(b);
-                        }
-                    }
-                    // Add reference bases for the mismatch positions (after the deleted stretch)
-                    for i in 0..mismatch_seq.len() {
-                        if let Some(b) = reference.get(del_start + (*len as i64) + i as i64) {
-                            ref_seq.push(b);
-                        }
-                    }
-
-                    // Alt sequence is just the mismatch sequence (no anchor)
-                    let alt_seq: Vec<u8> = mismatch_seq.to_vec();
-
-                    (
-                        VarType::Complex {
-                            insertion: String::from_utf8_lossy(&alt_seq).to_string(),
-                            deletion: ref_seq.len(),
-                        },
-                        String::from_utf8_lossy(&ref_seq).to_string(),
-                        String::from_utf8_lossy(&alt_seq).to_string(),
-                    )
+            VarDesc::Del { .. } => {
+                let desc_str = desc.to_key_string();
+                let (inferred, ref_str, var_str, start_position) =
+                    self.convert_desc_string_to_alleles(&desc_str, position, reference);
+                position = start_position;
+                (inferred, ref_str, var_str)
+            }
+            VarDesc::Complex { alt_seq, .. } => {
+                let desc_str = if alt_seq.len() > 1 {
+                    let mut s = String::new();
+                    s.push(alt_seq[0] as char);
+                    s.push('&');
+                    s.push_str(&String::from_utf8_lossy(&alt_seq[1..]));
+                    s
                 } else {
-                    // Simple deletion: ref allele includes anchor + deleted bases
-                    let mut ref_str = String::new();
-                    if let Some(anchor_base) = reference.get(position) {
-                        ref_str.push(anchor_base as char);
-                    }
-                    for i in 1..=(*len as i64) {
-                        if let Some(b) = reference.get(position + i) {
-                            ref_str.push(b as char);
-                        }
-                    }
-                    // Alt allele is just the anchor base
-                    let var_str = if !ref_str.is_empty() {
-                        ref_str[0..1].to_string()
-                    } else {
-                        String::new()
-                    };
-                    (
-                        VarType::Deletion(*len as usize),
-                        ref_str,
-                        var_str,
-                    )
-                }
+                    String::from_utf8_lossy(alt_seq).to_string()
+                };
+                let (inferred, ref_str, var_str, start_position) =
+                    self.convert_desc_string_to_alleles(&desc_str, position, reference);
+                position = start_position;
+                (inferred, ref_str, var_str)
             }
-            VarDesc::Complex { ref_seq, alt_seq } => {
-                (
-                    VarType::Complex {
-                        insertion: String::from_utf8_lossy(alt_seq).to_string(),
-                        deletion: ref_seq.len(),
-                    },
-                    String::from_utf8_lossy(ref_seq).to_string(),
-                    String::from_utf8_lossy(alt_seq).to_string(),
-                )
+            VarDesc::Raw { desc } => {
+                let desc_str = String::from_utf8_lossy(desc).to_string();
+                let (inferred, ref_str, var_str, start_position) =
+                    self.convert_desc_string_to_alleles(&desc_str, position, reference);
+                position = start_position;
+                (inferred, ref_str, var_str)
             }
         };
 
@@ -791,6 +830,22 @@ impl VarDictPipeline {
                     // SNV: use SNP/MNP MSI calculation
                     self.detect_microsatellite_snp(reference, position)
                 }
+                VarDesc::Raw { desc } => {
+                    if desc.starts_with(b"-") {
+                        let tail = String::from_utf8_lossy(&desc[1..]);
+                        if let Some(del_len) = parse_leading_digits(&tail) {
+                            if del_len > 0 {
+                                self.detect_microsatellite(reference, position, del_len)
+                            } else {
+                                (0.0, 0.0, 0)
+                            }
+                        } else {
+                            (0.0, 0.0, 0)
+                        }
+                    } else {
+                        self.detect_microsatellite_snp(reference, position)
+                    }
+                }
                 _ => (0.0, 0.0, 0),
             }
         };
@@ -815,6 +870,7 @@ impl VarDictPipeline {
             } else {
                 0.0
             },
+            extra_frequency,
             mean_position,
             mean_quality,
             mean_mapping_quality,
@@ -839,7 +895,245 @@ impl VarDictPipeline {
             ref_forward_count: 0,  // Will be set by build_vars_at_position for non-ref variants
             ref_reverse_count: 0,
             genotype,
+            duprate,
         }
+    }
+
+    /// Convert Java-style description string to alleles and adjusted start position
+    fn convert_desc_string_to_alleles(
+        &self,
+        desc_str: &str,
+        position: i64,
+        reference: &Reference,
+    ) -> (VarType, String, String, i64) {
+        let mut start_position = position;
+        let mut end_position = position;
+        let mut ref_str = String::new();
+        let mut var_str = String::new();
+
+        if desc_str.starts_with('+') {
+            // Insertion
+            let ins_str = desc_str.trim_start_matches('+');
+            ref_str = reference
+                .get(position)
+                .map(|b| (b as char).to_string())
+                .unwrap_or_default();
+            var_str = format!("{}{}", ref_str, ins_str);
+            let mut had_amp = false;
+
+            if let Some(extra) = extract_amp_seq(desc_str) {
+                had_amp = true;
+                var_str = var_str.replacen("&", "", 1);
+                let extra_len = extra.len() as i64;
+                ref_str.push_str(&self.get_reference_range(
+                    reference,
+                    end_position + 1,
+                    end_position + extra_len,
+                ));
+                end_position += extra_len;
+
+                while let Some(vextra) = extract_amp_seq(&var_str) {
+                    var_str = var_str.replacen("&", "", 1);
+                    let vextra_len = vextra.len() as i64;
+                    ref_str.push_str(&self.get_reference_range(
+                        reference,
+                        end_position + 1,
+                        end_position + vextra_len,
+                    ));
+                    end_position += vextra_len;
+                }
+
+                if !ref_str.is_empty() && !var_str.is_empty() {
+                    ref_str = ref_str[1..].to_string();
+                    var_str = var_str[1..].to_string();
+                    start_position += 1;
+                }
+            }
+
+            if let Some((matched_seq, tail)) = extract_hash_caret(desc_str) {
+                let matched_len = matched_seq.len() as i64;
+                end_position += matched_len;
+                ref_str.push_str(&self.get_reference_range(
+                    reference,
+                    end_position - matched_len + 1,
+                    end_position,
+                ));
+
+                if let Some(del_len) = parse_leading_digits(&tail) {
+                    let del_len_i64 = del_len as i64;
+                    ref_str.push_str(&self.get_reference_range(
+                        reference,
+                        end_position + 1,
+                        end_position + del_len_i64,
+                    ));
+                    end_position += del_len_i64;
+                }
+
+                var_str = var_str.replacen('#', "", 1);
+                var_str = remove_caret_and_digits(&var_str);
+            }
+
+            if desc_str.contains('^') {
+                var_str = var_str.replacen('^', "", 1);
+            }
+
+            let inferred = infer_var_type_from_alleles(&ref_str, &var_str);
+            return (inferred, ref_str, var_str, start_position);
+        }
+
+        if desc_str.starts_with('-') {
+            let del_len = parse_leading_digits(&desc_str[1..]).unwrap_or(0);
+            if del_len > 0 {
+                end_position = position + del_len as i64 - 1;
+            }
+
+            // Remove leading -<digits>
+            if del_len > 0 {
+                let prefix = format!("-{}", del_len);
+                var_str = desc_str.replacen(&prefix, "", 1);
+            } else {
+                var_str = desc_str.to_string();
+            }
+
+            let has_suffix = desc_str.contains('&') || desc_str.contains('#') || desc_str.contains('^');
+            if !has_suffix {
+                // Simple deletion: anchor base at position-1
+                let anchor_pos = position - 1;
+                if anchor_pos >= 1 {
+                    if let Some(anchor_base) = reference.get(anchor_pos) {
+                        ref_str.push(anchor_base as char);
+                    }
+                }
+                for i in 0..del_len as i64 {
+                    if let Some(b) = reference.get(position + i) {
+                        ref_str.push(b as char);
+                    }
+                }
+                var_str = if !ref_str.is_empty() {
+                    ref_str[0..1].to_string()
+                } else {
+                    String::new()
+                };
+                start_position = anchor_pos;
+            } else {
+                // Deletion with suffix: build ref from deleted bases
+                for i in 0..del_len as i64 {
+                    if let Some(b) = reference.get(position + i) {
+                        ref_str.push(b as char);
+                    }
+                }
+            }
+
+            if let Some(extra) = extract_amp_seq(desc_str) {
+                var_str = var_str.replacen("&", "", 1);
+                let extra_len = extra.len() as i64;
+                ref_str.push_str(&self.get_reference_range(
+                    reference,
+                    end_position + 1,
+                    end_position + extra_len,
+                ));
+                end_position += extra_len;
+
+                while let Some(vextra) = extract_amp_seq(&var_str) {
+                    var_str = var_str.replacen("&", "", 1);
+                    let vextra_len = vextra.len() as i64;
+                    ref_str.push_str(&self.get_reference_range(
+                        reference,
+                        end_position + 1,
+                        end_position + vextra_len,
+                    ));
+                    end_position += vextra_len;
+                }
+            }
+
+            if let Some((matched_seq, tail)) = extract_hash_caret(desc_str) {
+                let matched_len = matched_seq.len() as i64;
+                end_position += matched_len;
+                ref_str.push_str(&self.get_reference_range(
+                    reference,
+                    end_position - matched_len + 1,
+                    end_position,
+                ));
+
+                if let Some(extra_del_len) = parse_leading_digits(&tail) {
+                    let del_len_i64 = extra_del_len as i64;
+                    ref_str.push_str(&self.get_reference_range(
+                        reference,
+                        end_position + 1,
+                        end_position + del_len_i64,
+                    ));
+                    end_position += del_len_i64;
+                }
+
+                var_str = var_str.replacen('#', "", 1);
+                var_str = remove_caret_and_digits(&var_str);
+            }
+
+            if desc_str.contains('^') {
+                var_str = var_str.replacen('^', "", 1);
+            }
+
+            return (VarType::Deletion(del_len), ref_str, var_str, start_position);
+        }
+
+        // SNP/MNP or other substitution
+        ref_str = reference
+            .get(position)
+            .map(|b| (b as char).to_string())
+            .unwrap_or_default();
+        var_str = desc_str.to_string();
+
+        if let Some(extra) = extract_amp_seq(desc_str) {
+            var_str = var_str.replacen("&", "", 1);
+            let extra_len = extra.len() as i64;
+            ref_str.push_str(&self.get_reference_range(
+                reference,
+                end_position + 1,
+                end_position + extra_len,
+            ));
+            end_position += extra_len;
+
+            while let Some(vextra) = extract_amp_seq(&var_str) {
+                var_str = var_str.replacen("&", "", 1);
+                let vextra_len = vextra.len() as i64;
+                ref_str.push_str(&self.get_reference_range(
+                    reference,
+                    end_position + 1,
+                    end_position + vextra_len,
+                ));
+                end_position += vextra_len;
+            }
+        }
+
+        if let Some((matched_seq, tail)) = extract_hash_caret(desc_str) {
+            let matched_len = matched_seq.len() as i64;
+            end_position += matched_len;
+            ref_str.push_str(&self.get_reference_range(
+                reference,
+                end_position - matched_len + 1,
+                end_position,
+            ));
+
+            if let Some(extra_del_len) = parse_leading_digits(&tail) {
+                let del_len_i64 = extra_del_len as i64;
+                ref_str.push_str(&self.get_reference_range(
+                    reference,
+                    end_position + 1,
+                    end_position + del_len_i64,
+                ));
+                end_position += del_len_i64;
+            }
+
+            var_str = var_str.replacen('#', "", 1);
+            var_str = remove_caret_and_digits(&var_str);
+        }
+
+        if desc_str.contains('^') {
+            var_str = var_str.replacen('^', "", 1);
+        }
+
+        let inferred = infer_var_type_from_alleles(&ref_str, &var_str);
+        (inferred, ref_str, var_str, start_position)
     }
     
     /// Get 20bp flanking sequence from reference
@@ -939,7 +1233,7 @@ impl VarDictPipeline {
         }
         seq
     }
-    
+
     /// Java-compatible findMSI implementation
     /// Finds microsatellite repeats by checking:
     /// 1. Repeats at the END of tseq1 (optionally with left prepended)
@@ -1039,6 +1333,7 @@ impl VarDictPipeline {
         &self,
         data: AlignedVarsData,
         region: &Region,
+        splice: &HashSet<String>,
     ) -> Result<Vec<String>> {
         let mut output_lines = Vec::new();
 
@@ -1070,13 +1365,20 @@ impl VarDictPipeline {
                     if !self.do_pileup {
                         continue;
                     }
-                    // In pileup mode, output reference
+                    // In pileup mode, output reference (or empty if none)
                     if let Some(ref ref_var) = vars.reference_variant {
                         let output = SimpleOutputVariant::from_variant(
                             ref_var,
                             &output_region,
                             &self.sample_name,
                             "",
+                        );
+                        output_lines.push(output.to_string());
+                    } else {
+                        let output = SimpleOutputVariant::empty(
+                            position,
+                            &output_region,
+                            &self.sample_name,
                         );
                         output_lines.push(output.to_string());
                     }
@@ -1086,7 +1388,7 @@ impl VarDictPipeline {
                 for variant in &vars.variants {
                     event!(Level::DEBUG, "[PostProcessor] Variant: pos={} ref={} alt={} freq={:.3} good={} type={:?}", 
                         variant.start_position, variant.refallele, variant.varallele, variant.frequency,
-                        self.is_good_var(variant, vars.reference_variant.as_ref()), variant.vartype);
+                        self.is_good_var(variant, vars.reference_variant.as_ref(), splice), variant.vartype);
                     
                     // Skip if ref contains N
                     if variant.refallele.contains('N') {
@@ -1102,27 +1404,46 @@ impl VarDictPipeline {
                         }
                     }
 
+                    // If variant start position shifted (pileup + single variant), output reference
+                    if variant.start_position != position && self.do_pileup && vars.variants.len() == 1 {
+                        if let Some(ref ref_var) = vars.reference_variant {
+                            let output = SimpleOutputVariant::from_variant(
+                                ref_var,
+                                &output_region,
+                                &self.sample_name,
+                                "",
+                            );
+                            output_lines.push(output.to_string());
+                        } else {
+                            let output = SimpleOutputVariant::empty(
+                                position,
+                                &output_region,
+                                &self.sample_name,
+                            );
+                            output_lines.push(output.to_string());
+                        }
+                    }
+
+                    let var_type = var_type_string(&variant.refallele, &variant.varallele);
+
                     // Apply quality filter (isGoodVar equivalent)
-                    if !self.is_good_var(variant, vars.reference_variant.as_ref()) {
+                    if !self.is_good_var(variant, vars.reference_variant.as_ref(), splice) {
                         event!(Level::DEBUG, "[PostProcessor] Skipping - failed isGoodVar filter");
                         if !self.do_pileup {
                             continue;
                         }
                     }
 
-                    // Apply frequency filter
-                    if variant.frequency < self.min_frequency {
-                        event!(Level::DEBUG, "[PostProcessor] Skipping - freq {:.3} < min {:.3}", variant.frequency, self.min_frequency);
-                        if !self.do_pileup {
-                            continue;
-                        }
+                    let mut variant = variant.clone();
+                    if var_type == "Complex" {
+                        variant.adj_complex();
                     }
 
                     event!(Level::DEBUG, "[PostProcessor] Adding variant to output");
 
                     // Generate output
                     let output = SimpleOutputVariant::from_variant(
-                        variant,
+                        &variant,
                         &output_region,
                         &self.sample_name,
                         "",
@@ -1140,43 +1461,31 @@ impl VarDictPipeline {
     /// Java checks: frequency >= conf.freq, hicnt >= conf.minr, 
     /// meanPosition >= conf.readPosFilter, meanQuality >= conf.goodq,
     /// highQualityToLowQualityRatio >= conf.qratio
-    fn is_good_var(&self, variant: &Variant, ref_variant: Option<&Variant>) -> bool {
-        // Check frequency (already checked separately, but kept for completeness)
-        if variant.frequency < self.min_frequency {
+    fn is_good_var(
+        &self,
+        variant: &Variant,
+        ref_variant: Option<&Variant>,
+        splice: &HashSet<String>,
+    ) -> bool {
+        if variant.refallele.is_empty() {
             return false;
         }
 
-        // Check high-quality read count (minr = 2 by default)
-        let min_reads = 2;
-        if variant.high_qual_read_cnt < min_reads {
+        let var_type = var_type_string(&variant.refallele, &variant.varallele);
+
+        if variant.frequency < instance().conf.freq
+            || variant.high_qual_read_cnt < instance().conf.minr
+            || variant.mean_position < instance().conf.read_pos_filter
+            || variant.mean_quality < instance().conf.goodq
+        {
             return false;
         }
 
-        // Check mean position (readPosFilter = 5 by default)
-        let read_pos_filter = 5.0;
-        if variant.mean_position < read_pos_filter {
-            return false;
-        }
-
-        // Check mean quality (goodq = 22.5 by default)
-        let goodq = 22.5;
-        if variant.mean_quality < goodq {
-            return false;
-        }
-
-        // Check high-quality to low-quality ratio (qratio = 1.5 by default)
-        let qratio = 1.5;
-        if variant.low_qual_read_cnt > 0 {
-            let ratio = variant.high_qual_read_cnt as f64 / variant.low_qual_read_cnt as f64;
-            if ratio < qratio {
-                return false;
-            }
-        }
-
-        // Check mapping quality vs reference (Java logic for low-frequency variants)
         if let Some(ref_var) = ref_variant {
-            if ref_var.high_qual_read_cnt >= min_reads && variant.frequency < 0.25 {
-                let d = variant.mean_mapping_quality + variant.refallele.len() as f64 + variant.varallele.len() as f64;
+            if ref_var.high_qual_read_cnt > instance().conf.minr && variant.frequency < 0.25 {
+                let d = variant.mean_mapping_quality
+                    + variant.refallele.len() as f64
+                    + variant.varallele.len() as f64;
                 let f = (1.0 + d) / (ref_var.mean_mapping_quality + 1.0);
                 if (d - 2.0 < 5.0 && ref_var.mean_mapping_quality > 20.0) || f < 0.25 {
                     return false;
@@ -1184,46 +1493,128 @@ impl VarDictPipeline {
             }
         }
 
-        // High frequency variants pass without further checks
+        if var_type == "Deletion" {
+            let splice_key = format!("{}-{}", variant.start_position, variant.end_position);
+            if splice.contains(&splice_key) {
+                return false;
+            }
+        }
+
+        let hl_ratio = if variant.low_qual_read_cnt > 0 {
+            variant.high_qual_read_cnt as f64 / variant.low_qual_read_cnt as f64
+        } else if variant.high_qual_read_cnt > 0 {
+            variant.high_qual_read_cnt as f64 * 2.0
+        } else {
+            0.0
+        };
+
+        if hl_ratio < instance().conf.qratio {
+            return false;
+        }
+
         if variant.frequency > 0.30 {
             return true;
         }
 
-        // Check mapping quality threshold for low-frequency variants (mapq = 0 by default)
-        // Java: if (meanMappingQuality < instance().conf.mapq) return false;
-        // With default mapq=0, this is effectively a no-op
-        let mapq_threshold = 0.0;
-        if variant.mean_mapping_quality < mapq_threshold {
+        if variant.mean_mapping_quality < instance().conf.mapq as f64 {
             return false;
         }
 
-        // MSI (microsatellite instability) filters
-        // Java: if (msi >= 15 && frequency <= monomerMsiFrequency(0.005) && msint == 1) return false
-        let monomer_msi_freq = 0.005;
-        if variant.msi >= 15.0 && variant.frequency <= monomer_msi_freq && variant.msint == 1.0 {
-            return false;
-        }
-        // Java: if (msi >= 12 && frequency <= nonMonomerMsiFrequency(0.002) && msint > 1) return false
-        let non_monomer_msi_freq = 0.002;
-        if variant.msi >= 12.0 && variant.frequency <= non_monomer_msi_freq && variant.msint > 1.0 {
+        if variant.msi >= 15.0
+            && variant.frequency <= instance().conf.monomer_msi_frequency
+            && variant.msint == 1.0
+        {
             return false;
         }
 
-        // Strand bias filter: "2;1" pattern (ref good, var biased) at low frequency for small variants
-        // Java: if (strandBiasFlag.equals("2;1") && frequency < 0.20d)
-        //         if (type == null || type.equals("SNV") || (refallele.length() < 3 && varallele.length() < 3))
-        //           return false
+        if variant.msi >= 12.0
+            && variant.frequency <= instance().conf.non_monomer_msi_frequency
+            && variant.msint > 1.0
+        {
+            return false;
+        }
+
         if variant.strand_bias_flag.is_ref_good_var_biased() && variant.frequency < 0.20 {
-            let is_small_variant = match &variant.vartype {
-                VarType::SNV(_) => true,
-                _ => variant.refallele.len() < 3 && variant.varallele.len() < 3,
-            };
-            if is_small_variant {
+            if var_type.is_empty()
+                || var_type == "SNV"
+                || (variant.refallele.len() < 3 && variant.varallele.len() < 3)
+            {
                 return false;
             }
         }
 
         true
+    }
+}
+
+fn extract_amp_seq(s: &str) -> Option<String> {
+    let idx = s.find('&')?;
+    let tail = &s[idx + 1..];
+    let seq: String = tail
+        .chars()
+        .take_while(|c| matches!(c, 'A' | 'T' | 'G' | 'C'))
+        .collect();
+    if seq.is_empty() {
+        None
+    } else {
+        Some(seq)
+    }
+}
+
+fn extract_hash_caret(s: &str) -> Option<(String, String)> {
+    let hash_idx = s.find('#')?;
+    let tail = &s[hash_idx + 1..];
+    let caret_idx = tail.find('^')?;
+    let matched = &tail[..caret_idx];
+    let tail_after = &tail[caret_idx + 1..];
+    if matched.is_empty() || tail_after.is_empty() {
+        None
+    } else {
+        Some((matched.to_string(), tail_after.to_string()))
+    }
+}
+
+fn parse_leading_digits(s: &str) -> Option<usize> {
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse::<usize>().ok()
+    }
+}
+
+fn remove_caret_and_digits(s: &str) -> String {
+    if let Some(idx) = s.find('^') {
+        let bytes = s.as_bytes();
+        let mut end = idx + 1;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        let mut out = String::new();
+        out.push_str(&s[..idx]);
+        out.push_str(&s[end..]);
+        out
+    } else {
+        s.to_string()
+    }
+}
+
+fn infer_var_type_from_alleles(refallele: &str, varallele: &str) -> VarType {
+    if refallele.len() == 1 && varallele.len() == 1 {
+        return VarType::SNV(varallele.chars().next().unwrap_or('N'));
+    }
+
+    if varallele.len() > refallele.len() && varallele.starts_with(refallele) {
+        return VarType::Insertion(varallele[refallele.len()..].to_string());
+    }
+
+    if refallele.len() > varallele.len() && refallele.starts_with(varallele) {
+        return VarType::Deletion(refallele.len().saturating_sub(varallele.len()));
+    }
+
+    VarType::Complex {
+        insertion: varallele.to_string(),
+        deletion: refallele.len(),
     }
 }
 
@@ -1274,6 +1665,7 @@ mod tests {
     #[test]
     fn test_is_good_var_strand_bias() {
         use crate::mods::to_vars_builder::{StrandBiasFlag, StrandBiasValue};
+        use std::collections::HashSet;
         
         let pipeline = VarDictPipeline::new("test");
         
@@ -1286,7 +1678,9 @@ mod tests {
         good_var.high_qual_read_cnt = 5;
         good_var.mean_position = 10.0;
         good_var.mean_quality = 30.0;
-        assert!(pipeline.is_good_var(&good_var, None));
+        good_var.refallele = "A".to_string();
+        good_var.varallele = "G".to_string();
+        assert!(pipeline.is_good_var(&good_var, None, &HashSet::new()));
 
         // Bad variant - ref good (2), var has bias (1), low frequency (2;1 pattern)
         let mut bad_var = Variant::default();
@@ -1299,7 +1693,7 @@ mod tests {
         bad_var.mean_quality = 30.0;
         bad_var.refallele = "A".to_string();
         bad_var.varallele = "G".to_string();
-        assert!(!pipeline.is_good_var(&bad_var, None));
+        assert!(!pipeline.is_good_var(&bad_var, None, &HashSet::new()));
 
         // High frequency can overcome strand bias (2;1 but freq > 0.20)
         let mut high_freq_bias = Variant::default();
@@ -1310,7 +1704,9 @@ mod tests {
         high_freq_bias.high_qual_read_cnt = 5;
         high_freq_bias.mean_position = 10.0;
         high_freq_bias.mean_quality = 30.0;
-        assert!(pipeline.is_good_var(&high_freq_bias, None));
+        high_freq_bias.refallele = "A".to_string();
+        high_freq_bias.varallele = "G".to_string();
+        assert!(pipeline.is_good_var(&high_freq_bias, None, &HashSet::new()));
     }
 
     #[test]
