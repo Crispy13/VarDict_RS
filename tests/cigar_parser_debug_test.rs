@@ -282,3 +282,199 @@ fn test_cigar_parser_position_168714() {
     println!("then one read is not being counted properly.");
 
 }
+
+#[test]
+#[ignore]
+fn test_cigar_parser_variant_76749_matches_java() {
+    use crackle_kit::tracing::level_filters::LevelFilter;
+    use rust_htslib::bam::Record;
+    use vardict_rs::data::bam_reader::BamReader;
+    use vardict_rs::mods::vardict_pipeline::VarDictPipeline;
+    use vardict_rs::variants::variants::VarDesc;
+
+    crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(LevelFilter::DEBUG);
+
+    let ref_path = "/home/eck/workspace/VarDictJava/tests/integration/reference/hs37d5.fa";
+    let bam_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/input/NA12878.chrom20.ILLUMINA.bwa.CEU.exome.20121211.bam";
+    let java_output_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/raw_input/raw.vardict.simple.chr20.nosv.var";
+    if !Path::new(ref_path).exists() || !Path::new(bam_path).exists() {
+        eprintln!("Missing reference or BAM file");
+        return;
+    }
+    if !Path::new(java_output_path).exists() {
+        eprintln!("Missing Java output file: {}", java_output_path);
+        return;
+    }
+
+    // Region around the first mismatch: 20:76646-76845 (1-based, inclusive)
+    let region = Region::new("20".to_string(), 76646, 76845, "test".to_string());
+
+    // Load reference sequence (0-based, half-open)
+    let ref_reader = rust_htslib::faidx::Reader::from_path(ref_path)
+        .expect("Failed to open reference");
+    let ref_seq = ref_reader
+        .fetch_seq_string("20", 76645, 76845)
+        .expect("Failed to fetch reference sequence");
+    let reference = Reference::from_seq_with_start(ref_seq.as_bytes(), 76646);
+
+    // Configure global scope to match simple mode defaults
+    let mut conf = Configuration::default();
+    conf.goodq = 22.5;
+    conf.vext = 2;
+    conf.disable_sv = true;
+    conf.perform_local_realignment = true;
+
+    let mut scope = GlobalReadOnlyScope::default();
+    scope.conf = conf;
+    scope.chr_lens.insert("20".to_string(), 63025520);
+    let _ = INSTANCE.set(scope.clone());
+    let instance = Arc::new(scope);
+
+    let pipeline = VarDictPipeline::new("abc");
+    let sam_filter = instance.conf.sam_filter;
+    let mut bam_reader = BamReader::open(bam_path).expect("Failed to open BAM");
+    bam_reader
+        .fetch(region.chr(), region.start(), region.end())
+        .expect("Failed to fetch BAM region");
+
+    let mut records = Vec::new();
+    let mut record = Record::new();
+    while bam_reader.read(&mut record).unwrap_or(false) {
+        // Mirror VarDictPipeline::passes_preprocess
+        if sam_filter != 0 && (record.flags() & (sam_filter as u16)) != 0 {
+            continue;
+        }
+        if pipeline.min_mapping_quality > 0 && record.mapq() < pipeline.min_mapping_quality {
+            continue;
+        }
+        const SECONDARY_ALIGNMENT: u16 = 0x100;
+        if (record.flags() & SECONDARY_ALIGNMENT) != 0 && sam_filter != 0 {
+            continue;
+        }
+        let seq = record.seq();
+        if seq.len() == 0 || (seq.len() == 1 && seq.as_bytes()[0] == b'*') {
+            continue;
+        }
+        records.push(record.clone());
+    }
+
+    let mut parser = CigarParser::new(region.clone(), reference.clone(), instance);
+    parser
+        .process_records(records.iter_mut())
+        .expect("Failed to parse records");
+
+    #[derive(Debug)]
+    struct JavaVariantCounts {
+        pos: i64,
+        ref_base: u8,
+        alt_base: u8,
+        alt_depth: usize,
+        alt_fwd: usize,
+        alt_rev: usize,
+        ref_fwd: usize,
+        ref_rev: usize,
+        hicov: usize,
+    }
+
+    fn extract_java_variant(java_output_path: &str) -> Option<JavaVariantCounts> {
+        let content = std::fs::read_to_string(java_output_path).ok()?;
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 30 {
+                continue;
+            }
+            let chr = parts.get(2)?;
+            let start = parts.get(3)?;
+            let end = parts.get(4)?;
+            let ref_base = parts.get(5)?;
+            let alt_base = parts.get(6)?;
+            if *chr == "20" && *start == "76749" && *end == "76749" && *ref_base == "A" && *alt_base == "G" {
+                let alt_depth = parts.get(8)?.parse().ok()?;
+                let ref_fwd = parts.get(9)?.parse().ok()?;
+                let ref_rev = parts.get(10)?.parse().ok()?;
+                let alt_fwd = parts.get(11)?.parse().ok()?;
+                let alt_rev = parts.get(12)?.parse().ok()?;
+                let hicov = parts.get(29)?.parse().ok()?;
+
+                return Some(JavaVariantCounts {
+                    pos: 76749,
+                    ref_base: ref_base.as_bytes()[0],
+                    alt_base: alt_base.as_bytes()[0],
+                    alt_depth,
+                    alt_fwd,
+                    alt_rev,
+                    ref_fwd,
+                    ref_rev,
+                    hicov,
+                });
+            }
+        }
+        None
+    }
+
+    let java_counts = extract_java_variant(java_output_path)
+        .expect("Failed to extract Java variant counts for 20:76749 A>G");
+
+    println!("Java extracted counts: {:?}", java_counts);
+
+    let pos = java_counts.pos;
+    let ref_base = reference.get(pos).unwrap_or(b'N');
+    let alt_base = java_counts.alt_base;
+
+    let var_map = parser
+        .get_non_insertion_vars()
+        .get(&pos)
+        .expect("No variants found at 76749");
+
+    let ref_var = var_map
+        .get(&VarDesc::SNV { ref_base })
+        .expect("Missing reference variant at 76749");
+    let alt_key = VarDesc::SNV { ref_base: alt_base };
+    let alt_var = match var_map.get(&alt_key) {
+        Some(v) => v,
+        None => {
+            println!("Alt variant missing at 76749. Available keys:");
+            for (desc, variant) in var_map.iter() {
+                println!("  {:?}: alt_depth={} fwd={} rev={}", desc, variant.alt_depth, variant.alt_depth_fwd, variant.alt_depth_rev);
+            }
+            println!("Nearby positions with alt base '{}' in non_insertion_vars:", alt_base as char);
+            let start_pos = pos.saturating_sub(5);
+            let end_pos = pos + 5;
+            for p in start_pos..=end_pos {
+                if let Some(nearby_map) = parser.get_non_insertion_vars().get(&p) {
+                    let key = VarDesc::SNV { ref_base: alt_base };
+                    if let Some(variant) = nearby_map.get(&key) {
+                        println!(
+                            "  pos {}: alt_depth={} fwd={} rev={}",
+                            p,
+                            variant.alt_depth,
+                            variant.alt_depth_fwd,
+                            variant.alt_depth_rev
+                        );
+                    }
+                }
+            }
+            panic!("Missing alt variant at 76749");
+        }
+    };
+
+    println!("Ref {} counts: alt_depth={} fwd={} rev={}",
+        ref_base as char,
+        ref_var.alt_depth,
+        ref_var.alt_depth_fwd,
+        ref_var.alt_depth_rev,
+    );
+    println!("Alt {} counts: alt_depth={} fwd={} rev={}",
+        alt_base as char,
+        alt_var.alt_depth,
+        alt_var.alt_depth_fwd,
+        alt_var.alt_depth_rev,
+    );
+
+    assert_eq!(alt_var.alt_depth, java_counts.alt_depth, "alt_depth mismatch for 76749");
+    assert_eq!(alt_var.alt_depth_fwd, java_counts.alt_fwd, "alt fwd mismatch for 76749");
+    assert_eq!(alt_var.alt_depth_rev, java_counts.alt_rev, "alt rev mismatch for 76749");
+
+    assert_eq!(ref_var.alt_depth_fwd, java_counts.ref_fwd, "ref fwd mismatch for 76749");
+    assert_eq!(ref_var.alt_depth_rev, java_counts.ref_rev, "ref rev mismatch for 76749");
+}

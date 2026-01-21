@@ -778,8 +778,19 @@ fn test_vardict_pipeline_hard_clip() {
     
     let instance = Arc::new(scope);
     
-    // Create region
-    let region = Region::new(config.chrom.clone(), config.start as usize, config.end as usize, "testbed".to_string());
+    // Create region (Java IntegrationTest uses -z, so start is zero-based)
+    let mut start = config.start as usize;
+    let mut end = config.end as usize;
+    if start < end {
+        start += 1;
+    }
+    if start == 0 {
+        start = 1;
+    }
+    if end < start {
+        std::mem::swap(&mut start, &mut end);
+    }
+    let region = Region::new(config.chrom.clone(), start, end, "testbed".to_string());
     
     // Create reference with region start offset
     let reference = Reference::from_seq_with_start(ref_seq.as_bytes(), config.start);
@@ -945,8 +956,19 @@ fn test_rust_vs_java_output_comparison() {
     let _ = INSTANCE.set(scope.clone());
     let instance = Arc::new(scope);
     
-    // Create region
-    let region = Region::new(config.chrom.clone(), config.start as usize, config.end as usize, "testbed".to_string());
+    // Create region (Java IntegrationTest uses -z, so start is zero-based)
+    let mut start = config.start as usize;
+    let mut end = config.end as usize;
+    if start < end {
+        start += 1;
+    }
+    if start == 0 {
+        start = 1;
+    }
+    if end < start {
+        std::mem::swap(&mut start, &mut end);
+    }
+    let region = Region::new(config.chrom.clone(), start, end, "testbed".to_string());
     
     // Create reference with extended region start offset
     let reference = Reference::from_seq_with_start(ref_seq.as_bytes(), extended_start);

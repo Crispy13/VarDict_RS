@@ -76,6 +76,10 @@ struct Args {
     #[arg(short = 'F', long = "filter", default_value = "0x504")]
     sam_filter: String,
 
+    /// Downsampling fraction (Java: -Z). When set, randomly drop reads by this fraction.
+    #[arg(short = 'Z', long = "downsample")]
+    downsampling: Option<f64>,
+
     /// Turn off structural variant calling
     #[arg(short = 'U', long = "nosv")]
     no_sv: bool,
@@ -115,6 +119,10 @@ struct Args {
     /// Number of threads for parallel processing (default: 1)
     #[arg(short = 't', long = "threads", default_value = "1")]
     num_threads: usize,
+
+    /// Remove duplicated reads (Java: -t). TODO: option only; logic not yet implemented.
+    #[arg(long = "remove-duplicates")]
+    remove_duplicates: bool,
 
     /// Log level
     #[arg(long, default_value_t = LevelFilter::WARN)]
@@ -253,6 +261,8 @@ fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>
     conf.vext = args.vext;
     conf.mismatch = args.mismatch;
     conf.sam_filter = sam_filter;
+    conf.downsampling = args.downsampling;
+    conf.remove_duplicated_reads = args.remove_duplicates;
     conf.disable_sv = args.no_sv;
     conf.perform_local_realignment = args.local_realignment == 1;
     let mut scope = GlobalReadOnlyScope::default();
@@ -278,12 +288,7 @@ fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>
     // Process regions
     let start_processing = Instant::now();
     let bam_path = args.bam.to_str().unwrap().to_string();
-    let use_vardict_pipeline = std::env::var("VARDICT_USE_REAL_PIPELINE").is_ok();
-    let results = if use_vardict_pipeline {
-        pipeline.process_regions_vardict(bam_path, regions)
-    } else {
-        pipeline.process_regions(bam_path, regions)
-    };
+    let results = pipeline.process_regions_vardict(bam_path, regions);
     let elapsed_processing = start_processing.elapsed();
 
     // Output results

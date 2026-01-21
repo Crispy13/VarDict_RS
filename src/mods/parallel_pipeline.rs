@@ -22,10 +22,10 @@
 //! ```
 
 use std::sync::Arc;
-use std::thread;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 
 use crate::data::shared_reference::{SharedReference, SharedReferenceHandle};
 use crate::data::region::Region;
@@ -106,8 +106,6 @@ impl ParallelPipeline {
         bam_path: P,
         regions: Vec<Region>,
     ) -> Vec<RegionResult> {
-        use std::sync::mpsc;
-
         if regions.is_empty() {
             return Vec::new();
         }
@@ -115,50 +113,21 @@ impl ParallelPipeline {
         // Calculate regions per thread
         let regions_per_thread = (regions.len() + self.num_threads - 1) / self.num_threads;
         
-        // Create channel for results
-        let (tx, rx) = mpsc::channel();
-
         // Partition regions into chunks for each thread
         let region_chunks: Vec<Vec<Region>> = regions
             .chunks(regions_per_thread.max(1))
             .map(|c| c.to_vec())
             .collect();
 
-        // Spawn worker threads
-        let mut handles = Vec::new();
-        
-        for (thread_id, chunk) in region_chunks.into_iter().enumerate() {
-            let tx = tx.clone();
-            let reference = Arc::clone(&self.reference);
-            let config = self.config.clone();
-            let bam_path = bam_path.clone();
-
-            let handle = thread::spawn(move || {
-                process_region_chunk(
-                    thread_id,
-                    chunk,
-                    reference,
-                    config,
-                    bam_path,
-                    tx,
-                )
-            });
-            
-            handles.push(handle);
-        }
-
-        // Drop the original sender so rx.iter() will end
-        drop(tx);
-
-        // Collect results
-        let mut results: Vec<RegionResult> = rx.iter().collect();
-
-        // Wait for all threads to complete
-        for handle in handles {
-            if let Err(e) = handle.join() {
-                eprintln!("Worker thread panicked: {:?}", e);
-            }
-        }
+        let mut results: Vec<RegionResult> = region_chunks
+            .into_par_iter()
+            .flat_map(|chunk| {
+                let reference = Arc::clone(&self.reference);
+                let config = self.config.clone();
+                let bam_path = bam_path.clone();
+                process_region_chunk(chunk, reference, config, bam_path)
+            })
+            .collect();
 
         // Sort results by region for consistent output order
         results.sort_by(|a, b| {
@@ -190,8 +159,6 @@ impl ParallelPipeline {
         bam_path: P,
         regions: Vec<Region>,
     ) -> Vec<RegionResult> {
-        use std::sync::mpsc;
-
         if regions.is_empty() {
             return Vec::new();
         }
@@ -199,50 +166,21 @@ impl ParallelPipeline {
         // Calculate regions per thread
         let regions_per_thread = (regions.len() + self.num_threads - 1) / self.num_threads;
         
-        // Create channel for results
-        let (tx, rx) = mpsc::channel();
-
         // Partition regions into chunks for each thread
         let region_chunks: Vec<Vec<Region>> = regions
             .chunks(regions_per_thread.max(1))
             .map(|c| c.to_vec())
             .collect();
 
-        // Spawn worker threads
-        let mut handles = Vec::new();
-        
-        for (thread_id, chunk) in region_chunks.into_iter().enumerate() {
-            let tx = tx.clone();
-            let reference = Arc::clone(&self.reference);
-            let config = self.config.clone();
-            let bam_path = bam_path.clone();
-
-            let handle = thread::spawn(move || {
-                process_region_chunk_vardict(
-                    thread_id,
-                    chunk,
-                    reference,
-                    config,
-                    bam_path,
-                    tx,
-                )
-            });
-            
-            handles.push(handle);
-        }
-
-        // Drop the original sender so rx.iter() will end
-        drop(tx);
-
-        // Collect results
-        let mut results: Vec<RegionResult> = rx.iter().collect();
-
-        // Wait for all threads to complete
-        for handle in handles {
-            if let Err(e) = handle.join() {
-                eprintln!("Worker thread panicked: {:?}", e);
-            }
-        }
+        let mut results: Vec<RegionResult> = region_chunks
+            .into_par_iter()
+            .flat_map(|chunk| {
+                let reference = Arc::clone(&self.reference);
+                let config = self.config.clone();
+                let bam_path = bam_path.clone();
+                process_region_chunk_vardict(chunk, reference, config, bam_path)
+            })
+            .collect();
 
         // Sort results by region for consistent output order
         results.sort_by(|a, b| {
@@ -279,44 +217,38 @@ impl ParallelPipeline {
 
 /// Worker function to process a chunk of regions using VarDict pipeline
 fn process_region_chunk_vardict<P: AsRef<Path>>(
-    thread_id: usize,
     regions: Vec<Region>,
     reference: SharedReferenceHandle,
     config: PipelineConfig,
     bam_path: P,
-    tx: std::sync::mpsc::Sender<RegionResult>,
-) {
+) -> Vec<RegionResult> {
     use crackle_kit::tracing::{Level, event};
-    
+
     let start_thread = std::time::Instant::now();
-    
-    // Each thread opens its own BAM reader
+    let mut results = Vec::new();
+
+    // Each worker opens its own BAM reader
     let mut bam_reader = match BamReader::open(bam_path.as_ref().to_str().unwrap()) {
         Ok(reader) => reader,
         Err(e) => {
-            // Send error for all regions
             for region in regions {
-                let _ = tx.send(RegionResult {
+                results.push(RegionResult {
                     region,
                     output_lines: Vec::new(),
                     error: Some(format!("Failed to open BAM: {}", e)),
                 });
             }
-            return;
+            return results;
         }
     };
 
-    // Create VarDict pipeline for this thread
     let vardict_pipeline = VarDictPipeline::new(&config.sample_name)
         .with_min_frequency(config.min_frequency)
         .with_min_base_quality(config.quality_threshold)
         .with_min_mapping_quality(config.mapq_threshold);
 
-    // Get or create GlobalReadOnlyScope
-    // In production, this would be set up once at startup
     let global_scope = Arc::new(instance().clone());
 
-    // Process each region
     for region in regions {
         let result = match vardict_pipeline.process_region_from_bam(
             &region,
@@ -335,37 +267,37 @@ fn process_region_chunk_vardict<P: AsRef<Path>>(
                 error: Some(format!("Processing error: {}", e)),
             },
         };
-        
-        let _ = tx.send(result);
+
+        results.push(result);
     }
-    
+
     let elapsed_thread = start_thread.elapsed();
-    event!(Level::INFO, "[TIMING] Thread {} completed in {:.3}s", thread_id, elapsed_thread.as_secs_f64());
+    event!(Level::INFO, "[TIMING] Worker completed in {:.3}s", elapsed_thread.as_secs_f64());
+
+    results
 }
 
 
 /// Worker function to process a chunk of regions
 fn process_region_chunk<P: AsRef<Path>>(
-    _thread_id: usize,
     regions: Vec<Region>,
     reference: SharedReferenceHandle,
     config: PipelineConfig,
     bam_path: P,
-    tx: std::sync::mpsc::Sender<RegionResult>,
-) {
+) -> Vec<RegionResult> {
     // Each thread opens its own BAM reader
     let mut bam_reader = match BamReader::open(bam_path.as_ref().to_str().unwrap()) {
         Ok(reader) => reader,
         Err(e) => {
-            // Send error for all regions
+            let mut results = Vec::new();
             for region in regions {
-                let _ = tx.send(RegionResult {
+                results.push(RegionResult {
                     region,
                     output_lines: Vec::new(),
                     error: Some(format!("Failed to open BAM: {}", e)),
                 });
             }
-            return;
+            return results;
         }
     };
 
@@ -378,7 +310,7 @@ fn process_region_chunk<P: AsRef<Path>>(
     // Create pipeline for this thread
     let pipeline = Pipeline::new(config.clone());
 
-    // Process each region
+    let mut results = Vec::new();
     for region in regions {
         let result = process_single_region(
             &region,
@@ -388,9 +320,11 @@ fn process_region_chunk<P: AsRef<Path>>(
             &mut bam_reader,
             &config,
         );
-        
-        let _ = tx.send(result);
+
+        results.push(result);
     }
+
+    results
 }
 
 /// Process a single region using VarDictPipeline (Java-equivalent flow)

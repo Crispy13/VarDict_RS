@@ -151,10 +151,15 @@ impl VarDictPipeline {
         // Get SAM filter from instance configuration
         let sam_filter = instance.conf.sam_filter;
 
-        let records = self.collect_filtered_records(region, bam_reader, sam_filter)?.0;
+        let cigar_output = self.run_cigar_parser_from_bam(
+            region,
+            &reference,
+            Arc::clone(&instance),
+            bam_reader,
+            sam_filter,
+        )?;
 
-        // Process through the pipeline
-        self.process_region(records.into_iter(), region, &reference, instance)
+        self.process_region_from_cigar_output(cigar_output, region, &reference)
     }
 
     pub(crate) fn collect_filtered_records(
@@ -170,27 +175,7 @@ impl VarDictPipeline {
         bam_reader.fetch(region.chr(), region.start(), region.end())?;
 
         while bam_reader.read(&mut record).unwrap_or(false) {
-            // 1. Java SamView.read(): Skip records that match the filter flags
-            if sam_filter != 0 {
-                if (record.flags() & (sam_filter as u16)) != 0 {
-                    continue;
-                }
-            }
-
-            // 2. Java preprocessRecord line 117: Ignore low mapping quality reads
-            if self.min_mapping_quality > 0 && record.mapq() < self.min_mapping_quality {
-                continue;
-            }
-
-            // 3. Java preprocessRecord line 122: Skip not primary alignment reads
-            const SECONDARY_ALIGNMENT: u16 = 0x100;
-            if (record.flags() & SECONDARY_ALIGNMENT) != 0 && sam_filter != 0 {
-                continue;
-            }
-
-            // 4. Java preprocessRecord line 124: Skip reads where sequence is not stored in read
-            let seq = record.seq();
-            if seq.len() == 0 || (seq.len() == 1 && seq.as_bytes()[0] == b'*') {
+            if !self.passes_preprocess(&record, sam_filter) {
                 continue;
             }
 
@@ -225,6 +210,36 @@ impl VarDictPipeline {
         Ok((records, lines))
     }
 
+    fn passes_preprocess(&self, record: &Record, sam_filter: u32) -> bool {
+        // TODO: Implement Java downsampling behavior (RecordPreprocessor.preprocessRecord)
+        // TODO: Implement Java duplicate removal behavior (-t) from RecordPreprocessor.preprocessRecord
+        // 1. Java SamView.read(): Skip records that match the filter flags
+        if sam_filter != 0 {
+            if (record.flags() & (sam_filter as u16)) != 0 {
+                return false;
+            }
+        }
+
+        // 2. Java preprocessRecord line 117: Ignore low mapping quality reads
+        if self.min_mapping_quality > 0 && record.mapq() < self.min_mapping_quality {
+            return false;
+        }
+
+        // 3. Java preprocessRecord line 122: Skip not primary alignment reads
+        const SECONDARY_ALIGNMENT: u16 = 0x100;
+        if (record.flags() & SECONDARY_ALIGNMENT) != 0 && sam_filter != 0 {
+            return false;
+        }
+
+        // 4. Java preprocessRecord line 124: Skip reads where sequence is not stored in read
+        let seq = record.seq();
+        if seq.len() == 0 || (seq.len() == 1 && seq.as_bytes()[0] == b'*') {
+            return false;
+        }
+
+        true
+    }
+
     /// Process a batch of records for a region
     ///
     /// This is the main entry point - processes BAM records and returns output lines.
@@ -239,57 +254,50 @@ impl VarDictPipeline {
         I: Iterator<Item = Record>,
     {
         let start_total = std::time::Instant::now();
-        
+
         // Step 1: Parse CIGAR strings (CigarParser)
         let start_cigar = std::time::Instant::now();
         let cigar_output = self.run_cigar_parser(records, region, reference, instance)?;
         let elapsed_cigar = start_cigar.elapsed();
-        
+
         event!(Level::INFO, "[TIMING] CigarParser: {:.3}s - {} non_insertion_vars, {} ref_coverage positions",
             elapsed_cigar.as_secs_f64(),
             cigar_output.non_insertion_vars.len(),
             cigar_output.ref_coverage.len());
 
-        // Step 2: Realign soft clips and process structural variants
+        self.process_region_from_cigar_output(cigar_output, region, reference)
+    }
+
+    fn process_region_from_cigar_output(
+        &self,
+        cigar_output: CigarParserOutput,
+        region: &Region,
+        reference: &Reference,
+    ) -> Result<Vec<String>> {
         let start_realign = std::time::Instant::now();
         let realigned_output = self.run_variant_realigner_and_sv_processor(cigar_output, region, reference)?;
         let elapsed_realign = start_realign.elapsed();
-        
+
         event!(Level::INFO, "[TIMING] VariantRealigner+SVProcessor: {:.3}s - {} non_insertion_vars, {} ref_coverage",
             elapsed_realign.as_secs_f64(),
             realigned_output.non_insertion_vars.len(),
             realigned_output.ref_coverage.len());
 
-        // Step 3: Build variant objects with statistics (ToVarsBuilder)
         let start_tovars = std::time::Instant::now();
         let aligned_vars = self.run_to_vars_builder(realigned_output, reference)?;
         let elapsed_tovars = start_tovars.elapsed();
-        
+
         event!(Level::INFO, "[TIMING] ToVarsBuilder: {:.3}s - {} variants",
             elapsed_tovars.as_secs_f64(),
             aligned_vars.aligned_variants.len());
 
-        // Step 4: Post-process and generate output (SimplePostProcessor)
         let start_post = std::time::Instant::now();
         let output_lines = self.run_simple_post_processor(aligned_vars, region)?;
         let elapsed_post = start_post.elapsed();
-        
+
         event!(Level::INFO, "[TIMING] PostProcessor: {:.3}s - {} lines",
             elapsed_post.as_secs_f64(),
             output_lines.len());
-
-        // let elapsed_total = start_total.elapsed();
-        
-        // // Log timing summary for regions taking >10ms
-        // if elapsed_total.as_millis() > 10 {
-        //     event!(Level::TRACE, "[REGION] {}:{}-{} total={:.3}s cigar={:.3}s realign={:.3}s tovars={:.3}s post={:.3}s",
-        //         region.chr(), region.start(), region.end(),
-        //         elapsed_total.as_secs_f64(),
-        //         elapsed_cigar.as_secs_f64(),
-        //         elapsed_realign.as_secs_f64(),
-        //         elapsed_tovars.as_secs_f64(),
-        //         elapsed_post.as_secs_f64());
-        // }
 
         Ok(output_lines)
     }
@@ -322,9 +330,40 @@ impl VarDictPipeline {
         
         // Process all records
         cigar_parser.process_records(records_vec.iter_mut())?;
-        
-        // Extract results including soft clips
-        Ok(CigarParserOutput {
+
+        Ok(self.build_cigar_output(&mut cigar_parser))
+    }
+
+    fn run_cigar_parser_from_bam(
+        &self,
+        region: &Region,
+        reference: &Reference,
+        instance: Arc<GlobalReadOnlyScope>,
+        bam_reader: &mut BamReader,
+        sam_filter: u32,
+    ) -> Result<CigarParserOutput> {
+        let mut cigar_parser = CigarParser::new(
+            region.clone(),
+            reference.clone(),
+            instance,
+        );
+
+        bam_reader.fetch(region.chr(), region.start(), region.end())?;
+
+        let mut record = Record::new();
+        while bam_reader.read(&mut record).unwrap_or(false) {
+            if !self.passes_preprocess(&record, sam_filter) {
+                continue;
+            }
+
+            cigar_parser.process_record(&mut record)?;
+        }
+
+        Ok(self.build_cigar_output(&mut cigar_parser))
+    }
+
+    fn build_cigar_output(&self, cigar_parser: &mut CigarParser) -> CigarParserOutput {
+        CigarParserOutput {
             non_insertion_vars: cigar_parser.take_non_insertion_vars(),
             insertion_vars: cigar_parser.take_insertion_vars(),
             soft_clips_5end: cigar_parser.take_soft_clips_5end(),
@@ -332,7 +371,7 @@ impl VarDictPipeline {
             ref_coverage: cigar_parser.take_ref_coverage(),
             max_read_len: cigar_parser.get_max_read_len(),
             discordant_count: cigar_parser.get_discordant_count(),
-        })
+        }
     }
 
     /// Step 2: Run VariantRealigner and StructuralVariantsProcessor
@@ -1010,7 +1049,7 @@ impl VarDictPipeline {
         // Output uses the same coordinate base as the parsed regions
         let output_region = OutputRegion {
             chr: region.chr().to_string(),
-            start: region.start() as i64 + 1,
+            start: region.start() as i64,
             end: region.end() as i64,
             gene: region.gene().to_string(),
         };
