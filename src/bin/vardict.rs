@@ -59,6 +59,14 @@ struct Args {
     #[arg(short = 'Q', long = "mapq", default_value = "0")]
     min_mapping_quality: u8,
 
+    /// Number of nucleotides to extend regions (Java: -x)
+    #[arg(short = 'x', long = "extend", default_value = "0")]
+    number_nucleotide_to_extend: i32,
+
+    /// Reference extension for fetching sequence (Java: -Y)
+    #[arg(short = 'Y', long = "reference-extension", default_value = "1200")]
+    reference_extension: i32,
+
     /// Print header line
     #[arg(short = 'H', long = "header")]
     print_header: bool,
@@ -123,6 +131,7 @@ struct Args {
     /// Remove duplicated reads (Java: -t). TODO: option only; logic not yet implemented.
     #[arg(long = "remove-duplicates")]
     remove_duplicates: bool,
+
 
     /// Log level
     #[arg(long, default_value_t = LevelFilter::WARN)]
@@ -211,6 +220,11 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn parse_debug_dump_env() -> bool {
+    let value = std::env::var("VARDICT_DEBUG_DUMP").unwrap_or_default();
+    matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
 /// Run variant calling using SharedReference (loaded into memory)
 /// 
 /// SharedReference is the default for both single and multi-threaded modes.
@@ -218,7 +232,7 @@ fn main() -> Result<()> {
 fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>) -> Result<()> {
     use vardict_rs::data::shared_reference::load_shared_reference_chroms;
     use vardict_rs::mods::parallel_pipeline::ParallelPipeline;
-    use vardict_rs::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE};
+    use vardict_rs::scopedata::global_read_only_scope::{parse_debug_dump_region_env, GlobalReadOnlyScope, INSTANCE};
     use vardict_rs::conf::Configuration;
     use std::time::Instant;
 
@@ -267,7 +281,11 @@ fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>
     conf.remove_duplicated_reads = args.remove_duplicates;
     conf.disable_sv = args.no_sv;
     conf.perform_local_realignment = args.local_realignment == 1;
+    conf.number_nucleotide_to_extend = args.number_nucleotide_to_extend;
+    conf.reference_extension = args.reference_extension;
     let mut scope = GlobalReadOnlyScope::default();
+    scope.debug_dump_steps = parse_debug_dump_env();
+    scope.debug_dump_region = parse_debug_dump_region_env();
     scope.conf = conf;
     scope.chr_lens = reference.get_chromosome_lengths();
     let _ = INSTANCE.set(scope);

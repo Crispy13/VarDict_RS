@@ -286,13 +286,27 @@ impl VariantRealigner {
         all_mm.extend(r5.mismatches.iter().cloned());
 
         for mm in all_mm {
-            // Only handle simple SNV mismatches for now
-            if mm.mismatch_sequence.len() != 1 {
+            let mm_bytes: Vec<u8> = mm
+                .mismatch_sequence
+                .as_bytes()
+                .iter()
+                .map(|b| b.to_ascii_uppercase())
+                .collect();
+            if mm_bytes.is_empty() {
                 continue;
             }
 
-            let mm_base = mm.mismatch_sequence.as_bytes()[0].to_ascii_uppercase();
-            let key = VarDesc::SNV { ref_base: mm_base };
+            let key = if mm_bytes.len() == 1 {
+                VarDesc::SNV {
+                    ref_base: mm_bytes[0],
+                }
+            } else {
+                let mut raw = Vec::with_capacity(mm_bytes.len() + 1);
+                raw.push(mm_bytes[0]);
+                raw.push(b'&');
+                raw.extend_from_slice(&mm_bytes[1..]);
+                VarDesc::Raw { desc: raw.into() }
+            };
             let tv_snapshot = data
                 .non_insertion_variants
                 .get(&mm.mismatch_position)
@@ -326,8 +340,17 @@ impl VariantRealigner {
                     1.0
                 };
                 let f = f.clamp(0.0, 1.0);
-                let add = (tv.alt_depth as f64 * f).round() as usize;
+                let add = (tv.alt_depth as f64 * f) as usize;
                 *data.ref_coverage.entry(pos).or_insert(0) += add;
+
+                if let Some(ref_base) = self.get_ref_base(pos) {
+                    if let Some(pos_map) = data.non_insertion_variants.get_mut(&pos) {
+                        let ref_key = VarDesc::SNV { ref_base };
+                        if let Some(ref_var) = pos_map.get_mut(&ref_key) {
+                            adj_ref_cnt(&tv, ref_var, dellen);
+                        }
+                    }
+                }
             }
 
             let tv_owned = data
@@ -342,12 +365,26 @@ impl VariantRealigner {
                 }
             }
 
-            if let Some(vref) = data
-                .non_insertion_variants
-                .get_mut(&pos)
-                .and_then(|m| m.get_mut(desc))
-            {
-                adj_cnt(vref, &tv_owned);
+            let ref_key = if mm.mismatch_position > pos && mm.end == 3 {
+                self.get_ref_base(pos).map(|ref_base| VarDesc::SNV { ref_base })
+            } else {
+                None
+            };
+
+            if let Some(pos_map) = data.non_insertion_variants.get_mut(&pos) {
+                let mut ref_var = ref_key.as_ref().and_then(|k| pos_map.remove(k));
+                if let Some(vref) = pos_map.get_mut(desc) {
+                    if let Some(ref_var_mut) = ref_var.as_mut() {
+                        adj_cnt_with_ref(vref, &tv_owned, Some(ref_var_mut));
+                    } else {
+                        adj_cnt(vref, &tv_owned);
+                    }
+                }
+                if let Some(ref_key) = ref_key {
+                    if let Some(ref_var) = ref_var {
+                        pos_map.insert(ref_key, ref_var);
+                    }
+                }
             }
         }
 
@@ -423,22 +460,41 @@ impl VariantRealigner {
                 if seq.is_empty() {
                     continue;
                 }
-                let offset = (sc3pp - pos).max(0) as usize;
-                let mseq = if offset < sanpseq.len() {
+                let offset = if sc3pp > pos {
+                    (sc3pp - pos) as usize
+                } else {
+                    0
+                };
+                let mseq = if offset <= sanpseq.len() {
                     &sanpseq[offset..]
                 } else {
-                    &sanpseq[sanpseq.len().saturating_sub(1)..]
+                    &[]
                 };
                 if Self::is_match_bytes(&seq, mseq, 1) {
                     if sc3pp <= pos {
                         *data.ref_coverage.entry(pos).or_insert(0) += tv.var.alt_depth;
                     }
-                    if let Some(vref) = data
-                        .non_insertion_variants
-                        .get_mut(&pos)
-                        .and_then(|m| m.get_mut(desc))
-                    {
-                        adj_cnt(vref, &tv.var);
+
+                    let ref_key = if sc3pp > pos {
+                        self.get_ref_base(pos).map(|ref_base| VarDesc::SNV { ref_base })
+                    } else {
+                        None
+                    };
+
+                    if let Some(pos_map) = data.non_insertion_variants.get_mut(&pos) {
+                        let mut ref_var = ref_key.as_ref().and_then(|k| pos_map.remove(k));
+                        if let Some(vref) = pos_map.get_mut(desc) {
+                            if let Some(ref_var_mut) = ref_var.as_mut() {
+                                adj_cnt_with_ref(vref, &tv.var, Some(ref_var_mut));
+                            } else {
+                                adj_cnt(vref, &tv.var);
+                            }
+                        }
+                        if let Some(ref_key) = ref_key {
+                            if let Some(ref_var) = ref_var {
+                                pos_map.insert(ref_key, ref_var);
+                            }
+                        }
                     }
                     tv.mark_used();
                 }
@@ -921,6 +977,60 @@ impl VariantRealigner {
 
 }
 
+fn adj_cnt_with_ref(dest: &mut Variant, src: &Variant, reference: Option<&mut Variant>) {
+    adj_cnt(dest, src);
+
+    let Some(reference) = reference else { return; };
+
+    reference.alt_depth = reference.alt_depth.saturating_sub(src.alt_depth);
+    reference.high_qual_read_cnt = reference.high_qual_read_cnt.saturating_sub(src.high_qual_read_cnt);
+    reference.low_qual_read_cnt = reference.low_qual_read_cnt.saturating_sub(src.low_qual_read_cnt);
+    reference.mean_pos -= src.mean_pos;
+    reference.mean_qual -= src.mean_qual;
+    reference.mean_mapq -= src.mean_mapq;
+    reference.nm -= src.nm;
+    reference.alt_depth_fwd = reference.alt_depth_fwd.saturating_sub(src.alt_depth_fwd);
+    reference.alt_depth_rev = reference.alt_depth_rev.saturating_sub(src.alt_depth_rev);
+    correct_cnt(reference);
+}
+
+fn adj_ref_cnt(tv: &Variant, reference: &mut Variant, len: i64) {
+    if tv.alt_depth == 0 {
+        return;
+    }
+
+    let mean_pos = tv.mean_pos / tv.alt_depth as f64;
+    let mut f = if mean_pos != 0.0 {
+        (mean_pos - len as f64 + 1.0) / mean_pos
+    } else {
+        0.0
+    };
+
+    if f < 0.0 {
+        return;
+    }
+    if f > 1.0 {
+        f = 1.0;
+    }
+
+    let delta_alt = (f * tv.alt_depth as f64) as usize;
+    let delta_high = (f * tv.high_qual_read_cnt as f64) as usize;
+    let delta_low = (f * tv.low_qual_read_cnt as f64) as usize;
+    let delta_fwd = (f * tv.alt_depth_fwd as f64) as usize;
+    let delta_rev = (f * tv.alt_depth_rev as f64) as usize;
+
+    reference.alt_depth = reference.alt_depth.saturating_sub(delta_alt);
+    reference.high_qual_read_cnt = reference.high_qual_read_cnt.saturating_sub(delta_high);
+    reference.low_qual_read_cnt = reference.low_qual_read_cnt.saturating_sub(delta_low);
+    reference.mean_pos -= f * tv.mean_pos;
+    reference.mean_qual -= f * tv.mean_qual;
+    reference.mean_mapq -= f * tv.mean_mapq;
+    reference.nm -= f * tv.nm;
+    reference.alt_depth_fwd = reference.alt_depth_fwd.saturating_sub(delta_fwd);
+    reference.alt_depth_rev = reference.alt_depth_rev.saturating_sub(delta_rev);
+    correct_cnt(reference);
+}
+
 fn adj_cnt(dest: &mut Variant, src: &Variant) {
     dest.alt_depth += src.alt_depth;
     dest.extra_cnt += src.alt_depth;
@@ -934,6 +1044,21 @@ fn adj_cnt(dest: &mut Variant, src: &Variant) {
     dest.alt_depth_rev += src.alt_depth_rev;
     dest.pstd = true;
     dest.qstd = true;
+}
+
+fn correct_cnt(var: &mut Variant) {
+    if var.mean_pos < 0.0 {
+        var.mean_pos = 0.0;
+    }
+    if var.mean_qual < 0.0 {
+        var.mean_qual = 0.0;
+    }
+    if var.mean_mapq < 0.0 {
+        var.mean_mapq = 0.0;
+    }
+    if var.nm < 0.0 {
+        var.nm = 0.0;
+    }
 }
 
 fn char_at_neg(seq: &[u8], offset_from_end: isize) -> Option<u8> {
@@ -1076,7 +1201,7 @@ mod tests {
         }
 
         assert!(!reference.ref_seq.is_empty());
-        assert!(sv_input.non_insertion_variants.is_empty());
+        assert!(!sv_input.non_insertion_variants.is_empty());
         assert!(sv_input.insertion_variants.is_empty());
         assert!(sv_input.soft_clips_5end.is_empty());
         assert!(sv_input.soft_clips_3end.is_empty());

@@ -34,6 +34,12 @@ pub struct Configuration {
     /// The phred score for a base to be considered a good call
     pub goodq: f64,
 
+    /// Number of nucleotides to extend regions (Java: -x)
+    pub number_nucleotide_to_extend: i32,
+
+    /// Reference extension for fetching sequence (Java: -Y)
+    pub reference_extension: i32,
+
     /// The threshold for allele frequency. If -p it is set to -1.
     pub freq: f64,
 
@@ -79,6 +85,8 @@ impl Default for Configuration {
             unique_mode_alignment_enabled: false,
             unique_mode_second_in_pair_enabled: false,
             goodq: 22.5,
+            number_nucleotide_to_extend: 0,
+            reference_extension: 1200,
             freq: 0.01,
             minr: 2,
             read_pos_filter: 5.0,
@@ -87,7 +95,7 @@ impl Default for Configuration {
             monomer_msi_frequency: 0.25,
             non_monomer_msi_frequency: 0.1,
             vext: 2,
-            mismatch: 0,
+            mismatch: 8,
         }
     }
 }

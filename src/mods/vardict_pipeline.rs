@@ -9,6 +9,7 @@
 //! `simple_variant_caller.rs` approach.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::{Result, Error};
@@ -28,7 +29,7 @@ use crate::mods::to_vars_builder::{ToVarsBuilder, Variant, VariationData, Vars, 
 use crate::mods::simple_variant_caller::SimpleVarKey;
 use crate::scopedata::global_read_only_scope::GlobalReadOnlyScope;
 use crate::variants::variants::{VarDesc, Variant as RawVariant, SoftClip};
-use std::collections::HashSet;
+use rand::Rng;
 
 /// Data produced by CigarParser - mirrors Java VariationData
 #[derive(Default)]
@@ -45,12 +46,22 @@ pub struct CigarParserOutput {
     pub ref_coverage: HashMap<i64, usize>,
     /// MNP map (position -> description -> count)
     pub mnp: HashMap<i64, HashMap<String, usize>>,
+    /// Insertion counts by position and description (Java: positionToInsertionCount)
+    pub position_to_insertion_count: HashMap<i64, HashMap<String, usize>>,
+    /// Deletion counts by position and description (Java: positionToDeletionCount)
+    pub position_to_deletions_count: HashMap<i64, HashMap<String, usize>>,
     /// Maximum read length seen
     pub max_read_len: usize,
     /// Discordant read count
     pub discordant_count: usize,
     /// Splice positions ("start-end")
     pub splice: HashSet<String>,
+    /// Duplication rate
+    pub duprate: f64,
+    /// Total reads seen by preprocessor
+    pub total_reads: usize,
+    /// Duplicate reads filtered by preprocessor
+    pub duplicate_reads: usize,
 }
 
 /// Data after realignment - mirrors Java RealignedVariationData
@@ -86,6 +97,24 @@ pub struct VarDictPipeline {
     pub min_base_quality: f64,
     pub min_mapping_quality: u8,
     pub do_pileup: bool,
+}
+
+struct RecordPreprocessorState {
+    total_reads: usize,
+    duplicate_reads: usize,
+    duplicates: HashSet<String>,
+    first_matching_position: i64,
+}
+
+impl RecordPreprocessorState {
+    fn new() -> Self {
+        Self {
+            total_reads: 0,
+            duplicate_reads: 0,
+            duplicates: HashSet::new(),
+            first_matching_position: -1,
+        }
+    }
 }
 
 impl VarDictPipeline {
@@ -135,13 +164,19 @@ impl VarDictPipeline {
         bam_reader: &mut BamReader,
         instance: Arc<GlobalReadOnlyScope>,
     ) -> Result<Vec<String>> {
-        let flank_size = 20usize; // 20bp flanking for leftseq/rightseq
-        let extended_start = if region.start() > flank_size { 
-            region.start() - flank_size 
-        } else { 
-            1 
+        let extend = (instance.conf.number_nucleotide_to_extend + instance.conf.reference_extension)
+            .max(0) as usize;
+        let extended_start = if region.start() > extend {
+            region.start() - extend
+        } else {
+            1
         };
-        let extended_end = region.end() + flank_size;
+        let mut extended_end = region.end() + extend;
+        if let Some(&chr_len) = instance.chr_lens.get(region.chr()) {
+            if extended_end > chr_len {
+                extended_end = chr_len;
+            }
+        }
         
         // Get reference sequence for this region from shared reference
         let ref_seq = match shared_reference.get_subseq(region.chr(), extended_start, extended_end) {
@@ -169,6 +204,7 @@ impl VarDictPipeline {
         self.process_region_from_cigar_output(cigar_output, region, &reference)
     }
 
+    #[deprecated]
     pub(crate) fn collect_filtered_records(
         &self,
         region: &Region,
@@ -178,12 +214,13 @@ impl VarDictPipeline {
         let mut records = Vec::new();
         let mut lines = Vec::new();
         let mut record = Record::new();
+        let mut preprocess_state = RecordPreprocessorState::new();
 
-        let fetch_start = region.start().saturating_sub(1);
-        bam_reader.fetch(region.chr(), fetch_start, region.end())?;
+        bam_reader.fetch(region.chr(), region.start(), region.end())?;
 
         while bam_reader.read(&mut record).unwrap_or(false) {
-            if !self.passes_preprocess(&record, sam_filter) {
+            let mate_ref_name = Self::mate_reference_name(&record, bam_reader);
+            if !self.passes_preprocess(&record, sam_filter, &mut preprocess_state, &mate_ref_name) {
                 continue;
             }
 
@@ -218,9 +255,20 @@ impl VarDictPipeline {
         Ok((records, lines))
     }
 
-    fn passes_preprocess(&self, record: &Record, sam_filter: u32) -> bool {
-        // TODO: Implement Java downsampling behavior (RecordPreprocessor.preprocessRecord)
-        // TODO: Implement Java duplicate removal behavior (-t) from RecordPreprocessor.preprocessRecord
+    fn passes_preprocess(
+        &self,
+        record: &Record,
+        sam_filter: u32,
+        state: &mut RecordPreprocessorState,
+        mate_ref_name: &str,
+    ) -> bool {
+        // Java preprocessRecord: downsampling
+        if let Some(downsample) = instance().conf.downsampling {
+            if rand::random::<f64>() <= downsample {
+                return false;
+            }
+        }
+
         // 1. Java SamView.read(): Skip records that match the filter flags
         if sam_filter != 0 {
             if (record.flags() & (sam_filter as u16)) != 0 {
@@ -245,7 +293,54 @@ impl VarDictPipeline {
             return false;
         }
 
+        state.total_reads += 1;
+
+        // Java preprocessRecord: duplicate removal (-t)
+        if instance().conf.remove_duplicated_reads {
+            let alignment_start = record.pos() + 1;
+            if alignment_start != state.first_matching_position {
+                state.duplicates.clear();
+            }
+
+            let mate_start = if record.mpos() >= 0 { record.mpos() + 1 } else { 0 };
+
+            if mate_start < 10 {
+                let dup_key = format!("{}-{}-{}", alignment_start, mate_ref_name, mate_start);
+                if state.duplicates.contains(&dup_key) {
+                    state.duplicate_reads += 1;
+                    return false;
+                }
+                state.duplicates.insert(dup_key);
+                state.first_matching_position = alignment_start;
+            } else if record.is_paired() && record.is_mate_unmapped() {
+                let dup_key = format!("{}-{}", alignment_start, record.cigar().to_string());
+                if state.duplicates.contains(&dup_key) {
+                    state.duplicate_reads += 1;
+                    return false;
+                }
+                state.duplicates.insert(dup_key);
+                state.first_matching_position = alignment_start;
+            }
+        }
+
         true
+    }
+
+    fn mate_reference_name(record: &Record, bam_reader: &BamReader) -> String {
+        if record.mtid() < 0 {
+            return "*".to_string();
+        }
+
+        if record.mtid() == record.tid() {
+            return "=".to_string();
+        }
+
+        let mtid = record.mtid() as usize;
+        bam_reader
+            .target_names()
+            .get(mtid)
+            .cloned()
+            .unwrap_or_else(|| "*".to_string())
     }
 
     /// Process a batch of records for a region
@@ -273,6 +368,10 @@ impl VarDictPipeline {
             cigar_output.non_insertion_vars.len(),
             cigar_output.ref_coverage.len());
 
+        if self.should_dump_steps(region) {
+            self.dump_cigar_output(region, &cigar_output);
+        }
+
         self.process_region_from_cigar_output(cigar_output, region, reference)
     }
 
@@ -291,6 +390,10 @@ impl VarDictPipeline {
             realigned_output.non_insertion_vars.len(),
             realigned_output.ref_coverage.len());
 
+        if self.should_dump_steps(region) {
+            self.dump_realigned_output(region, &realigned_output);
+        }
+
         let start_tovars = std::time::Instant::now();
         let splice = realigned_output.splice.clone();
         let aligned_vars = self.run_to_vars_builder(realigned_output, reference)?;
@@ -300,6 +403,10 @@ impl VarDictPipeline {
             elapsed_tovars.as_secs_f64(),
             aligned_vars.aligned_variants.len());
 
+        if self.should_dump_steps(region) {
+            self.dump_aligned_vars(region, &aligned_vars);
+        }
+
         let start_post = std::time::Instant::now();
         let output_lines = self.run_simple_post_processor(aligned_vars, region, &splice)?;
         let elapsed_post = start_post.elapsed();
@@ -307,6 +414,10 @@ impl VarDictPipeline {
         event!(Level::INFO, "[TIMING] PostProcessor: {:.3}s - {} lines",
             elapsed_post.as_secs_f64(),
             output_lines.len());
+
+        if self.should_dump_steps(region) {
+            self.dump_post_output(region, &output_lines);
+        }
 
         Ok(output_lines)
     }
@@ -340,7 +451,7 @@ impl VarDictPipeline {
         // Process all records
         cigar_parser.process_records(records_vec.iter_mut())?;
 
-        Ok(self.build_cigar_output(&mut cigar_parser))
+        Ok(self.build_cigar_output(&mut cigar_parser, 0, 0))
     }
 
     fn run_cigar_parser_from_bam(
@@ -357,27 +468,120 @@ impl VarDictPipeline {
             instance,
         );
 
-        let fetch_start = region.start().saturating_sub(1);
-        bam_reader.fetch(region.chr(), fetch_start, region.end())?;
+        let mut preprocess_state = RecordPreprocessorState::new();
+
+        bam_reader.fetch(region.chr(), region.start(), region.end())?;
 
         let mut record = Record::new();
         while bam_reader.read(&mut record).unwrap_or(false) {
-            if !self.passes_preprocess(&record, sam_filter) {
+            let mate_ref_name = Self::mate_reference_name(&record, bam_reader);
+            let passed = self.passes_preprocess(
+                &record,
+                sam_filter,
+                &mut preprocess_state,
+                &mate_ref_name,
+            );
+            if self.should_dump_steps(region) {
+                let qname = String::from_utf8_lossy(record.qname()).to_string();
+                event!(
+                    Level::DEBUG,
+                    "[StepDump] RecordPreprocessor region={} qname={} passed={} flag={} pos={} mpos={} mapq={} cigar={} totalReads={} duplicateReads={}",
+                    region.to_region_string(),
+                    qname,
+                    passed,
+                    record.flags(),
+                    record.pos() + 1,
+                    if record.mpos() >= 0 { record.mpos() + 1 } else { 0 },
+                    record.mapq(),
+                    record.cigar().to_string(),
+                    preprocess_state.total_reads,
+                    preprocess_state.duplicate_reads,
+                );
+            }
+            if !passed {
                 continue;
             }
 
             cigar_parser.process_record(&mut record)?;
         }
 
-        Ok(self.build_cigar_output(&mut cigar_parser))
+        Ok(self.build_cigar_output(
+            &mut cigar_parser,
+            preprocess_state.total_reads,
+            preprocess_state.duplicate_reads,
+        ))
     }
 
-    fn build_cigar_output(&self, cigar_parser: &mut CigarParser) -> CigarParserOutput {
+    fn should_dump_steps(&self, region: &Region) -> bool {
+        instance().should_dump_steps_for(region.chr(), region.start() as i64, region.end() as i64)
+    }
+
+    fn dump_cigar_output(&self, region: &Region, output: &CigarParserOutput) {
+        event!(
+            Level::DEBUG,
+            "[StepDump] CigarParserOutput region={} non_insertion_vars={:?} insertion_vars={:?} ref_coverage={:?} mnp={:?} max_read_len={} discordant_count={} duprate={} splice={:?}",
+            region.to_region_string(),
+            output.non_insertion_vars,
+            output.insertion_vars,
+            output.ref_coverage,
+            output.mnp,
+            output.max_read_len,
+            output.discordant_count,
+            output.duprate,
+            output.splice,
+        );
+    }
+
+    fn dump_realigned_output(&self, region: &Region, output: &RealignedOutput) {
+        event!(
+            Level::DEBUG,
+            "[StepDump] RealignedOutput region={} non_insertion_vars={:?} insertion_vars={:?} ref_coverage={:?} duprate={} max_read_len={} splice={:?}",
+            region.to_region_string(),
+            output.non_insertion_vars,
+            output.insertion_vars,
+            output.ref_coverage,
+            output.duprate,
+            output.max_read_len,
+            output.splice,
+        );
+    }
+
+    fn dump_aligned_vars(&self, region: &Region, output: &AlignedVarsData) {
+        event!(
+            Level::DEBUG,
+            "[StepDump] AlignedVarsData region={} aligned_variants={:?} ref_coverage={:?}",
+            region.to_region_string(),
+            output.aligned_variants,
+            output.ref_coverage,
+        );
+    }
+
+    fn dump_post_output(&self, region: &Region, lines: &[String]) {
+        event!(
+            Level::DEBUG,
+            "[StepDump] PostProcessorOutput region={} lines={:?}",
+            region.to_region_string(),
+            lines,
+        );
+    }
+
+    fn build_cigar_output(
+        &self,
+        cigar_parser: &mut CigarParser,
+        total_reads: usize,
+        duplicate_reads: usize,
+    ) -> CigarParserOutput {
         let splice = cigar_parser
             .take_splice_count()
             .keys()
             .map(|(start, end)| format!("{}-{}", start, end))
             .collect();
+
+        let duprate = if instance().conf.remove_duplicated_reads && total_reads != 0 {
+            (duplicate_reads as f64 / total_reads as f64 * 1000.0).round() / 1000.0
+        } else {
+            0.0
+        };
 
         CigarParserOutput {
             non_insertion_vars: cigar_parser.take_non_insertion_vars(),
@@ -386,9 +590,14 @@ impl VarDictPipeline {
             soft_clips_3end: cigar_parser.take_soft_clips_3end(),
             ref_coverage: cigar_parser.take_ref_coverage(),
             mnp: cigar_parser.take_mnp(),
+            position_to_insertion_count: cigar_parser.take_position_to_insertion_count(),
+            position_to_deletions_count: cigar_parser.take_position_to_deletions_count(),
             max_read_len: cigar_parser.get_max_read_len(),
             discordant_count: cigar_parser.get_discordant_count(),
             splice,
+            duprate,
+            total_reads,
+            duplicate_reads,
         }
     }
 
@@ -410,7 +619,7 @@ impl VarDictPipeline {
             soft_clips_3end: input.soft_clips_3end,
             ref_coverage: input.ref_coverage,
             max_read_length: input.max_read_len,
-            duprate: 0.0,
+            duprate: input.duprate,
         };
 
         // Perform minimal deletion realignment using soft clips when enabled
@@ -674,6 +883,15 @@ impl VarDictPipeline {
         extra_frequency: f64,
         duprate: f64,
     ) -> Variant {
+        if (168600..=168720).contains(&position) {
+            event!(
+                Level::DEBUG,
+                "convert_raw_variant: pos={}, desc={}, desc_type={}",
+                position,
+                desc.to_key_string(),
+                desc.variant_type()
+            );
+        }
         let mut position = position;
         let total_count = raw.alt_depth_fwd + raw.alt_depth_rev;
         let frequency = if total_coverage > 0 {

@@ -326,7 +326,7 @@ impl SimpleOutputVariant {
             self.right_sequence.clone(),
             self.region.clone(),
             self.var_type.clone(),
-            format_f64(self.duprate, 2),
+            format_f64(self.duprate, 1),
             self.sv.clone(),
         ];
 
