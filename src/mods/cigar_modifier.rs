@@ -636,30 +636,55 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
         let mut rn = 0;
         let mut rrn = 0;
         let mut rmch = 0;
+        
+        let debug_this = self.should_debug_steps();
+        if debug_this {
+            event!(
+                target: "CigarModifier",
+                Level::DEBUG,
+                "capture_mis_softly3_mismatches START qname={} align_start_pos={} ml={} mch={} refoff={} rdoff={} ref_seq_len={}",
+                self.debug_qname(), align_start_pos, ml, mch, refoff, rdoff, self.contig_ref_seq().len()
+            );
+        }
 
         while rrn < mch && rn < mch {
-            if self
-                .contig_ref_seq()
-                .get((refoff - rrn - 1) as usize)
-                .is_none()
-            {
+            let ref_idx = (refoff - rrn - 1) as usize;
+            if self.contig_ref_seq().get(ref_idx).is_none() {
+                if debug_this {
+                    event!(
+                        target: "CigarModifier",
+                        Level::DEBUG,
+                        "capture_mis_softly3_mismatches BREAK ref_idx={} out of bounds qname={}",
+                        ref_idx, self.debug_qname()
+                    );
+                }
                 break;
             }
 
             if rrn < rdoff
                 && is_has_and_not_equals_ref_and_seq_base(
                     self.contig_ref_seq(),
-                    (refoff - rrn - 1) as usize,
+                    ref_idx,
                     self.query_sequence,
                     (rdoff - rrn - 1) as usize,
                 )
             {
+                if debug_this {
+                    let ref_base = self.contig_ref_seq().get(ref_idx).copied().unwrap_or(b'?');
+                    let seq_base = self.query_sequence.get((rdoff - rrn - 1) as usize).copied().unwrap_or(b'?');
+                    event!(
+                        target: "CigarModifier",
+                        Level::DEBUG,
+                        "capture_mis_softly3_mismatches MISMATCH rrn={} ref_idx={} ref_base={} seq_base={} qname={}",
+                        rrn, ref_idx, ref_base as char, seq_base as char, self.debug_qname()
+                    );
+                }
                 rn = rrn + 1;
                 rmch = 0;
             } else if rrn < rdoff
                 && is_has_and_equals_ref_and_seq_base(
                     self.contig_ref_seq(),
-                    (refoff - rrn - 1) as usize,
+                    ref_idx,
                     self.query_sequence,
                     (rdoff - rrn - 1) as usize,
                 )
@@ -671,12 +696,28 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
 
             // Stop at three consecure matches
             if rmch >= 3 {
+                if debug_this {
+                    event!(
+                        target: "CigarModifier",
+                        Level::DEBUG,
+                        "capture_mis_softly3_mismatches BREAK 3 consecutive matches rrn={} qname={}",
+                        rrn, self.debug_qname()
+                    );
+                }
                 break;
             }
         }
 
         mch -= rn;
         if rn > 0 && rn <= 3 {
+            if debug_this {
+                event!(
+                    target: "CigarModifier",
+                    Level::DEBUG,
+                    "capture_mis_softly3_mismatches MODIFY rn={} new_mch={} adding SoftClip qname={}",
+                    rn, mch, self.debug_qname()
+                );
+            }
             *cigar_vd.get_mut(cigar_vd.len() - 1).unwrap() = Cigar::Match(mch as u32);
             cigar_vd.push_back(Cigar::SoftClip(rn as u32));
         }
@@ -1341,12 +1382,24 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                 break;
             }
 
-            if is_has_and_not_equals_ref_and_seq_base(
+            let ref_idx = (*cigar_pos as i32 + rrn) as usize;
+            let seq_idx = rrn as usize;
+            let ref_base = self.contig_ref_seq().get(ref_idx).copied();
+            let seq_base = self.query_sequence.get(seq_idx).copied();
+            let mismatch = is_has_and_not_equals_ref_and_seq_base(
                 self.contig_ref_seq(),
-                (*cigar_pos as i32 + rrn) as usize,
+                ref_idx,
                 self.query_sequence,
-                (rrn) as usize,
-            ) {
+                seq_idx,
+            );
+            if debug_steps {
+                event!(
+                    Level::DEBUG,
+                    "[CigarModifier] combine_begin_dig_m rrn={} ref_idx={} ref_base={:?} seq_idx={} seq_base={:?} mismatch={} qname={}",
+                    rrn, ref_idx, ref_base.map(|b| b as char), seq_idx, seq_base.map(|b| b as char), mismatch, self.debug_qname()
+                );
+            }
+            if mismatch {
                 rn = rrn + 1;
                 rmch = 0;
             } else if is_has_and_equals_ref_and_seq_base(

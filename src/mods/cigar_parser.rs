@@ -995,7 +995,7 @@ impl CigarParser {
                                         self.region.start as i64,
                                         self.region.end as i64,
                                     );
-                                    if should_debug && (168600..=168720).contains(&pos) {
+                                    if should_debug && ((168532..=168540).contains(&pos) || (168600..=168720).contains(&pos)) {
                                         let qname = self.current_qname.as_deref().unwrap_or("");
                                         let ref_base = self.reference.get(pos).map(|b| b as char);
                                         event!(
@@ -1017,6 +1017,20 @@ impl CigarParser {
                                             self.start,
                                             start_with_deletion,
                                             is_reverse,
+                                        );
+                                    }
+
+                                    // DEBUG: unconditionally log position 168534
+                                    if pos == 168534 {
+                                        let qname = self.current_qname.as_deref().unwrap_or("");
+                                        event!(
+                                            Level::DEBUG,
+                                            "[DEBUG 168534] ADDING VARIANT qname={} pos={} s={} q={} qbases={}",
+                                            qname,
+                                            pos,
+                                            String::from_utf8_lossy(&s),
+                                            q,
+                                            qbases,
                                         );
                                     }
 
@@ -1400,13 +1414,8 @@ impl CigarParser {
                 *cigar_len -= 1;
             }
 
-            // Match Java: advance read position by soft-clip length and reset start/offset
-            self.read_pos_including_softclip += *cigar_len as usize;
-            self.offset = 0;
-            self.start = pos;
-
             // If there remains a soft-clipped sequence at the end (not everything was
-            // matched)
+            // matched) - Java checks this BEFORE advancing read_pos_including_softclip
             if query_sequence.len() - self.read_pos_including_softclip > 0 {
                 let mut read_qual_sum = 0;
                 let mut num_high_qual_base = 0;
@@ -1415,7 +1424,7 @@ impl CigarParser {
                     // Loop over remaining soft-clipped sequence
                     // Stop if unknown base (N - any of ATGC) is found
 
-                    // At this point, self.read_pos_including_softclip is start offset of soft clip. why?
+                    // At this point, self.read_pos_including_softclip is start offset of soft clip
                     if query_sequence
                         .get_or_err(self.read_pos_including_softclip + si as usize)
                         .copied()?
@@ -1442,6 +1451,7 @@ impl CigarParser {
 
                 {
                     let cigar_len = self.cigar_len;
+                    // Note: self.start here points to the first soft-clipped position (from while loop)
                     self.sclip3_high_quality_processing(
                         query_sequence,
                         mapq,
@@ -2609,7 +2619,8 @@ impl CigarParser {
                     .or_insert_with(|| NucBaseMap::default());
 
                 // increase count of current base (skip if not A/T/C/G/N)
-                if let Some(cnt) = cnts.get_mut(b) {
+                // Use get_or_insert_with to initialize the value if not present
+                if let Some(cnt) = cnts.get_or_insert_with(b, || 0) {
                     *cnt += 1;
                 }
 
@@ -2659,7 +2670,7 @@ impl CigarParser {
             && self.start as usize >= self.region.start
             && self.start as usize <= self.region.end
         {
-            //add record to $sclip5
+//add record to $sclip5
             let sclip = self
                 .soft_clips3_end
                 .entry(self.start)
@@ -2677,7 +2688,8 @@ impl CigarParser {
                     .or_insert_with(|| NucBaseMap::default());
 
                 // increase count of current base (skip if not A/T/C/G/N)
-                if let Some(cnt) = cnts.get_mut(b) {
+                // Use get_or_insert_with to initialize the value if not present
+                if let Some(cnt) = cnts.get_or_insert_with(b, || 0) {
                     *cnt += 1;
                 }
 
@@ -3527,10 +3539,7 @@ mod tests {
         use rust_htslib::bam::{Read, Reader};
         use std::sync::Arc;
 
-        let mut conf = Configuration {
-            ..Default::default()
-        };
-        conf.mismatch = 0;
+        let conf = Configuration::default();
 
         let _ = INSTANCE.set(GlobalReadOnlyScope {
             conf,

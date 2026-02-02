@@ -1604,9 +1604,11 @@ impl VarDictPipeline {
                 }
 
                 for variant in &vars.variants {
-                    event!(Level::DEBUG, "[PostProcessor] Variant: pos={} ref={} alt={} freq={:.3} good={} type={:?}", 
+                    event!(Level::DEBUG, "[PostProcessor] Variant: pos={} ref={} alt={} freq={:.3} good={} type={:?} hicnt={} meanpos={:.1} meanq={:.1} fwd={} rev={}", 
                         variant.start_position, variant.refallele, variant.varallele, variant.frequency,
-                        self.is_good_var(variant, vars.reference_variant.as_ref(), splice), variant.vartype);
+                        self.is_good_var(variant, vars.reference_variant.as_ref(), splice), variant.vartype,
+                        variant.high_qual_read_cnt, variant.mean_position, variant.mean_quality,
+                        variant.vars_count_on_forward, variant.vars_count_on_reverse);
                     
                     // Skip if ref contains N
                     if variant.refallele.contains('N') {
@@ -1696,6 +1698,13 @@ impl VarDictPipeline {
             || variant.mean_position < instance().conf.read_pos_filter
             || variant.mean_quality < instance().conf.goodq
         {
+            event!(Level::DEBUG, 
+                "[is_good_var] FAILED: freq={} (need>={}), hicnt={} (need>={}), meanpos={} (need>={}), meanq={} (need>={})",
+                variant.frequency, instance().conf.freq,
+                variant.high_qual_read_cnt, instance().conf.minr,
+                variant.mean_position, instance().conf.read_pos_filter,
+                variant.mean_quality, instance().conf.goodq
+            );
             return false;
         }
 

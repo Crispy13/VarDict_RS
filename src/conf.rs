@@ -104,6 +104,8 @@ impl Configuration {
     pub(crate) const SEED_1: i32 = 17;
     pub(crate) const SEED_2: i32 = 12;
     pub(crate) const ADSEED: i32 = 6;
+    pub(crate) const SVMAXLEN: i32 = 150000;
+    pub(crate) const SVFLANK: i32 = 50;
 
     /// Any base with quality <=10 will be consider low quality in soft-clipped seq and extension will stop.
     pub(crate) const LOW_QUAL: i32 = 10;
