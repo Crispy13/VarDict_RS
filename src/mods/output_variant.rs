@@ -137,13 +137,8 @@ impl SimpleOutputVariant {
         // Detect reference call (ref == alt)
         let is_ref_call = variant.refallele == variant.varallele;
         
-        // For reference calls: bias should be "0;0" (no bias for ref or var)
-        // For variants: bias is "ref_bias;var_bias" format
-        let bias = if is_ref_call {
-            "0;0".to_string()
-        } else {
-            format_strand_bias(variant.strand_bias_flag)
-        };
+        // Bias is "ref_bias;var_bias" format for all calls (Java uses variant.strandBiasFlag)
+        let bias = format_strand_bias(variant.strand_bias_flag);
         
         // For reference calls, counts go to ref_fwd/ref_rev, not var_fwd/var_rev
         let (variant_coverage, ref_fwd, ref_rev, var_fwd, var_rev, frequency) = if is_ref_call {
@@ -243,7 +238,7 @@ impl SimpleOutputVariant {
             variant_forward_count: 0,
             variant_reverse_count: 0,
 
-            genotype: "0".to_string(),
+            genotype: String::new(),
             frequency: 0.0,
             bias: "0;0".to_string(),
 
@@ -263,8 +258,8 @@ impl SimpleOutputVariant {
             hicnt: 0,
             hicov: 0,
 
-            left_sequence: "0".to_string(),
-            right_sequence: "0".to_string(),
+            left_sequence: String::new(),
+            right_sequence: String::new(),
             region: format!("{}:{}-{}", chr, region.start, region.end),
             var_type: String::new(),
             duprate: 0.0,
@@ -438,7 +433,7 @@ mod tests {
 
         assert_eq!(output.sample, "sample1");
         assert_eq!(output.start_position, 1500);
-        assert_eq!(output.genotype, "0");
+        assert_eq!(output.genotype, "");
         assert_eq!(output.bias, "0;0");
         assert_eq!(output.sv, "0");
     }

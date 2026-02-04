@@ -103,6 +103,9 @@ impl VariantRealigner {
         tmp.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
         for (position, vn, insertion_count) in tmp.iter().cloned() {
+            if insertion_count == 0 {
+                continue;
+            }
             let Some(insert_match) = BEGIN_PLUS_ATGC.captures(&vn) else { continue; };
             let insert = insert_match.get(1).map(|m| m.as_str()).unwrap_or("");
             if insert.is_empty() {
@@ -198,11 +201,11 @@ impl VariantRealigner {
             let insert_key = VarDesc::Ins {
                 seq: insert.as_bytes().iter().map(|b| b.to_ascii_uppercase()).collect(),
             };
-            let vref = crate::variants::var_utils::get_variants_from_map(
+            let _ = crate::variants::var_utils::get_variants_from_map(
                 &mut data.insertion_variants,
                 position,
                 &insert_key,
-            ) as *mut Variant;
+            );
 
             for mm in all_mm {
                 let mut mm_bytes: Vec<u8> = mm
@@ -252,40 +255,44 @@ impl VariantRealigner {
                     *data.ref_coverage.entry(position).or_insert(0) += tv.alt_depth;
                 }
 
-                let tv_owned = data
-                    .non_insertion_variants
-                    .get_mut(&mm.mismatch_position)
-                    .and_then(|m| m.remove(&key));
+                let tv_owned = {
+                    let tv_owned = data
+                        .non_insertion_variants
+                        .get_mut(&mm.mismatch_position)
+                        .and_then(|m| m.remove(&key));
+                    if let Some(map) = data.non_insertion_variants.get_mut(&mm.mismatch_position) {
+                        if map.is_empty() {
+                            data.non_insertion_variants.remove(&mm.mismatch_position);
+                        }
+                    }
+                    tv_owned
+                };
                 let Some(tv_owned) = tv_owned else { continue; };
 
-                if let Some(map) = data.non_insertion_variants.get_mut(&mm.mismatch_position) {
-                    if map.is_empty() {
-                        data.non_insertion_variants.remove(&mm.mismatch_position);
-                    }
-                }
-
-                let ref_key = if mm.mismatch_position > position && mm.end == 3 {
-                    self.get_ref_base(position).map(|ref_base| VarDesc::SNV { ref_base })
+                let ref_var = if mm.mismatch_position > position && mm.end == 3 {
+                    self.get_ref_base(position)
+                        .map(|ref_base| VarDesc::SNV { ref_base })
+                        .and_then(|ref_key| {
+                            data.non_insertion_variants
+                                .get_mut(&position)
+                                .and_then(|m| m.remove(&ref_key))
+                                .map(|var| (ref_key, var))
+                        })
                 } else {
                     None
                 };
 
-                unsafe {
-                    if let Some(ref_key) = ref_key {
+                if let Some(vref) = data
+                    .insertion_variants
+                    .get_mut(&position)
+                    .and_then(|m| m.get_mut(&insert_key))
+                {
+                    if let Some((ref_key, mut ref_var)) = ref_var {
+                        adj_cnt_with_ref(vref, &tv_owned, Some(&mut ref_var));
                         if let Some(pos_map) = data.non_insertion_variants.get_mut(&position) {
-                            let mut ref_var = pos_map.remove(&ref_key);
-                            if let Some(vref) = vref.as_mut() {
-                                if let Some(ref_var_mut) = ref_var.as_mut() {
-                                    adj_cnt_with_ref(vref, &tv_owned, Some(ref_var_mut));
-                                } else {
-                                    adj_cnt(vref, &tv_owned);
-                                }
-                            }
-                            if let Some(ref_var) = ref_var {
-                                pos_map.insert(ref_key, ref_var);
-                            }
+                            pos_map.insert(ref_key, ref_var);
                         }
-                    } else if let Some(vref) = vref.as_mut() {
+                    } else {
                         adj_cnt(vref, &tv_owned);
                     }
                 }
@@ -333,10 +340,12 @@ impl VariantRealigner {
                         if sc5pp > position {
                             *data.ref_coverage.entry(position).or_insert(0) += tv.var.alt_depth;
                         }
-                        unsafe {
-                            if let Some(vref) = vref.as_mut() {
-                                adj_cnt(vref, &tv.var);
-                            }
+                        if let Some(vref) = data
+                            .insertion_variants
+                            .get_mut(&position)
+                            .and_then(|m| m.get_mut(&insert_key))
+                        {
+                            adj_cnt(vref, &tv.var);
                         }
                         tv.mark_used();
                     }
@@ -356,30 +365,43 @@ impl VariantRealigner {
                         Self::substr_bytes(&sanpseq, offset, None)
                     };
                     if !seq.is_empty() && Self::is_match_bytes(&seq, &mseq, 1) {
-                        if sc3pp <= position || insert.len() as f64 > (tv.var.mean_pos / tv.var.alt_depth as f64) {
+                        let mean_pos = if tv.var.alt_depth > 0 {
+                            tv.var.mean_pos / tv.var.alt_depth as f64
+                        } else {
+                            0.0
+                        };
+                        if sc3pp <= position || insert.len() as f64 > mean_pos {
                             *data.ref_coverage.entry(position).or_insert(0) += tv.var.alt_depth;
                         }
 
-                        let mut lref = None;
-                        if sc3pp > position {
-                            if let Some(ref_base) = self.get_ref_base(position) {
-                                lref = data
-                                    .non_insertion_variants
-                                    .get_mut(&position)
-                                    .and_then(|m| m.get_mut(&VarDesc::SNV { ref_base }));
-                            }
-                        }
-                        if insert.len() as f64 > (tv.var.mean_pos / tv.var.alt_depth as f64) {
-                            lref = None;
+                        let mut ref_var = if sc3pp > position {
+                            self.get_ref_base(position)
+                                .map(|ref_base| VarDesc::SNV { ref_base })
+                                .and_then(|ref_key| {
+                                    data.non_insertion_variants
+                                        .get_mut(&position)
+                                        .and_then(|m| m.remove(&ref_key))
+                                        .map(|var| (ref_key, var))
+                                })
+                        } else {
+                            None
+                        };
+                        if insert.len() as f64 > mean_pos {
+                            ref_var = None;
                         }
 
-                        unsafe {
-                            if let Some(vref) = vref.as_mut() {
-                                if let Some(ref_var) = lref.as_deref_mut() {
-                                    adj_cnt_with_ref(vref, &tv.var, Some(ref_var));
-                                } else {
-                                    adj_cnt(vref, &tv.var);
+                        if let Some(vref) = data
+                            .insertion_variants
+                            .get_mut(&position)
+                            .and_then(|m| m.get_mut(&insert_key))
+                        {
+                            if let Some((ref_key, mut ref_var)) = ref_var {
+                                adj_cnt_with_ref(vref, &tv.var, Some(&mut ref_var));
+                                if let Some(pos_map) = data.non_insertion_variants.get_mut(&position) {
+                                    pos_map.insert(ref_key, ref_var);
                                 }
+                            } else {
+                                adj_cnt(vref, &tv.var);
                             }
                         }
                         tv.mark_used();
@@ -430,10 +452,12 @@ impl VariantRealigner {
                             }
                         }
                     }
-                    unsafe {
-                        if let Some(vref) = vref.as_mut() {
-                            Self::adj_ref_factor(vref, -((first3 - first5 - 1) as f64 / data.max_read_length as f64));
-                        }
+                    if let Some(vref) = data
+                        .insertion_variants
+                        .get_mut(&position)
+                        .and_then(|m| m.get_mut(&insert_key))
+                    {
+                        Self::adj_ref_factor(vref, -((first3 - first5 - 1) as f64 / data.max_read_length as f64));
                     }
                 }
             }
@@ -454,35 +478,38 @@ impl VariantRealigner {
             } else {
                 continue;
             };
-            let Some(vref) = map.get(&vref_key) else { continue; };
+            let vref_alt = map.get(&vref_key).map(|v| v.alt_depth);
             if let Some(cap) = ATGSs_AMP_ATGSs_END.captures(&vn) {
                 let tn = cap.get(1).map(|m| m.as_str()).unwrap_or("");
                 if !tn.is_empty() {
                     let tref_key = VarDesc::Ins { seq: tn[1..].as_bytes().iter().map(|b| b.to_ascii_uppercase()).collect() };
-                    if let Some(tref) = map.get(&tref_key) {
-                        if vref.alt_depth < tref.alt_depth {
-                            let ref_key = self.get_ref_base(position).map(|ref_base| VarDesc::SNV { ref_base });
-                            if let Some(ref_key) = ref_key {
-                                let mut ref_var = data
-                                    .non_insertion_variants
-                                    .get_mut(&position)
-                                    .and_then(|m| m.remove(&ref_key));
-                                if let Some(ref_var_mut) = ref_var.as_mut() {
-                                    let mut tref_mut = tref.clone();
-                                    let mut vref_mut = vref.clone();
-                                    adj_cnt_with_ref(&mut tref_mut, &vref_mut, Some(ref_var_mut));
-                                    map.insert(tref_key.clone(), tref_mut);
+                    let tref_alt = map.get(&tref_key).map(|v| v.alt_depth);
+                    if let (Some(vref_alt), Some(tref_alt)) = (vref_alt, tref_alt) {
+                        if vref_alt < tref_alt {
+                            let vref = map.remove(&vref_key);
+                            if let Some(vref) = vref {
+                                if let Some(tref) = map.get_mut(&tref_key) {
+                                    let ref_var = self.get_ref_base(position)
+                                        .map(|ref_base| VarDesc::SNV { ref_base })
+                                        .and_then(|ref_key| {
+                                            data.non_insertion_variants
+                                                .get_mut(&position)
+                                                .and_then(|m| m.remove(&ref_key))
+                                                .map(|var| (ref_key, var))
+                                        });
+
+                                    if let Some((ref_key, mut ref_var)) = ref_var {
+                                        adj_cnt_with_ref(tref, &vref, Some(&mut ref_var));
+                                        if let Some(pos_map) = data.non_insertion_variants.get_mut(&position) {
+                                            pos_map.insert(ref_key, ref_var);
+                                        }
+                                    } else {
+                                        adj_cnt(tref, &vref);
+                                    }
+                                } else {
+                                    map.insert(vref_key, vref);
                                 }
-                                if let Some(ref_var) = ref_var {
-                                    data.non_insertion_variants.get_mut(&position).unwrap().insert(ref_key, ref_var);
-                                }
-                            } else {
-                                let mut tref_mut = tref.clone();
-                                let vref_mut = vref.clone();
-                                adj_cnt(&mut tref_mut, &vref_mut);
-                                map.insert(tref_key.clone(), tref_mut);
                             }
-                            map.remove(&vref_key);
                         }
                     }
                 }

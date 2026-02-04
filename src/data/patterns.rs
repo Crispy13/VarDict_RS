@@ -42,6 +42,9 @@ pub(crate) static ATGSs_AMP_ATGSs_END: LazyLock<Regex> =
 pub(crate) static DUP_NUM_ATGC: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<dup(\d+)>([ATGC]+)$").unwrap());
 
+pub(crate) static DUP_NUM: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<dup(\d+)").unwrap());
+
 pub(crate) static BEGIN_ATGC_END: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[ATGC]+$").unwrap());
 

@@ -629,12 +629,13 @@ impl VarDictPipeline {
 
         if instance().conf.perform_local_realignment {
             realigner.process_deletions(&mut sv_input);
+            realigner.process_insertions(&mut sv_input, &input.position_to_insertion_count);
         }
         
         // Run StructuralVariantsProcessor (adjSNV always runs, SV detection is unimplemented)
         let sv_processor = StructuralVariantsProcessor::new(
             reference.ref_seq.clone(),
-            region.start() as i64,
+            reference.region_start,
         );
         let processed = sv_processor.process(sv_input);
         
@@ -674,7 +675,18 @@ impl VarDictPipeline {
                 }
             }
 
-            let hicov: usize = var_map.values().map(|raw_var| raw_var.high_qual_read_cnt).sum();
+            // Java calcHicov: sum high-qual counts for non-insertion variants,
+            // skipping SV and insertion-like descriptions.
+            let mut hicov: usize = 0;
+            for (desc, raw_var) in var_map {
+                let is_sv = matches!(desc, VarDesc::Raw { desc } if desc.as_slice() == b"SV");
+                let is_insertion_like = matches!(desc, VarDesc::Ins { .. })
+                    || matches!(desc, VarDesc::Raw { desc } if desc.as_slice().starts_with(b"+"));
+                if is_sv || is_insertion_like {
+                    continue;
+                }
+                hicov += raw_var.high_qual_read_cnt;
+            }
             hicov_by_pos.insert(*pos, hicov);
         }
 
@@ -700,7 +712,7 @@ impl VarDictPipeline {
                     &hicov_by_pos,
                     input.duprate,
                 );
-                if !vars.variants.is_empty() {
+                if !vars.variants.is_empty() || vars.reference_variant.is_some() {
                     aligned_variants.insert(pos, vars);
                 }
             }
@@ -715,13 +727,23 @@ impl VarDictPipeline {
                     &hicov_by_pos,
                     input.duprate,
                 );
-                if !vars.variants.is_empty() {
-                    aligned_variants.entry(pos)
-                        .or_insert_with(Vars::default)
-                        .variants
-                        .extend(vars.variants);
+                if !vars.variants.is_empty() || vars.reference_variant.is_some() {
+                    let entry = aligned_variants.entry(pos).or_insert_with(Vars::default);
+                    entry.variants.extend(vars.variants);
+                    if entry.reference_variant.is_none() {
+                        entry.reference_variant = vars.reference_variant;
+                    }
                 }
             }
+        }
+
+        for (pos, vars) in aligned_variants.iter_mut() {
+            self.apply_java_genotypes(
+                &mut vars.variants,
+                vars.reference_variant.as_ref(),
+                *pos,
+                reference,
+            );
         }
 
         Ok(AlignedVarsData {
@@ -800,6 +822,9 @@ impl VarDictPipeline {
 
         for (desc, raw_var) in var_map {
             let total_count = raw_var.alt_depth_fwd + raw_var.alt_depth_rev;
+            if total_count == 0 {
+                continue;
+            }
             let mut ttcov = total_coverage;
 
             if total_count > total_coverage
@@ -856,18 +881,127 @@ impl VarDictPipeline {
                     ref_strand_bias,
                     variant.strand_bias_flag.var_bias,
                 );
+                variants.push(variant);
             } else {
-                // This is a reference call - save it as the reference variant
-                reference_variant_opt = Some(variant.clone());
+                // This is a reference call - set bias as "ref_bias;0" (Java uses ref bias)
+                let ref_bias = check_strand_bias(raw_var.alt_depth_fwd, raw_var.alt_depth_rev);
+                variant.strand_bias_flag = StrandBiasFlag::new(
+                    ref_bias,
+                    StrandBiasValue::CantAssess,
+                );
+                reference_variant_opt = Some(variant);
             }
-            
-            variants.push(variant);
         }
+
+        // Sort variants to match Java ordering (meanQuality * variantCount, then descriptionString)
+        variants.sort_by(|a, b| {
+            let a_count = a.vars_count_on_forward + a.vars_count_on_reverse;
+            let b_count = b.vars_count_on_forward + b.vars_count_on_reverse;
+            let a_score = a.mean_quality * a_count as f64;
+            let b_score = b.mean_quality * b_count as f64;
+            match b_score.partial_cmp(&a_score).unwrap_or(std::cmp::Ordering::Equal) {
+                std::cmp::Ordering::Equal => a.description_string.cmp(&b.description_string),
+                other => other,
+            }
+        });
+
 
         Vars {
             variants,
             reference_variant: reference_variant_opt,
             sv_flags: Default::default(),
+        }
+    }
+
+    /// Apply Java ToVarsBuilder genotype selection logic for non-reference variants.
+    fn apply_java_genotypes(
+        &self,
+        variants: &mut [Variant],
+        reference_variant: Option<&Variant>,
+        position: i64,
+        reference: &Reference,
+    ) {
+        use crate::conf::Configuration;
+        use crate::data::patterns::{AMP_ATGC, BEGIN_MINUS_NUMBER, DUP_NUM};
+
+        if variants.is_empty() && reference_variant.is_none() {
+            return;
+        }
+
+        let conf = &instance().conf;
+
+        let mut genotype1 = if let Some(ref_var) = reference_variant {
+            if ref_var.frequency >= conf.freq {
+                ref_var.description_string.clone()
+            } else if !variants.is_empty() {
+                variants[0].description_string.clone()
+            } else {
+                ref_var.description_string.clone()
+            }
+        } else if !variants.is_empty() {
+            variants[0].description_string.clone()
+        } else {
+            String::new()
+        };
+
+        if genotype1.starts_with('+') {
+            if let Some(cap) = DUP_NUM.captures(&genotype1) {
+                if let Ok(dup_len) = cap.get(1).map(|m| m.as_str()).unwrap_or("0").parse::<i32>() {
+                    genotype1 = format!("+{}", Configuration::SVFLANK + dup_len);
+                }
+            } else if genotype1.len() > 1 {
+                genotype1 = format!("+{}", genotype1.len() - 1);
+            }
+        }
+
+        for variant in variants.iter_mut() {
+            let mut genotype1current = genotype1.clone();
+            let mut genotype2 = variant.description_string.clone();
+
+            let mut end_position = position;
+            if let Some(caps) = BEGIN_MINUS_NUMBER.captures(&variant.description_string) {
+                if let Some(m) = caps.get(1) {
+                    if let Ok(del_len) = m.as_str().parse::<i64>() {
+                        if del_len > 0 {
+                            end_position = position + del_len - 1;
+                        }
+                    }
+                }
+            }
+
+            if let Some(caps) = AMP_ATGC.captures(&variant.description_string) {
+                if let Some(extra_match) = caps.get(1) {
+                    let extra_len = extra_match.as_str().len() as i64;
+                    if extra_len > 0 {
+                        let extra_seq = self.get_reference_range(
+                            reference,
+                            end_position + 1,
+                            end_position + extra_len,
+                        );
+                        genotype1current.push_str(&extra_seq);
+                        end_position += extra_len;
+                    }
+                }
+            }
+
+            if genotype2.starts_with('+') {
+                if genotype2.len() > 1 {
+                    genotype2 = format!("+{}", genotype2.len() - 1);
+                }
+            }
+
+            if let Some(cap) = DUP_NUM.captures(&genotype2) {
+                if let Ok(dup_len) = cap.get(1).map(|m| m.as_str()).unwrap_or("0").parse::<i32>() {
+                    genotype2 = format!("+{}", 2 * Configuration::SVFLANK + dup_len);
+                }
+            }
+
+            let genotype = format!("{}/{}", genotype1current, genotype2)
+                .replace('&', "")
+                .replace('#', "")
+                .replace('^', "i");
+
+            variant.genotype = genotype;
         }
     }
 

@@ -2385,6 +2385,22 @@ impl CigarParser {
             // Create VarDesc keyed by alt_base (the read base)
             // This stores both matches (alt == ref) and mismatches (alt != ref)
             let var_desc = VarDesc::SNV { ref_base: alt_base };
+
+            if pos == 76962 {
+                event!(
+                    Level::DEBUG,
+                    "[SNV-TRACE] pos={} qname={} alt={} ref={} read_pos={} avg_qual={:.2} mapq={} nm={} is_reverse={}",
+                    pos,
+                    self.current_qname.as_deref().unwrap_or("-"),
+                    alt_base as char,
+                    ref_base as char,
+                    read_pos,
+                    avg_qual,
+                    mapq,
+                    nm_adjusted,
+                    is_reverse
+                );
+            }
             
             // Get or create variant and add count - use read_pos for tp calculation
             let var = get_variants_from_map(&mut self.non_insertion_vars, pos, &var_desc);

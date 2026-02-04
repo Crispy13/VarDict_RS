@@ -129,6 +129,7 @@ impl StructuralVariantsProcessor {
             // Create the variant description key for the first base
             let var_key = VarDesc::snv_key(bp);
 
+
             // Check if this base exists as a variant at the previous position
             if let Some(var_map) = data.non_insertion_variants.get_mut(&prev_pos) {
                 if var_map.contains_key(&var_key) {
