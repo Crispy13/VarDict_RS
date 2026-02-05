@@ -66,6 +66,12 @@ pub struct Configuration {
 
     /// If set, reads with mismatches more than INT will be filtered and ignored
     pub mismatch: i32,
+
+    /// Move indels to 3' end (Java: moveIndelsTo3 / -3)
+    pub move_indels_to_3: bool,
+
+    /// Minimum length for structural variants (Java: SVMINLEN / -L)
+    pub sv_min_len: usize,
 }
 
 impl Default for Configuration {
@@ -96,6 +102,8 @@ impl Default for Configuration {
             non_monomer_msi_frequency: 0.1,
             vext: 2,
             mismatch: 8,
+            move_indels_to_3: false,
+            sv_min_len: 1000,
         }
     }
 }

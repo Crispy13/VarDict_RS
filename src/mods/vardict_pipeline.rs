@@ -28,6 +28,7 @@ use crate::scopedata::global_read_only_scope::instance;
 use crate::mods::to_vars_builder::{ToVarsBuilder, Variant, VariationData, Vars, VarType, determine_genotype, var_type_string};
 use crate::mods::simple_variant_caller::SimpleVarKey;
 use crate::scopedata::global_read_only_scope::GlobalReadOnlyScope;
+use crate::utils::round_half_even;
 use crate::variants::variants::{VarDesc, Variant as RawVariant, SoftClip};
 use rand::Rng;
 
@@ -396,7 +397,7 @@ impl VarDictPipeline {
 
         let start_tovars = std::time::Instant::now();
         let splice = realigned_output.splice.clone();
-        let aligned_vars = self.run_to_vars_builder(realigned_output, reference)?;
+        let aligned_vars = self.run_to_vars_builder(realigned_output, reference, region)?;
         let elapsed_tovars = start_tovars.elapsed();
 
         event!(Level::INFO, "[TIMING] ToVarsBuilder: {:.3}s - {} variants",
@@ -655,101 +656,941 @@ impl VarDictPipeline {
         &self,
         input: RealignedOutput,
         reference: &Reference,
+        region: &Region,
     ) -> Result<AlignedVarsData> {
-        // Convert RawVariant data to the format ToVarsBuilder expects
         let mut aligned_variants: HashMap<i64, Vars> = HashMap::new();
-        
-        // First, collect reference forward/reverse counts from all non-insertion positions
-        // This allows us to look up reference counts from adjacent positions when needed
-        let mut ref_counts_by_pos: HashMap<i64, (usize, usize)> = HashMap::new();
-        let mut hicov_by_pos: HashMap<i64, usize> = HashMap::new();
-        
-        for (pos, var_map) in &input.non_insertion_vars {
-            let actual_ref_base = reference.get(*pos).unwrap_or(b'N');
-            for (desc, raw_var) in var_map {
-                if let VarDesc::SNV { ref_base: read_base } = desc {
-                    if *read_base == actual_ref_base {
-                        ref_counts_by_pos.insert(*pos, (raw_var.alt_depth_fwd, raw_var.alt_depth_rev));
-                        break;
-                    }
-                }
-            }
-
-            // Java calcHicov: sum high-qual counts for non-insertion variants,
-            // skipping SV and insertion-like descriptions.
-            let mut hicov: usize = 0;
-            for (desc, raw_var) in var_map {
-                let is_sv = matches!(desc, VarDesc::Raw { desc } if desc.as_slice() == b"SV");
-                let is_insertion_like = matches!(desc, VarDesc::Ins { .. })
-                    || matches!(desc, VarDesc::Raw { desc } if desc.as_slice().starts_with(b"+"));
-                if is_sv || is_insertion_like {
-                    continue;
-                }
-                hicov += raw_var.high_qual_read_cnt;
-            }
-            hicov_by_pos.insert(*pos, hicov);
-        }
-
         let mut non_insertion_vars = input.non_insertion_vars;
         let mut insertion_vars = input.insertion_vars;
 
-        let mut positions: Vec<i64> = non_insertion_vars
-            .keys()
-            .chain(insertion_vars.keys())
-            .copied()
-            .collect();
+        let mut positions: Vec<i64> = non_insertion_vars.keys().copied().collect();
         positions.sort();
-        positions.dedup();
 
-        for pos in positions {
-            if let Some(var_map) = non_insertion_vars.remove(&pos) {
-                let vars = self.build_vars_at_position(
-                    pos,
-                    var_map,
-                    &input.ref_coverage,
-                    reference,
-                    &mut ref_counts_by_pos,
-                    &hicov_by_pos,
-                    input.duprate,
-                );
-                if !vars.variants.is_empty() || vars.reference_variant.is_some() {
-                    aligned_variants.insert(pos, vars);
-                }
+        for position in positions {
+            let vars_at_pos = match non_insertion_vars.get(&position) {
+                Some(vars) => vars.clone(),
+                None => continue,
+            };
+
+            if vars_at_pos.is_empty() && !insertion_vars.contains_key(&position) {
+                continue;
             }
 
-            if let Some(var_map) = insertion_vars.remove(&pos) {
-                let vars = self.build_vars_at_position(
-                    pos,
-                    var_map,
-                    &input.ref_coverage,
-                    reference,
-                    &mut ref_counts_by_pos,
-                    &hicov_by_pos,
-                    input.duprate,
-                );
-                if !vars.variants.is_empty() || vars.reference_variant.is_some() {
-                    let entry = aligned_variants.entry(pos).or_insert_with(Vars::default);
-                    entry.variants.extend(vars.variants);
-                    if entry.reference_variant.is_none() {
-                        entry.reference_variant = vars.reference_variant;
-                    }
-                }
+            if position < region.start() as i64 || position > region.end() as i64 {
+                continue;
             }
-        }
 
-        for (pos, vars) in aligned_variants.iter_mut() {
-            self.apply_java_genotypes(
-                &mut vars.variants,
-                vars.reference_variant.as_ref(),
-                *pos,
+            if !input.ref_coverage.contains_key(&position) {
+                continue;
+            }
+
+            if self.is_same_variation_on_ref(
+                position,
+                &vars_at_pos,
+                insertion_vars.get(&position),
                 reference,
+            ) {
+                continue;
+            }
+
+            let mut total_pos_coverage = match input.ref_coverage.get(&position) {
+                Some(coverage) if *coverage > 0 => *coverage,
+                _ => continue,
+            };
+
+            let hicov = self.calc_hicov(insertion_vars.get(&position), &vars_at_pos);
+
+            let mut var_list: Vec<Variant> = Vec::new();
+            let mut debug_lines: Vec<String> = Vec::new();
+
+            let mut keys: Vec<VarDesc> = vars_at_pos.keys().cloned().collect();
+            keys.sort_by(|a, b| a.to_key_string().cmp(&b.to_key_string()));
+
+            self.create_variant_records(
+                position,
+                &vars_at_pos,
+                total_pos_coverage,
+                &mut var_list,
+                &mut debug_lines,
+                &keys,
+                hicov,
+                input.duprate,
             );
+
+            total_pos_coverage = self.create_insertion_records(
+                position,
+                total_pos_coverage,
+                insertion_vars.get(&position),
+                &mut non_insertion_vars,
+                &input.ref_coverage,
+                reference,
+                &mut var_list,
+                &mut debug_lines,
+                hicov,
+                input.duprate,
+            );
+
+            self.sort_variants(&mut var_list);
+
+            let maxfreq = self.collect_vars_at_position(
+                &mut aligned_variants,
+                position,
+                reference,
+                &var_list,
+            );
+
+            if !self.do_pileup && maxfreq <= instance().conf.freq && !instance().amplicon_based_calling {
+                aligned_variants.remove(&position);
+                continue;
+            }
+
+            if let Some(variations_at_pos) = aligned_variants.get_mut(&position) {
+                self.collect_reference_variants(
+                    position,
+                    total_pos_coverage,
+                    variations_at_pos,
+                    &input.ref_coverage,
+                    &mut non_insertion_vars,
+                    reference,
+                    region,
+                    &mut debug_lines,
+                    input.duprate,
+                );
+            }
         }
 
         Ok(AlignedVarsData {
             aligned_variants,
             ref_coverage: input.ref_coverage,
         })
+    }
+
+    fn is_same_variation_on_ref(
+        &self,
+        position: i64,
+        vars_at_pos: &HashMap<VarDesc, RawVariant>,
+        insertion_vars: Option<&HashMap<VarDesc, RawVariant>>,
+        reference: &Reference,
+    ) -> bool {
+        let mut keys = HashSet::new();
+        for desc in vars_at_pos.keys() {
+            keys.insert(desc.to_key_string());
+        }
+
+        if insertion_vars.is_some() {
+            keys.insert("I".to_string());
+        }
+
+        if keys.len() == 1 {
+            if let Some(ref_base) = reference.get(position).map(|b| (b as char).to_string()) {
+                if keys.contains(&ref_base)
+                    && !self.do_pileup
+                    && !instance().amplicon_based_calling
+                {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    fn calc_hicov(
+        &self,
+        _insertion_vars: Option<&HashMap<VarDesc, RawVariant>>,
+        non_insertion_vars: &HashMap<VarDesc, RawVariant>,
+    ) -> usize {
+        let mut hicov = 0usize;
+        for (desc, raw_var) in non_insertion_vars {
+            let is_sv = matches!(desc, VarDesc::Raw { desc } if desc.as_slice() == b"SV");
+            let is_insertion_like = matches!(desc, VarDesc::Ins { .. })
+                || matches!(desc, VarDesc::Raw { desc } if desc.as_slice().starts_with(b"+"));
+            if is_sv || is_insertion_like {
+                continue;
+            }
+            hicov += raw_var.high_qual_read_cnt;
+        }
+        hicov
+    }
+
+    fn create_variant_records(
+        &self,
+        position: i64,
+        vars_at_pos: &HashMap<VarDesc, RawVariant>,
+        total_pos_coverage: usize,
+        var_list: &mut Vec<Variant>,
+        _debug_lines: &mut Vec<String>,
+        keys: &[VarDesc],
+        hicov: usize,
+        duprate: f64,
+    ) {
+        use crate::mods::to_vars_builder::{check_strand_bias, StrandBiasFlag, StrandBiasValue};
+
+        for desc in keys {
+            if matches!(desc, VarDesc::Raw { desc } if desc.as_slice() == b"SV") {
+                continue;
+            }
+
+            let Some(raw_var) = vars_at_pos.get(desc) else {
+                continue;
+            };
+            let total_count = raw_var.alt_depth_fwd + raw_var.alt_depth_rev;
+            if total_count == 0 {
+                continue;
+            }
+
+            let fwd = raw_var.alt_depth_fwd;
+            let rev = raw_var.alt_depth_rev;
+            let bias = check_strand_bias(fwd, rev);
+
+            let base_quality = round_half_even("0.0", raw_var.mean_qual / total_count as f64);
+            let mapping_quality = round_half_even("0.0", raw_var.mean_mapq / total_count as f64);
+            let hicnt = raw_var.high_qual_read_cnt;
+            let locnt = raw_var.low_qual_read_cnt;
+
+            let mut ttcov = total_pos_coverage;
+            if total_count > total_pos_coverage
+                && raw_var.extra_cnt > 0
+                && total_count - total_pos_coverage < raw_var.extra_cnt
+            {
+                ttcov = total_count;
+            }
+
+            let mut variant = Variant::new();
+            variant.description_string = desc.to_key_string();
+            variant.position_coverage = total_count;
+            variant.vars_count_on_forward = fwd;
+            variant.vars_count_on_reverse = rev;
+            variant.strand_bias_flag = StrandBiasFlag::new(StrandBiasValue::CantAssess, bias);
+            variant.frequency = round_half_even("0.0000", total_count as f64 / ttcov as f64);
+            variant.mean_position = round_half_even("0.0", raw_var.mean_pos / total_count as f64);
+            variant.is_at_least_at_2_positions = raw_var.pstd;
+            variant.mean_quality = base_quality;
+            variant.has_at_least_2_diff_qualities = raw_var.qstd;
+            variant.mean_mapping_quality = mapping_quality;
+            variant.high_quality_reads_frequency = if hicov > 0 {
+                round_half_even("0.0000", hicnt as f64 / hicov as f64)
+            } else {
+                0.0
+            };
+            variant.extra_frequency = if raw_var.extra_cnt > 0 {
+                round_half_even("0.0000", raw_var.extra_cnt as f64 / ttcov as f64)
+            } else {
+                0.0
+            };
+            variant.shift3 = 0;
+            variant.msi = 0.0;
+            variant.nm = round_half_even("0.0", raw_var.nm / total_count as f64);
+            variant.high_qual_read_cnt = hicnt;
+            variant.low_qual_read_cnt = locnt;
+            variant.hicov = hicov;
+            variant.duprate = duprate;
+            variant.start_position = position;
+            variant.end_position = position;
+
+            var_list.push(variant);
+        }
+    }
+
+    fn create_insertion_records(
+        &self,
+        position: i64,
+        mut total_pos_coverage: usize,
+        insertion_vars: Option<&HashMap<VarDesc, RawVariant>>,
+        non_insertion_vars: &mut HashMap<i64, HashMap<VarDesc, RawVariant>>,
+        ref_coverage: &HashMap<i64, usize>,
+        reference: &Reference,
+        var_list: &mut Vec<Variant>,
+        _debug_lines: &mut Vec<String>,
+        hicov: usize,
+        duprate: f64,
+    ) -> usize {
+        use crate::mods::to_vars_builder::{check_strand_bias, StrandBiasFlag, StrandBiasValue};
+
+        let Some(insertion_variations) = insertion_vars else {
+            return total_pos_coverage;
+        };
+
+        let mut keys: Vec<VarDesc> = insertion_variations.keys().cloned().collect();
+        keys.sort_by(|a, b| a.to_key_string().cmp(&b.to_key_string()));
+
+        for desc in keys {
+            let desc_str = desc.to_key_string();
+            if desc_str.contains('&') {
+                if let Some(&coverage) = ref_coverage.get(&(position + 1)) {
+                    total_pos_coverage = coverage;
+                }
+            }
+
+            let Some(cnt) = insertion_variations.get(&desc) else {
+                continue;
+            };
+
+            let fwd = cnt.alt_depth_fwd;
+            let rev = cnt.alt_depth_rev;
+            let bias = check_strand_bias(fwd, rev);
+            let total_count = fwd + rev;
+            if total_count == 0 {
+                continue;
+            }
+
+            let vqual = round_half_even("0.0", cnt.mean_qual / total_count as f64);
+            let mq = round_half_even("0.0", cnt.mean_mapq / total_count as f64);
+            let hicnt = cnt.high_qual_read_cnt;
+            let locnt = cnt.low_qual_read_cnt;
+            let mut local_hicov = hicov;
+            if local_hicov < hicnt {
+                local_hicov = hicnt;
+            }
+
+            let mut ttcov = total_pos_coverage;
+            if total_count > total_pos_coverage
+                && cnt.extra_cnt != 0
+                && total_count - total_pos_coverage < cnt.extra_cnt
+            {
+                ttcov = total_count;
+            }
+
+            if ttcov < total_count {
+                ttcov = total_count;
+                if let Some(&next_cov) = ref_coverage.get(&(position + 1)) {
+                    if ttcov < next_cov.saturating_sub(total_count) {
+                        ttcov = next_cov;
+                        if let Some(next_map) = non_insertion_vars.get_mut(&(position + 1)) {
+                            if let Some(ref_base) = reference.get(position + 1) {
+                                let key = VarDesc::SNV { ref_base };
+                                if let Some(next_var) = next_map.get_mut(&key) {
+                                    next_var.alt_depth_fwd =
+                                        next_var.alt_depth_fwd.saturating_sub(fwd);
+                                    next_var.alt_depth_rev =
+                                        next_var.alt_depth_rev.saturating_sub(rev);
+                                }
+                            }
+                        }
+                    }
+                }
+                total_pos_coverage = ttcov;
+            }
+
+            let mut variant = Variant::new();
+            variant.description_string = desc_str;
+            variant.position_coverage = total_count;
+            variant.vars_count_on_forward = fwd;
+            variant.vars_count_on_reverse = rev;
+            variant.strand_bias_flag = StrandBiasFlag::new(StrandBiasValue::CantAssess, bias);
+            variant.frequency = round_half_even("0.0000", total_count as f64 / ttcov as f64);
+            variant.mean_position = round_half_even("0.0", cnt.mean_pos / total_count as f64);
+            variant.is_at_least_at_2_positions = cnt.pstd;
+            variant.mean_quality = vqual;
+            variant.has_at_least_2_diff_qualities = cnt.qstd;
+            variant.mean_mapping_quality = mq;
+            variant.high_quality_reads_frequency = if local_hicov > 0 {
+                round_half_even("0.0000", hicnt as f64 / local_hicov as f64)
+            } else {
+                0.0
+            };
+            variant.extra_frequency = if cnt.extra_cnt != 0 {
+                round_half_even("0.0000", cnt.extra_cnt as f64 / ttcov as f64)
+            } else {
+                0.0
+            };
+            variant.shift3 = 0;
+            variant.msi = 0.0;
+            variant.nm = round_half_even("0.0", cnt.nm / total_count as f64);
+            variant.high_qual_read_cnt = hicnt;
+            variant.low_qual_read_cnt = locnt;
+            variant.hicov = local_hicov;
+            variant.duprate = duprate;
+            variant.start_position = position;
+            variant.end_position = position;
+
+            var_list.push(variant);
+        }
+
+        total_pos_coverage
+    }
+
+    fn sort_variants(&self, variants: &mut [Variant]) {
+        variants.sort_by(|a, b| {
+            let a_score = a.mean_quality * a.position_coverage as f64;
+            let b_score = b.mean_quality * b.position_coverage as f64;
+            match b_score.partial_cmp(&a_score).unwrap_or(std::cmp::Ordering::Equal) {
+                std::cmp::Ordering::Equal => a.description_string.cmp(&b.description_string),
+                other => other,
+            }
+        });
+    }
+
+    fn collect_vars_at_position(
+        &self,
+        aligned_variants: &mut HashMap<i64, Vars>,
+        position: i64,
+        reference: &Reference,
+        variants: &[Variant],
+    ) -> f64 {
+        let mut maxfreq = 0.0;
+        let ref_base = reference.get(position).map(|b| (b as char).to_string());
+        let entry = aligned_variants.entry(position).or_insert_with(Vars::default);
+
+        for variant in variants {
+            if let Some(ref_base) = &ref_base {
+                if variant.description_string == *ref_base {
+                    entry.reference_variant = Some(variant.clone());
+                    continue;
+                }
+            }
+
+            if variant.frequency > maxfreq {
+                maxfreq = variant.frequency;
+            }
+            entry.variants.push(variant.clone());
+        }
+
+        maxfreq
+    }
+
+    fn collect_reference_variants(
+        &self,
+        position: i64,
+        mut total_pos_coverage: usize,
+        variations_at_pos: &mut Vars,
+        ref_coverage: &HashMap<i64, usize>,
+        non_insertion_vars: &mut HashMap<i64, HashMap<VarDesc, RawVariant>>,
+        reference: &Reference,
+        region: &Region,
+        _debug_lines: &mut Vec<String>,
+        duprate: f64,
+    ) {
+        use crate::data::patterns::{
+            AMP_ATGC, ANY_SV, BEGIN_DIGITS, BEGIN_MINUS_NUMBER, BEGIN_MINUS_NUMBER_CARET,
+            CARET_ATGNC, DUP_NUM, HASH_GROUP_CARET_GROUP, INV_NUM, SOME_SV_NUMBERS,
+        };
+        use crate::mods::to_vars_builder::{StrandBiasFlag, StrandBiasValue};
+
+        let mut reference_forward_coverage = 0usize;
+        let mut reference_reverse_coverage = 0usize;
+
+        let mut genotype1 = if let Some(ref_var) = &variations_at_pos.reference_variant {
+            if ref_var.frequency >= instance().conf.freq {
+                ref_var.description_string.clone()
+            } else if !variations_at_pos.variants.is_empty() {
+                variations_at_pos.variants[0].description_string.clone()
+            } else {
+                ref_var.description_string.clone()
+            }
+        } else if !variations_at_pos.variants.is_empty() {
+            variations_at_pos.variants[0].description_string.clone()
+        } else {
+            String::new()
+        };
+
+        if let Some(ref_var) = &variations_at_pos.reference_variant {
+            reference_forward_coverage = ref_var.vars_count_on_forward;
+            reference_reverse_coverage = ref_var.vars_count_on_reverse;
+        }
+
+        if genotype1.starts_with('+') {
+            if let Some(caps) = DUP_NUM.captures(&genotype1) {
+                if let Ok(dup_len) = caps.get(1).map(|m| m.as_str()).unwrap_or("0").parse::<i32>() {
+                    genotype1 = format!("+{}", crate::conf::Configuration::SVFLANK + dup_len);
+                }
+            } else if genotype1.len() > 1 {
+                genotype1 = format!("+{}", genotype1.len() - 1);
+            }
+        }
+
+        if let Some(&ref_cov_at_pos) = ref_coverage.get(&position) {
+            if total_pos_coverage > ref_cov_at_pos {
+                if let Some(next_map) = non_insertion_vars.get(&(position + 1)) {
+                    if let Some(ref_base) = reference.get(position + 1) {
+                        let key = VarDesc::SNV { ref_base };
+                        if let Some(tpref) = next_map.get(&key) {
+                            reference_forward_coverage = tpref.alt_depth_fwd;
+                            reference_reverse_coverage = tpref.alt_depth_rev;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut positions_for_changed_ref_variant: Vec<i64> = Vec::new();
+
+        if !variations_at_pos.variants.is_empty() {
+            for vref in variations_at_pos.variants.iter_mut() {
+                let mut genotype1current = genotype1.clone();
+                let mut genotype2 = vref.description_string.clone();
+
+                if genotype2.starts_with('+') {
+                    genotype2 = format!("+{}", genotype2.len().saturating_sub(1));
+                }
+
+                let description_string = vref.description_string.clone();
+                let mut deletion_length = 0usize;
+                if let Some(caps) = BEGIN_MINUS_NUMBER.captures(&description_string) {
+                    if let Ok(val) = caps.get(1).map(|m| m.as_str()).unwrap_or("0").parse::<usize>() {
+                        deletion_length = val;
+                    }
+                }
+
+                let mut end_position = position;
+                if description_string.starts_with('-') && deletion_length > 0 {
+                    end_position = position + deletion_length as i64 - 1;
+                }
+
+                let mut refallele = String::new();
+                let mut varallele = String::new();
+                let mut shift3 = 0i32;
+                let mut msi = 0.0;
+                let mut msint = 0.0;
+                let mut start_position = position;
+
+                if description_string.starts_with('+') {
+                    if !description_string.contains('&')
+                        && !description_string.contains('#')
+                        && !description_string.to_ascii_lowercase().contains("<dup")
+                    {
+                        let (msi_val, shift_val, msint_val) = self.proceed_vref_is_insertion(
+                            position,
+                            &description_string,
+                            reference,
+                            region,
+                        );
+                        msi = msi_val;
+                        shift3 = shift_val;
+                        msint = msint_val;
+                    }
+
+                    if instance().conf.move_indels_to_3 {
+                        start_position += shift3 as i64;
+                        end_position += shift3 as i64;
+                    }
+
+                    refallele = reference
+                        .get(position)
+                        .map(|b| (b as char).to_string())
+                        .unwrap_or_default();
+                    varallele = format!("{}{}", refallele, description_string.trim_start_matches('+'));
+
+                    if varallele.len() > instance().conf.sv_min_len {
+                        end_position += varallele.len() as i64;
+                        varallele = "<DUP>".to_string();
+                    }
+
+                    if let Some(caps) = DUP_NUM.captures(&varallele) {
+                        if let Ok(dup_count) = caps.get(1).map(|m| m.as_str()).unwrap_or("0").parse::<i32>() {
+                            end_position = start_position + (2 * crate::conf::Configuration::SVFLANK + dup_count) as i64 - 1;
+                            genotype2 = format!("+{}", 2 * crate::conf::Configuration::SVFLANK + dup_count);
+                            varallele = "<DUP>".to_string();
+                        }
+                    }
+                } else if description_string.starts_with('-') {
+                    let matcher_inv = INV_NUM.captures(&description_string);
+                    let matcher_start_minus = BEGIN_MINUS_NUMBER_CARET.is_match(&description_string);
+
+                    if deletion_length < instance().conf.sv_min_len {
+                        if deletion_length > 0 {
+                            let prefix = format!("-{}", deletion_length);
+                            varallele = description_string.replacen(&prefix, "", 1);
+                        } else {
+                            varallele = description_string.clone();
+                        }
+
+                        let (msi_val, shift_val, msint_val) =
+                            self.proceed_vref_is_deletion(position, deletion_length, reference);
+                        msi = msi_val;
+                        shift3 = shift_val;
+                        msint = msint_val;
+
+                        if matcher_inv.is_some() {
+                            varallele = "<INV>".to_string();
+                            genotype2 = format!("<INV{}>", deletion_length);
+                        }
+                    } else if matcher_start_minus {
+                        varallele = "<INV>".to_string();
+                        genotype2 = format!("<INV{}>", deletion_length);
+                    } else {
+                        varallele = "<DEL>".to_string();
+                    }
+
+                    if !description_string.contains('&')
+                        && !description_string.contains('#')
+                        && !description_string.contains('^')
+                    {
+                        if instance().conf.move_indels_to_3 {
+                            start_position += shift3 as i64;
+                        }
+                        if varallele != "<DEL>" {
+                            if let Some(base) = reference.get(position - 1) {
+                                varallele = (base as char).to_string();
+                            }
+                        }
+                        if let Some(base) = reference.get(position - 1) {
+                            refallele.push(base as char);
+                        }
+                        start_position -= 1;
+                    }
+
+                    if SOME_SV_NUMBERS.is_match(&description_string) {
+                        refallele = reference
+                            .get(position)
+                            .map(|b| (b as char).to_string())
+                            .unwrap_or_default();
+                    } else if deletion_length < instance().conf.sv_min_len {
+                        refallele.push_str(&self.get_reference_range(
+                            reference,
+                            position,
+                            position + deletion_length as i64 - 1,
+                        ));
+                    }
+                } else {
+                    let (msi_val, msint_val, shift_val) =
+                        self.detect_microsatellite_snp(reference, position);
+                    msi = msi_val;
+                    msint = msint_val;
+                    shift3 = shift_val;
+
+                    refallele = reference
+                        .get(position)
+                        .map(|b| (b as char).to_string())
+                        .unwrap_or_default();
+                    varallele = description_string.clone();
+                }
+
+                if let Some(caps) = AMP_ATGC.captures(&description_string) {
+                    let extra = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                    if !extra.is_empty() {
+                        varallele = varallele.replacen('&', "", 1);
+                        let tch = self.get_reference_range(
+                            reference,
+                            end_position + 1,
+                            end_position + extra.len() as i64,
+                        );
+                        refallele.push_str(&tch);
+                        genotype1current.push_str(&tch);
+                        end_position += extra.len() as i64;
+
+                        let varallele_match = varallele.clone();
+                        if let Some(caps2) = AMP_ATGC.captures(&varallele_match) {
+                            let vextra = caps2.get(1).map(|m| m.as_str()).unwrap_or("");
+                            if !vextra.is_empty() {
+                                varallele = varallele.replacen('&', "", 1);
+                                let tch2 = self.get_reference_range(
+                                    reference,
+                                    end_position + 1,
+                                    end_position + vextra.len() as i64,
+                                );
+                                refallele.push_str(&tch2);
+                                genotype1current.push_str(&tch2);
+                                end_position += vextra.len() as i64;
+                            }
+                        }
+
+                        if description_string.starts_with('+') {
+                            if !refallele.is_empty() {
+                                refallele = refallele[1..].to_string();
+                            }
+                            if !varallele.is_empty() {
+                                varallele = varallele[1..].to_string();
+                            }
+                            start_position += 1;
+                        }
+
+                        if varallele == "<DEL>" && !refallele.is_empty() {
+                            refallele = reference
+                                .get(start_position)
+                                .map(|b| (b as char).to_string())
+                                .unwrap_or_default();
+                            if let Some(&coverage) = ref_coverage.get(&(start_position - 1)) {
+                                total_pos_coverage = coverage;
+                            }
+                            if vref.position_coverage > total_pos_coverage {
+                                total_pos_coverage = vref.position_coverage;
+                            }
+                            vref.frequency = vref.position_coverage as f64 / total_pos_coverage as f64;
+                        }
+                    }
+                }
+
+                if let Some(caps) = HASH_GROUP_CARET_GROUP.captures(&description_string) {
+                    let matched_seq = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                    let tail = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+
+                    end_position += matched_seq.len() as i64;
+                    refallele.push_str(&self.get_reference_range(
+                        reference,
+                        end_position - matched_seq.len() as i64 + 1,
+                        end_position,
+                    ));
+
+                    if let Some(digits) = BEGIN_DIGITS.captures(tail) {
+                        if let Ok(deletion) = digits.get(1).map(|m| m.as_str()).unwrap_or("0").parse::<i64>() {
+                            refallele.push_str(&self.get_reference_range(
+                                reference,
+                                end_position + 1,
+                                end_position + deletion,
+                            ));
+                            end_position += deletion;
+                        }
+                    }
+
+                    varallele = varallele.replacen('#', "", 1);
+                    varallele = remove_caret_and_digits(&varallele);
+                    genotype1current = genotype1current.replace('#', "m").replace('^', "i");
+                    genotype2 = genotype2.replace('#', "m").replace('^', "i");
+                }
+
+                if CARET_ATGNC.is_match(&description_string) {
+                    varallele = varallele.replacen('^', "", 1);
+                    genotype1current = genotype1current.replace('^', "i");
+                    genotype2 = genotype2.replace('^', "i");
+                }
+
+                let cut_site = instance().conf.crispr_cutting_site as i64;
+                if cut_site != 0 && refallele.len() > 1 && varallele.len() > 1 {
+                    let mut n = 0usize;
+                    while refallele.len() > n + 1
+                        && varallele.len() > n + 1
+                        && refallele.as_bytes()[n] == varallele.as_bytes()[n]
+                    {
+                        n += 1;
+                    }
+                    if n != 0 {
+                        start_position += n as i64;
+                        refallele = refallele[n..].to_string();
+                        varallele = varallele[n..].to_string();
+                    }
+                }
+
+                if cut_site != 0
+                    && refallele.len() != varallele.len()
+                    && refallele.chars().next() == varallele.chars().next()
+                {
+                    if start_position != cut_site && end_position != cut_site {
+                        let mut n = 0i64;
+                        let dis = (cut_site - start_position).abs().min((cut_site - end_position).abs());
+                        if start_position < cut_site {
+                            while start_position + n < cut_site
+                                && n < shift3 as i64
+                                && end_position + n != cut_site
+                            {
+                                n += 1;
+                            }
+                            if (start_position + n - cut_site).abs() > dis
+                                && (end_position + n - cut_site).abs() > dis
+                            {
+                                n = 0;
+                            }
+                        }
+                        if end_position < cut_site && n == 0 {
+                            if (end_position - cut_site).abs() <= (start_position - cut_site).abs() {
+                                while end_position + n < cut_site && n < shift3 as i64 {
+                                    n += 1;
+                                }
+                            }
+                        }
+                        if n > 0 {
+                            start_position += n;
+                            end_position += n;
+                            refallele.clear();
+                            for pos in start_position..=end_position {
+                                if let Some(base) = reference.get(pos) {
+                                    refallele.push(base as char);
+                                }
+                            }
+                            let mut tva = String::new();
+                            if refallele.len() < varallele.len() {
+                                tva = varallele[1..].to_string();
+                                if tva.len() > 1 {
+                                    let ttn = (n as usize) % tva.len();
+                                    if ttn != 0 {
+                                        tva = format!("{}{}", &tva[ttn..], &tva[..ttn]);
+                                    }
+                                }
+                            }
+                            if let Some(base) = reference.get(start_position) {
+                                varallele = format!("{}{}", base as char, tva);
+                            }
+                            vref.shift3 = n as i32;
+                        }
+                    }
+                }
+
+                vref.leftseq = self.get_reference_range(
+                    reference,
+                    (start_position - 20).max(1),
+                    start_position - 1,
+                );
+
+                let chr_len = instance()
+                    .chr_lens
+                    .get(region.chr())
+                    .copied()
+                    .unwrap_or(0) as i64;
+                let fallback_len = reference.region_start + reference.ref_seq.len() as i64 - 1;
+                let chr_len = if chr_len > 0 { chr_len } else { fallback_len };
+                let right_end = (end_position + 20).min(chr_len);
+                vref.rightseq = self.get_reference_range(reference, end_position + 1, right_end);
+
+                let mut genotype = format!("{}/{}", genotype1current, genotype2)
+                    .replace('&', "")
+                    .replace('#', "")
+                    .replace('^', "i");
+
+                vref.extra_frequency = round_half_even("0.0000", vref.extra_frequency);
+                vref.frequency = round_half_even("0.0000", vref.frequency);
+                vref.high_quality_reads_frequency =
+                    round_half_even("0.0000", vref.high_quality_reads_frequency);
+                vref.msi = round_half_even("0.000", msi);
+                vref.msint = msint;
+                vref.shift3 = shift3;
+                vref.start_position = start_position;
+                vref.end_position = end_position;
+                vref.refallele = self.validate_refallele(&refallele);
+                vref.varallele = varallele;
+                vref.genotype = genotype;
+                vref.total_pos_coverage = total_pos_coverage;
+                vref.ref_forward_count = reference_forward_coverage;
+                vref.ref_reverse_count = reference_reverse_coverage;
+
+                let ref_bias = if let Some(ref_var) = &variations_at_pos.reference_variant {
+                    ref_var.strand_bias_flag.var_bias
+                } else {
+                    StrandBiasValue::CantAssess
+                };
+                vref.strand_bias_flag = StrandBiasFlag::new(ref_bias, vref.strand_bias_flag.var_bias);
+
+                if start_position != position && self.do_pileup {
+                    positions_for_changed_ref_variant.push(position);
+                }
+            }
+
+            if instance().conf.disable_sv {
+                variations_at_pos
+                    .variants
+                    .retain(|vref| !ANY_SV.is_match(&vref.varallele));
+            }
+        } else if let Some(ref_var) = variations_at_pos.reference_variant.as_mut() {
+            self.update_ref_variant(
+                position,
+                total_pos_coverage,
+                ref_var,
+                reference,
+                reference_forward_coverage,
+                reference_reverse_coverage,
+                duprate,
+            );
+        } else {
+            variations_at_pos.reference_variant = Some(Variant::new());
+        }
+
+        if let Some(ref_var) = variations_at_pos.reference_variant.as_mut() {
+            if self.do_pileup
+                && (positions_for_changed_ref_variant.contains(&position)
+                    || instance().amplicon_based_calling)
+            {
+                self.update_ref_variant(
+                    position,
+                    total_pos_coverage,
+                    ref_var,
+                    reference,
+                    reference_forward_coverage,
+                    reference_reverse_coverage,
+                    duprate,
+                );
+            }
+        }
+    }
+
+    fn update_ref_variant(
+        &self,
+        position: i64,
+        total_pos_coverage: usize,
+        vref: &mut Variant,
+        reference: &Reference,
+        reference_forward_coverage: usize,
+        reference_reverse_coverage: usize,
+        duprate: f64,
+    ) {
+        vref.total_pos_coverage = total_pos_coverage;
+        vref.position_coverage = 0;
+        vref.frequency = 0.0;
+        vref.ref_forward_count = reference_forward_coverage;
+        vref.ref_reverse_count = reference_reverse_coverage;
+        vref.vars_count_on_forward = 0;
+        vref.vars_count_on_reverse = 0;
+        vref.msi = 0.0;
+        vref.msint = 0.0;
+        vref.shift3 = 0;
+        vref.start_position = position;
+        vref.end_position = position;
+        vref.high_quality_reads_frequency =
+            round_half_even("0.0000", vref.high_quality_reads_frequency);
+
+        let reference_base = reference
+            .get(position)
+            .map(|b| (b as char).to_string())
+            .unwrap_or_default();
+
+        vref.refallele = self.validate_refallele(&reference_base);
+        vref.varallele = self.validate_refallele(&reference_base);
+        vref.genotype = format!("{}/{}", reference_base, reference_base);
+        vref.leftseq.clear();
+        vref.rightseq.clear();
+        vref.duprate = duprate;
+    }
+
+    fn validate_refallele(&self, refallele: &str) -> String {
+        let mut out = refallele.to_string();
+        let replacements = [
+            ('M', 'A'),
+            ('R', 'A'),
+            ('W', 'A'),
+            ('S', 'C'),
+            ('Y', 'C'),
+            ('K', 'G'),
+            ('V', 'A'),
+            ('H', 'A'),
+            ('D', 'A'),
+            ('B', 'C'),
+        ];
+
+        for (from, to) in replacements {
+            if out.contains(from) {
+                out = out.replacen(from, &to.to_string(), 1);
+            }
+        }
+        out
+    }
+
+    fn proceed_vref_is_deletion(
+        &self,
+        position: i64,
+        del_len: usize,
+        reference: &Reference,
+    ) -> (f64, i32, f64) {
+        let (msi, msint, shift3) = self.detect_microsatellite(reference, position, del_len);
+        (msi, shift3, msint)
+    }
+
+    fn proceed_vref_is_insertion(
+        &self,
+        position: i64,
+        desc: &str,
+        reference: &Reference,
+        region: &Region,
+    ) -> (f64, i32, f64) {
+        let tseq1 = desc.trim_start_matches('+');
+        let leftseq = self.get_reference_range(reference, (position - 50).max(1), position);
+        let chr_len = instance()
+            .chr_lens
+            .get(region.chr())
+            .copied()
+            .unwrap_or(0) as i64;
+        let fallback_len = reference.region_start + reference.ref_seq.len() as i64 - 1;
+        let chr_len = if chr_len > 0 { chr_len } else { fallback_len };
+        let tseq2 = self.get_reference_range(reference, position + 1, (position + 70).min(chr_len));
+
+        let (msi, msint, shift3) = self.find_msi(tseq1, &tseq2, Some(&leftseq));
+        (msi, shift3 as i32, msint)
     }
 
     /// Build Vars struct from raw variant data at a position
@@ -1029,7 +1870,7 @@ impl VarDictPipeline {
         let mut position = position;
         let total_count = raw.alt_depth_fwd + raw.alt_depth_rev;
         let frequency = if total_coverage > 0 {
-            total_count as f64 / total_coverage as f64
+            round_half_even("0.0000", total_count as f64 / total_coverage as f64)
         } else {
             0.0
         };
@@ -1112,25 +1953,25 @@ impl VarDictPipeline {
         // Calculate means by dividing sums by count
         // RawVariant stores sums, we need actual means
         let mean_position = if total_count > 0 {
-            raw.mean_pos / total_count as f64
+            round_half_even("0.0", raw.mean_pos / total_count as f64)
         } else {
             0.0
         };
         
         let mean_quality = if total_count > 0 {
-            raw.mean_qual / total_count as f64
+            round_half_even("0.0", raw.mean_qual / total_count as f64)
         } else {
             0.0
         };
         
         let mean_mapping_quality = if total_count > 0 {
-            raw.mean_mapq / total_count as f64
+            round_half_even("0.0", raw.mean_mapq / total_count as f64)
         } else {
             0.0
         };
         
         let nm_mean = if total_count > 0 {
-            raw.nm / total_count as f64
+            round_half_even("0.0", raw.nm / total_count as f64)
         } else {
             0.0
         };
@@ -1211,18 +2052,23 @@ impl VarDictPipeline {
             end_position,
             vars_count_on_forward: raw.alt_depth_fwd,
             vars_count_on_reverse: raw.alt_depth_rev,
-            position_coverage: total_coverage,
+            position_coverage: total_count,
+            total_pos_coverage: total_coverage,
             frequency,
             high_quality_reads_frequency: if total_coverage > 0 {
                 if hicov > 0 {
-                    raw.high_qual_read_cnt as f64 / hicov as f64
+                    round_half_even("0.0000", raw.high_qual_read_cnt as f64 / hicov as f64)
                 } else {
                     0.0
                 }
             } else {
                 0.0
             },
-            extra_frequency,
+            extra_frequency: if extra_frequency > 0.0 {
+                round_half_even("0.0000", extra_frequency)
+            } else {
+                0.0
+            },
             mean_position,
             mean_quality,
             mean_mapping_quality,

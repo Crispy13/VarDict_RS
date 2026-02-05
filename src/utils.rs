@@ -8,6 +8,45 @@ use std::{
 
 pub mod aligner;
 
+pub fn round_half_even(pattern: &str, value: f64) -> f64 {
+    let decimals = pattern
+        .split('.')
+        .nth(1)
+        .map(|s| s.len())
+        .unwrap_or(0);
+    if decimals == 0 {
+        return round_half_even_with_scale(value, 1.0).0;
+    }
+
+    let scale = 10_f64.powi(decimals as i32);
+    round_half_even_with_scale(value, scale).0 / scale
+}
+
+fn round_half_even_with_scale(value: f64, scale: f64) -> (f64, bool) {
+    if !value.is_finite() {
+        return (value, false);
+    }
+
+    let scaled = value * scale;
+    let sign = if scaled < 0.0 { -1.0 } else { 1.0 };
+    let abs_scaled = scaled.abs();
+    let floor = abs_scaled.floor();
+    let frac = abs_scaled - floor;
+    let rounded = if (frac - 0.5).abs() < f64::EPSILON {
+        if (floor as i64) % 2 == 0 {
+            floor
+        } else {
+            floor + 1.0
+        }
+    } else if frac > 0.5 {
+        floor + 1.0
+    } else {
+        floor
+    };
+
+    (rounded * sign, true)
+}
+
 fn subbyte(s: &[u8], mut begin: i32, len: i32) -> Option<&[u8]> {
     if begin < 0 {
         begin = s.len() as i32 + begin;

@@ -100,6 +100,7 @@ pub struct Variant {
     pub vars_count_on_forward: usize,
     pub vars_count_on_reverse: usize,
     pub position_coverage: usize,
+    pub total_pos_coverage: usize,
 
     // === Frequencies ===
     pub frequency: f64,
@@ -155,6 +156,7 @@ impl Variant {
             vars_count_on_forward: 0,
             vars_count_on_reverse: 0,
             position_coverage: 0,
+            total_pos_coverage: 0,
             frequency: 0.0,
             high_quality_reads_frequency: 0.0,
             extra_frequency: 0.0,
@@ -346,7 +348,7 @@ impl ToVarsBuilder {
         variant.end_position = position;
         variant.vartype = var_type.clone();
         variant.description_string = create_description_string(&var_type);
-        variant.position_coverage = total_coverage;
+        variant.total_pos_coverage = total_coverage;
 
         if variations.is_empty() {
             return variant;
@@ -375,6 +377,7 @@ impl ToVarsBuilder {
 
         // === Calculate frequency ===
         let total_var_count = forward_count + reverse_count;
+        variant.position_coverage = total_var_count;
         variant.frequency = if total_coverage > 0 {
             total_var_count as f64 / total_coverage as f64
         } else {
@@ -1100,7 +1103,7 @@ mod tests {
         // Verify counts
         assert_eq!(variant.vars_count_on_forward, 2);
         assert_eq!(variant.vars_count_on_reverse, 2);
-        assert_eq!(variant.position_coverage, 100);
+        assert_eq!(variant.position_coverage, 4);
 
         // Verify frequency: 4 variants out of 100 coverage = 4%
         assert!((variant.frequency - 0.04).abs() < 0.001);

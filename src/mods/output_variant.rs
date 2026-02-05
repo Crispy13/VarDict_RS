@@ -144,8 +144,8 @@ impl SimpleOutputVariant {
         let (variant_coverage, ref_fwd, ref_rev, var_fwd, var_rev, frequency) = if is_ref_call {
             (
                 0,  // variant_coverage = 0 for ref calls
-                variant.vars_count_on_forward,  // ref counts FROM vars counts
-                variant.vars_count_on_reverse,
+                variant.ref_forward_count,
+                variant.ref_reverse_count,
                 0,  // var counts = 0
                 0,
                 0.0,  // frequency = 0 for ref calls
@@ -174,7 +174,7 @@ impl SimpleOutputVariant {
             ref_allele: variant.refallele.clone(),
             var_allele: variant.varallele.clone(),
 
-            total_coverage: variant.position_coverage,
+            total_coverage: variant.total_pos_coverage,
             variant_coverage,
             reference_forward_count: ref_fwd,
             reference_reverse_count: ref_rev,
@@ -450,7 +450,8 @@ mod tests {
             end_position: 1000,
             vars_count_on_forward: 5,
             vars_count_on_reverse: 5,
-            position_coverage: 100,
+            position_coverage: 10,
+            total_pos_coverage: 100,
             frequency: 0.10,
             high_quality_reads_frequency: 0.08,
             extra_frequency: 0.0,
