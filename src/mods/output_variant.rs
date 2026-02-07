@@ -474,6 +474,7 @@ mod tests {
             ref_reverse_count: 0,
             genotype: "0/1".to_string(),
             duprate: 0.0,
+            crispr: 0,
         };
 
         let region = Region::new("chr1", 900, 1100, "BRCA1");

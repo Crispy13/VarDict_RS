@@ -79,7 +79,11 @@ impl BamReader {
     /// Returns None when no more records are available
     pub fn read(&mut self, record: &mut Record) -> Result<bool> {
         match self.reader.read(record) {
-            Some(Ok(())) => Ok(true),
+            Some(Ok(())) => {
+                // Refresh cached CIGAR data for reused Record instances.
+                record.cache_cigar();
+                Ok(true)
+            }
             Some(Err(e)) => Err(anyhow!("Error reading BAM record: {}", e)),
             None => Ok(false),
         }

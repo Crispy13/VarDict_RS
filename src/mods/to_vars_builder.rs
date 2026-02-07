@@ -141,6 +141,9 @@ pub struct Variant {
 
     // === Duplication rate ===
     pub duprate: f64,
+
+    // === CRISPR adjustment ===
+    pub crispr: i32,
 }
 
 impl Variant {
@@ -179,6 +182,7 @@ impl Variant {
             ref_reverse_count: 0,
             genotype: "0/0".to_string(),
             duprate: 0.0,
+            crispr: 0,
         }
     }
 

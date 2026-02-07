@@ -276,6 +276,11 @@ fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>
     conf.minr = if args.pileup { 0 } else { args.min_variant_reads };
     conf.vext = args.vext;
     conf.mismatch = args.mismatch;
+    conf.mapping_quality = if args.min_mapping_quality > 0 {
+        Some(args.min_mapping_quality)
+    } else {
+        None
+    };
     conf.sam_filter = sam_filter;
     conf.downsampling = args.downsampling;
     conf.remove_duplicated_reads = args.remove_duplicates;
@@ -401,7 +406,8 @@ fn parse_region_string(s: &str, zero_based: bool) -> Result<Region> {
         (start, end)
     };
 
-    Ok(Region::new(chr, start, end, String::new()))
+    // Java uses the chromosome as the gene field for -R regions.
+    Ok(Region::new(chr.clone(), start, end, chr))
 }
 
 /// Parse a BED file and return regions

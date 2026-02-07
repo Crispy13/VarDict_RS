@@ -67,6 +67,9 @@ pub struct Configuration {
     /// If set, reads with mismatches more than INT will be filtered and ignored
     pub mismatch: i32,
 
+    /// If set, reads with mapping quality less than INT will be filtered and ignored (Java: -Q)
+    pub mapping_quality: Option<u8>,
+
     /// Move indels to 3' end (Java: moveIndelsTo3 / -3)
     pub move_indels_to_3: bool,
 
@@ -102,6 +105,7 @@ impl Default for Configuration {
             non_monomer_msi_frequency: 0.1,
             vext: 2,
             mismatch: 8,
+            mapping_quality: None,
             move_indels_to_3: false,
             sv_min_len: 1000,
         }
