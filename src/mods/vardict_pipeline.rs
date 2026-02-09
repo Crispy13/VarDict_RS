@@ -11,6 +11,9 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::env;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::sync::Arc;
 
 use anyhow::{Result, Error};
@@ -60,12 +63,476 @@ pub struct CigarParserOutput {
     pub discordant_count: usize,
     /// Splice positions ("start-end")
     pub splice: HashSet<String>,
+    /// Splice counts by intron key ("start-end")
+    pub splice_count: HashMap<String, usize>,
     /// Duplication rate
     pub duprate: f64,
     /// Total reads seen by preprocessor
     pub total_reads: usize,
     /// Duplicate reads filtered by preprocessor
     pub duplicate_reads: usize,
+}
+
+impl CigarParserOutput {
+    pub fn write_jsonl_snapshot_if_enabled(&self, region: &Region) -> Result<()> {
+        let path = match env::var("VARDICT_CIGAR_PARSER_JSONL") {
+            Ok(val) => val.trim().to_string(),
+            Err(_) => String::new(),
+        };
+        if path.is_empty() {
+            return Ok(());
+        }
+
+        self.write_jsonl_snapshot(&path, region)
+    }
+
+    fn write_jsonl_snapshot(&self, path: &str, region: &Region) -> Result<()> {
+        let file = File::create(path)?;
+        let mut writer = BufWriter::new(file);
+
+        let meta = format!(
+            "{{\"region\":\"{}\",\"maxReadLength\":{},\"duprate\":\"{}\"}}",
+            json_escape(&region.to_region_string()),
+            self.max_read_len,
+            fmt_f64(self.duprate),
+        );
+        write_json_line(&mut writer, "META", 0, "-", &meta)?;
+
+        write_variant_map(&mut writer, "NONINS", &self.non_insertion_vars)?;
+        write_variant_map(&mut writer, "INS", &self.insertion_vars)?;
+        write_ref_cov(&mut writer, &self.ref_coverage)?;
+        write_count_map(&mut writer, "MNP", &self.mnp)?;
+        write_count_map(&mut writer, "INSCOUNT", &self.position_to_insertion_count)?;
+        write_count_map(&mut writer, "DELCOUNT", &self.position_to_deletions_count)?;
+        write_soft_clips(&mut writer, "SCLIP5", &self.soft_clips_5end)?;
+        write_soft_clips(&mut writer, "SCLIP3", &self.soft_clips_3end)?;
+        write_splice(&mut writer, &self.splice)?;
+        write_splice_count(&mut writer, &self.splice_count)?;
+
+        writer.flush()?;
+        Ok(())
+    }
+}
+
+fn write_realigned_jsonl_snapshot_if_enabled(
+    data: &RealignedVariationData,
+    region: &Region,
+) -> Result<()> {
+    let path = match env::var("VARDICT_VARIANT_REALIGNER_JSONL") {
+        Ok(val) => val.trim().to_string(),
+        Err(_) => String::new(),
+    };
+    if path.is_empty() {
+        return Ok(());
+    }
+
+    write_realigned_jsonl_snapshot(data, region, &path)
+}
+
+fn write_realigned_jsonl_snapshot(
+    data: &RealignedVariationData,
+    region: &Region,
+    path: &str,
+) -> Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    let meta = format!(
+        "{{\"region\":\"{}\",\"maxReadLength\":{},\"duprate\":\"{}\"}}",
+        json_escape(&region.to_region_string()),
+        data.max_read_length,
+        fmt_f64(data.duprate),
+    );
+    write_json_line(&mut writer, "META", 0, "-", &meta)?;
+
+    write_variant_map(&mut writer, "NONINS", &data.non_insertion_variants)?;
+    write_variant_map(&mut writer, "INS", &data.insertion_variants)?;
+    write_ref_cov(&mut writer, &data.ref_coverage)?;
+    write_soft_clips(&mut writer, "SCLIP5", &data.soft_clips_5end)?;
+    write_soft_clips(&mut writer, "SCLIP3", &data.soft_clips_3end)?;
+
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_structural_variants_jsonl_snapshot_if_enabled(
+    data: &RealignedVariationData,
+    region: &Region,
+) -> Result<()> {
+    let path = match env::var("VARDICT_STRUCTURAL_VARIANTS_JSONL") {
+        Ok(val) => val.trim().to_string(),
+        Err(_) => String::new(),
+    };
+    if path.is_empty() {
+        return Ok(());
+    }
+
+    write_structural_variants_jsonl_snapshot(data, region, &path)
+}
+
+fn write_structural_variants_jsonl_snapshot(
+    data: &RealignedVariationData,
+    region: &Region,
+    path: &str,
+) -> Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    let meta = format!(
+        "{{\"region\":\"{}\",\"maxReadLength\":{},\"duprate\":\"{}\"}}",
+        json_escape(&region.to_region_string()),
+        data.max_read_length,
+        fmt_f64(data.duprate),
+    );
+    write_json_line(&mut writer, "META", 0, "-", &meta)?;
+
+    write_variant_map(&mut writer, "NONINS", &data.non_insertion_variants)?;
+    write_variant_map(&mut writer, "INS", &data.insertion_variants)?;
+    write_ref_cov(&mut writer, &data.ref_coverage)?;
+    write_soft_clips(&mut writer, "SCLIP5", &data.soft_clips_5end)?;
+    write_soft_clips(&mut writer, "SCLIP3", &data.soft_clips_3end)?;
+
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_tovars_jsonl_snapshot_if_enabled(
+    data: &AlignedVarsData,
+    region: &Region,
+    max_read_len: usize,
+    duprate: f64,
+) -> Result<()> {
+    let path = match env::var("VARDICT_TO_VARS_JSONL") {
+        Ok(val) => val.trim().to_string(),
+        Err(_) => String::new(),
+    };
+    if path.is_empty() {
+        return Ok(());
+    }
+
+    write_tovars_jsonl_snapshot(data, region, max_read_len, duprate, &path)
+}
+
+fn write_tovars_jsonl_snapshot(
+    data: &AlignedVarsData,
+    region: &Region,
+    max_read_len: usize,
+    duprate: f64,
+    path: &str,
+) -> Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    let meta = format!(
+        "{{\"region\":\"{}\",\"maxReadLength\":{},\"duprate\":\"{}\"}}",
+        json_escape(&region.to_region_string()),
+        max_read_len,
+        fmt_f64(duprate),
+    );
+    write_json_line(&mut writer, "META", 0, "-", &meta)?;
+
+    write_tovars_variants(&mut writer, &data.aligned_variants)?;
+
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_json_line<W: Write>(
+    writer: &mut W,
+    line_type: &str,
+    pos: i64,
+    key: &str,
+    data: &str,
+) -> Result<()> {
+    writeln!(
+        writer,
+        "{{\"type\":\"{}\",\"pos\":{},\"key\":\"{}\",\"data\":{}}}",
+        line_type,
+        pos,
+        json_escape(key),
+        data
+    )?;
+    Ok(())
+}
+
+fn write_variant_map<W: Write>(
+    writer: &mut W,
+    line_type: &str,
+    map: &HashMap<i64, HashMap<VarDesc, RawVariant>>,
+) -> Result<()> {
+    let mut positions: Vec<i64> = map.keys().copied().collect();
+    positions.sort_unstable();
+
+    for pos in positions {
+        if let Some(vars) = map.get(&pos) {
+            let mut keys: Vec<&VarDesc> = vars.keys().collect();
+            keys.sort_by(|a, b| a.to_key_string().cmp(&b.to_key_string()));
+            for key in keys {
+                let key_str = key.to_key_string();
+                let var = vars.get(key).expect("variant missing for key");
+                let data = format!("{{\"variant\":{}}}", variant_json(var));
+                write_json_line(writer, line_type, pos, &key_str, &data)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn write_tovars_variants<W: Write>(
+    writer: &mut W,
+    map: &HashMap<i64, Vars>,
+) -> Result<()> {
+    let mut positions: Vec<i64> = map.keys().copied().collect();
+    positions.sort_unstable();
+
+    for pos in positions {
+        let vars = map.get(&pos).expect("vars missing for position");
+        let mut variants: Vec<&Variant> = vars.variants.iter().collect();
+        variants.sort_by(|a, b| a.description_string.cmp(&b.description_string));
+        for variant in variants {
+            let data = format!("{{\"variant\":{}}}", tovars_variant_json(variant));
+            write_json_line(writer, "VAR", pos, &variant.description_string, &data)?;
+        }
+        if let Some(ref_variant) = &vars.reference_variant {
+            let data = format!("{{\"variant\":{}}}", tovars_variant_json(ref_variant));
+            write_json_line(writer, "REF", pos, &ref_variant.description_string, &data)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_ref_cov<W: Write>(writer: &mut W, map: &HashMap<i64, usize>) -> Result<()> {
+    let mut positions: Vec<i64> = map.keys().copied().collect();
+    positions.sort_unstable();
+    for pos in positions {
+        let count = map.get(&pos).copied().unwrap_or(0);
+        let data = format!("{{\"count\":{}}}", count);
+        write_json_line(writer, "REFCOV", pos, "-", &data)?;
+    }
+    Ok(())
+}
+
+fn write_count_map<W: Write>(
+    writer: &mut W,
+    line_type: &str,
+    map: &HashMap<i64, HashMap<String, usize>>,
+) -> Result<()> {
+    let mut positions: Vec<i64> = map.keys().copied().collect();
+    positions.sort_unstable();
+    for pos in positions {
+        if let Some(inner) = map.get(&pos) {
+            let mut keys: Vec<&String> = inner.keys().collect();
+            keys.sort();
+            for key in keys {
+                let count = inner.get(key).copied().unwrap_or(0);
+                let data = format!("{{\"count\":{}}}", count);
+                write_json_line(writer, line_type, pos, key, &data)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_soft_clips<W: Write>(
+    writer: &mut W,
+    line_type: &str,
+    map: &HashMap<i64, SoftClip>,
+) -> Result<()> {
+    let mut positions: Vec<i64> = map.keys().copied().collect();
+    positions.sort_unstable();
+    for pos in positions {
+        if let Some(sc) = map.get(&pos) {
+            let data = soft_clip_json(sc);
+            write_json_line(writer, line_type, pos, "-", &data)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_splice<W: Write>(writer: &mut W, splice: &HashSet<String>) -> Result<()> {
+    let mut keys: Vec<&String> = splice.iter().collect();
+    keys.sort();
+    for key in keys {
+        let pos = parse_splice_pos(key);
+        let data = String::from("{}");
+        write_json_line(writer, "SPLICE", pos, key, &data)?;
+    }
+    Ok(())
+}
+
+fn write_splice_count<W: Write>(
+    writer: &mut W,
+    splice_count: &HashMap<String, usize>,
+) -> Result<()> {
+    let mut keys: Vec<&String> = splice_count.keys().collect();
+    keys.sort();
+    for key in keys {
+        let count = splice_count.get(key).copied().unwrap_or(0);
+        let pos = parse_splice_pos(key);
+        let data = format!("{{\"count\":{}}}", count);
+        write_json_line(writer, "SPLICECOUNT", pos, key, &data)?;
+    }
+    Ok(())
+}
+
+fn parse_splice_pos(key: &str) -> i64 {
+    key.split_once('-')
+        .and_then(|(start, _)| start.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+fn variant_json(v: &RawVariant) -> String {
+    format!(
+        "{{\"varsCount\":{},\"varsCountOnForward\":{},\"varsCountOnReverse\":{},\"extracnt\":{},\"meanPosition\":\"{}\",\"meanQuality\":\"{}\",\"meanMappingQuality\":\"{}\",\"numberOfMismatches\":\"{}\",\"lowQualityReadsCount\":{},\"highQualityReadsCount\":{},\"pstd\":{},\"qstd\":{},\"pp\":{},\"pq\":\"{}\"}}",
+        v.alt_depth,
+        v.alt_depth_fwd,
+        v.alt_depth_rev,
+        v.extra_cnt,
+        fmt_f64(v.mean_pos),
+        fmt_f64(v.mean_qual),
+        fmt_f64(v.mean_mapq),
+        fmt_f64(v.nm),
+        v.low_qual_read_cnt,
+        v.high_qual_read_cnt,
+        v.pstd,
+        v.qstd,
+        v.pp,
+        fmt_f64(v.pq),
+    )
+}
+
+fn tovars_variant_json(v: &Variant) -> String {
+    let msint = v.msint.round() as i64;
+    let var_type = var_type_string(&v.refallele, &v.varallele);
+    format!(
+        "{{\"descriptionString\":\"{}\",\"positionCoverage\":{},\"varsCountOnForward\":{},\"varsCountOnReverse\":{},\"strandBiasFlag\":\"{}\",\"frequency\":\"{}\",\"meanPosition\":\"{}\",\"pstd\":{},\"meanQuality\":\"{}\",\"qstd\":{},\"meanMappingQuality\":\"{}\",\"highQualityReadsFrequency\":\"{}\",\"extraFrequency\":\"{}\",\"shift3\":{},\"msi\":\"{}\",\"msint\":{},\"numberOfMismatches\":\"{}\",\"hicnt\":{},\"hicov\":{},\"leftseq\":\"{}\",\"rightseq\":\"{}\",\"startPosition\":{},\"endPosition\":{},\"refReverseCoverage\":{},\"refForwardCoverage\":{},\"totalPosCoverage\":{},\"duprate\":\"{}\",\"genotype\":\"{}\",\"varallele\":\"{}\",\"refallele\":\"{}\",\"varType\":\"{}\",\"crispr\":{}}}",
+        json_escape(&v.description_string),
+        v.position_coverage,
+        v.vars_count_on_forward,
+        v.vars_count_on_reverse,
+        json_escape(&v.strand_bias_flag.to_string()),
+        fmt_f64_with("0.0000", v.frequency),
+        fmt_f64_with("0.0", v.mean_position),
+        v.is_at_least_at_2_positions,
+        fmt_f64_with("0.0", v.mean_quality),
+        v.has_at_least_2_diff_qualities,
+        fmt_f64_with("0.0", v.mean_mapping_quality),
+        fmt_f64_with("0.0000", v.high_quality_reads_frequency),
+        fmt_f64_with("0.0000", v.extra_frequency),
+        v.shift3,
+        fmt_f64_with("0.000", v.msi),
+        msint,
+        fmt_f64_with("0.0", v.nm),
+        v.high_qual_read_cnt,
+        v.hicov,
+        json_escape(&v.leftseq),
+        json_escape(&v.rightseq),
+        v.start_position,
+        v.end_position,
+        v.ref_reverse_count,
+        v.ref_forward_count,
+        v.total_pos_coverage,
+        fmt_f64_with("0.000", v.duprate),
+        json_escape(&v.genotype),
+        json_escape(&v.varallele),
+        json_escape(&v.refallele),
+        json_escape(&var_type),
+        v.crispr,
+    )
+}
+
+fn soft_clip_json(sc: &SoftClip) -> String {
+    let consensus = String::from_utf8_lossy(sc.consensus_seq());
+    let nt = soft_clip_nt_json(&sc.nt);
+    let seq = soft_clip_seq_json(&sc.seq);
+    format!(
+        "{{\"variant\":{},\"nt\":{},\"seq\":{},\"sequence\":\"{}\",\"used\":{}}}",
+        variant_json(&sc.var),
+        nt,
+        seq,
+        json_escape(&consensus),
+        sc.used()
+    )
+}
+
+fn soft_clip_nt_json(map: &std::collections::BTreeMap<i64, crackle_kit::nuc_base_map::NucBaseMap<usize>>) -> String {
+    let mut out = String::from("[");
+    let mut first = true;
+    for (offset, base_map) in map.iter() {
+        for base in [b'A', b'C', b'G', b'T', b'N'] {
+            if let Some(val) = base_map.get(base) {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                out.push_str(&format!(
+                    "{{\"offset\":{},\"base\":\"{}\",\"count\":{}}}",
+                    offset,
+                    base as char,
+                    val
+                ));
+            }
+        }
+    }
+    out.push(']');
+    out
+}
+
+fn soft_clip_seq_json(map: &std::collections::BTreeMap<usize, crackle_kit::nuc_base_map::NucBaseMap<RawVariant>>) -> String {
+    let mut out = String::from("[");
+    let mut first = true;
+    for (offset, base_map) in map.iter() {
+        for base in [b'A', b'C', b'G', b'T', b'N'] {
+            if let Some(val) = base_map.get(base) {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                out.push_str(&format!(
+                    "{{\"offset\":{},\"base\":\"{}\",\"variant\":{}}}",
+                    offset,
+                    base as char,
+                    variant_json(val)
+                ));
+            }
+        }
+    }
+    out.push(']');
+    out
+}
+
+fn fmt_f64(value: f64) -> String {
+    fmt_f64_with("0.000", value)
+}
+
+fn fmt_f64_with(pattern: &str, value: f64) -> String {
+    let rounded = round_half_even(pattern, value);
+    let decimals = pattern
+        .split('.')
+        .nth(1)
+        .map(|s| s.len())
+        .unwrap_or(0);
+    if decimals == 0 {
+        return format!("{:.0}", rounded);
+    }
+    format!("{:.*}", decimals, rounded)
+}
+
+fn json_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Data after realignment - mirrors Java RealignedVariationData
@@ -258,6 +725,8 @@ impl VarDictPipeline {
             sam_filter,
         )?;
 
+        cigar_output.write_jsonl_snapshot_if_enabled(region)?;
+
         self.process_region_from_cigar_output(cigar_output, region, &reference)
     }
 
@@ -420,6 +889,9 @@ impl VarDictPipeline {
         let start_cigar = std::time::Instant::now();
         let cigar_output = self.run_cigar_parser(records, region, reference, instance)?;
         let elapsed_cigar = start_cigar.elapsed();
+        // Step 2: Write JSONL snapshot if enabled
+        cigar_output.write_jsonl_snapshot_if_enabled(region)?;
+
 
         event!(Level::INFO, "[TIMING] CigarParser: {:.3}s - {} non_insertion_vars, {} ref_coverage positions",
             elapsed_cigar.as_secs_f64(),
@@ -629,11 +1101,15 @@ impl VarDictPipeline {
         total_reads: usize,
         duplicate_reads: usize,
     ) -> CigarParserOutput {
-        let splice = cigar_parser
-            .take_splice_count()
-            .keys()
-            .map(|(start, end)| format!("{}-{}", start, end))
-            .collect();
+        let splice_count_raw = cigar_parser.take_splice_count();
+        let mut splice: HashSet<String> = HashSet::new();
+        let mut splice_count: HashMap<String, usize> = HashMap::new();
+        for ((start, end), counts) in splice_count_raw.into_iter() {
+            let key = format!("{}-{}", start, end);
+            splice.insert(key.clone());
+            let count = counts.get(0).copied().unwrap_or(0);
+            splice_count.insert(key, count);
+        }
 
         let duprate = if instance().conf.remove_duplicated_reads && total_reads != 0 {
             (duplicate_reads as f64 / total_reads as f64 * 1000.0).round() / 1000.0
@@ -654,6 +1130,7 @@ impl VarDictPipeline {
             max_read_len: cigar_parser.get_max_read_len(),
             discordant_count: cigar_parser.get_discordant_count(),
             splice,
+            splice_count,
             duprate,
             total_reads,
             duplicate_reads,
@@ -705,6 +1182,8 @@ impl VarDictPipeline {
             realigner.process_deletions(&mut sv_input);
             realigner.process_insertions(&mut sv_input, &position_to_insertion_count);
         }
+
+        write_realigned_jsonl_snapshot_if_enabled(&sv_input, region)?;
         
         // Run StructuralVariantsProcessor (adjSNV always runs, SV detection is unimplemented)
         let sv_processor = StructuralVariantsProcessor::new(
@@ -712,6 +1191,8 @@ impl VarDictPipeline {
             reference.region_start,
         );
         let processed = sv_processor.process(sv_input);
+
+        write_structural_variants_jsonl_snapshot_if_enabled(&processed, region)?;
         
         // Convert back to RealignedOutput
         Ok(RealignedOutput {
@@ -740,6 +1221,7 @@ impl VarDictPipeline {
             insertion_vars,
             ref_coverage,
             duprate,
+            max_read_len,
             ..
         } = input;
         let mut non_insertion_vars = non_insertion_vars;
@@ -845,11 +1327,15 @@ impl VarDictPipeline {
             }
         }
 
-        Ok(AlignedVarsData {
+        let aligned_data = AlignedVarsData {
             aligned_variants,
             aligned_variants_order,
             ref_coverage,
-        })
+        };
+
+        write_tovars_jsonl_snapshot_if_enabled(&aligned_data, region, max_read_len, duprate)?;
+
+        Ok(aligned_data)
     }
 
     fn is_same_variation_on_ref(
@@ -921,13 +1407,16 @@ impl VarDictPipeline {
             let Some(raw_var) = vars_at_pos.get(desc) else {
                 continue;
             };
-            let total_count = raw_var.alt_depth_fwd + raw_var.alt_depth_rev;
+            let fwd = raw_var.alt_depth_fwd;
+            let rev = raw_var.alt_depth_rev;
+            let total_count = if raw_var.alt_depth > 0 {
+                raw_var.alt_depth
+            } else {
+                fwd + rev
+            };
             if total_count == 0 {
                 continue;
             }
-
-            let fwd = raw_var.alt_depth_fwd;
-            let rev = raw_var.alt_depth_rev;
             let bias = check_strand_bias(fwd, rev);
 
             let base_quality = round_half_even("0.0", raw_var.mean_qual / total_count as f64);
@@ -1016,7 +1505,7 @@ impl VarDictPipeline {
             let fwd = cnt.alt_depth_fwd;
             let rev = cnt.alt_depth_rev;
             let bias = check_strand_bias(fwd, rev);
-            let total_count = fwd + rev;
+            let total_count = if cnt.alt_depth > 0 { cnt.alt_depth } else { fwd + rev };
             if total_count == 0 {
                 continue;
             }
@@ -2951,6 +3440,132 @@ mod tests {
         assert!((pipeline.min_frequency - 0.05).abs() < 0.001);
         assert!((pipeline.min_base_quality - 20.0).abs() < 0.001);
         assert_eq!(pipeline.min_mapping_quality, 10);
+    }
+
+    #[test]
+    fn test_create_variant_java_values() {
+        use crate::mods::to_vars_builder::StrandBiasValue;
+        use crate::prelude::SmallVecBytes;
+        use crate::variants::variants::Variant as RawVariant;
+
+        let pipeline = VarDictPipeline::new("test");
+        let position = 1_234_567i64;
+
+        let mut raw = RawVariant::default();
+        raw.alt_depth = 4;
+        raw.alt_depth_fwd = 3;
+        raw.alt_depth_rev = 5;
+        raw.mean_pos = 9.0;
+        raw.mean_qual = 10.5;
+        raw.mean_mapq = 31.0;
+        raw.nm = 8.0;
+        raw.high_qual_read_cnt = 44;
+        raw.low_qual_read_cnt = 35;
+
+        let desc = VarDesc::Raw {
+            desc: SmallVecBytes::from_slice(b"T"),
+        };
+        let mut vars_at_pos: HashMap<VarDesc, RawVariant> = HashMap::new();
+        vars_at_pos.insert(desc.clone(), raw);
+
+        let mut var_list = Vec::new();
+        let mut debug_lines = Vec::new();
+        let keys = vec![desc];
+
+        pipeline.create_variant_records(
+            position,
+            &vars_at_pos,
+            10,
+            &mut var_list,
+            &mut debug_lines,
+            &keys,
+            0,
+            0.0,
+        );
+
+        assert_eq!(var_list.len(), 1);
+        let v = &var_list[0];
+        assert_eq!(v.description_string, "T");
+        assert_eq!(v.position_coverage, 4);
+        assert_eq!(v.vars_count_on_forward, 3);
+        assert_eq!(v.vars_count_on_reverse, 5);
+        assert_eq!(v.strand_bias_flag.var_bias, StrandBiasValue::NoBias);
+        assert!((v.frequency - 0.4).abs() < 0.0001);
+        assert!((v.mean_position - 2.2).abs() < 0.001);
+        assert!((v.mean_quality - 2.6).abs() < 0.001);
+        assert!((v.mean_mapping_quality - 7.8).abs() < 0.001);
+        assert!((v.nm - 2.0).abs() < 0.001);
+        assert_eq!(v.high_qual_read_cnt, 44);
+        assert_eq!(v.low_qual_read_cnt, 35);
+        assert_eq!(v.hicov, 0);
+    }
+
+    #[test]
+    fn test_create_insertion_java_values() {
+        use crate::mods::to_vars_builder::StrandBiasValue;
+        use crate::prelude::SmallVecBytes;
+        use crate::variants::variants::Variant as RawVariant;
+
+        let pipeline = VarDictPipeline::new("test");
+        let position = 1_234_567i64;
+
+        let mut raw = RawVariant::default();
+        raw.alt_depth = 4;
+        raw.alt_depth_fwd = 3;
+        raw.alt_depth_rev = 5;
+        raw.mean_pos = 9.0;
+        raw.mean_qual = 10.5;
+        raw.mean_mapq = 31.0;
+        raw.nm = 8.0;
+        raw.high_qual_read_cnt = 44;
+        raw.low_qual_read_cnt = 35;
+
+        let desc = VarDesc::Raw {
+            desc: SmallVecBytes::from_slice(b"T"),
+        };
+        let mut insertion_variations: HashMap<VarDesc, RawVariant> = HashMap::new();
+        insertion_variations.insert(desc.clone(), raw);
+        let mut insertion_vars: HashMap<i64, HashMap<VarDesc, RawVariant>> = HashMap::new();
+        insertion_vars.insert(position, insertion_variations);
+
+        let mut non_insertion_vars: HashMap<i64, HashMap<VarDesc, RawVariant>> = HashMap::new();
+        let ref_coverage: HashMap<i64, usize> = HashMap::new();
+        let reference = Reference::from_seq_with_start(b"A", 1);
+
+        let mut var_list = Vec::new();
+        let mut debug_lines = Vec::new();
+
+        let updated_tcov = pipeline.create_insertion_records(
+            position,
+            10,
+            insertion_vars.get(&position),
+            &mut non_insertion_vars,
+            &ref_coverage,
+            &reference,
+            &mut var_list,
+            &mut debug_lines,
+            0,
+            0.0,
+        );
+
+        assert_eq!(updated_tcov, 10);
+        assert_eq!(var_list.len(), 1);
+        let v = &var_list[0];
+        assert_eq!(v.description_string, "T");
+        assert_eq!(v.position_coverage, 4);
+        assert_eq!(v.vars_count_on_forward, 3);
+        assert_eq!(v.vars_count_on_reverse, 5);
+        assert_eq!(v.strand_bias_flag.var_bias, StrandBiasValue::NoBias);
+        assert!((v.frequency - 0.4).abs() < 0.0001);
+        assert!((v.mean_position - 2.2).abs() < 0.001);
+        assert!((v.mean_quality - 2.6).abs() < 0.001);
+        assert!((v.mean_mapping_quality - 7.8).abs() < 0.001);
+        assert!((v.nm - 2.0).abs() < 0.001);
+        assert_eq!(v.high_qual_read_cnt, 44);
+        assert_eq!(v.low_qual_read_cnt, 35);
+        assert_eq!(v.hicov, 44);
+        assert!((v.high_quality_reads_frequency - 1.0).abs() < 0.001);
+        assert!((v.extra_frequency - 0.0).abs() < 0.0001);
     }
 
     #[test]
