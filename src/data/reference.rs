@@ -4,6 +4,8 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use rust_htslib::faidx;
 
+use crate::conf::Configuration;
+
 /// Reference sequence data
 #[derive(Default, Clone)]
 pub struct Reference {
@@ -47,6 +49,47 @@ impl Reference {
             ref_seq,
             seed: HashMap::new(),
             region_start,
+        }
+    }
+
+    /// Build the reference seed map using SEED_1 and SEED_2 lengths.
+    pub fn build_seed_map(&mut self, region_end: i64, chr_len: Option<usize>) {
+        self.seed.clear();
+
+        if self.ref_seq.is_empty() {
+            return;
+        }
+
+        let seed1 = Configuration::SEED_1 as usize;
+        let seed2 = Configuration::SEED_2 as usize;
+        let seq_len = self.ref_seq.len();
+        let at_end = chr_len.map_or(false, |len| region_end as usize == len);
+        let site_end = if at_end {
+            seq_len
+        } else {
+            seq_len.saturating_sub(seed1)
+        };
+
+        for i in 0..site_end {
+            if at_end && i > seq_len.saturating_sub(seed1) {
+                continue;
+            }
+
+            if i + seed1 <= seq_len {
+                let key = self.ref_seq[i..i + seed1].to_vec();
+                self.seed
+                    .entry(key)
+                    .or_insert_with(Vec::new)
+                    .push(self.region_start + i as i64);
+            }
+
+            if i + seed2 <= seq_len {
+                let key = self.ref_seq[i..i + seed2].to_vec();
+                self.seed
+                    .entry(key)
+                    .or_insert_with(Vec::new)
+                    .push(self.region_start + i as i64);
+            }
         }
     }
     
@@ -127,11 +170,14 @@ impl FastaReader {
     /// Create a Reference struct with sequence for a region
     pub fn get_reference(&self, chrom: &str, start: usize, end: usize) -> Result<Reference> {
         let ref_seq = self.fetch_seq(chrom, start, end)?;
-        Ok(Reference {
+        let mut reference = Reference {
             ref_seq,
-            seed: HashMap::new(), // Seeds computed separately if needed
+            seed: HashMap::new(),
             region_start: start as i64,
-        })
+        };
+        let chr_len = self.seq_len(chrom);
+        reference.build_seed_map(end as i64, Some(chr_len));
+        Ok(reference)
     }
 }
 

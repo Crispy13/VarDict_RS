@@ -744,7 +744,9 @@ impl VarDictPipeline {
                 ));
             }
         };
-        let reference = Reference::new_with_start(ref_seq, extended_start as i64);
+        let mut reference = Reference::new_with_start(ref_seq, extended_start as i64);
+        let chr_len = instance.chr_lens.get(region.chr()).copied();
+        reference.build_seed_map(extended_end as i64, chr_len);
 
         // Get SAM filter from instance configuration
         let sam_filter = instance.conf.sam_filter;
@@ -1258,12 +1260,18 @@ impl VarDictPipeline {
 
         // Perform minimal deletion realignment using soft clips when enabled
         // Re-enable realigner to match Java behavior
-        let realigner = VariantRealigner::new(reference.ref_seq.clone(), reference.region_start);
+        let realigner = VariantRealigner::new(
+            reference.ref_seq.clone(),
+            reference.seed.clone(),
+            reference.region_start,
+        );
         realigner.adjust_mnp(&mut sv_input, &mnp);
 
         if instance().conf.perform_local_realignment {
             realigner.process_deletions(&mut sv_input);
             realigner.process_insertions(&mut sv_input, &position_to_insertion_count);
+            realigner.realign_long_insertions_30(&mut sv_input);
+            realigner.realign_long_insertions(&mut sv_input);
         }
 
         write_realigned_jsonl_snapshot_if_enabled(&sv_input, region)?;

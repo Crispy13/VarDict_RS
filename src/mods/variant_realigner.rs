@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::{
     conf::Configuration,
     data::patterns::{
@@ -5,9 +7,10 @@ use crate::{
         UP_NUMBER_END,
     },
     mods::structural_variants_processor::RealignedVariationData,
+    prelude::SmallVecBytes,
     variants::{
-        var_utils::find_conseq,
-        variants::{InsOrDelLen, SoftClip, VarDesc, Variant},
+        var_utils::{find_conseq, get_variants_from_map},
+        variants::{InsOrDelLen, VarDesc, Variant},
     },
 };
 
@@ -17,6 +20,19 @@ pub struct Match35 {
     pub matched_5_end: usize,
     pub matched_3_end: usize,
     pub max_matched_length: usize,
+}
+
+#[derive(Debug, Clone)]
+struct Match {
+    base_position: i64,
+    matched_sequence: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct BaseInsertion {
+    base_insert: i64,
+    insertion_sequence: Vec<u8>,
+    base_insert2: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -37,13 +53,15 @@ struct MismatchResult {
 
 pub struct VariantRealigner {
     reference_seq: Vec<u8>,
+    reference_seed: HashMap<Vec<u8>, Vec<i64>>,
     ref_start: i64,
 }
 
 impl VariantRealigner {
-    pub fn new(reference_seq: Vec<u8>, ref_start: i64) -> Self {
+    pub fn new(reference_seq: Vec<u8>, reference_seed: HashMap<Vec<u8>, Vec<i64>>, ref_start: i64) -> Self {
         Self {
             reference_seq,
+            reference_seed,
             ref_start,
         }
     }
@@ -208,7 +226,7 @@ impl VariantRealigner {
             );
 
             for mm in all_mm {
-                let mut mm_bytes: Vec<u8> = mm
+                let mm_bytes: Vec<u8> = mm
                     .mismatch_sequence
                     .as_bytes()
                     .iter()
@@ -514,6 +532,660 @@ impl VariantRealigner {
                     }
                 }
             }
+        }
+    }
+
+    pub fn realign_long_insertions_30(&self, data: &mut RealignedVariationData) {
+        let conf = &crate::scopedata::global_read_only_scope::instance().conf;
+
+        let mut tmp5: Vec<(i64, usize)> = data
+            .soft_clips_5end
+            .iter()
+            .map(|(pos, sc)| (*pos, sc.var.alt_depth))
+            .collect();
+        tmp5.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let mut tmp3: Vec<(i64, usize)> = data
+            .soft_clips_3end
+            .iter()
+            .map(|(pos, sc)| (*pos, sc.var.alt_depth))
+            .collect();
+        tmp3.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        for (p5, cnt5) in tmp5 {
+            if cnt5 < conf.minr {
+                break;
+            }
+            if data
+                .soft_clips_5end
+                .get(&p5)
+                .map(|sc| sc.used())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            for (p3, cnt3) in tmp3.iter().copied() {
+                if data
+                    .soft_clips_5end
+                    .get(&p5)
+                    .map(|sc| sc.used())
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                if data
+                    .soft_clips_3end
+                    .get(&p3)
+                    .map(|sc| sc.used())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                if (p5 - p3) as f64 > data.max_read_length as f64 * 2.5 {
+                    continue;
+                }
+                if p3 - p5 > data.max_read_length as i64 - 10 {
+                    continue;
+                }
+
+                let seq5 = {
+                    let Some(sc5v) = data.soft_clips_5end.get_mut(&p5) else { continue; };
+                    find_conseq(sc5v, 5)
+                };
+                let seq3 = {
+                    let Some(sc3v) = data.soft_clips_3end.get_mut(&p3) else { continue; };
+                    find_conseq(sc3v, 3)
+                };
+
+                if seq5.len() <= 10 || seq3.len() <= 10 {
+                    continue;
+                }
+                if cnt3 == 0 {
+                    continue;
+                }
+                let ratio = cnt5 as f64 / cnt3 as f64;
+                if ratio < 0.08 || ratio > 12.0 {
+                    continue;
+                }
+
+                let match35 = Self::find_35_match(
+                    &String::from_utf8_lossy(&seq5),
+                    &String::from_utf8_lossy(&seq3),
+                );
+                let score = match35.max_matched_length;
+                if score == 0 {
+                    continue;
+                }
+                let smscore = score / 2;
+
+                let mut ins = if match35.matched_3_end + smscore > 1 {
+                    Self::substr_bytes(
+                        &seq3,
+                        0,
+                        Some(-(match35.matched_3_end as i64 + smscore as i64) + 1),
+                    )
+                } else {
+                    seq3.clone()
+                };
+
+                if match35.matched_5_end + smscore > 0 {
+                    let mut part = Self::substr_bytes(
+                        &seq5,
+                        0,
+                        Some((match35.matched_5_end + smscore) as i64),
+                    );
+                    part.reverse();
+                    ins.extend_from_slice(&part);
+                }
+
+                if Self::is_low_complex_seq(&String::from_utf8_lossy(&ins)) {
+                    continue;
+                }
+
+                let mut ins_desc = ins;
+                let bi: i64;
+
+                if p5 > p3 {
+                    if seq3.len() > ins_desc.len() {
+                        let tail = &seq3[ins_desc.len()..];
+                        let ref_seq = self.join_ref(
+                            p5,
+                            p5 + seq3.len() as i64 - ins_desc.len() as i64 + 2,
+                        );
+                        if !Self::is_match_bytes(tail, &ref_seq, 1) {
+                            continue;
+                        }
+                    }
+                    if seq5.len() > ins_desc.len() {
+                        let tail = &seq5[ins_desc.len()..];
+                        let start = p3 - (seq5.len() as i64 - ins_desc.len() as i64) - 2;
+                        let ref_seq = self.join_ref(start, p3 - 1);
+                        if !Self::is_match_bytes(tail, &ref_seq, -1) {
+                            continue;
+                        }
+                    }
+
+                    let tmp = self.join_ref(p3, p5 - 1);
+                    if tmp.len() > ins_desc.len() {
+                        let mut desc = (p3 - p5).to_string().into_bytes();
+                        desc.push(b'^');
+                        desc.extend_from_slice(&ins_desc);
+                        ins_desc = desc;
+                        bi = p3;
+                    } else if tmp.len() < ins_desc.len() {
+                        let mut desc = Self::substr_bytes(
+                            &ins_desc,
+                            0,
+                            Some((ins_desc.len() - tmp.len()) as i64),
+                        );
+                        desc.push(b'&');
+                        let tail = Self::substr_bytes(&ins_desc, (p3 - p5) as i64, None);
+                        desc.extend_from_slice(&tail);
+                        let mut with_plus = Vec::new();
+                        with_plus.push(b'+');
+                        with_plus.extend_from_slice(&desc);
+                        ins_desc = with_plus;
+                        bi = p3 - 1;
+                    } else {
+                        let mut desc = Vec::new();
+                        desc.push(b'-');
+                        desc.extend_from_slice(ins_desc.len().to_string().as_bytes());
+                        desc.push(b'^');
+                        desc.extend_from_slice(&ins_desc);
+                        ins_desc = desc;
+                        bi = p3;
+                    }
+                } else {
+                    if seq3.len() > ins_desc.len() {
+                        let tail = &seq3[ins_desc.len()..];
+                        let ref_seq = self.join_ref(
+                            p5,
+                            p5 + seq3.len() as i64 - ins_desc.len() as i64 + 2,
+                        );
+                        if !Self::is_match_bytes(tail, &ref_seq, 1) {
+                            continue;
+                        }
+                    }
+                    if seq5.len() > ins_desc.len() {
+                        let tail = &seq5[ins_desc.len()..];
+                        let start = p3 - (seq5.len() as i64 - ins_desc.len() as i64) - 2;
+                        let ref_seq = self.join_ref(start, p3 - 1);
+                        if !Self::is_match_bytes(tail, &ref_seq, -1) {
+                            continue;
+                        }
+                    }
+
+                    if ins_desc.len() <= (p3 - p5) as usize {
+                        let mut rpt = 2i64;
+                        let mut tnr = 3i64;
+                        while (((p3 - p5 + ins_desc.len() as i64) as f64 / tnr as f64)
+                            / ins_desc.len() as f64)
+                            > 1.0
+                        {
+                            if (p3 - p5 + ins_desc.len() as i64) % tnr == 0 {
+                                rpt += 1;
+                            }
+                            tnr += 1;
+                        }
+                        let to = p5 as f64
+                            + (p3 - p5 + ins_desc.len() as i64) as f64 / rpt as f64
+                            - ins_desc.len() as f64;
+                        let tmp = self.join_ref_float(p5, to);
+                        let mut desc = Vec::new();
+                        desc.push(b'+');
+                        desc.extend_from_slice(&tmp);
+                        desc.extend_from_slice(&ins_desc);
+                        ins_desc = desc;
+                    } else {
+                        let tmp = self.join_ref(p5, p3 - 1);
+                        if (ins_desc.len() as i64 - tmp.len() as i64) % 2 == 0 {
+                            let tex = (ins_desc.len() - tmp.len()) / 2;
+                            let left = Self::substr_bytes(&ins_desc, 0, Some(tex as i64));
+                            let right = Self::substr_bytes(&ins_desc, tex as i64, None);
+                            let mut tmp_plus_left = tmp.clone();
+                            tmp_plus_left.extend_from_slice(&left);
+                            if tmp_plus_left == right {
+                                let mut desc = Vec::new();
+                                desc.push(b'+');
+                                desc.extend_from_slice(&right);
+                                ins_desc = desc;
+                            } else {
+                                let mut desc = Vec::new();
+                                desc.push(b'+');
+                                desc.extend_from_slice(&tmp);
+                                desc.extend_from_slice(&ins_desc);
+                                ins_desc = desc;
+                            }
+                        } else {
+                            let mut desc = Vec::new();
+                            desc.push(b'+');
+                            desc.extend_from_slice(&tmp);
+                            desc.extend_from_slice(&ins_desc);
+                            ins_desc = desc;
+                        }
+                    }
+                    bi = p5 - 1;
+                }
+
+                let sc5_var = data
+                    .soft_clips_5end
+                    .get(&p5)
+                    .map(|sc| sc.var.clone())
+                    .unwrap_or_default();
+                let sc3_var = data
+                    .soft_clips_3end
+                    .get(&p3)
+                    .map(|sc| sc.var.clone())
+                    .unwrap_or_default();
+
+                if let Some(sc3v) = data.soft_clips_3end.get_mut(&p3) {
+                    sc3v.mark_used();
+                }
+                if let Some(sc5v) = data.soft_clips_5end.get_mut(&p5) {
+                    sc5v.mark_used();
+                }
+
+                *data.ref_coverage.entry(bi).or_insert(0) += sc5_var.alt_depth;
+
+                let ins_starts_with_plus = ins_desc.first() == Some(&b'+');
+                let ins_starts_with_minus = ins_desc.first() == Some(&b'-');
+
+                if ins_starts_with_plus {
+                    let key = VarDesc::Ins {
+                        seq: ins_desc[1..]
+                            .iter()
+                            .map(|b| b.to_ascii_uppercase())
+                            .collect(),
+                    };
+                    let vref = get_variants_from_map(&mut data.insertion_variants, bi, &key);
+                    vref.pstd = true;
+                    vref.qstd = true;
+
+                    let ref_key = self.get_ref_base(bi).map(|ref_base| VarDesc::SNV { ref_base });
+                    let mut ref_var = ref_key.as_ref().and_then(|k| {
+                        data.non_insertion_variants
+                            .get_mut(&bi)
+                            .and_then(|m| m.remove(k))
+                    });
+                    if let Some(ref_var_mut) = ref_var.as_mut() {
+                        adj_cnt_with_ref(vref, &sc3_var, Some(ref_var_mut));
+                    } else {
+                        adj_cnt(vref, &sc3_var);
+                    }
+                    adj_cnt(vref, &sc5_var);
+
+                    if let (Some(ref_key), Some(ref_var)) = (ref_key, ref_var) {
+                        if let Some(pos_map) = data.non_insertion_variants.get_mut(&bi) {
+                            pos_map.insert(ref_key, ref_var);
+                        }
+                    }
+
+                    let mut tins = HashMap::new();
+                    let mut map = HashMap::new();
+                    map.insert(
+                        String::from_utf8_lossy(&ins_desc).to_string(),
+                        vref.alt_depth,
+                    );
+                    tins.insert(bi, map);
+                    self.process_insertions(data, &tins);
+                } else if ins_starts_with_minus {
+                    let vref_key = self
+                        .del_desc_to_key(&ins_desc)
+                        .unwrap_or_else(|| VarDesc::Raw { desc: ins_desc.clone().into() });
+                    if let Some(pos_map) = data.non_insertion_variants.get_mut(&bi) {
+                        let ref_key =
+                            self.get_ref_base(bi).map(|ref_base| VarDesc::SNV { ref_base });
+                        let mut ref_var = ref_key.as_ref().and_then(|k| pos_map.remove(k));
+                        let vref = pos_map.entry(vref_key.clone()).or_default();
+                        vref.pstd = true;
+                        vref.qstd = true;
+                        if let Some(ref_var_mut) = ref_var.as_mut() {
+                            adj_cnt_with_ref(vref, &sc3_var, Some(ref_var_mut));
+                        } else {
+                            adj_cnt(vref, &sc3_var);
+                        }
+                        adj_cnt(vref, &sc5_var);
+                        if let (Some(ref_key), Some(ref_var)) = (ref_key, ref_var) {
+                            pos_map.insert(ref_key, ref_var);
+                        }
+                    }
+                    self.realign_deletion_for_desc(bi, &vref_key, data);
+                } else {
+                    let vref_key = VarDesc::Raw {
+                        desc: ins_desc.clone().into(),
+                    };
+                    let vref = get_variants_from_map(&mut data.non_insertion_variants, bi, &vref_key);
+                    vref.pstd = true;
+                    vref.qstd = true;
+                    adj_cnt(vref, &sc3_var);
+                    adj_cnt(vref, &sc5_var);
+                }
+
+                break;
+            }
+        }
+    }
+
+    pub fn realign_long_insertions(&self, data: &mut RealignedVariationData) {
+        let conf = &crate::scopedata::global_read_only_scope::instance().conf;
+
+        let mut tmp: Vec<(i64, usize)> = data
+            .soft_clips_5end
+            .iter()
+            .map(|(pos, sc)| (*pos, sc.var.alt_depth))
+            .collect();
+        tmp.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        for (p, cnt) in tmp {
+            if cnt < conf.minr {
+                break;
+            }
+            if data
+                .soft_clips_5end
+                .get(&p)
+                .map(|sc| sc.used())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            let seq = {
+                let Some(sc5v) = data.soft_clips_5end.get_mut(&p) else { continue; };
+                find_conseq(sc5v, 0)
+            };
+            if seq.is_empty() || seq.len() < 12 {
+                continue;
+            }
+
+            let tpl = self.find_bi(&seq, p, -1);
+            let mut bi = tpl.base_insert;
+            let mut ins = tpl.insertion_sequence;
+
+            if bi == 0 {
+                if Self::is_low_complex_seq(&String::from_utf8_lossy(&seq)) {
+                    continue;
+                }
+                let match_res = self.find_match(&seq, p, -1, Configuration::SEED_1 as usize, 1);
+                bi = match_res.base_position;
+                let extra = match_res.matched_sequence;
+                if !(bi != 0
+                    && bi - p > 15
+                    && bi - p < Configuration::SVMAXLEN as i64)
+                {
+                    continue;
+                }
+
+                if bi - p
+                    > conf.sv_min_len as i64 + 2 * Configuration::SVFLANK as i64
+                {
+                    ins = self.join_ref(p, p + Configuration::SVFLANK as i64 - 1);
+                    let dup_len = bi - p - 2 * Configuration::SVFLANK as i64 + 1;
+                    ins.extend_from_slice(format!("<dup{}>", dup_len).as_bytes());
+                    let tail = self.join_ref_for_5_lgins(
+                        bi - Configuration::SVFLANK as i64 + 1,
+                        bi,
+                        &seq,
+                        &extra,
+                    );
+                    ins.extend_from_slice(&tail);
+                } else {
+                    ins = self.join_ref_for_5_lgins(p, bi, &seq, &extra);
+                }
+                ins.extend_from_slice(&extra);
+
+                let ref_cov_bi = data.ref_coverage.get(&bi).copied();
+                let ref_cov_p1 = data.ref_coverage.get(&(p - 1)).copied();
+                if ref_cov_p1.is_none()
+                    || (ref_cov_bi.is_some()
+                        && ref_cov_p1.is_some()
+                        && ref_cov_p1.unwrap() < ref_cov_bi.unwrap())
+                {
+                    if let Some(val) = ref_cov_bi {
+                        data.ref_coverage.insert(p - 1, val);
+                    } else {
+                        data.ref_coverage.insert(p - 1, cnt);
+                    }
+                } else if cnt > ref_cov_p1.unwrap_or(0) {
+                    *data.ref_coverage.entry(p - 1).or_insert(0) += cnt;
+                }
+
+                bi = p - 1;
+            }
+
+            let sc5_var = data
+                .soft_clips_5end
+                .get(&p)
+                .map(|sc| sc.var.clone())
+                .unwrap_or_default();
+            let sc5_seq = data
+                .soft_clips_5end
+                .get(&p)
+                .map(|sc| sc.seq.clone())
+                .unwrap_or_default();
+
+            let iref_key = VarDesc::Ins {
+                seq: ins.iter().map(|b| b.to_ascii_uppercase()).collect(),
+            };
+            let iref = get_variants_from_map(&mut data.insertion_variants, bi, &iref_key);
+            iref.pstd = true;
+            iref.qstd = true;
+            adj_cnt(iref, &sc5_var);
+
+            if data.non_insertion_variants.contains_key(&bi) {
+                *data.ref_coverage.entry(bi).or_insert(0) += sc5_var.alt_depth;
+            }
+
+            let mut len = ins.len();
+            if ins.iter().any(|b| *b == b'&') {
+                len = len.saturating_sub(1);
+            }
+            let seq_len = sc5_seq.keys().next_back().map(|k| *k + 1).unwrap_or(0);
+
+            for ii in (len + 1)..seq_len {
+                let pii = bi - ii as i64 + len as i64;
+                let Some(map) = sc5_seq.get(&ii) else { continue; };
+                for base in [b'A', b'C', b'G', b'T', b'N'] {
+                    let Some(tv) = map.get(base) else { continue; };
+                    let key = VarDesc::SNV { ref_base: base };
+                    let tvr = get_variants_from_map(&mut data.non_insertion_variants, pii, &key);
+                    adj_cnt(tvr, tv);
+                    tvr.pstd = true;
+                    tvr.qstd = true;
+                    *data.ref_coverage.entry(pii).or_insert(0) += tv.alt_depth;
+                }
+            }
+
+            if bi + len as i64 != 0 {
+                if let Some(sc5v) = data.soft_clips_5end.get_mut(&p) {
+                    sc5v.mark_used();
+                }
+            }
+
+            let mut tins = HashMap::new();
+            let mut map = HashMap::new();
+            map.insert(
+                format!("+{}", String::from_utf8_lossy(&ins)),
+                iref.alt_depth,
+            );
+            tins.insert(bi, map);
+            self.process_insertions(data, &tins);
+
+        }
+
+        let mut tmp3: Vec<(i64, usize)> = data
+            .soft_clips_3end
+            .iter()
+            .map(|(pos, sc)| (*pos, sc.var.alt_depth))
+            .collect();
+        tmp3.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        for (position, cnt) in tmp3 {
+            if cnt < conf.minr {
+                break;
+            }
+            if data
+                .soft_clips_3end
+                .get(&position)
+                .map(|sc| sc.used())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            let seq = {
+                let Some(sc3v) = data.soft_clips_3end.get_mut(&position) else { continue; };
+                find_conseq(sc3v, 0)
+            };
+            if seq.is_empty() || seq.len() < 12 {
+                continue;
+            }
+
+            let mut p = position;
+            let tpl = self.find_bi(&seq, p, 1);
+            let mut bi = tpl.base_insert;
+            let mut ins = tpl.insertion_sequence;
+
+            if bi == 0 {
+                if Self::is_low_complex_seq(&String::from_utf8_lossy(&seq)) {
+                    continue;
+                }
+                let match_res = self.find_match(&seq, p, 1, Configuration::SEED_1 as usize, 1);
+                bi = match_res.base_position;
+                let extra = match_res.matched_sequence;
+                if !(bi != 0
+                    && p - bi > 15
+                    && p - bi < Configuration::SVMAXLEN as i64)
+                {
+                    continue;
+                }
+
+                let mut shift5 = 0i64;
+                while self.get_ref_base(p - 1).is_some()
+                    && self.get_ref_base(bi - 1).is_some()
+                    && self.get_ref_base(p - 1) == self.get_ref_base(bi - 1)
+                {
+                    p -= 1;
+                    bi -= 1;
+                    shift5 += 1;
+                }
+
+                if p - bi
+                    > conf.sv_min_len as i64 + 2 * Configuration::SVFLANK as i64
+                {
+                    ins = self.join_ref_for_3_lgins(
+                        bi,
+                        bi + Configuration::SVFLANK as i64 - 1,
+                        shift5,
+                        &seq,
+                        &extra,
+                    );
+                    let dup_len = p - bi - 2 * Configuration::SVFLANK as i64;
+                    ins.extend_from_slice(format!("<dup{}>", dup_len).as_bytes());
+                    let tail = self.join_ref(p - Configuration::SVFLANK as i64, p - 1);
+                    ins.extend_from_slice(&tail);
+                } else {
+                    ins = self.join_ref_for_3_lgins(bi, p - 1, shift5, &seq, &extra);
+                }
+                ins.extend_from_slice(&extra);
+
+                let ref_cov_p = data.ref_coverage.get(&p).copied();
+                let ref_cov_bi = data.ref_coverage.get(&bi).copied();
+                if ref_cov_bi.is_none()
+                    || (ref_cov_p.is_some()
+                        && ref_cov_bi.is_some()
+                        && ref_cov_bi.unwrap() < ref_cov_p.unwrap())
+                {
+                    if let Some(val) = ref_cov_p {
+                        data.ref_coverage.insert(bi, val);
+                    } else {
+                        data.ref_coverage.insert(bi, cnt);
+                    }
+                } else if cnt > ref_cov_bi.unwrap_or(0) {
+                    *data.ref_coverage.entry(bi).or_insert(0) += cnt;
+                }
+
+                bi -= 1;
+            }
+
+            let sc3_var = data
+                .soft_clips_3end
+                .get(&position)
+                .map(|sc| sc.var.clone())
+                .unwrap_or_default();
+            let sc3_seq = data
+                .soft_clips_3end
+                .get(&position)
+                .map(|sc| sc.seq.clone())
+                .unwrap_or_default();
+
+            let iref_key = VarDesc::Ins {
+                seq: ins.iter().map(|b| b.to_ascii_uppercase()).collect(),
+            };
+            let iref = get_variants_from_map(&mut data.insertion_variants, bi, &iref_key);
+            iref.pstd = true;
+            iref.qstd = true;
+
+            let mean_pos = if cnt > 0 {
+                sc3_var.mean_pos / cnt as f64
+            } else {
+                0.0
+            };
+            let mut ref_key = self.get_ref_base(bi).map(|ref_base| VarDesc::SNV { ref_base });
+            if (p - bi) as f64 > mean_pos {
+                ref_key = None;
+            }
+
+            let mut ref_var = ref_key.as_ref().and_then(|k| {
+                data.non_insertion_variants
+                    .get_mut(&bi)
+                    .and_then(|m| m.remove(k))
+            });
+            if let Some(ref_var_mut) = ref_var.as_mut() {
+                adj_cnt_with_ref(iref, &sc3_var, Some(ref_var_mut));
+            } else {
+                adj_cnt(iref, &sc3_var);
+            }
+
+            if let (Some(ref_key), Some(ref_var)) = (ref_key, ref_var) {
+                if let Some(pos_map) = data.non_insertion_variants.get_mut(&bi) {
+                    pos_map.insert(ref_key, ref_var);
+                }
+            }
+
+            let mut len = ins.len();
+            if ins.iter().any(|b| *b == b'&') {
+                len = len.saturating_sub(1);
+            }
+            let seq_len = sc3_seq.keys().next_back().map(|k| *k + 1).unwrap_or(0);
+
+            for ii in len..seq_len {
+                let pii = p + ii as i64 - len as i64;
+                let Some(map) = sc3_seq.get(&ii) else { continue; };
+                for base in [b'A', b'C', b'G', b'T', b'N'] {
+                    let Some(tv) = map.get(base) else { continue; };
+                    let key = VarDesc::SNV { ref_base: base };
+                    let vref = get_variants_from_map(&mut data.non_insertion_variants, pii, &key);
+                    adj_cnt(vref, tv);
+                    vref.pstd = true;
+                    vref.qstd = true;
+                    *data.ref_coverage.entry(pii).or_insert(0) += tv.alt_depth;
+                }
+            }
+
+            if let Some(sc3v) = data.soft_clips_3end.get_mut(&position) {
+                sc3v.mark_used();
+            }
+
+            let mut tins = HashMap::new();
+            let mut map = HashMap::new();
+            map.insert(
+                format!("+{}", String::from_utf8_lossy(&ins)),
+                iref.alt_depth,
+            );
+            tins.insert(bi, map);
+            self.process_insertions(data, &tins);
+
         }
     }
 
@@ -1193,6 +1865,423 @@ impl VariantRealigner {
         }
     }
 
+    fn join_ref(&self, from: i64, to: i64) -> Vec<u8> {
+        self.get_ref_range(from, to)
+    }
+
+    fn join_ref_float(&self, from: i64, to: f64) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut i = from;
+        while (i as f64) < to {
+            if let Some(base) = self.get_ref_base(i) {
+                out.push(base);
+            }
+            i += 1;
+        }
+        out
+    }
+
+    fn join_ref_for_5_lgins(
+        &self,
+        from: i64,
+        to: i64,
+        seq: &[u8],
+        extra: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        let seq_len = seq.len();
+        let extra_len = extra.len();
+        let usable_len = seq_len.saturating_sub(extra_len) as i64;
+
+        for i in from..=to {
+            if to - i < usable_len {
+                let idx = (to - i) as usize + extra_len;
+                if let Some(base) = seq.get(idx) {
+                    out.push(*base);
+                }
+            } else if let Some(base) = self.get_ref_base(i) {
+                out.push(base);
+            }
+        }
+
+        out
+    }
+
+    fn join_ref_for_3_lgins(
+        &self,
+        from: i64,
+        to: i64,
+        shift5: i64,
+        seq: &[u8],
+        extra: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        let seq_len = seq.len();
+        let extra_len = extra.len();
+        let usable_len = seq_len.saturating_sub(extra_len) as i64;
+
+        for i in from..=to {
+            let rel = i - from;
+            if rel >= shift5 && rel - shift5 < usable_len {
+                let idx = (rel - shift5) as usize + extra_len;
+                if let Some(base) = seq.get(idx) {
+                    out.push(*base);
+                }
+            } else if let Some(base) = self.get_ref_base(i) {
+                out.push(base);
+            }
+        }
+
+        out
+    }
+
+    fn adj_ins_pos(&self, mut bi: i64, ins: &[u8]) -> BaseInsertion {
+        let mut n = 1usize;
+        let len = ins.len();
+        let mut ins_seq = ins.to_vec();
+
+        while let Some(ref_base) = self.get_ref_base(bi) {
+            if len == 0 {
+                break;
+            }
+            let idx = len.saturating_sub(n);
+            if idx >= len || ref_base != ins_seq[idx] {
+                break;
+            }
+            n += 1;
+            if n > len {
+                n = 1;
+            }
+            bi -= 1;
+        }
+
+        if n > 1 {
+            let tail = Self::substr_bytes(&ins_seq, 1 - n as i64, None);
+            let head = Self::substr_bytes(&ins_seq, 0, Some(1 - n as i64));
+            let mut rotated = tail;
+            rotated.extend_from_slice(&head);
+            ins_seq = rotated;
+        }
+
+        BaseInsertion {
+            base_insert: bi,
+            insertion_sequence: ins_seq,
+            base_insert2: bi,
+        }
+    }
+
+    fn find_bi(&self, seq: &[u8], position: i64, dir: i64) -> BaseInsertion {
+        let maxmm = 3usize;
+        let dir_ext = if dir == -1 { 1 } else { 0 };
+        let mut score = 0i64;
+        let mut bi = 0i64;
+        let mut ins: Vec<u8> = Vec::new();
+        let mut bi2 = 0i64;
+
+        let ref_end = self.ref_start + self.reference_seq.len() as i64 - 1;
+
+        for n in 6..seq.len() {
+            if position + 6 >= ref_end {
+                break;
+            }
+            let mut mm = 0usize;
+            let mut i = 0usize;
+            let mut m: std::collections::HashSet<u8> = std::collections::HashSet::new();
+
+            while i + n < seq.len() {
+                let ref_pos = position + dir * i as i64 - dir_ext;
+                if ref_pos < self.ref_start || ref_pos > ref_end {
+                    break;
+                }
+                let Some(ref_base) = self.get_ref_base(ref_pos) else { break; };
+                if seq[i + n] != ref_base {
+                    mm += 1;
+                } else {
+                    m.insert(seq[i + n]);
+                }
+                if mm > maxmm {
+                    break;
+                }
+                i += 1;
+            }
+
+            let mnt = m.len();
+            if mnt < 2 {
+                continue;
+            }
+            let mm_rate_ok = i > 0 && (mm as f64 / i as f64) < 0.15;
+            let end_match = i + n >= seq.len().saturating_sub(1);
+            let long_match = i + n == seq.len();
+            if (mnt >= 3 && end_match && i >= 8 && mm_rate_ok)
+                || (mnt >= 2 && mm == 0 && long_match && n >= 20 && i >= 8)
+            {
+                let mut insert = Self::substr_bytes(seq, 0, Some(n as i64));
+                let mut extra: Vec<u8> = Vec::new();
+                let mut ept = 0usize;
+                while n + ept + 1 < seq.len() {
+                    let pos1 = position + ept as i64 * dir - dir_ext;
+                    let pos2 = position + (ept + 1) as i64 * dir - dir_ext;
+                    let ref1 = self.get_ref_base(pos1);
+                    let ref2 = self.get_ref_base(pos2);
+                    if ref1.is_none() || ref2.is_none() {
+                        break;
+                    }
+                    if seq[n + ept] == ref1.unwrap() && seq[n + ept + 1] == ref2.unwrap() {
+                        break;
+                    }
+                    extra.push(seq[n + ept]);
+                    ept += 1;
+                }
+
+                if dir == -1 {
+                    insert.extend_from_slice(&extra);
+                    insert.reverse();
+                    if !extra.is_empty() {
+                        let pos = insert.len().saturating_sub(extra.len());
+                        insert.insert(pos, b'&');
+                    }
+                    if mm == 0 && long_match {
+                        bi = position - 1 - extra.len() as i64;
+                        ins = insert;
+                        bi2 = position - 1;
+                        if extra.is_empty() {
+                            let tpl = self.adj_ins_pos(bi, &ins);
+                            bi = tpl.base_insert;
+                            ins = tpl.insertion_sequence;
+                            bi2 = tpl.base_insert2;
+                        }
+                        return BaseInsertion {
+                            base_insert: bi,
+                            insertion_sequence: ins,
+                            base_insert2: bi2,
+                        };
+                    } else if (i as i64 - mm as i64) > score {
+                        bi = position - 1 - extra.len() as i64;
+                        ins = insert;
+                        bi2 = position - 1;
+                        score = i as i64 - mm as i64;
+                    }
+                } else {
+                    let mut s = -1i64;
+                    if !extra.is_empty() {
+                        insert.push(b'&');
+                        insert.extend_from_slice(&extra);
+                    } else {
+                        while s >= -(n as i64) {
+                            let seq_ch = Self::char_at(&insert, s);
+                            let ref_ch = self.get_ref_base(position + s);
+                            if seq_ch.is_some() && ref_ch.is_some() && seq_ch.unwrap() == ref_ch.unwrap() {
+                                s -= 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        if s < -1 {
+                            let tins = Self::substr_bytes(&insert, s + 1, Some(1 - s));
+                            let truncate_at = (insert.len() as i64 + s + 1).max(0) as usize;
+                            insert.truncate(truncate_at);
+                            let mut rotated = tins;
+                            rotated.extend_from_slice(&insert);
+                            insert = rotated;
+                        }
+                    }
+
+                    if mm == 0 && long_match {
+                        bi = position + s;
+                        ins = insert;
+                        bi2 = position + s + extra.len() as i64;
+                        if extra.is_empty() {
+                            let tpl = self.adj_ins_pos(bi, &ins);
+                            bi = tpl.base_insert;
+                            ins = tpl.insertion_sequence;
+                            bi2 = tpl.base_insert2;
+                        }
+                        return BaseInsertion {
+                            base_insert: bi,
+                            insertion_sequence: ins,
+                            base_insert2: bi2,
+                        };
+                    } else if (i as i64 - mm as i64) > score {
+                        bi = position + s;
+                        ins = insert;
+                        bi2 = position + s + extra.len() as i64;
+                        score = i as i64 - mm as i64;
+                    }
+                }
+            }
+        }
+
+        if bi2 == bi && !ins.is_empty() && bi != 0 {
+            let tpl = self.adj_ins_pos(bi, &ins);
+            bi = tpl.base_insert;
+            ins = tpl.insertion_sequence;
+        }
+
+        BaseInsertion {
+            base_insert: bi,
+            insertion_sequence: ins,
+            base_insert2: bi2,
+        }
+    }
+
+    fn find_match(&self, seq: &[u8], _position: i64, dir: i64, seed_len: usize, mm: usize) -> Match {
+        let mut seq_work = seq.to_vec();
+        if dir == -1 {
+            seq_work.reverse();
+        }
+
+        if seq_work.len() < seed_len {
+            return Match {
+                base_position: 0,
+                matched_sequence: Vec::new(),
+            };
+        }
+
+        for i in (0..=seq_work.len() - seed_len).rev() {
+            let seed = &seq_work[i..i + seed_len];
+            let Some(seeds) = self.reference_seed.get(seed) else { continue; };
+            if seeds.len() != 1 {
+                continue;
+            }
+            let first_seed = seeds[0];
+            let mut bp = if dir == 1 {
+                first_seed - i as i64
+            } else {
+                first_seed + seq_work.len() as i64 - i as i64 - 1
+            };
+
+            if self.is_match_ref(&seq_work, bp, dir, mm) {
+                let mut extra: Vec<u8> = Vec::new();
+                let mut mm_idx: i64 = if dir == -1 { -1 } else { 0 };
+                loop {
+                    let Some(ch) = Self::char_at(&seq_work, mm_idx) else { break; };
+                    if self.is_has_and_not_equals(bp, ch) {
+                        extra.push(ch);
+                        bp += dir;
+                        mm_idx += dir;
+                    } else {
+                        break;
+                    }
+                }
+                if !extra.is_empty() && dir == -1 {
+                    extra.reverse();
+                }
+                return Match {
+                    base_position: bp,
+                    matched_sequence: extra,
+                };
+            } else {
+                let mut sseq = seq_work.clone();
+                let mut eqcnt = 0usize;
+                for ii in 1..=15 {
+                    bp += dir;
+                    sseq = if dir == 1 {
+                        Self::substr_bytes(&sseq, 1, None)
+                    } else {
+                        Self::substr_bytes(&sseq, 0, Some(-1))
+                    };
+
+                    if sseq.is_empty() {
+                        break;
+                    }
+
+                    let extra = if dir == 1 {
+                        let Some(ch0) = sseq.get(0).copied() else { continue; };
+                        if self.is_has_and_not_equals(bp, ch0) {
+                            continue;
+                        }
+                        eqcnt += 1;
+                        let ch1 = sseq.get(1).copied().unwrap_or(b'N');
+                        if sseq.len() < 2 || self.is_has_and_not_equals(bp + 1, ch1) {
+                            continue;
+                        }
+                        Self::substr_bytes(&seq_work, 0, Some(ii as i64))
+                    } else {
+                        let Some(ch_last) = Self::char_at(&sseq, -1) else { continue; };
+                        if self.is_has_and_not_equals(bp, ch_last) {
+                            continue;
+                        }
+                        eqcnt += 1;
+                        let Some(ch_prev) = Self::char_at(&sseq, -2) else { continue; };
+                        if self.is_has_and_not_equals(bp - 1, ch_prev) {
+                            continue;
+                        }
+                        Self::substr_bytes(&seq_work, -(ii as i64), None)
+                    };
+
+                    if eqcnt >= 3 && (eqcnt as f64 / ii as f64) > 0.5 {
+                        break;
+                    }
+
+                    if self.is_match_ref(&sseq, bp, dir, 1) {
+                        return Match {
+                            base_position: bp,
+                            matched_sequence: extra,
+                        };
+                    }
+                }
+            }
+        }
+
+        Match {
+            base_position: 0,
+            matched_sequence: Vec::new(),
+        }
+    }
+
+    fn del_desc_to_key(&self, desc: &[u8]) -> Option<VarDesc> {
+        if desc.first() != Some(&b'-') {
+            return None;
+        }
+        let mut idx = 1usize;
+        while idx < desc.len() && desc[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        if idx == 1 {
+            return None;
+        }
+        let len = std::str::from_utf8(&desc[1..idx]).ok()?.parse::<u32>().ok()?;
+        let mut ins_or_del_len = InsOrDelLen::None;
+        if idx < desc.len() && desc[idx] == b'^' {
+            let seq_bytes = &desc[(idx + 1)..];
+            if !seq_bytes.is_empty() {
+                let seq: SmallVecBytes = seq_bytes.iter().map(|b| b.to_ascii_uppercase()).collect();
+                ins_or_del_len = InsOrDelLen::InsSeq(seq);
+            }
+        }
+
+        Some(VarDesc::Del {
+            len,
+            match_seq: SmallVecBytes::new(),
+            ins_or_del_len,
+            mismatch_seq: SmallVecBytes::new(),
+        })
+    }
+
+    fn realign_deletion_for_desc(
+        &self,
+        pos: i64,
+        desc: &VarDesc,
+        data: &mut RealignedVariationData,
+    ) {
+        let dellen = match desc {
+            VarDesc::Del { len, ins_or_del_len, .. } => {
+                let mut total = *len as i64;
+                if let InsOrDelLen::DelLen(extra) = ins_or_del_len {
+                    total += *extra as i64;
+                }
+                total
+            }
+            _ => return,
+        };
+
+        let wupseq = self.get_ref_range(pos - 200, pos - 1);
+        let sanpseq = self.get_ref_range(pos + dellen, pos + dellen + 200);
+        self.realign_with_softclips_5end(pos, desc, data, &wupseq);
+        self.realign_with_softclips_3end(pos, desc, data, &sanpseq);
+        self.realign_deletion_mismatches(pos, desc, data);
+    }
+
     fn get_ref_range(&self, start: i64, end: i64) -> Vec<u8> {
         if start > end {
             return Vec::new();
@@ -1446,6 +2535,19 @@ impl VariantRealigner {
         correct_cnt(ref_var);
     }
 
+    fn char_at(seq: &[u8], idx: i64) -> Option<u8> {
+        if seq.is_empty() {
+            return None;
+        }
+        let len = seq.len() as i64;
+        let pos = if idx < 0 { len + idx } else { idx };
+        if pos < 0 || pos >= len {
+            None
+        } else {
+            Some(seq[pos as usize])
+        }
+    }
+
     fn substr_bytes(seq: &[u8], begin: i64, len: Option<i64>) -> Vec<u8> {
         let seq_len = seq.len() as i64;
         let mut b = begin;
@@ -1694,7 +2796,11 @@ mod tests {
         };
 
         if instance().conf.perform_local_realignment {
-            let realigner = VariantRealigner::new(reference.ref_seq.clone(), reference.region_start);
+            let realigner = VariantRealigner::new(
+                reference.ref_seq.clone(),
+                reference.seed.clone(),
+                reference.region_start,
+            );
             realigner.process_deletions(&mut sv_input);
         }
 
