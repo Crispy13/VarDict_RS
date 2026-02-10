@@ -296,7 +296,6 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                 ) => {
                     if ml <= 10 {
                         let tslen = sl + ml + if matches!(c3, Cigar::Ins(_)) { idl } else { 0 };
-                        ref_start_pos += ml + if matches!(c3, Cigar::Del(_)) { idl } else { 0 };
 
                         cigar_vec.drain(cigar_vec.len() - 2..);
                         *cigar_vec.back_mut().unwrap() = Cigar::SoftClip(tslen);

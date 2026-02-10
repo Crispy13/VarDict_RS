@@ -206,7 +206,7 @@ impl SimpleOutputVariant {
             shift3: variant.shift3,
             msi: variant.msi,
             msint: variant.msint,
-            nm: variant.nm,
+            nm: if variant.nm > 0.0 { variant.nm } else { 0.0 },
             hicnt: variant.high_qual_read_cnt,
             hicov: variant.hicov,
 

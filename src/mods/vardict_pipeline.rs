@@ -237,6 +237,38 @@ fn write_tovars_jsonl_snapshot(
     Ok(())
 }
 
+struct RecordPreprocessorJsonlEntry {
+    pos: i64,
+    key: String,
+    data: String,
+}
+
+fn write_record_preprocessor_jsonl_snapshot(
+    path: &str,
+    region: &Region,
+    total_reads: usize,
+    duplicate_reads: usize,
+    entries: &[RecordPreprocessorJsonlEntry],
+) -> Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    let meta = format!(
+        "{{\"region\":\"{}\",\"totalReads\":{},\"duplicateReads\":{}}}",
+        json_escape(&region.to_region_string()),
+        total_reads,
+        duplicate_reads,
+    );
+    write_json_line(&mut writer, "META", 0, "-", &meta)?;
+
+    for entry in entries {
+        write_json_line(&mut writer, "RECORD", entry.pos, &entry.key, &entry.data)?;
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
 fn write_json_line<W: Write>(
     writer: &mut W,
     line_type: &str,
@@ -999,18 +1031,59 @@ impl VarDictPipeline {
         );
 
         let mut preprocess_state = RecordPreprocessorState::new();
+        let jsonl_path = env::var("VARDICT_RECORD_PREPROCESSOR_JSONL")
+            .ok()
+            .map(|val| val.trim().to_string())
+            .filter(|val| !val.is_empty());
+        let mut jsonl_entries = jsonl_path.as_ref().map(|_| Vec::new());
 
         bam_reader.fetch(region.chr(), region.start(), region.end())?;
 
         let mut record = Record::new();
         while bam_reader.read(&mut record).unwrap_or(false) {
             let mate_ref_name = Self::mate_reference_name(&record, bam_reader);
+            let passes_sam_filter = sam_filter == 0 || (record.flags() & (sam_filter as u16)) == 0;
             let passed = self.passes_preprocess(
                 &record,
                 sam_filter,
                 &mut preprocess_state,
                 &mate_ref_name,
             );
+            if let Some(entries) = jsonl_entries.as_mut() {
+                if !passes_sam_filter {
+                    continue;
+                }
+                let qname = String::from_utf8_lossy(record.qname()).to_string();
+                let alignment_start = record.pos() + 1;
+                let mate_start = if record.mpos() >= 0 { record.mpos() + 1 } else { 0 };
+                let cigar = record.cigar().to_string();
+                let seq_bytes = record.seq().as_bytes();
+                let seq_str = String::from_utf8_lossy(&seq_bytes).to_string();
+                let qual_str: String = record
+                    .qual()
+                    .iter()
+                    .map(|q| (*q as u8 + 33) as char)
+                    .collect();
+                let data = format!(
+                    "{{\"passed\":{},\"flag\":{},\"pos\":{},\"mpos\":{},\"mapq\":{},\"cigar\":\"{}\",\"mateRef\":\"{}\",\"sequence\":\"{}\",\"quality\":\"{}\",\"totalReads\":{},\"duplicateReads\":{}}}",
+                    passed,
+                    record.flags(),
+                    alignment_start,
+                    mate_start,
+                    record.mapq(),
+                    json_escape(&cigar),
+                    json_escape(&mate_ref_name),
+                    json_escape(&seq_str),
+                    json_escape(&qual_str),
+                    preprocess_state.total_reads,
+                    preprocess_state.duplicate_reads,
+                );
+                entries.push(RecordPreprocessorJsonlEntry {
+                    pos: alignment_start,
+                    key: qname,
+                    data,
+                });
+            }
             if self.should_dump_steps(region) {
                 let qname = String::from_utf8_lossy(record.qname()).to_string();
                 event!(
@@ -1033,6 +1106,16 @@ impl VarDictPipeline {
             }
 
             cigar_parser.process_record(&mut record)?;
+        }
+
+        if let (Some(path), Some(entries)) = (jsonl_path.as_ref(), jsonl_entries.as_ref()) {
+            write_record_preprocessor_jsonl_snapshot(
+                path,
+                region,
+                preprocess_state.total_reads,
+                preprocess_state.duplicate_reads,
+                entries,
+            )?;
         }
 
         Ok(self.build_cigar_output(

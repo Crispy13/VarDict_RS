@@ -96,7 +96,7 @@ fn test_structural_variants_snapshot_fixture() {
     } else {
         let mut conf = Configuration::default();
         conf.disable_sv = true;
-        conf.perform_local_realignment = false;
+        conf.perform_local_realignment = true;
         let mut scope = GlobalReadOnlyScope::default();
         scope.conf = conf;
         scope

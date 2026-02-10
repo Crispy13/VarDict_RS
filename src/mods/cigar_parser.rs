@@ -661,7 +661,7 @@ impl CigarParser {
                         query_seq,
                         mapping_quality,
                         query_qual,
-                        nm as usize,
+                        nm,
                         is_reverse,
                         pos,
                         read_len_including_softclips,
@@ -680,7 +680,7 @@ impl CigarParser {
                             query_seq,
                             mapping_quality,
                             query_qual,
-                            nm as usize,
+                            nm,
                             is_reverse,
                             pos,
                             read_match_ins_len,
@@ -694,7 +694,7 @@ impl CigarParser {
                             query_seq,
                             mapping_quality,
                             query_qual,
-                            nm as usize,
+                            nm,
                             is_reverse,
                             read_match_ins_len,
                             ci,
@@ -1094,7 +1094,7 @@ impl CigarParser {
 
                                     self.add_variation_for_matching_part(
                                         mapping_quality,
-                                        nm as usize,
+                                        nm,
                                         is_reverse,
                                         read_match_ins_len,
                                         self.read_pos_excluding_softclip,  // Use current position (after MNV loop, before final +1)
@@ -1193,7 +1193,7 @@ impl CigarParser {
         query_sequence: &[u8],
         mapq: u8,
         query_quality: &[u8],
-        num_mismatch: usize,
+        num_mismatch: i32,
         is_reverse: bool,
         pos: i64,
         total_length_including_soft_clipped: usize,
@@ -1525,7 +1525,7 @@ impl CigarParser {
         query_seq: &[u8],
         mapq: u8,
         query_qual: &[u8],
-        nm: usize,
+        nm: i32,
         is_reverse: bool,
         read_len_including_match_ins: usize,
         mut ci: usize,
@@ -1837,7 +1837,7 @@ impl CigarParser {
     fn add_variation_for_deletion(
         &mut self,
         mapq: u8,
-        nm: usize,
+        nm: i32,
         is_reverse: bool,
         read_len_including_match_ins: usize,
         var_desc: &VarDesc,
@@ -1894,7 +1894,7 @@ impl CigarParser {
             var.mean_mapq += mapq as f64;
             var.pp = tp;
             var.pq = tmpq;
-            var.nm += nm.saturating_sub(nmoff) as f64;
+            var.nm += (nm - nmoff as i32) as f64;
 
             if tmpq >= instance().conf.goodq {
                 var.high_qual_read_cnt += 1;
@@ -2068,7 +2068,7 @@ impl CigarParser {
         query_seq: &[u8],
         mapq: u8,
         query_qual: &[u8],
-        nm: usize,
+        nm: i32,
         is_reverse: bool,
         pos: i64,
         read_len_including_match_ins: usize,
@@ -2239,7 +2239,7 @@ impl CigarParser {
                 self.read_pos_excluding_softclip,
                 tmpq,
                 mapq,
-                nm.saturating_sub(nmoff),
+                nm - nmoff as i32,
                 Some(read_len_including_match_ins),
             );
 
@@ -2261,7 +2261,7 @@ impl CigarParser {
                                     self.read_pos_excluding_softclip,
                                     base_qual,
                                     mapq,
-                                    nm.saturating_sub(nmoff),
+                                    nm - nmoff as i32,
                                     Some(read_len_including_match_ins),
                                 );
                             }
@@ -2306,7 +2306,7 @@ impl CigarParser {
                     ref_var.mean_mapq += mapq as f64;
                     ref_var.pp = tp;
                     ref_var.pq = tmpq;
-                    ref_var.nm += nm.saturating_sub(nmoff) as f64;
+                    ref_var.nm += (nm - nmoff as i32) as f64;
                     inc_cnt(&mut self.ref_coverage, insertion_pos, 1);
                 }
             }
@@ -2325,7 +2325,7 @@ impl CigarParser {
     fn add_variation_for_matching_part(
         &mut self,
         mapq: u8,
-        nm: usize,
+        nm: i32,
         is_reverse: bool,
         read_len_including_match_ins: usize,
         read_pos: usize,  // Current read position (0-based)
@@ -2352,7 +2352,7 @@ impl CigarParser {
             q
         };
         
-        let nm_adjusted = nm.saturating_sub(nmoff);
+        let nm_adjusted = nm - nmoff as i32;
         let mut did_add_variant = false;
         let s_str = String::from_utf8_lossy(s);
 
@@ -2486,6 +2486,25 @@ impl CigarParser {
         }
 
         if is_begin_atgc_amp_atgcs_end(s) {
+            if instance().should_dump_steps_for(
+                self.region.chr(),
+                self.region.start as i64,
+                self.region.end as i64,
+            ) {
+                let qname = self.current_qname.as_deref().unwrap_or("-");
+                event!(
+                    Level::DEBUG,
+                    "[MNP] qname={} pos={} s={} start={} read_pos={} read_pos_excl={} cigar={:?}",
+                    qname,
+                    pos,
+                    String::from_utf8_lossy(s),
+                    self.start,
+                    self.read_pos_including_softclip,
+                    self.read_pos_excluding_softclip,
+                    self.cigar,
+                );
+            }
+
             let desc = String::from_utf8_lossy(s).to_string();
             let pos_map = self.mnp.entry(pos).or_insert_with(HashMap::new);
             *pos_map.entry(desc).or_insert(0) += 1;
@@ -2646,7 +2665,7 @@ impl CigarParser {
         query_sequence: &[u8],
         mapq: u8,
         query_quality: &[u8],
-        num_mismatch: usize,
+        num_mismatch: i32,
         is_reverse: bool,
         read_qual_sum: usize,
         num_high_qual_base: usize,
@@ -2716,7 +2735,7 @@ impl CigarParser {
         query_sequence: &[u8],
         mapq: u8,
         query_quality: &[u8],
-        num_mismatch: usize,
+        num_mismatch: i32,
         is_reverse: bool,
         read_qual_sum: usize,
         num_high_qual_base: usize,
@@ -2903,7 +2922,7 @@ fn is_read_chimeric_with_sa(
 /// read_pos: position in read (excluding soft clips)  
 /// bq: base quality
 /// read_len: optional total read length for calculating tp correctly
-fn add_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64, mapq: u8, nm: usize, read_len: Option<usize>) {
+fn add_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64, mapq: u8, nm: i32, read_len: Option<usize>) {
     var.alt_depth += 1;
     var.inc_dir(is_reverse);
 
@@ -2956,7 +2975,7 @@ fn add_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64, mapq: 
 
 /// Increment variant counters without adjusting high/low quality counts.
 /// Used for edge insertion adjustment to match Java's ref-call metrics.
-fn add_cnt_no_qual(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64, mapq: u8, nm: usize, read_len: Option<usize>) {
+fn add_cnt_no_qual(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64, mapq: u8, nm: i32, read_len: Option<usize>) {
     var.alt_depth += 1;
     var.inc_dir(is_reverse);
 
@@ -2993,7 +3012,7 @@ fn add_cnt_no_qual(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64
 /// read_pos: position in read (excluding soft clips)
 /// bq: base quality
 /// read_len: optional total read length for calculating tp correctly
-fn sub_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64, mapq: u8, nm: usize, read_len: Option<usize>) {
+fn sub_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64, mapq: u8, nm: i32, read_len: Option<usize>) {
     if var.alt_depth > 0 {
         var.alt_depth = var.alt_depth.saturating_sub(1);
     }
@@ -3033,7 +3052,7 @@ fn sub_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64, mapq: 
 /// read_pos: position in read (excluding soft clips)  
 /// bq: base quality
 /// read_len: optional total read length for calculating tp correctly
-fn add_cnt_anchor(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64, mapq: u8, nm: usize, read_len: Option<usize>) {
+fn add_cnt_anchor(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64, mapq: u8, nm: i32, read_len: Option<usize>) {
     var.alt_depth += 1;
     var.inc_dir(is_reverse);
     
@@ -3329,6 +3348,56 @@ fn inc_cnt(coverage_map: &mut HashMap<i64, usize>, pos: i64, depth: usize) {
         .entry(pos)
         .and_modify(|v| v.add_assign(depth))
         .or_insert_with(|| depth);
+}
+
+fn cleanup_cigar_view(cigar: &CigarStringView, pos: i64) -> CigarStringView {
+    let mut elems: Vec<Cigar> = cigar.iter().copied().collect();
+
+    // Leading elements.
+    let mut idx = 0;
+    let mut no_matches_yet = true;
+    while idx < elems.len() && no_matches_yet {
+        match elems[idx] {
+            Cigar::Ins(len) => {
+                elems[idx] = Cigar::SoftClip(len);
+            }
+            Cigar::HardClip(_) => {
+                elems.remove(idx);
+                continue;
+            }
+            ref op if consumes_read_and_ref(op) => {
+                no_matches_yet = false;
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    // Trailing elements.
+    let mut idx = elems.len();
+    let mut no_matches_yet = true;
+    while idx > 0 && no_matches_yet {
+        idx -= 1;
+        match elems[idx] {
+            Cigar::Ins(len) => {
+                elems[idx] = Cigar::SoftClip(len);
+            }
+            Cigar::HardClip(_) => {
+                elems.remove(idx);
+                continue;
+            }
+            ref op if consumes_read_and_ref(op) => {
+                no_matches_yet = false;
+            }
+            _ => {}
+        }
+    }
+
+    CigarString(elems).into_view(pos)
+}
+
+fn consumes_read_and_ref(op: &Cigar) -> bool {
+    matches!(op, Cigar::Match(_) | Cigar::Equal(_) | Cigar::Diff(_))
 }
 
 /// Skip the insertions and deletions that are right after or before introns

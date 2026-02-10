@@ -11,6 +11,7 @@ use clap::Parser;
 
 use crackle_kit::tracing::level_filters::LevelFilter;
 use crackle_kit::tracing_kit::{setup_logging_stderr_only, setup_logging_stderr_only_verbose};
+use vardict_rs::data::bam_reader::BamReader;
 use vardict_rs::data::region::Region;
 use vardict_rs::mods::pipeline::{Pipeline, PipelineConfig};
 
@@ -347,15 +348,18 @@ fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>
 /// Parse regions from command line arguments
 fn get_regions(args: &Args) -> Result<Vec<Region>> {
     let mut regions = Vec::new();
+    let bam_targets = BamReader::open(&args.bam)
+        .context("Failed to open BAM for region normalization")?
+        .target_names();
 
     // Check for -R option first
     if let Some(ref region_str) = args.region {
         let region_path = PathBuf::from(region_str);
         if region_path.exists() {
-            regions = parse_bed_file(&region_path, args)?;
+            regions = parse_bed_file(&region_path, args, Some(&bam_targets))?;
             return Ok(regions);
         }
-        let region = parse_region_string(region_str, args.zero_based)?;
+        let region = parse_region_string(region_str, args.zero_based, Some(&bam_targets))?;
         regions.push(region);
         return Ok(regions);
     }
@@ -365,7 +369,7 @@ fn get_regions(args: &Args) -> Result<Vec<Region>> {
         if !bed_path.exists() {
             return Err(anyhow!("BED file not found: {:?}", bed_path));
         }
-        regions = parse_bed_file(bed_path, args)?;
+        regions = parse_bed_file(bed_path, args, Some(&bam_targets))?;
         return Ok(regions);
     }
 
@@ -373,14 +377,18 @@ fn get_regions(args: &Args) -> Result<Vec<Region>> {
 }
 
 /// Parse a region string like "chr1:1000-2000" or "chr1:1000"
-fn parse_region_string(s: &str, zero_based: bool) -> Result<Region> {
+fn parse_region_string(
+    s: &str,
+    zero_based: bool,
+    bam_targets: Option<&[String]>,
+) -> Result<Region> {
     // Format: chr:start-end or chr:start
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() != 2 {
         return Err(anyhow!("Invalid region format: {}. Expected chr:start-end", s));
     }
 
-    let chr = parts[0].to_string();
+    let chr = normalize_region_chrom(parts[0], bam_targets);
     let pos_parts: Vec<&str> = parts[1].split('-').collect();
 
     let (start, end) = match pos_parts.len() {
@@ -411,7 +419,11 @@ fn parse_region_string(s: &str, zero_based: bool) -> Result<Region> {
 }
 
 /// Parse a BED file and return regions
-fn parse_bed_file(path: &PathBuf, args: &Args) -> Result<Vec<Region>> {
+fn parse_bed_file(
+    path: &PathBuf,
+    args: &Args,
+    bam_targets: Option<&[String]>,
+) -> Result<Vec<Region>> {
     let file = File::open(path).context("Failed to open BED file")?;
     let reader = BufReader::new(file);
     let mut regions = Vec::new();
@@ -440,7 +452,7 @@ fn parse_bed_file(path: &PathBuf, args: &Args) -> Result<Vec<Region>> {
             continue;
         }
 
-        let chr = fields[chr_idx].to_string();
+        let chr = normalize_region_chrom(fields[chr_idx], bam_targets);
         let start: usize = fields[start_idx].parse()
             .with_context(|| format!("Invalid start at line {}", line_num + 1))?;
         let end: usize = fields[end_idx].parse()
@@ -465,13 +477,36 @@ fn parse_bed_file(path: &PathBuf, args: &Args) -> Result<Vec<Region>> {
     Ok(regions)
 }
 
+fn normalize_region_chrom(chrom: &str, bam_targets: Option<&[String]>) -> String {
+    let Some(targets) = bam_targets else {
+        return chrom.to_string();
+    };
+
+    if targets.iter().any(|name| name == chrom) {
+        return chrom.to_string();
+    }
+
+    if let Some(stripped) = chrom.strip_prefix("chr") {
+        if targets.iter().any(|name| name == stripped) {
+            return stripped.to_string();
+        }
+    }
+
+    let with_chr = format!("chr{}", chrom);
+    if targets.iter().any(|name| name == &with_chr) {
+        return with_chr;
+    }
+
+    chrom.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_parse_region_string_full() {
-        let region = parse_region_string("chr1:1000-2000", false).unwrap();
+        let region = parse_region_string("chr1:1000-2000", false, None).unwrap();
         assert_eq!(region.chr(), "chr1");
         assert_eq!(region.start(), 1000);
         assert_eq!(region.end(), 2000);
@@ -479,7 +514,7 @@ mod tests {
 
     #[test]
     fn test_parse_region_string_single_position() {
-        let region = parse_region_string("chr1:1000", false).unwrap();
+        let region = parse_region_string("chr1:1000", false, None).unwrap();
         assert_eq!(region.chr(), "chr1");
         assert_eq!(region.start(), 1000);
         assert_eq!(region.end(), 1000);
@@ -487,7 +522,7 @@ mod tests {
 
     #[test]
     fn test_parse_region_string_zero_based() {
-        let region = parse_region_string("chr1:999-2000", true).unwrap();
+        let region = parse_region_string("chr1:999-2000", true, None).unwrap();
         assert_eq!(region.chr(), "chr1");
         assert_eq!(region.start(), 1000); // 999 + 1
         assert_eq!(region.end(), 2000);
@@ -495,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_parse_region_string_invalid() {
-        assert!(parse_region_string("invalid", false).is_err());
-        assert!(parse_region_string("chr1", false).is_err());
+        assert!(parse_region_string("invalid", false, None).is_err());
+        assert!(parse_region_string("chr1", false, None).is_err());
     }
 }
