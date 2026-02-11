@@ -221,11 +221,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_debug_dump_env() -> bool {
-    let value = std::env::var("VARDICT_DEBUG_DUMP").unwrap_or_default();
-    matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-}
-
 /// Run variant calling using SharedReference (loaded into memory)
 /// 
 /// SharedReference is the default for both single and multi-threaded modes.
@@ -233,7 +228,7 @@ fn parse_debug_dump_env() -> bool {
 fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>) -> Result<()> {
     use vardict_rs::data::shared_reference::load_shared_reference_chroms;
     use vardict_rs::mods::parallel_pipeline::ParallelPipeline;
-    use vardict_rs::scopedata::global_read_only_scope::{parse_debug_dump_region_env, GlobalReadOnlyScope, INSTANCE};
+    use vardict_rs::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE};
     use vardict_rs::conf::Configuration;
     use std::time::Instant;
 
@@ -290,8 +285,6 @@ fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>
     conf.number_nucleotide_to_extend = args.number_nucleotide_to_extend;
     conf.reference_extension = args.reference_extension;
     let mut scope = GlobalReadOnlyScope::default();
-    scope.debug_dump_steps = parse_debug_dump_env();
-    scope.debug_dump_region = parse_debug_dump_region_env();
     scope.conf = conf;
     scope.chr_lens = reference.get_chromosome_lengths();
     let _ = INSTANCE.set(scope);

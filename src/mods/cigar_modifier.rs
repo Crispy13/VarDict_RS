@@ -35,7 +35,6 @@ pub struct CigarModifier<'a, 'b> {
     max_read_length: usize,
     region: &'a Region,
     rev_complementor: &'a mut RevComplementor,
-    qname: Option<String>,
 }
 
 impl<'a, 'b> CigarModifier<'a, 'b> {
@@ -49,7 +48,6 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
         max_read_length: usize,
         region: &'a Region,
         rev_complementor: &'a mut RevComplementor,
-        qname: Option<String>,
     ) -> Self {
         Self {
             pos,
@@ -62,7 +60,6 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
             max_read_length,
             region,
             rev_complementor,
-            qname,
         }
     }
 
@@ -70,40 +67,16 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
         &self.ref_data.ref_seq
     }
 
-    fn debug_qname(&self) -> &str {
-        self.qname.as_deref().unwrap_or("-")
-    }
-
-    fn should_debug_steps(&self) -> bool {
-        instance().should_dump_steps_for(
-            self.region.chr(),
-            self.region.start as i64,
-            self.region.end as i64,
-        )
-    }
-
     pub fn modify_cigar(&mut self) -> Result<ModifiedCigar<'b>, Error> {
         let mut flag = true;
-        let debug_steps = self.should_debug_steps();
 
         let mut cigar_vec = VecDeque::from_iter(self.cigar_str.0.iter().copied());
         let mut ref_start_pos = self.cigar_str.pos() as u32;
 
         // if CIGAR starts with deletion cut it off
         if let Some(Cigar::Del(l)) = cigar_vec.front() {
-            let old_pos = ref_start_pos;
             ref_start_pos += *l;
             cigar_vec.pop_front().unwrap();
-            if debug_steps {
-                event!(
-                    Level::DEBUG,
-                    "[CigarModifier] trim_leading_del old_pos={} new_pos={} cigar={:?} qname={}",
-                    old_pos,
-                    ref_start_pos,
-                    cigar_vec,
-                    self.debug_qname()
-                );
-            }
         }
 
         // if CIGAR ends with deletion cut it off
@@ -138,7 +111,6 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                             as usize)
                             < 2 * self.max_read_length
                     {
-                        let old_pos = ref_start_pos;
                         cigar_vec.pop_front().unwrap();
                         self.query_sequence = self.query_sequence.get_or_err(l..)?;
                         self.query_quality = self.query_quality.get_or_err(l..)?;
@@ -149,18 +121,7 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                             self.query_sequence.try_as_str()?,
                             ref_start_pos,
                             Configuration::SEED_2,
-                        )
-                        ;
-                        if debug_steps {
-                            event!(
-                                Level::DEBUG,
-                                "[CigarModifier] chimeric_clip_5end old_pos={} new_pos={} cigar={:?} qname={}",
-                                old_pos,
-                                ref_start_pos,
-                                cigar_vec,
-                                self.debug_qname()
-                            );
-                        }
+                        );
                     }
                 }
             }
@@ -182,7 +143,6 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                             as usize)
                             < 2 * self.max_read_length
                     {
-                        let old_pos = ref_start_pos;
                         cigar_vec.pop_back().unwrap();
                         self.query_sequence = self.query_sequence.get_with_int(0..-(l as i32))?;
                         self.query_quality = self.query_quality.get_with_int(0..-(l as i32))?;
@@ -193,18 +153,7 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                             self.query_sequence.try_as_str()?,
                             ref_start_pos,
                             Configuration::SEED_2,
-                        )
-                        ;
-                        if debug_steps {
-                            event!(
-                                Level::DEBUG,
-                                "[CigarModifier] chimeric_clip_3end old_pos={} new_pos={} cigar={:?} qname={}",
-                                old_pos,
-                                ref_start_pos,
-                                cigar_vec,
-                                self.debug_qname()
-                            );
-                        }
+                        );
                     }
                 }
             }
@@ -217,23 +166,12 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
             match (cigar_vec.get(0), cigar_vec.get(1)) {
                 (Some(&Cigar::SoftClip(sl)), Some(c2 @ (&Cigar::Ins(idl) | &Cigar::Del(idl)))) => {
                     let tslen = sl + if matches!(c2, Cigar::Ins(_)) { idl } else { 0 };
-                    let old_pos = ref_start_pos;
                     ref_start_pos += if matches!(c2, Cigar::Del(_)) { idl } else { 0 };
 
                     cigar_vec.pop_front().unwrap();
                     *cigar_vec.front_mut().unwrap() = Cigar::SoftClip(tslen);
 
                     flag = true;
-                    if debug_steps && old_pos != ref_start_pos {
-                        event!(
-                            Level::DEBUG,
-                            "[CigarModifier] begin_softclip_indel old_pos={} new_pos={} cigar={:?} qname={}",
-                            old_pos,
-                            ref_start_pos,
-                            cigar_vec,
-                            self.debug_qname()
-                        );
-                    }
                 }
                 _ => {}
             }
@@ -260,23 +198,12 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                 ) => {
                     if ml <= 10 {
                         let tslen = sl + ml + if matches!(c3, Cigar::Ins(_)) { idl } else { 0 };
-                        let old_pos = ref_start_pos;
                         ref_start_pos += ml + if matches!(c3, Cigar::Del(_)) { idl } else { 0 };
 
                         cigar_vec.drain(..2);
                         *cigar_vec.front_mut().unwrap() = Cigar::SoftClip(tslen);
 
                         flag = true;
-                        if debug_steps && old_pos != ref_start_pos {
-                            event!(
-                                Level::DEBUG,
-                                "[CigarModifier] begin_softclip_match_indel old_pos={} new_pos={} cigar={:?} qname={}",
-                                old_pos,
-                                ref_start_pos,
-                                cigar_vec,
-                                self.debug_qname()
-                            );
-                        }
                     }
                 }
                 _ => {}
@@ -319,7 +246,6 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                         } else {
                             0
                         };
-                    let old_pos = ref_start_pos;
                     ref_start_pos += ml1
                         + if matches!(c_id, Cigar::Del(_)) {
                             idl
@@ -636,27 +562,9 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
         let mut rrn = 0;
         let mut rmch = 0;
         
-        let debug_this = self.should_debug_steps();
-        if debug_this {
-            event!(
-                target: "CigarModifier",
-                Level::DEBUG,
-                "capture_mis_softly3_mismatches START qname={} align_start_pos={} ml={} mch={} refoff={} rdoff={} ref_seq_len={}",
-                self.debug_qname(), align_start_pos, ml, mch, refoff, rdoff, self.contig_ref_seq().len()
-            );
-        }
-
         while rrn < mch && rn < mch {
             let ref_idx = (refoff - rrn - 1) as usize;
             if self.contig_ref_seq().get(ref_idx).is_none() {
-                if debug_this {
-                    event!(
-                        target: "CigarModifier",
-                        Level::DEBUG,
-                        "capture_mis_softly3_mismatches BREAK ref_idx={} out of bounds qname={}",
-                        ref_idx, self.debug_qname()
-                    );
-                }
                 break;
             }
 
@@ -668,16 +576,6 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                     (rdoff - rrn - 1) as usize,
                 )
             {
-                if debug_this {
-                    let ref_base = self.contig_ref_seq().get(ref_idx).copied().unwrap_or(b'?');
-                    let seq_base = self.query_sequence.get((rdoff - rrn - 1) as usize).copied().unwrap_or(b'?');
-                    event!(
-                        target: "CigarModifier",
-                        Level::DEBUG,
-                        "capture_mis_softly3_mismatches MISMATCH rrn={} ref_idx={} ref_base={} seq_base={} qname={}",
-                        rrn, ref_idx, ref_base as char, seq_base as char, self.debug_qname()
-                    );
-                }
                 rn = rrn + 1;
                 rmch = 0;
             } else if rrn < rdoff
@@ -695,28 +593,12 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
 
             // Stop at three consecure matches
             if rmch >= 3 {
-                if debug_this {
-                    event!(
-                        target: "CigarModifier",
-                        Level::DEBUG,
-                        "capture_mis_softly3_mismatches BREAK 3 consecutive matches rrn={} qname={}",
-                        rrn, self.debug_qname()
-                    );
-                }
                 break;
             }
         }
 
         mch -= rn;
         if rn > 0 && rn <= 3 {
-            if debug_this {
-                event!(
-                    target: "CigarModifier",
-                    Level::DEBUG,
-                    "capture_mis_softly3_mismatches MODIFY rn={} new_mch={} adding SoftClip qname={}",
-                    rn, mch, self.debug_qname()
-                );
-            }
             *cigar_vd.get_mut(cigar_vd.len() - 1).unwrap() = Cigar::Match(mch as u32);
             cigar_vd.push_back(Cigar::SoftClip(rn as u32));
         }
@@ -1179,8 +1061,6 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
         sl: u32,
         ml: u32,
     ) -> Result<(), Error> {
-        let debug_steps = self.should_debug_steps();
-        let mut last_pos = *cigar_pos;
         //length of matched sequence
         let mut mch = ml as i32;
         //length of soft-clipping
@@ -1217,20 +1097,6 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
 
             *cigar_pos -= rn as u32;
             rn = 0;
-            if debug_steps && last_pos != *cigar_pos {
-                event!(
-                    Level::DEBUG,
-                    "[CigarModifier] combine_dig_s_dig_m_shift_left old_pos={} new_pos={} rn={} soft={} mch={} cigar={:?} qname={}",
-                    last_pos,
-                    *cigar_pos,
-                    rn,
-                    soft,
-                    mch,
-                    cigar_vd,
-                    self.debug_qname()
-                );
-                last_pos = *cigar_pos;
-            }
         }
 
         if soft > 0 {
@@ -1272,20 +1138,6 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                 }
 
                 *cigar_pos -= rn as u32 + 1;
-                if debug_steps && last_pos != *cigar_pos {
-                    event!(
-                        Level::DEBUG,
-                        "[CigarModifier] combine_dig_s_dig_m_extend_left old_pos={} new_pos={} rn={} soft={} mch={} cigar={:?} qname={}",
-                        last_pos,
-                        *cigar_pos,
-                        rn,
-                        soft,
-                        mch,
-                        cigar_vd,
-                        self.debug_qname()
-                    );
-                    last_pos = *cigar_pos;
-                }
             }
 
             if rn == 0 {
@@ -1338,20 +1190,6 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                     }
 
                     *cigar_pos += rn as u32;
-                    if debug_steps && last_pos != *cigar_pos {
-                        event!(
-                            Level::DEBUG,
-                            "[CigarModifier] combine_dig_s_dig_m_shift_right old_pos={} new_pos={} rn={} soft={} mch={} cigar={:?} qname={}",
-                            last_pos,
-                            *cigar_pos,
-                            rn,
-                            soft,
-                            mch,
-                            cigar_vd,
-                            self.debug_qname()
-                        );
-                        last_pos = *cigar_pos;
-                    }
                 }
             }
         }
@@ -1365,8 +1203,6 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
         cigar_vd: &mut VecDeque<Cigar>,
         ml: u32,
     ) -> Result<(), Error> {
-        let debug_steps = self.should_debug_steps();
-        let old_pos = *cigar_pos;
         let mut mch = ml as i32;
         let mut rn = 0;
         let mut rrn = 0;
@@ -1391,13 +1227,6 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                 self.query_sequence,
                 seq_idx,
             );
-            if debug_steps {
-                event!(
-                    Level::DEBUG,
-                    "[CigarModifier] combine_begin_dig_m rrn={} ref_idx={} ref_base={:?} seq_idx={} seq_base={:?} mismatch={} qname={}",
-                    rrn, ref_idx, ref_base.map(|b| b as char), seq_idx, seq_base.map(|b| b as char), mismatch, self.debug_qname()
-                );
-            }
             if mismatch {
                 rn = rrn + 1;
                 rmch = 0;
@@ -1422,18 +1251,6 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
             cigar_vd[0] = Cigar::Match(mch as u32);
             cigar_vd.push_front(Cigar::SoftClip(rn as u32));
             *cigar_pos += rn as u32;
-            if debug_steps && old_pos != *cigar_pos {
-                event!(
-                    Level::DEBUG,
-                    "[CigarModifier] combine_begin_dig_m_shift_right old_pos={} new_pos={} rn={} mch={} cigar={:?} qname={}",
-                    old_pos,
-                    *cigar_pos,
-                    rn,
-                    mch,
-                    cigar_vd,
-                    self.debug_qname()
-                );
-            }
         }
 
         Ok(())
@@ -1810,7 +1627,6 @@ mod tests {
             query_seq_owned.len(),
             &region,
             &mut rev_complementor,
-            None,
         );
 
         let modified = modifier.modify_cigar().expect("modify_cigar failed");

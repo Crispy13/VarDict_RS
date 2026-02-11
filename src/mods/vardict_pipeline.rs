@@ -932,10 +932,6 @@ impl VarDictPipeline {
             cigar_output.non_insertion_vars.len(),
             cigar_output.ref_coverage.len());
 
-        if self.should_dump_steps(region) {
-            self.dump_cigar_output(region, &cigar_output);
-        }
-
         self.process_region_from_cigar_output(cigar_output, region, reference)
     }
 
@@ -954,10 +950,6 @@ impl VarDictPipeline {
             realigned_output.non_insertion_vars.len(),
             realigned_output.ref_coverage.len());
 
-        if self.should_dump_steps(region) {
-            self.dump_realigned_output(region, &realigned_output);
-        }
-
         let start_tovars = std::time::Instant::now();
         let splice = realigned_output.splice.clone();
         let aligned_vars = self.run_to_vars_builder(realigned_output, reference, region)?;
@@ -967,10 +959,6 @@ impl VarDictPipeline {
             elapsed_tovars.as_secs_f64(),
             aligned_vars.aligned_variants.len());
 
-        if self.should_dump_steps(region) {
-            self.dump_aligned_vars(region, &aligned_vars);
-        }
-
         let start_post = std::time::Instant::now();
         let output_lines = self.run_simple_post_processor(aligned_vars, region, &splice)?;
         let elapsed_post = start_post.elapsed();
@@ -978,10 +966,6 @@ impl VarDictPipeline {
         event!(Level::INFO, "[TIMING] PostProcessor: {:.3}s - {} lines",
             elapsed_post.as_secs_f64(),
             output_lines.len());
-
-        if self.should_dump_steps(region) {
-            self.dump_post_output(region, &output_lines);
-        }
 
         Ok(output_lines)
     }
@@ -1086,23 +1070,6 @@ impl VarDictPipeline {
                     data,
                 });
             }
-            if self.should_dump_steps(region) {
-                let qname = String::from_utf8_lossy(record.qname()).to_string();
-                event!(
-                    Level::DEBUG,
-                    "[StepDump] RecordPreprocessor region={} qname={} passed={} flag={} pos={} mpos={} mapq={} cigar={} totalReads={} duplicateReads={}",
-                    region.to_region_string(),
-                    qname,
-                    passed,
-                    record.flags(),
-                    record.pos() + 1,
-                    if record.mpos() >= 0 { record.mpos() + 1 } else { 0 },
-                    record.mapq(),
-                    record.cigar().to_string(),
-                    preprocess_state.total_reads,
-                    preprocess_state.duplicate_reads,
-                );
-            }
             if !passed {
                 continue;
             }
@@ -1127,58 +1094,6 @@ impl VarDictPipeline {
         ))
     }
 
-    fn should_dump_steps(&self, region: &Region) -> bool {
-        instance().should_dump_steps_for(region.chr(), region.start() as i64, region.end() as i64)
-    }
-
-    fn dump_cigar_output(&self, region: &Region, output: &CigarParserOutput) {
-        event!(
-            Level::DEBUG,
-            "[StepDump] CigarParserOutput region={} non_insertion_vars={:?} insertion_vars={:?} ref_coverage={:?} mnp={:?} max_read_len={} discordant_count={} duprate={} splice={:?}",
-            region.to_region_string(),
-            output.non_insertion_vars,
-            output.insertion_vars,
-            output.ref_coverage,
-            output.mnp,
-            output.max_read_len,
-            output.discordant_count,
-            output.duprate,
-            output.splice,
-        );
-    }
-
-    fn dump_realigned_output(&self, region: &Region, output: &RealignedOutput) {
-        event!(
-            Level::DEBUG,
-            "[StepDump] RealignedOutput region={} non_insertion_vars={:?} insertion_vars={:?} ref_coverage={:?} duprate={} max_read_len={} splice={:?}",
-            region.to_region_string(),
-            output.non_insertion_vars,
-            output.insertion_vars,
-            output.ref_coverage,
-            output.duprate,
-            output.max_read_len,
-            output.splice,
-        );
-    }
-
-    fn dump_aligned_vars(&self, region: &Region, output: &AlignedVarsData) {
-        event!(
-            Level::DEBUG,
-            "[StepDump] AlignedVarsData region={} aligned_variants={:?} ref_coverage={:?}",
-            region.to_region_string(),
-            output.aligned_variants,
-            output.ref_coverage,
-        );
-    }
-
-    fn dump_post_output(&self, region: &Region, lines: &[String]) {
-        event!(
-            Level::DEBUG,
-            "[StepDump] PostProcessorOutput region={} lines={:?}",
-            region.to_region_string(),
-            lines,
-        );
-    }
 
     fn build_cigar_output(
         &self,
