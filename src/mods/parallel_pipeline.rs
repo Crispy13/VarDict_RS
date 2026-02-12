@@ -227,21 +227,6 @@ fn process_region_chunk_vardict<P: AsRef<Path>>(
     let start_thread = std::time::Instant::now();
     let mut results = Vec::new();
 
-    // Each worker opens its own BAM reader
-    let mut bam_reader = match BamReader::open(bam_path.as_ref().to_str().unwrap()) {
-        Ok(reader) => reader,
-        Err(e) => {
-            for region in regions {
-                results.push(RegionResult {
-                    region,
-                    output_lines: Vec::new(),
-                    error: Some(format!("Failed to open BAM: {}", e)),
-                });
-            }
-            return results;
-        }
-    };
-
     let vardict_pipeline = VarDictPipeline::new(&config.sample_name)
         .with_min_frequency(config.min_frequency)
         .with_min_base_quality(config.quality_threshold)
@@ -250,6 +235,18 @@ fn process_region_chunk_vardict<P: AsRef<Path>>(
     let global_scope = Arc::new(instance().clone());
 
     for region in regions {
+        let mut bam_reader = match BamReader::open(bam_path.as_ref().to_str().unwrap()) {
+            Ok(reader) => reader,
+            Err(e) => {
+                results.push(RegionResult {
+                    region: region.clone(),
+                    output_lines: Vec::new(),
+                    error: Some(format!("Failed to open BAM: {}", e)),
+                });
+                continue;
+            }
+        };
+
         let result = match vardict_pipeline.process_region_from_bam(
             &region,
             &reference,

@@ -1,5 +1,6 @@
 use anyhow::{Error, anyhow};
 use std::{
+    cmp::Ordering,
     fmt::Debug,
     ops::{Range, RangeFrom},
     slice::SliceIndex,
@@ -27,13 +28,43 @@ fn round_half_even_with_scale(value: f64, scale: f64) -> (f64, bool) {
         return (value, false);
     }
 
-    let scaled = value * scale;
-    let sign = if scaled < 0.0 { -1.0 } else { 1.0 };
-    let abs_scaled = scaled.abs();
+    if !scale.is_finite() || scale <= 0.0 {
+        return (value, false);
+    }
+
+    let scale_int = scale.round() as u64;
+    if (scale - scale_int as f64).abs() < f64::EPSILON {
+        if let Some((floor, frac_cmp_half)) = exact_scaled_floor_and_frac_cmp_half(value.abs(), scale_int) {
+            let rounded = match frac_cmp_half {
+                Ordering::Less => floor,
+                Ordering::Greater => floor.saturating_add(1),
+                Ordering::Equal => {
+                    if floor % 2 == 0 {
+                        floor
+                    } else {
+                        floor.saturating_add(1)
+                    }
+                }
+            };
+
+            let sign = if value < 0.0 { -1.0 } else { 1.0 };
+            return (rounded as f64 * sign, true);
+        }
+    }
+
+    let sign = if value < 0.0 { -1.0 } else { 1.0 };
+    let abs_value = value.abs();
+    let abs_scaled = abs_value * scale;
     let floor = abs_scaled.floor();
     let frac = abs_scaled - floor;
-    let rounded = if (frac - 0.5).abs() < f64::EPSILON {
-        if (floor as i64) % 2 == 0 {
+    let tie_tolerance = 1e-12;
+    let rounded = if (frac - 0.5).abs() <= tie_tolerance {
+        let tie_value = (floor + 0.5) / scale;
+        if abs_value < tie_value {
+            floor
+        } else if abs_value > tie_value {
+            floor + 1.0
+        } else if (floor as i64) % 2 == 0 {
             floor
         } else {
             floor + 1.0
@@ -45,6 +76,43 @@ fn round_half_even_with_scale(value: f64, scale: f64) -> (f64, bool) {
     };
 
     (rounded * sign, true)
+}
+
+fn exact_scaled_floor_and_frac_cmp_half(abs_value: f64, scale: u64) -> Option<(u128, Ordering)> {
+    let bits = abs_value.to_bits();
+    let exp_bits = ((bits >> 52) & 0x7ff) as i32;
+    let mantissa = bits & ((1u64 << 52) - 1);
+
+    let (significand, exponent) = if exp_bits == 0 {
+        if mantissa == 0 {
+            return Some((0, Ordering::Less));
+        }
+        (mantissa, 1 - 1023 - 52)
+    } else {
+        ((1u64 << 52) | mantissa, exp_bits - 1023 - 52)
+    };
+
+    let numerator = (significand as u128).checked_mul(scale as u128)?;
+
+    if exponent >= 0 {
+        let shift = exponent as u32;
+        if shift >= 128 {
+            return None;
+        }
+        let floor = numerator.checked_shl(shift)?;
+        return Some((floor, Ordering::Less));
+    }
+
+    let shift = (-exponent) as u32;
+    if shift >= 128 {
+        return Some((0, Ordering::Less));
+    }
+
+    let denominator = 1u128 << shift;
+    let floor = numerator / denominator;
+    let remainder = numerator % denominator;
+    let cmp = remainder.saturating_mul(2).cmp(&denominator);
+    Some((floor, cmp))
 }
 
 fn subbyte(s: &[u8], mut begin: i32, len: i32) -> Option<&[u8]> {

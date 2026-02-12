@@ -6,3 +6,4 @@ VarDictJava
 rust_chr20.var
 test_data/
 tmp_compare/
+tmp/

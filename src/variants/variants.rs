@@ -251,7 +251,10 @@ pub(crate) struct SoftClip {
     pub(crate) seq: BTreeMap<usize, NucBaseMap<Variant>>,
 
     /// The consensus sequence in soft-clipped reads.
-    consensus_seq: Vec<u8>,
+    ///
+    /// Java caches even empty consensus (sequence = "").
+    /// `None` means not computed yet; `Some(vec![])` means computed empty.
+    consensus_seq: Option<Vec<u8>>,
 
     used: bool,
 
@@ -278,12 +281,18 @@ struct Mate {
 impl SoftClip {
     /// Get the consensus sequence
     pub fn consensus_seq(&self) -> &[u8] {
-        &self.consensus_seq
+        self.consensus_seq.as_deref().unwrap_or(&[])
+    }
+
+    /// Returns true when consensus has already been computed,
+    /// including an explicitly empty consensus.
+    pub fn consensus_seq_is_set(&self) -> bool {
+        self.consensus_seq.is_some()
     }
 
     /// Set the consensus sequence
     pub fn set_consensus_seq(&mut self, seq: Vec<u8>) {
-        self.consensus_seq = seq;
+        self.consensus_seq = Some(seq);
     }
 
     /// Check if this soft clip has been used

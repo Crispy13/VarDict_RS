@@ -55,7 +55,7 @@ pub(crate) fn get_variation_from_seq(softclip: &mut SoftClip, idx: usize, base: 
 
 /// Find consensus sequence from soft clip data (ported from Java VariationUtils.findconseq)
 pub(crate) fn find_conseq(softclip: &mut SoftClip, dir: i32) -> Vec<u8> {
-    if !softclip.consensus_seq().is_empty() {
+    if softclip.consensus_seq_is_set() {
         return softclip.consensus_seq().to_vec();
     }
 
