@@ -113,29 +113,35 @@ impl ParallelPipeline {
         // Calculate regions per thread
         let regions_per_thread = (regions.len() + self.num_threads - 1) / self.num_threads;
         
-        // Partition regions into chunks for each thread
-        let region_chunks: Vec<Vec<Region>> = regions
-            .chunks(regions_per_thread.max(1))
-            .map(|c| c.to_vec())
+        let chunk_size = regions_per_thread.max(1);
+
+        // Partition regions into chunks for each thread and keep original chunk start index
+        let region_chunks: Vec<(usize, Vec<Region>)> = regions
+            .chunks(chunk_size)
+            .enumerate()
+            .map(|(chunk_index, chunk)| (chunk_index * chunk_size, chunk.to_vec()))
             .collect();
 
-        let mut results: Vec<RegionResult> = region_chunks
+        let mut chunk_results: Vec<(usize, Vec<RegionResult>)> = region_chunks
             .into_par_iter()
-            .flat_map(|chunk| {
+            .map(|(chunk_start_index, chunk)| {
                 let reference = Arc::clone(&self.reference);
                 let config = self.config.clone();
                 let bam_path = bam_path.clone();
-                process_region_chunk(chunk, reference, config, bam_path)
+                (
+                    chunk_start_index,
+                    process_region_chunk(chunk, reference, config, bam_path),
+                )
             })
             .collect();
 
-        // Sort results by region for consistent output order
-        results.sort_by(|a, b| {
-            (&a.region.chr(), a.region.start(), a.region.end())
-                .cmp(&(&b.region.chr(), b.region.start(), b.region.end()))
-        });
+        // Preserve original BED input order when flattening chunk results
+        chunk_results.sort_by_key(|(chunk_start_index, _)| *chunk_start_index);
 
-        results
+        chunk_results
+            .into_iter()
+            .flat_map(|(_, results)| results)
+            .collect()
     }
 
     /// Process regions and return all output lines
@@ -166,29 +172,35 @@ impl ParallelPipeline {
         // Calculate regions per thread
         let regions_per_thread = (regions.len() + self.num_threads - 1) / self.num_threads;
         
-        // Partition regions into chunks for each thread
-        let region_chunks: Vec<Vec<Region>> = regions
-            .chunks(regions_per_thread.max(1))
-            .map(|c| c.to_vec())
+        let chunk_size = regions_per_thread.max(1);
+
+        // Partition regions into chunks for each thread and keep original chunk start index
+        let region_chunks: Vec<(usize, Vec<Region>)> = regions
+            .chunks(chunk_size)
+            .enumerate()
+            .map(|(chunk_index, chunk)| (chunk_index * chunk_size, chunk.to_vec()))
             .collect();
 
-        let mut results: Vec<RegionResult> = region_chunks
+        let mut chunk_results: Vec<(usize, Vec<RegionResult>)> = region_chunks
             .into_par_iter()
-            .flat_map(|chunk| {
+            .map(|(chunk_start_index, chunk)| {
                 let reference = Arc::clone(&self.reference);
                 let config = self.config.clone();
                 let bam_path = bam_path.clone();
-                process_region_chunk_vardict(chunk, reference, config, bam_path)
+                (
+                    chunk_start_index,
+                    process_region_chunk_vardict(chunk, reference, config, bam_path),
+                )
             })
             .collect();
 
-        // Sort results by region for consistent output order
-        results.sort_by(|a, b| {
-            (&a.region.chr(), a.region.start(), a.region.end())
-                .cmp(&(&b.region.chr(), b.region.start(), b.region.end()))
-        });
+        // Preserve original BED input order when flattening chunk results
+        chunk_results.sort_by_key(|(chunk_start_index, _)| *chunk_start_index);
 
-        results
+        chunk_results
+            .into_iter()
+            .flat_map(|(_, results)| results)
+            .collect()
     }
 
     /// Process regions using VarDict pipeline and return all output lines

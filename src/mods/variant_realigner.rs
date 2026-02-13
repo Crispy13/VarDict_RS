@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use rust_htslib::bam::{record::Cigar, Record};
 
 use crate::{
     conf::Configuration,
+    data::bam_reader::BamReader,
     data::patterns::{
         AMP_ATGC, ATGSs_AMP_ATGSs_END, BEGIN_PLUS_ATGC, CARET_ATGC_END, DUP_NUM_ATGC, HASH_ATGC,
         UP_NUMBER_END,
@@ -55,14 +57,28 @@ pub struct VariantRealigner {
     reference_seq: Vec<u8>,
     reference_seed: HashMap<Vec<u8>, Vec<i64>>,
     ref_start: i64,
+    chromosome: Option<String>,
+    bam_paths: Vec<String>,
 }
 
 impl VariantRealigner {
     pub fn new(reference_seq: Vec<u8>, reference_seed: HashMap<Vec<u8>, Vec<i64>>, ref_start: i64) -> Self {
+        Self::new_with_context(reference_seq, reference_seed, ref_start, None, Vec::new())
+    }
+
+    pub fn new_with_context(
+        reference_seq: Vec<u8>,
+        reference_seed: HashMap<Vec<u8>, Vec<i64>>,
+        ref_start: i64,
+        chromosome: Option<String>,
+        bam_paths: Vec<String>,
+    ) -> Self {
         Self {
             reference_seq,
             reference_seed,
             ref_start,
+            chromosome,
+            bam_paths,
         }
     }
 
@@ -70,20 +86,74 @@ impl VariantRealigner {
         &self,
         data: &mut RealignedVariationData,
     ) {
-        // Collect deletion keys to avoid borrow checker issues while mutating maps
-        let mut del_keys: Vec<(i64, VarDesc)> = Vec::new();
+        let mut del_keys: Vec<(i64, VarDesc, String)> = Vec::new();
         for (pos, var_map) in data.non_insertion_variants.iter() {
             for desc in var_map.keys() {
                 if matches!(desc, VarDesc::Del { .. }) {
-                    del_keys.push((*pos, desc.clone()));
+                    del_keys.push((*pos, desc.clone(), desc.to_key_string()));
                 }
             }
         }
 
-        for (pos, desc) in del_keys {
-            // Run mismatch-based realignment similar to Java realigndel
-            self.realign_deletion_mismatches(pos, &desc, data);
+        del_keys.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
+
+        for (pos, desc, _) in &del_keys {
+            self.realign_deletion_mismatches(*pos, desc, data);
         }
+
+        // Java realigndel post-pass:
+        // for i = tmp.size()-1; i > 0; i-- {
+        //   if vn =~ /^(-\d+)&[ATGC]+$/ and vars(vn) < vars($1) then merge vn into $1
+        // }
+        for idx in (1..del_keys.len()).rev() {
+            let (pos, desc, desc_str) = &del_keys[idx];
+            let Some(base_del_desc) = Self::minus_amp_base_desc(desc_str) else {
+                continue;
+            };
+            let Some(base_key) = self.del_desc_to_key(base_del_desc.as_bytes()) else {
+                continue;
+            };
+
+            let Some(pos_map) = data.non_insertion_variants.get_mut(pos) else {
+                continue;
+            };
+
+            let Some(vref_alt_depth) = pos_map.get(desc).map(|v| v.alt_depth) else {
+                continue;
+            };
+            let Some(tref_alt_depth) = pos_map.get(&base_key).map(|v| v.alt_depth) else {
+                continue;
+            };
+
+            if vref_alt_depth < tref_alt_depth {
+                if let Some(vref) = pos_map.remove(desc) {
+                    if let Some(tref) = pos_map.get_mut(&base_key) {
+                        adj_cnt(tref, &vref);
+                    } else {
+                        pos_map.insert(desc.clone(), vref);
+                    }
+                }
+            }
+        }
+    }
+
+    fn minus_amp_base_desc(desc: &str) -> Option<String> {
+        let (base, suffix) = desc.split_once('&')?;
+        if !base.starts_with('-') || base.len() <= 1 {
+            return None;
+        }
+        if !base[1..].as_bytes().iter().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if suffix.is_empty()
+            || !suffix
+                .as_bytes()
+                .iter()
+                .all(|b| matches!(*b, b'A' | b'T' | b'G' | b'C'))
+        {
+            return None;
+        }
+        Some(base.to_string())
     }
 
     pub fn process_insertions(
@@ -1592,6 +1662,46 @@ impl VariantRealigner {
                 }
             }
         }
+
+        // Java realigndel noPassingReads block:
+        // if (pe - p >= 5 && pe - p < maxReadLength - 10
+        //     && h != null && h.varsCount != 0
+        //     && noPassingReads(chr, p, pe, bams)
+        //     && vref.varsCount > 2 * h.varsCount * (1 - (pe - p) / maxReadLength)) {
+        //     adjCnt(vref, h, h);
+        // }
+        let pe = pos + dellen + extra_seq.len() as i64 - extrains_len;
+        let gap_len = pe - pos;
+        if !self.bam_paths.is_empty()
+            && gap_len >= 5
+            && gap_len < data.max_read_length.saturating_sub(10) as i64
+        {
+            if let Some(ref_base) = self.get_ref_base(pos) {
+                let ref_key = VarDesc::SNV { ref_base };
+                if let Some(pos_map) = data.non_insertion_variants.get_mut(&pos) {
+                    let h_snapshot = pos_map.get(&ref_key).cloned();
+                    let vref_snapshot = pos_map.get(desc).cloned();
+
+                    if let (Some(h), Some(vref_now)) = (h_snapshot, vref_snapshot) {
+                        if h.alt_depth != 0
+                            && self.no_passing_reads(pos, pe)
+                            && vref_now.alt_depth as f64
+                                > 2.0
+                                    * h.alt_depth as f64
+                                    * (1.0 - gap_len as f64 / data.max_read_length as f64)
+                        {
+                            if let Some(mut h_work) = pos_map.remove(&ref_key) {
+                                let h_src = h_work.clone();
+                                if let Some(vref_mut) = pos_map.get_mut(desc) {
+                                    adj_cnt_with_ref(vref_mut, &h_src, Some(&mut h_work));
+                                }
+                                pos_map.insert(ref_key, h_work);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn realign_with_softclips_5end(
@@ -2263,6 +2373,80 @@ impl VariantRealigner {
             }
         }
         seq
+    }
+
+    fn no_passing_reads(&self, start: i64, end: i64) -> bool {
+        let Some(chr) = self.chromosome.as_deref() else {
+            return false;
+        };
+        if start <= 0 || end <= start || self.bam_paths.is_empty() {
+            return false;
+        }
+
+        let mut cnt = 0usize;
+        let mut midcnt = 0usize;
+        let dlen = (end - start) as u32;
+
+        for bam in &self.bam_paths {
+            let mut reader = match BamReader::open(bam) {
+                Ok(reader) => reader,
+                Err(_) => return false,
+            };
+
+            if reader.fetch(chr, start as usize, end as usize).is_err() {
+                return false;
+            }
+
+            let mut record = Record::new();
+            loop {
+                match reader.read(&mut record) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(_) => return false,
+                }
+
+                if Self::record_contains_exact_deletion_len(&record, dlen) {
+                    continue;
+                }
+
+                let read_start = record.pos() + 1;
+                let read_end = read_start + Self::aligned_length_excluding_softclips_and_insertions(&record) as i64;
+
+                if read_end > end + 2 && read_start < start - 2 {
+                    cnt += 1;
+                }
+
+                if read_start < start - 2 && read_end > start && read_end < end {
+                    midcnt += 1;
+                }
+            }
+        }
+
+        cnt == 0 && midcnt + 1 > 0
+    }
+
+    fn record_contains_exact_deletion_len(record: &Record, dlen: u32) -> bool {
+        record
+            .cigar()
+            .iter()
+            .any(|op| matches!(*op, Cigar::Del(len) if len == dlen))
+    }
+
+    fn aligned_length_excluding_softclips_and_insertions(record: &Record) -> u32 {
+        let mut len = 0u32;
+        for op in record.cigar().iter() {
+            match *op {
+                Cigar::Match(l)
+                | Cigar::Equal(l)
+                | Cigar::Diff(l)
+                | Cigar::Del(l)
+                | Cigar::RefSkip(l) => {
+                    len += l;
+                }
+                _ => {}
+            }
+        }
+        len
     }
 
     fn get_ref_base(&self, pos: i64) -> Option<u8> {

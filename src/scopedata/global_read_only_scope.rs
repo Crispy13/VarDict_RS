@@ -15,6 +15,7 @@ pub fn instance() -> &'static GlobalReadOnlyScope {
 pub struct GlobalReadOnlyScope {
     pub amplicon_based_calling: bool,
     pub chr_lens: HashMap<String, usize>,
+    pub bam_paths: Vec<String>,
     pub conf: Configuration,
     pub adaptor_forward: HashMap<String, usize>,
     pub adaptor_reverse: HashMap<String, usize>,

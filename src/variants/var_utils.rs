@@ -73,7 +73,9 @@ pub(crate) fn find_conseq(softclip: &mut SoftClip, dir: i32) -> Vec<u8> {
         let mut total_count = 0usize;
 
         let idx = *pos as usize;
-        for &base in [b'A', b'T', b'G', b'C', b'N'].iter() {
+        // Java iterates TreeMap<Character, Integer> entries in natural key order.
+        // For nucleotide keys this is: A, C, G, N, T.
+        for &base in [b'A', b'C', b'G', b'N', b'T'].iter() {
             let Some(&count) = base_counts.get(base) else { continue; };
             total_count += count;
 

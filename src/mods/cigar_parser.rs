@@ -273,6 +273,7 @@ impl CigarParser {
     fn parse_cigar(&mut self, record: &mut Record) -> Result<(), Error> {
         event!(Level::DEBUG, "Starting for record at pos {}", record.pos());
         self.current_qname = Some(String::from_utf8_lossy(record.qname()).to_string());
+        let trace_target = record.qname() == b"SRR098401.96368837";
         
         // Build query sequence and quality as owned vectors
         let mut query_seq_owned: Vec<u8> = record.seq().into_decoded_base_iter().collect();
@@ -327,7 +328,22 @@ impl CigarParser {
 
         let nm = tot_nm;
 
+        if trace_target {
+            event!(
+                Level::INFO,
+                "[trace_target] qname={} initial_pos={} cigar={} nm={} ins_del_len={}",
+                String::from_utf8_lossy(record.qname()),
+                record.pos() + 1,
+                cigar,
+                nm,
+                ins_del_len
+            );
+        }
+
         if nm > instance().conf.mismatch {
+            if trace_target {
+                event!(Level::INFO, "[trace_target] return: nm > mismatch");
+            }
             return Ok(());
         }
 
@@ -409,6 +425,15 @@ impl CigarParser {
         //Ignore reads that are softclipped at both ends and both greater than 10 bp
         match cigar.0.as_slice() {
             [Cigar::SoftClip(sl1), .., Cigar::SoftClip(sl2)] if *sl1 >= 10 && *sl2 >= 10 => {
+                if trace_target {
+                    event!(
+                        Level::INFO,
+                        "[trace_target] return: both-end softclip check sl1={} sl2={} cigar={}",
+                        sl1,
+                        sl2,
+                        cigar
+                    );
+                }
                 return Ok(());
             }
             _ => {}
@@ -420,6 +445,14 @@ impl CigarParser {
 
         if instance().conf.min_match != 0 && read_match_ins_len < instance().conf.min_match as usize
         {
+            if trace_target {
+                event!(
+                    Level::INFO,
+                    "[trace_target] return: min_match read_match_ins_len={} min_match={}",
+                    read_match_ins_len,
+                    instance().conf.min_match
+                );
+            }
             return Ok(());
         }
 
@@ -431,13 +464,29 @@ impl CigarParser {
         if instance().conf.sam_filter != 0 {
             const SUPPLEMENTARY_ALIGNMENT: u16 = 0x800;
             if (record.flags() & SUPPLEMENTARY_ALIGNMENT) != 0 {
+                if trace_target {
+                    event!(Level::INFO, "[trace_target] return: supplementary alignment");
+                }
                 return Ok(());
             }
         }
 
         // Skip sites that are not in region of interest in CRISPR mode
         if self.skip_sites_out_region_of_interest(cigar.0.as_slice()) {
+            if trace_target {
+                event!(Level::INFO, "[trace_target] return: skip_sites_out_region_of_interest");
+            }
             return Ok(());
+        }
+
+        if trace_target {
+            event!(
+                Level::INFO,
+                "[trace_target] entering process loop start={} read_match_ins_len={} soft_len={}",
+                self.start,
+                read_match_ins_len,
+                read_len_including_softclips
+            );
         }
 
         let alignment_start = self.start;

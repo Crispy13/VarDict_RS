@@ -106,9 +106,9 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                 let rc_seed = seq.get_or_err(0..Configuration::SEED_2 as usize)?;
 
                 if let Some(poss) = self.ref_data.seed.get(rc_seed) {
+                    let genomic_ref_start = self.ref_data.region_start + ref_start_pos as i64;
                     if poss.len() == 1
-                        && ((ref_start_pos as i32 - poss.get(0).copied().unwrap() as i32).abs()
-                            as usize)
+                        && ((genomic_ref_start - poss.get(0).copied().unwrap()).abs() as usize)
                             < 2 * self.max_read_length
                     {
                         cigar_vec.pop_front().unwrap();
@@ -138,9 +138,9 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                 let rc_seed = seq.get_with_int(-(Configuration::SEED_2)..)?;
 
                 if let Some(poss) = self.ref_data.seed.get(rc_seed) {
+                    let genomic_ref_start = self.ref_data.region_start + ref_start_pos as i64;
                     if poss.len() == 1
-                        && ((ref_start_pos as i32 - poss.get(0).copied().unwrap() as i32).abs()
-                            as usize)
+                        && ((genomic_ref_start - poss.get(0).copied().unwrap()).abs() as usize)
                             < 2 * self.max_read_length
                     {
                         cigar_vec.pop_back().unwrap();

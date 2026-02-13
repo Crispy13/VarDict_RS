@@ -57,12 +57,26 @@ impl Drop for TempFileGuard {
 }
 
 #[test]
-fn test_variant_realigner_snapshot_fixture() {
+fn test_variant_realigner_snapshot_fixtures() {
+    run_variant_realigner_fixture(
+        "tests/fixtures/variant_realigner_chr20_168600_168800.jsonl",
+        "test_data/test_168714.bam",
+        Region::new("20".to_string(), 168600, 168800, String::new()),
+    );
+
+    run_variant_realigner_fixture(
+        "tests/fixtures/variant_realigner_chr20_25456879_25457078.jsonl",
+        "VarDictJava/tests/integration/input/NA12878.chrom20.ILLUMINA.bwa.CEU.exome.20121211.bam",
+        Region::new("20".to_string(), 25456879, 25457078, String::new()),
+    );
+}
+
+fn run_variant_realigner_fixture(fixture_rel: &str, bam_rel: &str, region: Region) {
     crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(LevelFilter::DEBUG);
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let fixture_path = manifest_dir.join("tests/fixtures/variant_realigner_chr20_168600_168800.jsonl");
-    let bam_path = manifest_dir.join("test_data/test_168714.bam");
+    let fixture_path = manifest_dir.join(fixture_rel);
+    let bam_path = manifest_dir.join(bam_rel);
     let ref_path = manifest_dir.join("VarDictJava/tests/integration/reference/hs37d5.fa");
 
     assert!(fixture_path.exists(), "Missing fixture: {:?}", fixture_path);
@@ -101,12 +115,13 @@ fn test_variant_realigner_snapshot_fixture() {
         scope.conf = conf;
         scope
     };
+    scope.conf.disable_sv = true;
+    scope.conf.perform_local_realignment = true;
     scope.chr_lens = shared_reference.get_chromosome_lengths();
+    scope.bam_paths = vec![bam_path.to_str().expect("bam path").to_string()];
     let _ = INSTANCE.set(scope.clone());
 
     let instance = Arc::new(scope);
-
-    let region = Region::new("20".to_string(), 168600, 168800, String::new());
 
     let mut bam_reader = BamReader::open(bam_path.to_str().expect("bam path"))
         .expect("failed to open BAM");

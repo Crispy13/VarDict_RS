@@ -287,6 +287,7 @@ fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>
     let mut scope = GlobalReadOnlyScope::default();
     scope.conf = conf;
     scope.chr_lens = reference.get_chromosome_lengths();
+    scope.bam_paths = vec![args.bam.to_string_lossy().to_string()];
     let _ = INSTANCE.set(scope);
 
     if args.debug {

@@ -761,7 +761,12 @@ impl VarDictPipeline {
 
         cigar_output.write_jsonl_snapshot_if_enabled(region)?;
 
-        self.process_region_from_cigar_output(cigar_output, region, &reference)
+        self.process_region_from_cigar_output(
+            cigar_output,
+            region,
+            &reference,
+            &instance.bam_paths,
+        )
     }
 
     #[deprecated]
@@ -918,6 +923,7 @@ impl VarDictPipeline {
         I: Iterator<Item = Record>,
     {
         let start_total = std::time::Instant::now();
+        let bam_paths = instance.bam_paths.clone();
 
         // Step 1: Parse CIGAR strings (CigarParser)
         let start_cigar = std::time::Instant::now();
@@ -932,7 +938,7 @@ impl VarDictPipeline {
             cigar_output.non_insertion_vars.len(),
             cigar_output.ref_coverage.len());
 
-        self.process_region_from_cigar_output(cigar_output, region, reference)
+        self.process_region_from_cigar_output(cigar_output, region, reference, &bam_paths)
     }
 
     fn process_region_from_cigar_output(
@@ -940,9 +946,11 @@ impl VarDictPipeline {
         cigar_output: CigarParserOutput,
         region: &Region,
         reference: &Reference,
+        bam_paths: &[String],
     ) -> Result<Vec<String>> {
         let start_realign = std::time::Instant::now();
-        let realigned_output = self.run_variant_realigner_and_sv_processor(cigar_output, region, reference)?;
+        let realigned_output =
+            self.run_variant_realigner_and_sv_processor(cigar_output, region, reference, bam_paths)?;
         let elapsed_realign = start_realign.elapsed();
 
         event!(Level::INFO, "[TIMING] VariantRealigner+SVProcessor: {:.3}s - {} non_insertion_vars, {} ref_coverage",
@@ -1143,6 +1151,7 @@ impl VarDictPipeline {
         input: CigarParserOutput,
         region: &Region,
         reference: &Reference,
+        bam_paths: &[String],
     ) -> Result<RealignedOutput> {
         // TODO: Integrate actual VariantRealigner for soft clip realignment
         // For now, we pass through to StructuralVariantsProcessor
@@ -1175,10 +1184,12 @@ impl VarDictPipeline {
 
         // Perform minimal deletion realignment using soft clips when enabled
         // Re-enable realigner to match Java behavior
-        let realigner = VariantRealigner::new(
+        let realigner = VariantRealigner::new_with_context(
             reference.ref_seq.clone(),
             reference.seed.clone(),
             reference.region_start,
+            Some(region.chr().to_string()),
+            bam_paths.to_vec(),
         );
         realigner.adjust_mnp(&mut sv_input, &mnp);
 
