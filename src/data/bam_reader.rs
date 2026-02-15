@@ -3,6 +3,7 @@
 //! Provides region-based BAM file access for variant calling.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use rust_htslib::bam::{self, Read, IndexedReader, Record};
@@ -137,7 +138,11 @@ impl<'a> Iterator for BamRecordIter<'a> {
         }
 
         match self.reader.read(&mut self.record) {
-            Ok(true) => Some(Ok(self.record.clone())),
+            Ok(true) => {
+                let mut cloned = self.record.clone();
+                cloned.set_header(Arc::new(bam::HeaderView::from_header(self.reader.header())));
+                Some(Ok(cloned))
+            }
             Ok(false) => {
                 self.done = true;
                 None

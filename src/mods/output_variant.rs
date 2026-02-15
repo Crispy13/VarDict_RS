@@ -66,13 +66,13 @@ impl Region {
 
     /// Format as "chr:start-end"
     pub fn to_region_string(&self) -> String {
-        format!("{}:{}-{}", normalize_chr_for_output(&self.chr), self.start, self.end)
+        format!("{}:{}-{}", self.chr, self.start, self.end)
     }
 }
 
-/// Normalize chromosome name for output to match VarDict Java (drop leading "chr")
+/// Preserve chromosome name for output (Java uses region.chr directly)
 fn normalize_chr_for_output(chr: &str) -> String {
-    chr.strip_prefix("chr").unwrap_or(chr).to_string()
+    chr.to_string()
 }
 
 /// Simple Output Variant - 36 column format for Simple Mode
@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn test_region_to_string() {
         let region = Region::new("chr1", 1000, 2000, "GENE1");
-        assert_eq!(region.to_region_string(), "1:1000-2000");
+        assert_eq!(region.to_region_string(), "chr1:1000-2000");
     }
 
     #[test]
@@ -482,7 +482,7 @@ mod tests {
 
         assert_eq!(output.sample, "sample1");
         assert_eq!(output.gene, "BRCA1");
-        assert_eq!(output.chr, "1");
+        assert_eq!(output.chr, "chr1");
         assert_eq!(output.start_position, 1000);
         assert_eq!(output.ref_allele, "A");
         assert_eq!(output.var_allele, "T");
@@ -521,7 +521,7 @@ mod tests {
         // Check key fields
         assert_eq!(fields[0], "sample1");          // Sample
         assert_eq!(fields[1], "GENE1");            // Gene
-        assert_eq!(fields[2], "1");                // Chr
+        assert_eq!(fields[2], "chr1");             // Chr
         assert_eq!(fields[3], "1500");             // Start
         assert_eq!(fields[5], "A");                // Ref
         assert_eq!(fields[6], "T");                // Alt

@@ -156,6 +156,21 @@ impl VariantRealigner {
         Some(base.to_string())
     }
 
+    fn has_sv_marker(variation_map: &HashMap<VarDesc, Variant>) -> bool {
+        variation_map
+            .keys()
+            .any(|desc| matches!(desc, VarDesc::Raw { desc } if desc.as_slice() == b"SV"))
+    }
+
+    fn ensure_sv_marker(data: &mut RealignedVariationData, position: i64) {
+        let variation_map = data.non_insertion_variants.entry(position).or_default();
+        variation_map
+            .entry(VarDesc::Raw {
+                desc: b"SV".to_vec().into(),
+            })
+            .or_default();
+    }
+
     pub fn process_insertions(
         &self,
         data: &mut RealignedVariationData,
@@ -171,7 +186,11 @@ impl VariantRealigner {
                 tmp.push((*pos, desc.clone(), *count));
             }
         }
-        tmp.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        tmp.sort_by(|a, b| {
+            b.2.cmp(&a.2)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| b.1.cmp(&a.1))
+        });
 
         for (position, vn, insertion_count) in tmp.iter().cloned() {
             if insertion_count == 0 {
@@ -534,15 +553,8 @@ impl VariantRealigner {
             }
         }
 
-        let mut tmp2: Vec<(i64, String)> = Vec::new();
-        for (pos, desc_map) in position_to_insertion_count {
-            for desc in desc_map.keys() {
-                tmp2.push((*pos, desc.clone()));
-            }
-        }
-        tmp2.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-        for (position, vn) in tmp2.into_iter().rev() {
+        for idx in (1..tmp.len()).rev() {
+            let (position, vn, _) = tmp[idx].clone();
             let Some(map) = data.insertion_variants.get_mut(&position) else { continue; };
             let vref_key = if vn.starts_with('+') {
                 VarDesc::Ins { seq: vn[1..].as_bytes().iter().map(|b| b.to_ascii_uppercase()).collect() }
@@ -1004,6 +1016,7 @@ impl VariantRealigner {
                 }
 
                 bi = p - 1;
+                Self::ensure_sv_marker(data, bi);
             }
 
             let sc5_var = data
@@ -1025,8 +1038,10 @@ impl VariantRealigner {
             iref.qstd = true;
             adj_cnt(iref, &sc5_var);
 
-            if data.non_insertion_variants.contains_key(&bi) {
-                *data.ref_coverage.entry(bi).or_insert(0) += sc5_var.alt_depth;
+            if let Some(variation_map) = data.non_insertion_variants.get(&bi) {
+                if !Self::has_sv_marker(variation_map) {
+                    *data.ref_coverage.entry(bi).or_insert(0) += sc5_var.alt_depth;
+                }
             }
 
             let mut len = ins.len();
@@ -1142,6 +1157,9 @@ impl VariantRealigner {
                 }
                 ins.extend_from_slice(&extra);
 
+                bi -= 1;
+                Self::ensure_sv_marker(data, bi);
+
                 let ref_cov_p = data.ref_coverage.get(&p).copied();
                 let ref_cov_bi = data.ref_coverage.get(&bi).copied();
                 if ref_cov_bi.is_none()
@@ -1157,8 +1175,6 @@ impl VariantRealigner {
                 } else if cnt > ref_cov_bi.unwrap_or(0) {
                     *data.ref_coverage.entry(bi).or_insert(0) += cnt;
                 }
-
-                bi -= 1;
             }
 
             let sc3_var = data
@@ -2708,19 +2724,32 @@ impl VariantRealigner {
         if b < 0 {
             b = seq_len + b;
         }
-        if b < 0 || b > seq_len {
+        if b > seq_len {
             return Vec::new();
         }
-        let b_usize = b as usize;
 
         match len {
-            None => seq.get(b_usize..).unwrap_or(&[]).to_vec(),
+            None => {
+                if b < 0 {
+                    b = 0;
+                }
+                let b_usize = b as usize;
+                seq.get(b_usize..).unwrap_or(&[]).to_vec()
+            }
             Some(l) if l > 0 => {
+                if b < 0 {
+                    return Vec::new();
+                }
+                let b_usize = b as usize;
                 let end = (b + l).min(seq_len).max(b);
                 seq.get(b_usize..end as usize).unwrap_or(&[]).to_vec()
             }
             Some(0) => Vec::new(),
             Some(l) => {
+                if b < 0 {
+                    return Vec::new();
+                }
+                let b_usize = b as usize;
                 let end = seq_len + l;
                 if end < b {
                     return Vec::new();

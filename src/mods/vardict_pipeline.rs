@@ -104,8 +104,8 @@ impl CigarParserOutput {
         write_count_map(&mut writer, "MNP", &self.mnp)?;
         write_count_map(&mut writer, "INSCOUNT", &self.position_to_insertion_count)?;
         write_count_map(&mut writer, "DELCOUNT", &self.position_to_deletions_count)?;
-        write_soft_clips(&mut writer, "SCLIP5", &self.soft_clips_5end)?;
-        write_soft_clips(&mut writer, "SCLIP3", &self.soft_clips_3end)?;
+        write_soft_clips(&mut writer, "SCLIP5", &self.soft_clips_5end, false)?;
+        write_soft_clips(&mut writer, "SCLIP3", &self.soft_clips_3end, false)?;
         write_splice(&mut writer, &self.splice)?;
         write_splice_count(&mut writer, &self.splice_count)?;
 
@@ -148,8 +148,8 @@ fn write_realigned_jsonl_snapshot(
     write_variant_map(&mut writer, "NONINS", &data.non_insertion_variants)?;
     write_variant_map(&mut writer, "INS", &data.insertion_variants)?;
     write_ref_cov(&mut writer, &data.ref_coverage)?;
-    write_soft_clips(&mut writer, "SCLIP5", &data.soft_clips_5end)?;
-    write_soft_clips(&mut writer, "SCLIP3", &data.soft_clips_3end)?;
+    write_soft_clips(&mut writer, "SCLIP5", &data.soft_clips_5end, true)?;
+    write_soft_clips(&mut writer, "SCLIP3", &data.soft_clips_3end, true)?;
 
     writer.flush()?;
     Ok(())
@@ -189,8 +189,8 @@ fn write_structural_variants_jsonl_snapshot(
     write_variant_map(&mut writer, "NONINS", &data.non_insertion_variants)?;
     write_variant_map(&mut writer, "INS", &data.insertion_variants)?;
     write_ref_cov(&mut writer, &data.ref_coverage)?;
-    write_soft_clips(&mut writer, "SCLIP5", &data.soft_clips_5end)?;
-    write_soft_clips(&mut writer, "SCLIP3", &data.soft_clips_3end)?;
+    write_soft_clips(&mut writer, "SCLIP5", &data.soft_clips_5end, false)?;
+    write_soft_clips(&mut writer, "SCLIP3", &data.soft_clips_3end, false)?;
 
     writer.flush()?;
     Ok(())
@@ -371,12 +371,13 @@ fn write_soft_clips<W: Write>(
     writer: &mut W,
     line_type: &str,
     map: &HashMap<i64, SoftClip>,
+    compute_consensus_if_unset: bool,
 ) -> Result<()> {
     let mut positions: Vec<i64> = map.keys().copied().collect();
     positions.sort_unstable();
     for pos in positions {
         if let Some(sc) = map.get(&pos) {
-            let data = soft_clip_json(sc);
+            let data = soft_clip_json(sc, compute_consensus_if_unset);
             write_json_line(writer, line_type, pos, "-", &data)?;
         }
     }
@@ -475,8 +476,19 @@ fn tovars_variant_json(v: &Variant) -> String {
     )
 }
 
-fn soft_clip_json(sc: &SoftClip) -> String {
-    let consensus = String::from_utf8_lossy(sc.consensus_seq());
+fn soft_clip_json(sc: &SoftClip, compute_consensus_if_unset: bool) -> String {
+    let consensus_bytes = if sc.consensus_seq_is_set() {
+        sc.consensus_seq().to_vec()
+    } else if compute_consensus_if_unset {
+        let mut soft_clip_for_snapshot = SoftClip::default();
+        soft_clip_for_snapshot.var = sc.var.clone();
+        soft_clip_for_snapshot.nt = sc.nt.clone();
+        soft_clip_for_snapshot.seq = sc.seq.clone();
+        crate::variants::var_utils::find_conseq(&mut soft_clip_for_snapshot, 0)
+    } else {
+        Vec::new()
+    };
+    let consensus = String::from_utf8_lossy(&consensus_bytes);
     let nt = soft_clip_nt_json(&sc.nt);
     let seq = soft_clip_seq_json(&sc.seq);
     format!(
@@ -780,6 +792,7 @@ impl VarDictPipeline {
         let mut lines = Vec::new();
         let mut record = Record::new();
         let mut preprocess_state = RecordPreprocessorState::new();
+        let header_view = Arc::new(rust_htslib::bam::HeaderView::from_header(bam_reader.header()));
 
         bam_reader.fetch(region.chr(), region.start(), region.end())?;
 
@@ -814,7 +827,9 @@ impl VarDictPipeline {
                 mapq
             ));
 
-            records.push(record.clone());
+            let mut cloned = record.clone();
+            cloned.set_header(header_view.clone());
+            records.push(cloned);
         }
 
         Ok((records, lines))
@@ -925,9 +940,14 @@ impl VarDictPipeline {
         let start_total = std::time::Instant::now();
         let bam_paths = instance.bam_paths.clone();
 
+        let mut working_reference = reference.clone();
+        let region_end_for_seed = working_reference.region_start + working_reference.ref_seq.len() as i64 - 1;
+        let chr_len = instance.chr_lens.get(region.chr()).copied();
+        working_reference.build_seed_map(region_end_for_seed, chr_len);
+
         // Step 1: Parse CIGAR strings (CigarParser)
         let start_cigar = std::time::Instant::now();
-        let cigar_output = self.run_cigar_parser(records, region, reference, instance)?;
+        let cigar_output = self.run_cigar_parser(records, region, &working_reference, instance)?;
         let elapsed_cigar = start_cigar.elapsed();
         // Step 2: Write JSONL snapshot if enabled
         cigar_output.write_jsonl_snapshot_if_enabled(region)?;
@@ -938,7 +958,7 @@ impl VarDictPipeline {
             cigar_output.non_insertion_vars.len(),
             cigar_output.ref_coverage.len());
 
-        self.process_region_from_cigar_output(cigar_output, region, reference, &bam_paths)
+        self.process_region_from_cigar_output(cigar_output, region, &working_reference, &bam_paths)
     }
 
     fn process_region_from_cigar_output(
@@ -1244,27 +1264,87 @@ impl VarDictPipeline {
         let mut non_insertion_vars = non_insertion_vars;
         let mut insertion_vars = insertion_vars;
 
+        let debug_pos = env::var("VARDICT_DEBUG_POS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok());
+
+        if let Some(pos) = debug_pos {
+            event!(
+                Level::DEBUG,
+                debug_pos = pos,
+                nonins_has_pos = non_insertion_vars.contains_key(&pos),
+                ins_has_pos = insertion_vars.contains_key(&pos),
+                refcov_has_pos = ref_coverage.contains_key(&pos),
+                nonins_len = non_insertion_vars.len(),
+                ins_len = insertion_vars.len(),
+                "to_vars_builder: debug position presence before iteration"
+            );
+        }
+
+        let mut position_keys: Vec<i64> = non_insertion_vars.keys().copied().collect();
+        let mut seen_positions: HashSet<i64> = position_keys.iter().copied().collect();
+        for pos in insertion_vars.keys().copied() {
+            if seen_positions.insert(pos) {
+                position_keys.push(pos);
+            }
+        }
+
         let positions = java_hashmap_iteration_order(
-            non_insertion_vars.keys().copied(),
-            non_insertion_vars.len(),
+            position_keys.into_iter(),
+            seen_positions.len(),
             Some(&non_insertion_vars_insert_index),
         );
 
         for position in positions {
-            let vars_at_pos = match non_insertion_vars.get(&position) {
-                Some(vars) => vars.clone(),
-                None => continue,
-            };
+            let trace_this_pos = debug_pos == Some(position);
+            let vars_at_pos = non_insertion_vars
+                .get(&position)
+                .cloned()
+                .unwrap_or_default();
+
+            if trace_this_pos {
+                event!(
+                    Level::DEBUG,
+                    position,
+                    nonins_count = vars_at_pos.len(),
+                    has_insertion = insertion_vars.contains_key(&position),
+                    has_refcov = ref_coverage.contains_key(&position),
+                    "to_vars_builder: position encountered"
+                );
+            }
 
             if vars_at_pos.is_empty() && !insertion_vars.contains_key(&position) {
+                if trace_this_pos {
+                    event!(
+                        Level::DEBUG,
+                        position,
+                        "to_vars_builder: skipped because no non-insertion and no insertion variants"
+                    );
+                }
                 continue;
             }
 
             if position < region.start() as i64 || position > region.end() as i64 {
+                if trace_this_pos {
+                    event!(
+                        Level::DEBUG,
+                        position,
+                        region_start = region.start(),
+                        region_end = region.end(),
+                        "to_vars_builder: skipped because position outside region"
+                    );
+                }
                 continue;
             }
 
             if !ref_coverage.contains_key(&position) {
+                if trace_this_pos {
+                    event!(
+                        Level::DEBUG,
+                        position,
+                        "to_vars_builder: skipped because reference coverage missing"
+                    );
+                }
                 continue;
             }
 
@@ -1274,6 +1354,13 @@ impl VarDictPipeline {
                 insertion_vars.get(&position),
                 reference,
             ) {
+                if trace_this_pos {
+                    event!(
+                        Level::DEBUG,
+                        position,
+                        "to_vars_builder: skipped because only reference variation"
+                    );
+                }
                 continue;
             }
 
@@ -1314,6 +1401,16 @@ impl VarDictPipeline {
                 duprate,
             );
 
+            if trace_this_pos {
+                event!(
+                    Level::DEBUG,
+                    position,
+                    variant_count = var_list.len(),
+                    total_pos_coverage,
+                    "to_vars_builder: variants created before sorting"
+                );
+            }
+
             self.sort_variants(&mut var_list);
 
             let maxfreq = self.collect_vars_at_position(
@@ -1325,6 +1422,15 @@ impl VarDictPipeline {
             );
 
             if !self.do_pileup && maxfreq <= instance().conf.freq && !instance().amplicon_based_calling {
+                if trace_this_pos {
+                    event!(
+                        Level::DEBUG,
+                        position,
+                        maxfreq,
+                        min_freq = instance().conf.freq,
+                        "to_vars_builder: removing position due to maxfreq threshold"
+                    );
+                }
                 aligned_variants.remove(&position);
                 continue;
             }
@@ -1341,6 +1447,15 @@ impl VarDictPipeline {
                     &mut debug_lines,
                     duprate,
                 );
+                if trace_this_pos {
+                    event!(
+                        Level::DEBUG,
+                        position,
+                        variant_count_after_ref = variations_at_pos.variants.len(),
+                        has_reference_variant = variations_at_pos.reference_variant.is_some(),
+                        "to_vars_builder: position retained after reference collection"
+                    );
+                }
             }
         }
 
