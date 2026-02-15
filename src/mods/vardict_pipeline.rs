@@ -25,7 +25,7 @@ use crate::data::region::Region;
 use crate::data::shared_reference::SharedReferenceHandle;
 use crate::data::bam_reader::BamReader;
 use crate::mods::cigar_parser::CigarParser;
-use crate::mods::output_variant::{SimpleOutputVariant, Region as OutputRegion};
+use crate::mods::output_variant::{AmpliconOutputVariant, SimpleOutputVariant, Region as OutputRegion};
 use crate::mods::structural_variants_processor::{StructuralVariantsProcessor, RealignedVariationData};
 use crate::mods::variant_realigner::VariantRealigner;
 use crate::scopedata::global_read_only_scope::instance;
@@ -609,6 +609,12 @@ pub struct AlignedVarsData {
     pub ref_coverage: HashMap<i64, usize>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RegionAlignedVarsOutput {
+    pub aligned_vars: AlignedVarsData,
+    pub splice: HashSet<String>,
+}
+
 fn java_hashmap_capacity(size: usize) -> usize {
     let mut capacity = 16usize;
     if size == 0 {
@@ -732,6 +738,35 @@ impl VarDictPipeline {
         bam_reader: &mut BamReader,
         instance: Arc<GlobalReadOnlyScope>,
     ) -> Result<Vec<String>> {
+        let region_output = self.process_region_to_aligned_vars_from_bam(
+            region,
+            shared_reference,
+            bam_reader,
+            Arc::clone(&instance),
+        )?;
+
+        let start_post = std::time::Instant::now();
+        let output_lines = self.run_simple_post_processor(
+            region_output.aligned_vars,
+            region,
+            &region_output.splice,
+        )?;
+        let elapsed_post = start_post.elapsed();
+
+        event!(Level::INFO, "[TIMING] PostProcessor: {:.3}s - {} lines",
+            elapsed_post.as_secs_f64(),
+            output_lines.len());
+
+        Ok(output_lines)
+    }
+
+    pub fn process_region_to_aligned_vars_from_bam(
+        &self,
+        region: &Region,
+        shared_reference: &SharedReferenceHandle,
+        bam_reader: &mut BamReader,
+        instance: Arc<GlobalReadOnlyScope>,
+    ) -> Result<RegionAlignedVarsOutput> {
         let extend = (instance.conf.number_nucleotide_to_extend + instance.conf.reference_extension)
             .max(0) as usize;
         let extended_start = if region.start() > extend {
@@ -773,7 +808,7 @@ impl VarDictPipeline {
 
         cigar_output.write_jsonl_snapshot_if_enabled(region)?;
 
-        self.process_region_from_cigar_output(
+        self.process_region_to_aligned_vars_from_cigar_output(
             cigar_output,
             region,
             &reference,
@@ -937,7 +972,6 @@ impl VarDictPipeline {
     where
         I: Iterator<Item = Record>,
     {
-        let start_total = std::time::Instant::now();
         let bam_paths = instance.bam_paths.clone();
 
         let mut working_reference = reference.clone();
@@ -958,7 +992,12 @@ impl VarDictPipeline {
             cigar_output.non_insertion_vars.len(),
             cigar_output.ref_coverage.len());
 
-        self.process_region_from_cigar_output(cigar_output, region, &working_reference, &bam_paths)
+        self.process_region_from_cigar_output(
+            cigar_output,
+            region,
+            &working_reference,
+            &bam_paths,
+        )
     }
 
     fn process_region_from_cigar_output(
@@ -968,6 +1007,35 @@ impl VarDictPipeline {
         reference: &Reference,
         bam_paths: &[String],
     ) -> Result<Vec<String>> {
+        let region_output = self.process_region_to_aligned_vars_from_cigar_output(
+            cigar_output,
+            region,
+            reference,
+            bam_paths,
+        )?;
+
+        let start_post = std::time::Instant::now();
+        let output_lines = self.run_simple_post_processor(
+            region_output.aligned_vars,
+            region,
+            &region_output.splice,
+        )?;
+        let elapsed_post = start_post.elapsed();
+
+        event!(Level::INFO, "[TIMING] PostProcessor: {:.3}s - {} lines",
+            elapsed_post.as_secs_f64(),
+            output_lines.len());
+
+        Ok(output_lines)
+    }
+
+    fn process_region_to_aligned_vars_from_cigar_output(
+        &self,
+        cigar_output: CigarParserOutput,
+        region: &Region,
+        reference: &Reference,
+        bam_paths: &[String],
+    ) -> Result<RegionAlignedVarsOutput> {
         let start_realign = std::time::Instant::now();
         let realigned_output =
             self.run_variant_realigner_and_sv_processor(cigar_output, region, reference, bam_paths)?;
@@ -987,15 +1055,312 @@ impl VarDictPipeline {
             elapsed_tovars.as_secs_f64(),
             aligned_vars.aligned_variants.len());
 
-        let start_post = std::time::Instant::now();
-        let output_lines = self.run_simple_post_processor(aligned_vars, region, &splice)?;
-        let elapsed_post = start_post.elapsed();
+        Ok(RegionAlignedVarsOutput {
+            aligned_vars,
+            splice,
+        })
+    }
 
-        event!(Level::INFO, "[TIMING] PostProcessor: {:.3}s - {} lines",
-            elapsed_post.as_secs_f64(),
-            output_lines.len());
+    pub fn run_amplicon_post_processor(
+        &self,
+        group_region: &Region,
+        vars_per_amplicon: &[HashMap<i64, Vars>],
+        amplicon_regions: &[Region],
+        splice: &HashSet<String>,
+    ) -> Vec<String> {
+        let mut output_lines = Vec::new();
+        let output_region = OutputRegion {
+            chr: group_region.chr().to_string(),
+            start: group_region.start() as i64,
+            end: group_region.end() as i64,
+            gene: group_region.gene().to_string(),
+        };
 
-        Ok(output_lines)
+        let mut amplicons_on_positions: std::collections::BTreeMap<i64, Vec<(usize, &Region)>> =
+            std::collections::BTreeMap::new();
+        for (amplicon_number, amp_region) in amplicon_regions.iter().enumerate() {
+            for position in amp_region.insert_start()..=amp_region.insert_end() {
+                amplicons_on_positions
+                    .entry(position as i64)
+                    .or_default()
+                    .push((amplicon_number, amp_region));
+            }
+        }
+
+        for (position, amplicon_regions_at_pos) in amplicons_on_positions {
+            let mut gvs: Vec<(Variant, String)> = Vec::new();
+            let mut ref_variants: Vec<Variant> = Vec::new();
+            let mut vref_list: Vec<Variant> = Vec::new();
+            let mut goodmap: HashSet<String> = HashSet::new();
+            let mut vcovs: Vec<usize> = Vec::new();
+            let mut good_variants_on_amp: std::collections::BTreeMap<usize, Vec<Variant>> =
+                std::collections::BTreeMap::new();
+            let mut maxcov = 0usize;
+
+            for (amplicon_number, amp_region) in amplicon_regions_at_pos.iter().copied() {
+                let vars_at_amplicon = vars_per_amplicon
+                    .get(amplicon_number)
+                    .and_then(|vars| vars.get(&position));
+                let variants_on_amplicon = vars_at_amplicon.map(|vars| &vars.variants);
+                let ref_amplicon = vars_at_amplicon.and_then(|vars| vars.reference_variant.as_ref());
+
+                if let Some(variants) = variants_on_amplicon {
+                    if !variants.is_empty() {
+                        let mut good_vars = Vec::new();
+                        for variant in variants {
+                            vcovs.push(variant.total_pos_coverage);
+                            if variant.total_pos_coverage > maxcov {
+                                maxcov = variant.total_pos_coverage;
+                            }
+                            if self.is_good_var(variant, ref_amplicon, splice) {
+                                gvs.push((
+                                    variant.clone(),
+                                    format!(
+                                        "{}:{}-{}",
+                                        amp_region.chr(),
+                                        amp_region.start(),
+                                        amp_region.end()
+                                    ),
+                                ));
+                                good_vars.push(variant.clone());
+                                goodmap.insert(format!(
+                                    "{}-{}-{}",
+                                    amplicon_number,
+                                    variant.refallele,
+                                    variant.varallele
+                                ));
+                            }
+                        }
+                        if !good_vars.is_empty() {
+                            good_variants_on_amp.insert(amplicon_number, good_vars);
+                        }
+                    } else if let Some(reference_variant) = ref_amplicon {
+                        vcovs.push(reference_variant.total_pos_coverage);
+                    } else {
+                        vcovs.push(0);
+                    }
+                } else {
+                    vcovs.push(0);
+                }
+
+                if let Some(reference_variant) = ref_amplicon {
+                    ref_variants.push(reference_variant.clone());
+                }
+            }
+
+            let nocov = vcovs
+                .iter()
+                .filter(|coverage| (**coverage as f64) < (maxcov as f64 / 50.0))
+                .count();
+
+            gvs.sort_by(|left, right| {
+                right
+                    .0
+                    .frequency
+                    .partial_cmp(&left.0.frequency)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            ref_variants.sort_by(|left, right| right.total_pos_coverage.cmp(&left.total_pos_coverage));
+
+            if gvs.is_empty() {
+                if self.do_pileup {
+                    if let Some(reference_variant) = ref_variants.first() {
+                        vref_list.push(reference_variant.clone());
+                    } else {
+                        output_lines.push(
+                            AmpliconOutputVariant::from_variant(
+                                None,
+                                &output_region,
+                                &[],
+                                0,
+                                position,
+                                0,
+                                nocov,
+                                false,
+                                &self.sample_name,
+                            )
+                            .to_string(),
+                        );
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            } else {
+                self.fill_vref_list(&gvs, &mut vref_list);
+            }
+
+            let mut flag = self.is_amp_bias_flag(&good_variants_on_amp);
+            let mut good_variants = gvs.clone();
+
+            for mut vref in vref_list {
+                if flag {
+                    let top_description = &gvs[0].0.description_string;
+                    let mut gcnt: Vec<(Variant, String)> = Vec::new();
+                    for (amplicon_number, amp_region) in amplicon_regions_at_pos.iter().copied() {
+                        if let Some(vars_at_amplicon) = vars_per_amplicon
+                            .get(amplicon_number)
+                            .and_then(|vars| vars.get(&position))
+                        {
+                            if let Some(variant) = vars_at_amplicon
+                                .variants
+                                .iter()
+                                .find(|variant| variant.description_string == *top_description)
+                            {
+                                if self.is_good_var(
+                                    variant,
+                                    vars_at_amplicon.reference_variant.as_ref(),
+                                    splice,
+                                ) {
+                                    gcnt.push((
+                                        variant.clone(),
+                                        format!(
+                                            "{}:{}-{}",
+                                            amp_region.chr(),
+                                            amp_region.start(),
+                                            amp_region.end()
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    if gcnt.len() == gvs.len() {
+                        flag = false;
+                    }
+                    gcnt.sort_by(|left, right| {
+                        right
+                            .0
+                            .frequency
+                            .partial_cmp(&left.0.frequency)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    good_variants = gcnt;
+                }
+
+                let initial_gvscnt = self.count_variant_on_amplicons(&vref, &good_variants_on_amp);
+                let mut current_gvscnt = initial_gvscnt;
+                let mut bad_variants_count = 0usize;
+
+                if initial_gvscnt != amplicon_regions_at_pos.len() || flag {
+                    for (amplicon_number, amp_region) in amplicon_regions_at_pos.iter().copied() {
+                        if goodmap.contains(&format!(
+                            "{}-{}-{}",
+                            amplicon_number,
+                            vref.refallele,
+                            vref.varallele
+                        )) {
+                            continue;
+                        }
+                        if self.do_pileup && vref.refallele == vref.varallele {
+                            continue;
+                        }
+                        if vref.start_position >= amp_region.insert_start() as i64
+                            && vref.end_position <= amp_region.insert_end() as i64
+                        {
+                            bad_variants_count += 1;
+                        } else if (vref.start_position < amp_region.insert_end() as i64
+                            && (amp_region.insert_end() as i64) < vref.end_position)
+                            || (vref.start_position < amp_region.insert_start() as i64
+                                && (amp_region.insert_start() as i64) < vref.end_position)
+                        {
+                            if current_gvscnt > 1 {
+                                current_gvscnt -= 1;
+                            }
+                        }
+                    }
+                }
+
+                if flag && current_gvscnt < initial_gvscnt {
+                    flag = false;
+                }
+
+                if var_type_string(&vref.refallele, &vref.varallele) == "Complex" {
+                    vref.adj_complex();
+                }
+
+                output_lines.push(
+                    AmpliconOutputVariant::from_variant(
+                        Some(&vref),
+                        &output_region,
+                        &good_variants,
+                        bad_variants_count,
+                        position,
+                        current_gvscnt,
+                        nocov,
+                        flag,
+                        &self.sample_name,
+                    )
+                    .to_string(),
+                );
+            }
+        }
+
+        output_lines
+    }
+
+    fn count_variant_on_amplicons(
+        &self,
+        variant: &Variant,
+        good_variants_on_amp: &std::collections::BTreeMap<usize, Vec<Variant>>,
+    ) -> usize {
+        good_variants_on_amp
+            .values()
+            .flat_map(|variants| variants.iter())
+            .filter(|candidate| {
+                candidate.refallele == variant.refallele && candidate.varallele == variant.varallele
+            })
+            .count()
+    }
+
+    fn fill_vref_list(&self, gvs: &[(Variant, String)], vref_list: &mut Vec<Variant>) {
+        for (good_variant, _) in gvs {
+            let already_added = vref_list.iter().any(|existing| {
+                existing.varallele == good_variant.varallele
+                    && existing.refallele == good_variant.refallele
+            });
+            if !already_added {
+                vref_list.push(good_variant.clone());
+            }
+        }
+    }
+
+    fn is_amp_bias_flag(
+        &self,
+        good_variants_on_amp: &std::collections::BTreeMap<usize, Vec<Variant>>,
+    ) -> bool {
+        if good_variants_on_amp.is_empty() {
+            return false;
+        }
+
+        let amplicon_list: Vec<usize> = good_variants_on_amp.keys().copied().collect();
+        for index in 0..amplicon_list.len().saturating_sub(1) {
+            let current_amplicon = amplicon_list[index];
+            let next_amplicon = amplicon_list[index + 1];
+            let Some(current_variants) = good_variants_on_amp.get(&current_amplicon) else {
+                return true;
+            };
+            let Some(next_variants) = good_variants_on_amp.get(&next_amplicon) else {
+                return true;
+            };
+
+            if current_variants.len() != next_variants.len() {
+                return true;
+            }
+
+            let mut current_sorted = current_variants.clone();
+            let mut next_sorted = next_variants.clone();
+            current_sorted.sort_by(|left, right| right.total_pos_coverage.cmp(&left.total_pos_coverage));
+            next_sorted.sort_by(|left, right| right.total_pos_coverage.cmp(&left.total_pos_coverage));
+
+            for position in 0..current_sorted.len() {
+                if current_sorted[position].description_string != next_sorted[position].description_string {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     /// Step 1: Run CigarParser on records
@@ -1427,7 +1792,10 @@ impl VarDictPipeline {
                 }
             }
 
-            if !self.do_pileup && maxfreq <= instance().conf.freq && !instance().amplicon_based_calling {
+            if !self.do_pileup
+                && maxfreq <= instance().conf.freq
+                && instance().amplicon_based_calling.is_none()
+            {
                 if trace_this_pos {
                     event!(
                         Level::DEBUG,
@@ -1496,7 +1864,7 @@ impl VarDictPipeline {
             if let Some(ref_base) = reference.get(position).map(|b| (b as char).to_string()) {
                 if keys.contains(&ref_base)
                     && !self.do_pileup
-                    && !instance().amplicon_based_calling
+                    && instance().amplicon_based_calling.is_none()
                 {
                     return true;
                 }
@@ -2214,7 +2582,7 @@ impl VarDictPipeline {
         if let Some(ref_var) = variations_at_pos.reference_variant.as_mut() {
             if self.do_pileup
                 && (positions_for_changed_ref_variant.contains(&position)
-                    || instance().amplicon_based_calling)
+                    || instance().amplicon_based_calling.is_some())
             {
                 self.update_ref_variant(
                     position,
@@ -3590,6 +3958,78 @@ fn infer_var_type_from_alleles(refallele: &str, varallele: &str) -> VarType {
 mod tests {
     use super::*;
 
+    fn ensure_test_scope_initialized() {
+        use crate::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE};
+        let _ = INSTANCE.get_or_init(GlobalReadOnlyScope::default);
+    }
+
+    fn make_amplicon_region(gene: &str, insert_start: usize, insert_end: usize) -> Region {
+        Region::new_with_insert(
+            "chr1".to_string(),
+            100,
+            110,
+            gene.to_string(),
+            insert_start,
+            insert_end,
+        )
+    }
+
+    fn make_test_variant(
+        ref_allele: &str,
+        var_allele: &str,
+        description: &str,
+        start_position: i64,
+        end_position: i64,
+        total_coverage: usize,
+        variant_coverage: usize,
+        frequency: f64,
+    ) -> Variant {
+        let mut variant = Variant::default();
+        variant.description_string = description.to_string();
+        variant.refallele = ref_allele.to_string();
+        variant.varallele = var_allele.to_string();
+        variant.start_position = start_position;
+        variant.end_position = end_position;
+        variant.total_pos_coverage = total_coverage;
+        variant.position_coverage = variant_coverage;
+        variant.vars_count_on_forward = variant_coverage;
+        variant.frequency = frequency;
+        variant.high_qual_read_cnt = 200;
+        variant.low_qual_read_cnt = 1;
+        variant.mean_position = 100.0;
+        variant.mean_quality = 100.0;
+        variant.mean_mapping_quality = 100.0;
+        variant.is_at_least_at_2_positions = true;
+        variant.has_at_least_2_diff_qualities = true;
+        variant.hicov = total_coverage;
+        variant.high_quality_reads_frequency = frequency;
+        variant.genotype = format!("{}/{}", ref_allele, var_allele);
+        variant
+    }
+
+    fn make_vars_at_position(
+        position: i64,
+        variants: Vec<Variant>,
+        reference_variant: Option<Variant>,
+    ) -> HashMap<i64, Vars> {
+        let mut vars = HashMap::new();
+        vars.insert(
+            position,
+            Vars {
+                variants,
+                reference_variant,
+                ..Vars::default()
+            },
+        );
+        vars
+    }
+
+    fn parse_amplicon_output_fields(line: &str) -> Vec<String> {
+        let fields: Vec<String> = line.split('\t').map(str::to_string).collect();
+        assert_eq!(fields.len(), 38);
+        fields
+    }
+
     #[test]
     fn test_pipeline_creation() {
         let pipeline = VarDictPipeline::new("test_sample")
@@ -3934,5 +4374,209 @@ mod tests {
         }
 
         assert!(total_lines > 0, "Expected at least one kept read across all bed regions");
+    }
+
+    #[test]
+    fn test_amplicon_nocov_strict_lt_maxcov_over_50() {
+        use std::collections::HashSet;
+
+        ensure_test_scope_initialized();
+
+        let pipeline = VarDictPipeline::new("sample");
+        let position = 105i64;
+        let amplicon_regions = vec![
+            make_amplicon_region("G1", 105, 105),
+            make_amplicon_region("G2", 105, 105),
+            make_amplicon_region("G3", 105, 105),
+        ];
+        let group_region = amplicon_regions.last().unwrap().clone();
+
+        let good_variant = make_test_variant("A", "T", "A>T", 105, 105, 100, 20, 1.0);
+        let ref_cov_1 = make_test_variant("A", "A", "A", 105, 105, 1, 1, 0.0);
+        let ref_cov_2 = make_test_variant("A", "A", "A", 105, 105, 2, 2, 0.0);
+
+        let vars_per_amplicon = vec![
+            make_vars_at_position(position, vec![good_variant], None),
+            make_vars_at_position(position, Vec::new(), Some(ref_cov_1)),
+            make_vars_at_position(position, Vec::new(), Some(ref_cov_2)),
+        ];
+
+        let output_lines = pipeline.run_amplicon_post_processor(
+            &group_region,
+            &vars_per_amplicon,
+            &amplicon_regions,
+            &HashSet::new(),
+        );
+
+        assert_eq!(output_lines.len(), 1);
+        let fields = parse_amplicon_output_fields(&output_lines[0]);
+        assert_eq!(fields[6], "T");
+        assert_eq!(fields[34], "1");
+        assert_eq!(fields[35], "3");
+        assert_eq!(fields[36], "1");
+        assert_eq!(fields[37], "0");
+    }
+
+    #[test]
+    fn test_amplicon_primer_overlap_decrements_gvscnt_without_ampbias() {
+        use std::collections::HashSet;
+
+        ensure_test_scope_initialized();
+
+        let pipeline = VarDictPipeline::new("sample");
+        let position = 105i64;
+        let amplicon_regions = vec![
+            make_amplicon_region("G1", 100, 110),
+            make_amplicon_region("G2", 100, 110),
+            make_amplicon_region("G3", 105, 105),
+        ];
+        let group_region = amplicon_regions.last().unwrap().clone();
+
+        let deletion_1 = make_test_variant("ATC", "A", "delX", 104, 106, 40, 18, 1.0);
+        let deletion_2 = make_test_variant("ATC", "A", "delX", 104, 106, 38, 16, 1.0);
+
+        let vars_per_amplicon = vec![
+            make_vars_at_position(position, vec![deletion_1], None),
+            make_vars_at_position(position, vec![deletion_2], None),
+            HashMap::new(),
+        ];
+
+        let output_lines = pipeline.run_amplicon_post_processor(
+            &group_region,
+            &vars_per_amplicon,
+            &amplicon_regions,
+            &HashSet::new(),
+        );
+
+        assert_eq!(output_lines.len(), 1);
+        let fields = parse_amplicon_output_fields(&output_lines[0]);
+        assert_eq!(fields[33], "Deletion");
+        assert_eq!(fields[34], "1");
+        assert_eq!(fields[35], "1");
+        assert_eq!(fields[37], "0");
+    }
+
+    #[test]
+    fn test_amplicon_flag_resets_when_current_gvscnt_decreases() {
+        use std::collections::HashSet;
+
+        ensure_test_scope_initialized();
+
+        let pipeline = VarDictPipeline::new("sample");
+        let position = 105i64;
+        let amplicon_regions = vec![
+            make_amplicon_region("G1", 100, 110),
+            make_amplicon_region("G2", 100, 110),
+            make_amplicon_region("G3", 105, 105),
+        ];
+        let group_region = amplicon_regions.last().unwrap().clone();
+
+        let deletion_1 = make_test_variant("ATC", "A", "delX", 104, 106, 40, 18, 1.0);
+        let deletion_2 = make_test_variant("ATC", "A", "delX", 104, 106, 38, 16, 1.0);
+        let snv_other = make_test_variant("A", "G", "snvY", 105, 105, 35, 14, 1.0);
+
+        let vars_per_amplicon = vec![
+            make_vars_at_position(position, vec![deletion_1], None),
+            make_vars_at_position(position, vec![deletion_2], None),
+            make_vars_at_position(position, vec![snv_other], None),
+        ];
+
+        let output_lines = pipeline.run_amplicon_post_processor(
+            &group_region,
+            &vars_per_amplicon,
+            &amplicon_regions,
+            &HashSet::new(),
+        );
+
+        assert_eq!(output_lines.len(), 2);
+        let parsed: Vec<Vec<String>> = output_lines
+            .iter()
+            .map(|line| parse_amplicon_output_fields(line))
+            .collect();
+        let deletion_fields = parsed
+            .iter()
+            .find(|fields| fields[33] == "Deletion")
+            .expect("expected deletion output line");
+
+        assert_eq!(deletion_fields[34], "1");
+        assert_eq!(deletion_fields[35], "1");
+        assert_eq!(deletion_fields[37], "0");
+    }
+
+    #[test]
+    fn test_amplicon_pileup_empty_gvs_with_reference_uses_top_ref() {
+        use std::collections::HashSet;
+
+        ensure_test_scope_initialized();
+
+        let pipeline = VarDictPipeline::new("sample").with_pileup(true);
+        let position = 105i64;
+        let amplicon_regions = vec![
+            make_amplicon_region("G1", 105, 105),
+            make_amplicon_region("G2", 105, 105),
+        ];
+        let group_region = amplicon_regions.last().unwrap().clone();
+
+        let ref_high_cov = make_test_variant("A", "A", "A", 105, 105, 30, 30, 0.0);
+        let ref_low_cov = make_test_variant("A", "A", "A", 105, 105, 10, 10, 0.0);
+
+        let vars_per_amplicon = vec![
+            make_vars_at_position(position, Vec::new(), Some(ref_high_cov)),
+            make_vars_at_position(position, Vec::new(), Some(ref_low_cov)),
+        ];
+
+        let output_lines = pipeline.run_amplicon_post_processor(
+            &group_region,
+            &vars_per_amplicon,
+            &amplicon_regions,
+            &HashSet::new(),
+        );
+
+        assert_eq!(output_lines.len(), 1);
+        let fields = parse_amplicon_output_fields(&output_lines[0]);
+        assert_eq!(fields[5], "A");
+        assert_eq!(fields[6], "A");
+        assert_eq!(fields[7], "30");
+        assert_eq!(fields[32], "chr1:105-105");
+        assert_eq!(fields[34], "0");
+        assert_eq!(fields[35], "0");
+        assert_eq!(fields[36], "0");
+        assert_eq!(fields[37], "0");
+    }
+
+    #[test]
+    fn test_amplicon_pileup_empty_gvs_without_reference_outputs_empty_variant() {
+        use std::collections::HashSet;
+
+        ensure_test_scope_initialized();
+
+        let pipeline = VarDictPipeline::new("sample").with_pileup(true);
+        let amplicon_regions = vec![
+            make_amplicon_region("G1", 105, 105),
+            make_amplicon_region("G2", 105, 105),
+        ];
+        let group_region = amplicon_regions.last().unwrap().clone();
+
+        let vars_per_amplicon = vec![HashMap::new(), HashMap::new()];
+
+        let output_lines = pipeline.run_amplicon_post_processor(
+            &group_region,
+            &vars_per_amplicon,
+            &amplicon_regions,
+            &HashSet::new(),
+        );
+
+        assert_eq!(output_lines.len(), 1);
+        let fields = parse_amplicon_output_fields(&output_lines[0]);
+        assert_eq!(fields[3], "105");
+        assert_eq!(fields[4], "105");
+        assert_eq!(fields[5], "");
+        assert_eq!(fields[6], "");
+        assert_eq!(fields[7], "0");
+        assert_eq!(fields[8], "0");
+        assert_eq!(fields[34], "0");
+        assert_eq!(fields[35], "0");
+        assert_eq!(fields[36], "0");
+        assert_eq!(fields[37], "0");
     }
 }

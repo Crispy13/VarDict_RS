@@ -14,6 +14,9 @@ use crackle_kit::tracing_kit::{setup_logging_stderr_only, setup_logging_stderr_o
 use vardict_rs::data::bam_reader::BamReader;
 use vardict_rs::data::region::Region;
 use vardict_rs::mods::pipeline::{Pipeline, PipelineConfig};
+use vardict_rs::mods::vardict_pipeline::VarDictPipeline;
+
+const DEFAULT_AMPLICON_PARAMETERS: &str = "10:0.95";
 
 /// VarDict-rs: Variant caller for NGS data (Simple Mode)
 #[derive(Parser, Debug)]
@@ -93,6 +96,10 @@ struct Args {
     #[arg(short = 'U', long = "nosv")]
     no_sv: bool,
 
+    /// Amplicon mode parameters (Java: -a), e.g. "10:0.95"
+    #[arg(short = 'a', long = "amplicon")]
+    amplicon_based_calling: Option<String>,
+
     /// Debug mode - print additional information
     #[arg(short = 'D', long = "debug")]
     debug: bool,
@@ -101,9 +108,9 @@ struct Args {
     #[arg(short = 'p', long = "pileup")]
     pileup: bool,
 
-    /// Indicate coordinates are zero-based (default: 1 for BED)
-    #[arg(short = 'z', long = "zero")]
-    zero_based: bool,
+    /// Indicate whether coordinates are zero-based: 1 for zero-based, 0 for one-based
+    #[arg(short = 'z', long = "zero", value_parser = clap::value_parser!(u8).range(0..=1))]
+    zero_based: Option<u8>,
 
     /// Perform local realignment (default: 1). Use 0 to disable.
     #[arg(short = 'k', long = "realign", default_value = "1")]
@@ -194,8 +201,8 @@ fn main() -> Result<()> {
     });
 
     // Get regions to process
-    let regions = get_regions(&args)?;
-    if regions.is_empty() {
+    let region_load = get_regions(&args)?;
+    if region_load.regions.is_empty() {
         return Err(anyhow!("No regions specified. Provide -R option or a BED file."));
     }
 
@@ -209,14 +216,27 @@ fn main() -> Result<()> {
         .pileup(args.pileup)
         .build();
 
+    let execution_mode = resolve_execution_mode(&args, &region_load.amplicon_based_calling);
+
     // Print header if requested
     if args.print_header {
-        let pipeline = Pipeline::new(config.clone());
-        println!("{}", pipeline.get_header());
+        if execution_mode == ExecutionMode::Amplicon {
+            println!("{}", vardict_rs::mods::output_variant::get_amplicon_header_line());
+        } else {
+            let pipeline = Pipeline::new(config.clone());
+            println!("{}", pipeline.get_header());
+        }
     }
 
     // Always use SharedReference (loaded into memory for fast access)
-    run_variant_calling(&args, config, regions)?;
+    run_variant_calling(
+        &args,
+        config,
+        region_load.regions,
+        region_load.amplicon_based_calling,
+        region_load.amplicon_region_groups,
+        execution_mode,
+    )?;
 
     Ok(())
 }
@@ -225,11 +245,19 @@ fn main() -> Result<()> {
 /// 
 /// SharedReference is the default for both single and multi-threaded modes.
 /// The reference is loaded once and shared across all threads for fast access.
-fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>) -> Result<()> {
+fn run_variant_calling(
+    args: &Args,
+    config: PipelineConfig,
+    regions: Vec<Region>,
+    amplicon_based_calling: Option<String>,
+    amplicon_region_groups: Option<Vec<Vec<Region>>>,
+    execution_mode: ExecutionMode,
+) -> Result<()> {
     use vardict_rs::data::shared_reference::load_shared_reference_chroms;
     use vardict_rs::mods::parallel_pipeline::ParallelPipeline;
     use vardict_rs::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE};
     use vardict_rs::conf::Configuration;
+    use std::sync::Arc;
     use std::time::Instant;
 
     let start_total = Instant::now();
@@ -281,66 +309,195 @@ fn run_variant_calling(args: &Args, config: PipelineConfig, regions: Vec<Region>
     conf.downsampling = args.downsampling;
     conf.remove_duplicated_reads = args.remove_duplicates;
     conf.disable_sv = args.no_sv;
+    conf.amplicon_based_calling = amplicon_based_calling.clone();
     conf.perform_local_realignment = args.local_realignment == 1;
     conf.number_nucleotide_to_extend = args.number_nucleotide_to_extend;
     conf.reference_extension = args.reference_extension;
     let mut scope = GlobalReadOnlyScope::default();
+    scope.amplicon_based_calling = conf.amplicon_based_calling.clone();
     scope.conf = conf;
     scope.chr_lens = reference.get_chromosome_lengths();
     scope.bam_paths = vec![args.bam.to_string_lossy().to_string()];
     let _ = INSTANCE.set(scope);
+
+    let region_batches = select_region_batches_for_execution(
+        execution_mode,
+        regions,
+        amplicon_region_groups,
+    );
 
     if args.debug {
         eprintln!("[TIMING] Reference loading: {:.3}s", elapsed_ref_load.as_secs_f64());
         eprintln!("Loaded {} chromosome(s), {:.2} MB total",
             reference.num_chromosomes(),
             reference.total_size() as f64 / 1_048_576.0);
+        eprintln!("Execution mode: {:?}", execution_mode);
+        eprintln!("Execution batches: {}", region_batches.len());
         if num_threads > 1 {
-            eprintln!("Processing {} regions with {} threads...", regions.len(), num_threads);
+            eprintln!(
+                "Processing {} regions with {} threads...",
+                region_batches.iter().map(Vec::len).sum::<usize>(),
+                num_threads
+            );
         } else {
-            eprintln!("Processing {} regions...", regions.len());
+            eprintln!(
+                "Processing {} regions...",
+                region_batches.iter().map(Vec::len).sum::<usize>()
+            );
         }
     }
-
-    // Create parallel pipeline (works for single thread too)
-    let pipeline = ParallelPipeline::new(reference, config, num_threads);
 
     // Process regions
     let start_processing = Instant::now();
     let bam_path = args.bam.to_str().unwrap().to_string();
-    let results = pipeline.process_regions_vardict(bam_path, regions);
-    let elapsed_processing = start_processing.elapsed();
 
-    // Output results
-    let start_output = Instant::now();
-    let mut stdout = io::stdout().lock();
-    for result in results {
-        if let Some(error) = result.error {
-            if args.debug {
-                eprintln!("Error processing {}:{}-{}: {}",
-                    result.region.chr(), result.region.start(), result.region.end(), error);
+    match execution_mode {
+        ExecutionMode::Simple => {
+            let pipeline = ParallelPipeline::new(reference, config, num_threads);
+            let mut results = Vec::new();
+            for batch in region_batches {
+                let mut batch_results = pipeline.process_regions_vardict(bam_path.clone(), batch);
+                results.append(&mut batch_results);
             }
-        } else {
-            for line in result.output_lines {
-                writeln!(stdout, "{}", line)?;
+
+            let elapsed_processing = start_processing.elapsed();
+
+            let start_output = Instant::now();
+            let mut stdout = io::stdout().lock();
+            for result in results {
+                if let Some(error) = result.error {
+                    if args.debug {
+                        eprintln!("Error processing {}:{}-{}: {}",
+                            result.region.chr(), result.region.start(), result.region.end(), error);
+                    }
+                } else {
+                    for line in result.output_lines {
+                        writeln!(stdout, "{}", line)?;
+                    }
+                }
+            }
+            let elapsed_output = start_output.elapsed();
+
+            let elapsed_total = start_total.elapsed();
+
+            if args.debug {
+                eprintln!("[TIMING] Processing all regions: {:.3}s", elapsed_processing.as_secs_f64());
+                eprintln!("[TIMING] Output writing: {:.3}s", elapsed_output.as_secs_f64());
+                eprintln!("[TIMING] TOTAL execution: {:.3}s", elapsed_total.as_secs_f64());
             }
         }
-    }
-    let elapsed_output = start_output.elapsed();
-    
-    let elapsed_total = start_total.elapsed();
-    
-    if args.debug {
-        eprintln!("[TIMING] Processing all regions: {:.3}s", elapsed_processing.as_secs_f64());
-        eprintln!("[TIMING] Output writing: {:.3}s", elapsed_output.as_secs_f64());
-        eprintln!("[TIMING] TOTAL execution: {:.3}s", elapsed_total.as_secs_f64());
+        ExecutionMode::Amplicon => {
+            use std::collections::HashSet;
+
+            let vardict_pipeline = VarDictPipeline::new(&config.sample_name)
+                .with_min_frequency(config.min_frequency)
+                .with_min_base_quality(config.quality_threshold)
+                .with_min_mapping_quality(config.mapq_threshold);
+
+            let global_scope = Arc::new(INSTANCE.get().expect("GlobalReadOnlyScope not initialized").clone());
+            let mut stdout = io::stdout().lock();
+
+            for amplicon_group in region_batches {
+                if amplicon_group.is_empty() {
+                    continue;
+                }
+
+                let mut vars_per_amplicon = Vec::with_capacity(amplicon_group.len());
+                let mut splice: HashSet<String> = HashSet::new();
+
+                for region in &amplicon_group {
+                    let mut bam_reader = BamReader::open(&bam_path)?;
+                    let aligned_output = vardict_pipeline.process_region_to_aligned_vars_from_bam(
+                        region,
+                        &reference,
+                        &mut bam_reader,
+                        Arc::clone(&global_scope),
+                    )?;
+                    vars_per_amplicon.push(aligned_output.aligned_vars.aligned_variants);
+                    splice.extend(aligned_output.splice.into_iter());
+                }
+
+                let current_region = amplicon_group
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Empty amplicon group encountered"))?;
+                let output_lines = vardict_pipeline.run_amplicon_post_processor(
+                    &current_region,
+                    &vars_per_amplicon,
+                    &amplicon_group,
+                    &splice,
+                );
+
+                for line in output_lines {
+                    writeln!(stdout, "{}", line)?;
+                }
+            }
+
+            let elapsed_processing = start_processing.elapsed();
+            let elapsed_total = start_total.elapsed();
+
+            if args.debug {
+                eprintln!("[TIMING] Processing all regions: {:.3}s", elapsed_processing.as_secs_f64());
+                eprintln!("[TIMING] Output writing: {:.3}s", 0.0f64);
+                eprintln!("[TIMING] TOTAL execution: {:.3}s", elapsed_total.as_secs_f64());
+            }
+        }
     }
 
     Ok(())
 }
 
+struct RegionLoadResult {
+    regions: Vec<Region>,
+    amplicon_based_calling: Option<String>,
+    amplicon_region_groups: Option<Vec<Vec<Region>>>,
+}
+
+struct ParsedBedResult {
+    regions: Vec<Region>,
+    amplicon_based_calling: Option<String>,
+    amplicon_region_groups: Option<Vec<Vec<Region>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionMode {
+    Simple,
+    Amplicon,
+}
+
+fn resolve_execution_mode(args: &Args, amplicon_based_calling: &Option<String>) -> ExecutionMode {
+    if args.region.is_some() {
+        ExecutionMode::Simple
+    } else if amplicon_based_calling.is_some() {
+        ExecutionMode::Amplicon
+    } else {
+        ExecutionMode::Simple
+    }
+}
+
+fn select_region_batches_for_execution(
+    execution_mode: ExecutionMode,
+    regions: Vec<Region>,
+    amplicon_region_groups: Option<Vec<Vec<Region>>>,
+) -> Vec<Vec<Region>> {
+    match execution_mode {
+        ExecutionMode::Simple => vec![regions],
+        ExecutionMode::Amplicon => {
+            if let Some(groups) = amplicon_region_groups {
+                if groups.is_empty() {
+                    vec![regions]
+                } else {
+                    groups
+                }
+            } else {
+                vec![regions]
+            }
+        }
+    }
+}
+
 /// Parse regions from command line arguments
-fn get_regions(args: &Args) -> Result<Vec<Region>> {
+fn get_regions(args: &Args) -> Result<RegionLoadResult> {
     let mut regions = Vec::new();
     let bam_targets = BamReader::open(&args.bam)
         .context("Failed to open BAM for region normalization")?
@@ -350,12 +507,24 @@ fn get_regions(args: &Args) -> Result<Vec<Region>> {
     if let Some(ref region_str) = args.region {
         let region_path = PathBuf::from(region_str);
         if region_path.exists() {
-            regions = parse_bed_file(&region_path, args, Some(&bam_targets))?;
-            return Ok(regions);
+            let parsed = parse_bed_file(&region_path, args, Some(&bam_targets))?;
+            return Ok(RegionLoadResult {
+                regions: parsed.regions,
+                amplicon_based_calling: parsed.amplicon_based_calling,
+                amplicon_region_groups: parsed.amplicon_region_groups,
+            });
         }
-        let region = parse_region_string(region_str, args.zero_based, Some(&bam_targets))?;
+        let region = parse_region_string(
+            region_str,
+            args.zero_based.unwrap_or(0) == 1,
+            Some(&bam_targets),
+        )?;
         regions.push(region);
-        return Ok(regions);
+        return Ok(RegionLoadResult {
+            regions,
+            amplicon_based_calling: None,
+            amplicon_region_groups: None,
+        });
     }
 
     // Check for BED file
@@ -363,11 +532,19 @@ fn get_regions(args: &Args) -> Result<Vec<Region>> {
         if !bed_path.exists() {
             return Err(anyhow!("BED file not found: {:?}", bed_path));
         }
-        regions = parse_bed_file(bed_path, args, Some(&bam_targets))?;
-        return Ok(regions);
+        let parsed = parse_bed_file(bed_path, args, Some(&bam_targets))?;
+        return Ok(RegionLoadResult {
+            regions: parsed.regions,
+            amplicon_based_calling: parsed.amplicon_based_calling,
+            amplicon_region_groups: parsed.amplicon_region_groups,
+        });
     }
 
-    Ok(regions)
+    Ok(RegionLoadResult {
+        regions,
+        amplicon_based_calling: None,
+        amplicon_region_groups: None,
+    })
 }
 
 /// Parse a region string like "chr1:1000-2000" or "chr1:1000"
@@ -417,12 +594,14 @@ fn parse_bed_file(
     path: &PathBuf,
     args: &Args,
     bam_targets: Option<&[String]>,
-) -> Result<Vec<Region>> {
+) -> Result<ParsedBedResult> {
     let file = File::open(path).context("Failed to open BED file")?;
     let reader = BufReader::new(file);
-    let mut regions = Vec::new();
+    let mut bed_lines = Vec::new();
+    let mut amplicon_parameters = args.amplicon_based_calling.clone();
+    let mut zero_based = args.zero_based.map(|value| value == 1);
 
-    for (line_num, line) in reader.lines().enumerate() {
+    for (_line_num, line) in reader.lines().enumerate() {
         let line = line.context("Failed to read BED line")?;
         let line = line.trim();
 
@@ -431,8 +610,72 @@ fn parse_bed_file(
             continue;
         }
 
+        if amplicon_parameters.is_none() {
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() == 8 {
+                let col6 = fields[6].parse::<i32>();
+                let col7 = fields[7].parse::<i32>();
+                if col6.is_ok() && col7.is_ok() {
+                    let start_region = fields[1].parse::<i32>().map_err(|error| {
+                        anyhow!(
+                            "Incorrect format of BED file for amplicon mode. It must be 8 columns and 2, 3, 7 and 8 columns must contain region and amplicon starts and ends. {}",
+                            error
+                        )
+                    })?;
+                    let end_region = fields[2].parse::<i32>().map_err(|error| {
+                        anyhow!(
+                            "Incorrect format of BED file for amplicon mode. It must be 8 columns and 2, 3, 7 and 8 columns must contain region and amplicon starts and ends. {}",
+                            error
+                        )
+                    })?;
+                    let start_amplicon = col6.unwrap();
+                    let end_amplicon = col7.unwrap();
+                    if start_amplicon >= start_region && end_amplicon <= end_region {
+                        amplicon_parameters = Some(DEFAULT_AMPLICON_PARAMETERS.to_string());
+                        if zero_based.is_none() {
+                            zero_based = Some(true);
+                        }
+                    }
+                }
+            }
+        }
+
+        bed_lines.push(line.to_string());
+    }
+
+    let use_zero_based = zero_based.unwrap_or(false);
+    let (regions, amplicon_region_groups) = if amplicon_parameters.is_some() {
+        let region_groups = parse_amplicon_region_groups(&bed_lines, bam_targets, use_zero_based)?;
+        let flattened_regions = region_groups
+            .iter()
+            .flat_map(|group| group.iter().cloned())
+            .collect();
+        (flattened_regions, Some(region_groups))
+    } else {
+        (
+            parse_standard_regions(&bed_lines, args, bam_targets, use_zero_based)?,
+            None,
+        )
+    };
+
+    Ok(ParsedBedResult {
+        regions,
+        amplicon_based_calling: amplicon_parameters,
+        amplicon_region_groups,
+    })
+}
+
+fn parse_standard_regions(
+    bed_lines: &[String],
+    args: &Args,
+    bam_targets: Option<&[String]>,
+    zero_based: bool,
+) -> Result<Vec<Region>> {
+    let mut regions = Vec::new();
+
+    for (line_num, line) in bed_lines.iter().enumerate() {
         let fields: Vec<&str> = line.split('\t').collect();
-        
+
         // Get chromosome (1-indexed column number to 0-indexed)
         let chr_idx = args.col_chr.saturating_sub(1);
         let start_idx = args.col_start.saturating_sub(1);
@@ -459,7 +702,7 @@ fn parse_bed_file(
         };
 
         // BED is 0-based, half-open; convert to 1-based inclusive
-        let (start, end) = if args.zero_based {
+        let (start, end) = if zero_based {
             (start + 1, end) // BED format: 0-based start, end is exclusive
         } else {
             (start, end)
@@ -469,6 +712,97 @@ fn parse_bed_file(
     }
 
     Ok(regions)
+}
+
+fn parse_amplicon_region_groups(
+    bed_lines: &[String],
+    bam_targets: Option<&[String]>,
+    zero_based: bool,
+) -> Result<Vec<Vec<Region>>> {
+    let mut chromosome_order = Vec::new();
+    let mut regions_by_chrom: std::collections::HashMap<String, Vec<(usize, usize, Region)>> =
+        std::collections::HashMap::new();
+
+    for (line_num, line) in bed_lines.iter().enumerate() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 8 {
+            return Err(anyhow!(
+                "Incorrect format of BED file for amplicon mode at line {}: expected at least 8 columns",
+                line_num + 1
+            ));
+        }
+
+        let chr = normalize_region_chrom(fields[0], bam_targets);
+        let mut start: usize = fields[1]
+            .parse()
+            .with_context(|| format!("Invalid start at line {}", line_num + 1))?;
+        let end: usize = fields[2]
+            .parse()
+            .with_context(|| format!("Invalid end at line {}", line_num + 1))?;
+        let gene = fields[3].to_string();
+        let mut insert_start: usize = fields[6]
+            .parse()
+            .with_context(|| format!("Invalid amplicon start at line {}", line_num + 1))?;
+        let insert_end: usize = fields[7]
+            .parse()
+            .with_context(|| format!("Invalid amplicon end at line {}", line_num + 1))?;
+
+        if zero_based && start < end {
+            start += 1;
+            insert_start += 1;
+        }
+
+        if !regions_by_chrom.contains_key(&chr) {
+            chromosome_order.push(chr.clone());
+        }
+
+        let region = Region::new_with_insert(
+            chr,
+            start,
+            end,
+            gene,
+            insert_start,
+            insert_end,
+        );
+
+        let chrom_key = region.chr().to_string();
+        regions_by_chrom
+            .entry(chrom_key)
+            .or_default()
+            .push((insert_start, insert_end, region));
+    }
+
+    let mut region_groups = Vec::new();
+    let mut previous_chr: Option<String> = None;
+    let mut previous_end: Option<usize> = None;
+
+    for chrom in chromosome_order {
+        if let Some(chr_regions) = regions_by_chrom.get_mut(&chrom) {
+            chr_regions.sort_by_key(|(insert_start, _, _)| *insert_start);
+
+            for (insert_start, insert_end, region) in chr_regions.iter() {
+                let starts_new_group = match (&previous_chr, previous_end) {
+                    (Some(prev_chr), Some(prev_end)) => {
+                        region.chr() != prev_chr || *insert_start > prev_end
+                    }
+                    _ => true,
+                };
+
+                if starts_new_group {
+                    region_groups.push(Vec::new());
+                }
+
+                if let Some(current_group) = region_groups.last_mut() {
+                    current_group.push(region.clone());
+                }
+
+                previous_chr = Some(region.chr().to_string());
+                previous_end = Some(*insert_end);
+            }
+        }
+    }
+
+    Ok(region_groups)
 }
 
 fn normalize_region_chrom(chrom: &str, bam_targets: Option<&[String]>) -> String {
@@ -526,5 +860,231 @@ mod tests {
     fn test_parse_region_string_invalid() {
         assert!(parse_region_string("invalid", false, None).is_err());
         assert!(parse_region_string("chr1", false, None).is_err());
+    }
+
+    #[test]
+    fn test_parse_args_amplicon_based_calling() {
+        let args = Args::parse_from([
+            "vardict",
+            "-G",
+            "reference.fa",
+            "-b",
+            "input.bam",
+            "-R",
+            "chr1:1-10",
+            "-a",
+            "10:0.95",
+        ]);
+
+        assert_eq!(args.amplicon_based_calling.as_deref(), Some("10:0.95"));
+    }
+
+    #[test]
+    fn test_parse_args_amplicon_based_calling_absent_by_default() {
+        let args = Args::parse_from([
+            "vardict",
+            "-G",
+            "reference.fa",
+            "-b",
+            "input.bam",
+            "-R",
+            "chr1:1-10",
+        ]);
+
+        assert!(args.amplicon_based_calling.is_none());
+    }
+
+    #[test]
+    fn test_parse_args_zero_based_option_values() {
+        let args_zero = Args::parse_from([
+            "vardict",
+            "-G",
+            "reference.fa",
+            "-b",
+            "input.bam",
+            "-R",
+            "chr1:1-10",
+            "-z",
+            "1",
+        ]);
+        assert_eq!(args_zero.zero_based, Some(1));
+
+        let args_one_based = Args::parse_from([
+            "vardict",
+            "-G",
+            "reference.fa",
+            "-b",
+            "input.bam",
+            "-R",
+            "chr1:1-10",
+            "-z",
+            "0",
+        ]);
+        assert_eq!(args_one_based.zero_based, Some(0));
+    }
+
+    #[test]
+    fn test_parse_bed_file_auto_detects_amplicon_and_zero_based_default() {
+        let args = Args::parse_from([
+            "vardict",
+            "-G",
+            "reference.fa",
+            "-b",
+            "input.bam",
+        ]);
+
+        let bed_path = PathBuf::from(format!(
+            "tmp/test_amplicon_auto_{}_{}.bed",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all("tmp").unwrap();
+        std::fs::write(&bed_path, "chr1\t100\t200\tGENE\t.\t.\t120\t180\n").unwrap();
+
+        let parsed = parse_bed_file(&bed_path, &args, None).unwrap();
+        assert_eq!(
+            parsed.amplicon_based_calling.as_deref(),
+            Some(DEFAULT_AMPLICON_PARAMETERS)
+        );
+        assert_eq!(parsed.regions.len(), 1);
+        assert_eq!(parsed.regions[0].start(), 101);
+        assert_eq!(parsed.amplicon_region_groups.as_ref().map(Vec::len), Some(1));
+
+        let _ = std::fs::remove_file(&bed_path);
+    }
+
+    #[test]
+    fn test_parse_bed_file_amplicon_groups_by_insert_overlap() {
+        let args = Args::parse_from([
+            "vardict",
+            "-G",
+            "reference.fa",
+            "-b",
+            "input.bam",
+            "-a",
+            "10:0.95",
+        ]);
+
+        let bed_path = PathBuf::from(format!(
+            "tmp/test_amplicon_groups_{}_{}.bed",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all("tmp").unwrap();
+        std::fs::write(
+            &bed_path,
+            concat!(
+                "chr1\t100\t200\tG1\t.\t.\t120\t140\n",
+                "chr1\t150\t250\tG2\t.\t.\t135\t160\n",
+                "chr1\t260\t320\tG3\t.\t.\t200\t210\n"
+            ),
+        )
+        .unwrap();
+
+        let parsed = parse_bed_file(&bed_path, &args, None).unwrap();
+        let groups = parsed.amplicon_region_groups.expect("expected amplicon groups");
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[1].len(), 1);
+        assert_eq!(groups[0][0].gene(), "G1");
+        assert_eq!(groups[0][1].gene(), "G2");
+        assert_eq!(groups[1][0].gene(), "G3");
+
+        let _ = std::fs::remove_file(&bed_path);
+    }
+
+    #[test]
+    fn test_get_regions_region_option_ignores_amplicon_setting() {
+        let args = Args::parse_from([
+            "vardict",
+            "-G",
+            "reference.fa",
+            "-b",
+            "test_data/test_168714.bam",
+            "-R",
+            "chr20:168700-168710",
+            "-a",
+            "10:0.95",
+        ]);
+
+        let loaded = get_regions(&args).unwrap();
+        assert_eq!(loaded.amplicon_based_calling, None);
+        assert_eq!(loaded.regions.len(), 1);
+    }
+
+    #[test]
+    fn test_resolve_execution_mode_region_forces_simple() {
+        let args = Args::parse_from([
+            "vardict",
+            "-G",
+            "reference.fa",
+            "-b",
+            "input.bam",
+            "-R",
+            "chr1:1-10",
+            "-a",
+            "10:0.95",
+        ]);
+
+        let mode = resolve_execution_mode(&args, &Some("10:0.95".to_string()));
+        assert_eq!(mode, ExecutionMode::Simple);
+    }
+
+    #[test]
+    fn test_resolve_execution_mode_amplicon_without_region() {
+        let args = Args::parse_from([
+            "vardict",
+            "-G",
+            "reference.fa",
+            "-b",
+            "input.bam",
+        ]);
+
+        let mode = resolve_execution_mode(&args, &Some("10:0.95".to_string()));
+        assert_eq!(mode, ExecutionMode::Amplicon);
+    }
+
+    #[test]
+    fn test_select_region_batches_for_execution_simple_mode_uses_flat_regions() {
+        let regions = vec![
+            Region::new("chr1".to_string(), 10, 20, "G1".to_string()),
+            Region::new("chr1".to_string(), 30, 40, "G2".to_string()),
+        ];
+
+        let batches = select_region_batches_for_execution(ExecutionMode::Simple, regions, None);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 2);
+    }
+
+    #[test]
+    fn test_select_region_batches_for_execution_amplicon_mode_uses_groups() {
+        let regions = vec![
+            Region::new("chr1".to_string(), 10, 20, "G1".to_string()),
+            Region::new("chr1".to_string(), 30, 40, "G2".to_string()),
+            Region::new("chr1".to_string(), 50, 60, "G3".to_string()),
+        ];
+        let groups = vec![
+            vec![Region::new("chr1".to_string(), 10, 20, "G1".to_string())],
+            vec![
+                Region::new("chr1".to_string(), 30, 40, "G2".to_string()),
+                Region::new("chr1".to_string(), 50, 60, "G3".to_string()),
+            ],
+        ];
+
+        let batches = select_region_batches_for_execution(
+            ExecutionMode::Amplicon,
+            regions,
+            Some(groups),
+        );
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 1);
+        assert_eq!(batches[1].len(), 2);
     }
 }

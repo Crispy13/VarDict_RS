@@ -1,5 +1,9 @@
 #[derive(Clone)]
 pub struct Configuration {
+    /// Amplicon activation parameters (Java: -a), e.g. "10:0.95".
+    /// None means amplicon mode is not activated.
+    pub amplicon_based_calling: Option<String>,
+
     pub perform_local_realignment: bool,
 
     /// For downsampling fraction (Java: -Z)
@@ -80,6 +84,7 @@ pub struct Configuration {
 impl Default for Configuration {
     fn default() -> Self {
         Self {
+            amplicon_based_calling: None,
             perform_local_realignment: Default::default(),
             downsampling: None,
             chimeric_filter: false,

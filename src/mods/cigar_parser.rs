@@ -269,6 +269,67 @@ impl CigarParser {
         std::mem::take(&mut self.splice_count)
     }
 
+    fn parse_cigar_with_amp_case(
+        &self,
+        record: &Record,
+        cigar: &CigarStringView,
+        is_mate_reference_name_equal: bool,
+    ) -> bool {
+        let (distance_to_amplicon, overlap_fraction) = self
+            .instance
+            .amplicon_based_calling
+            .as_deref()
+            .and_then(|value| {
+                let split: Vec<&str> = value.split(':').collect();
+                let distance = split.first()?.parse::<i64>().ok()?;
+                let overlap = split.get(1)?.parse::<f64>().ok()?;
+                Some((distance, overlap))
+            })
+            .unwrap_or((10, 0.95));
+
+        let read_len_match_del = get_aligned_length(cigar);
+        let mut seg_start = record.pos() + 1;
+        let mut seg_end = seg_start + read_len_match_del - 1;
+
+        if matches!(cigar.iter().next(), Some(Cigar::SoftClip(_))) {
+            let ts1 = seg_start.max(self.region.start as i64);
+            let te1 = seg_end.min(self.region.end as i64);
+            let overlap = ((ts1 - te1).abs() as f64) / ((seg_end - seg_start) as f64);
+            if !(overlap > overlap_fraction) {
+                return true;
+            }
+        } else if matches!(cigar.iter().last(), Some(Cigar::SoftClip(_))) {
+            let ts1 = seg_start.max(self.region.start as i64);
+            let te1 = seg_end.min(self.region.end as i64);
+            let overlap = ((te1 - ts1).abs() as f64) / ((seg_end - seg_start) as f64);
+            if !(overlap > overlap_fraction) {
+                return true;
+            }
+        } else {
+            if is_mate_reference_name_equal && record.insert_size() != 0 {
+                if record.insert_size() > 0 {
+                    seg_end = seg_start + record.insert_size() - 1;
+                } else {
+                    seg_start = record.mpos() + 1;
+                    seg_end = record.mpos() + 1 - record.insert_size() - 1;
+                }
+            }
+
+            let ts1 = seg_start.max(self.region.start as i64);
+            let te1 = seg_end.min(self.region.end as i64);
+            let overlap = (((ts1 - te1) as f64) / ((seg_end - seg_start) as f64)).abs();
+
+            if ((seg_start - self.region.start as i64).abs() > distance_to_amplicon
+                || (seg_end - self.region.end as i64).abs() > distance_to_amplicon)
+                || overlap <= overlap_fraction
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+
 
     fn parse_cigar(&mut self, record: &mut Record) -> Result<(), Error> {
         event!(Level::DEBUG, "Starting for record at pos {}", record.pos());
@@ -347,8 +408,13 @@ impl CigarParser {
             return Ok(());
         }
 
-        if self.instance.amplicon_based_calling {
-            todo!("amplicon-based calling not implemented");
+        if self.instance.amplicon_based_calling.is_some()
+            && self.parse_cigar_with_amp_case(record, &cigar, record.tid() == record.mtid())
+        {
+            if trace_target {
+                event!(Level::INFO, "[trace_target] return: amplicon gate filtered read");
+            }
+            return Ok(());
         }
 
         let mut pos = 0;
@@ -2535,6 +2601,17 @@ fn get_ins_del_len(cigar: &CigarStringView) -> u32 {
         .sum::<u32>()
 }
 
+#[inline]
+fn get_aligned_length(cigar: &CigarStringView) -> i64 {
+    cigar
+        .iter()
+        .map(|c| match c {
+            Cigar::Match(l) | Cigar::Del(l) => *l as i64,
+            _ => 0,
+        })
+        .sum::<i64>()
+}
+
 fn get_match_insertion_length(cigar: &CigarStringView) -> usize {
     cigar
         .iter()
@@ -3201,6 +3278,21 @@ mod tests {
         ]);
 
         assert_eq!(get_match_insertion_length(&cigar), 5); // 1 + 4
+    }
+
+    /// Test getAlignedLength (Java parity) - calculates sum of M + D lengths
+    #[test]
+    fn test_get_aligned_length() {
+        let cigar = make_cigar(vec![
+            Cigar::Match(1),
+            Cigar::SoftClip(2),
+            Cigar::Ins(4),
+            Cigar::Del(8),
+            Cigar::RefSkip(16),
+            Cigar::HardClip(32),
+        ]);
+
+        assert_eq!(get_aligned_length(&cigar), 9); // 1 + 8
     }
 
     /// Test getSoftClippedLength - calculates sum of M + I + S lengths

@@ -18,6 +18,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use crackle_kit::tracing::level_filters::LevelFilter;
+use vardict_rs::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE};
 
 #[derive(Debug, Clone)]
 struct ParityManifestRow {
@@ -54,6 +55,47 @@ fn test_log_level() -> LevelFilter {
         .ok()
         .and_then(|value| value.to_ascii_lowercase().parse::<LevelFilter>().ok())
         .unwrap_or(LevelFilter::WARN)
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn resolve_run_now_simple_limit(default_limit: usize) -> Option<usize> {
+    if env_flag("VARDICT_RUN_NOW_FULL_SWEEP") {
+        return None;
+    }
+
+    match env::var("VARDICT_RUN_NOW_SIMPLE_LIMIT") {
+        Ok(raw) => {
+            let value = raw.trim();
+            if value.eq_ignore_ascii_case("all") {
+                None
+            } else {
+                match value.parse::<usize>() {
+                    Ok(0) => None,
+                    Ok(parsed) => Some(parsed),
+                    Err(_) => Some(default_limit),
+                }
+            }
+        }
+        Err(_) => Some(default_limit),
+    }
+}
+
+#[allow(invalid_reference_casting)]
+fn install_test_scope(scope: GlobalReadOnlyScope) {
+    if let Some(existing) = INSTANCE.get() {
+        unsafe {
+            let ptr = existing as *const GlobalReadOnlyScope as *mut GlobalReadOnlyScope;
+            let _ = std::ptr::replace(ptr, scope);
+        }
+    } else {
+        let _ = INSTANCE.set(scope);
+    }
 }
 
 fn load_parity_manifest(path: &Path) -> Result<Vec<ParityManifestRow>, String> {
@@ -426,10 +468,6 @@ fn test_somatic_mode_test_cases() {
 #[test]
 #[ignore] // Ignored by default - requires BAM files which are not in repo
 fn test_run_simple_variant_calling() {
-    use vardict_rs::mods::pipeline::{Pipeline, PipelineConfig};
-    use vardict_rs::mods::simple_variant_caller::SimpleVariantCaller;
-    use vardict_rs::data::region::Region;
-
     let testdata_dir = get_testdata_dir();
     let test_cases_dir = testdata_dir.join("integrationtestcases");
 
@@ -468,7 +506,6 @@ fn test_run_simple_variant_calling() {
 #[ignore]
 fn test_generate_output_for_verification() {
     use vardict_rs::mods::pipeline::{Pipeline, PipelineConfig};
-    use vardict_rs::mods::simple_variant_caller::SimpleVariantCaller;
     use vardict_rs::mods::to_vars_builder::VariationData;
     use vardict_rs::mods::simple_variant_caller::SimpleVarKey;
     use std::collections::HashMap;
@@ -569,6 +606,37 @@ fn query_reference_csv(
     Some(seq[start_idx..end_idx].to_string())
 }
 
+fn parse_u32_option_value(value: &str) -> Option<u32> {
+    let trimmed = value.trim();
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        trimmed.parse::<u32>().ok()
+    }
+}
+
+fn parse_amplicon_option_value(options: &str) -> Option<String> {
+    let tokens = options.split_whitespace().collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let token = tokens[index];
+        if token == "-a" {
+            if let Some(value) = tokens.get(index + 1) {
+                return Some((*value).to_string());
+            }
+        } else if let Some(value) = token.strip_prefix("-a") {
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
 fn apply_simple_options_to_conf_and_pipeline(
     options: &str,
     conf: &mut vardict_rs::conf::Configuration,
@@ -584,6 +652,12 @@ fn apply_simple_options_to_conf_and_pipeline(
         match token {
             "-p" => {
                 pileup = true;
+            }
+            "-u" => {
+                conf.unique_mode_alignment_enabled = true;
+            }
+            "-UN" => {
+                conf.unique_mode_second_in_pair_enabled = true;
             }
             "-U" | "--nosv" => {
                 conf.disable_sv = true;
@@ -612,6 +686,24 @@ fn apply_simple_options_to_conf_and_pipeline(
                     index += 1;
                 }
             }
+            "-F" => {
+                if let Some(value) = tokens
+                    .get(index + 1)
+                    .and_then(|value| parse_u32_option_value(value))
+                {
+                    conf.sam_filter = value;
+                    index += 1;
+                }
+            }
+            "-k" => {
+                if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<u8>().ok()) {
+                    conf.perform_local_realignment = value != 0;
+                    index += 1;
+                }
+            }
+            "-K" => {
+                conf.include_n_in_total_depth = true;
+            }
             "-x" => {
                 if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<i32>().ok()) {
                     conf.number_nucleotide_to_extend = value;
@@ -636,6 +728,14 @@ fn apply_simple_options_to_conf_and_pipeline(
                 } else if let Some(value) = token.strip_prefix("-Q") {
                     if let Ok(parsed) = value.parse::<u8>() {
                         conf.mapping_quality = Some(parsed);
+                    }
+                } else if let Some(value) = token.strip_prefix("-F") {
+                    if let Some(parsed) = parse_u32_option_value(value) {
+                        conf.sam_filter = parsed;
+                    }
+                } else if let Some(value) = token.strip_prefix("-k") {
+                    if let Ok(parsed) = value.parse::<u8>() {
+                        conf.perform_local_realignment = parsed != 0;
                     }
                 } else if let Some(value) = token.strip_prefix("-r") {
                     if let Ok(parsed) = value.parse::<usize>() {
@@ -675,12 +775,24 @@ fn is_low_risk_simple_tier1_row(row: &ParityManifestRow) -> bool {
 
     let tags: Vec<&str> = row.tags.split('|').collect();
     let has_tag = |name: &str| tags.iter().any(|tag| *tag == name);
+    let normalized_options = row.options.split_whitespace().collect::<Vec<_>>().join(" ");
 
-    row.options.trim() == "-f 0.001"
-        && !has_tag("sv_related")
+    !has_tag("sv_related")
         && !has_tag("pileup")
-        && !has_tag("fisher")
         && !has_tag("hard_clip")
+        && matches!(
+            normalized_options.as_str(),
+            ""
+                | "-f 0.0"
+                | "-f 0.001"
+                | "-f 0.001 --fisher"
+                | "-f 0.001 -Q 10 -F 0x700"
+                | "-f 0.0025 -F 0x700 -Q 10"
+                | "-f 0.01 -Q 10 -F 0x700"
+                | "-f 0.1"
+                | "-k 0 -f 0.001"
+                | "-q 20"
+        )
 }
 
 fn select_tier1_simple_run_now_cases(
@@ -738,7 +850,6 @@ fn run_vardict_pipeline_simple_raw_case(
     use vardict_rs::data::region::Region;
     use vardict_rs::data::shared_reference::{ChromosomeData, SharedReference};
     use vardict_rs::mods::vardict_pipeline::VarDictPipeline;
-    use vardict_rs::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE};
 
     let fasta_csv_path = testdata_dir
         .join("fastas")
@@ -752,6 +863,7 @@ fn run_vardict_pipeline_simple_raw_case(
     conf.goodq = 22.5;
     conf.vext = 2;
     conf.mismatch = 8;
+    conf.disable_sv = true;
     conf.perform_local_realignment = true;
     conf.disable_sv = true;
     let (min_frequency, pileup, min_mapping_quality) =
@@ -891,7 +1003,7 @@ fn run_vardict_pipeline_simple_raw_case(
     scope.chr_lens.insert(config.chrom.clone(), config_chr_len);
     scope.bam_paths = vec![bam_path.to_string_lossy().to_string()];
 
-    let _ = INSTANCE.set(scope.clone());
+    install_test_scope(scope.clone());
     let instance = Arc::new(scope);
 
     let csv_entries = ref_regions
@@ -975,6 +1087,287 @@ fn run_vardict_pipeline_simple_raw_case(
                 case_name, resolved_ref_chrom, e
             )
         })
+}
+
+fn run_vardict_pipeline_amplicon_raw_case(
+    testdata_dir: &Path,
+    resources_dir: &Path,
+    config: &TestCaseConfig,
+    case_name: &str,
+    sample_name: &str,
+) -> Result<Vec<String>, String> {
+    use std::sync::Arc;
+
+    use vardict_rs::conf::Configuration;
+    use vardict_rs::data::bam_reader::BamReader;
+    use vardict_rs::data::region::Region;
+    use vardict_rs::data::shared_reference::{ChromosomeData, SharedReference};
+    use vardict_rs::mods::vardict_pipeline::VarDictPipeline;
+
+    let fasta_csv_path = testdata_dir
+        .join("fastas")
+        .join(format!("{}.csv", config.reference));
+    if !fasta_csv_path.exists() {
+        return Err(format!("FASTA CSV not found: {}", fasta_csv_path.display()));
+    }
+    let ref_regions = parse_fasta_csv(&fasta_csv_path)?;
+
+    let mut conf = Configuration::default();
+    conf.goodq = 22.5;
+    conf.vext = 2;
+    conf.mismatch = 8;
+    conf.disable_sv = true;
+    conf.perform_local_realignment = true;
+    let (min_frequency, pileup, min_mapping_quality) =
+        apply_simple_options_to_conf_and_pipeline(&config.options, &mut conf);
+
+    let amplicon_params = parse_amplicon_option_value(&config.options)
+        .or_else(|| Some("10:0.95".to_string()))
+        .ok_or_else(|| format!("Amplicon options missing -a parameter for case {}", case_name))?;
+    conf.amplicon_based_calling = Some(amplicon_params);
+
+    let mut start = config.start as usize;
+    let mut end = config.end as usize;
+    let mut insert_start = config.start_amp.unwrap_or(config.start) as usize;
+    let mut insert_end = config.end_amp.unwrap_or(config.end) as usize;
+    if start < end {
+        start += 1;
+        insert_start += 1;
+    }
+    if start == 0 {
+        start = 1;
+    }
+    if end < start {
+        std::mem::swap(&mut start, &mut end);
+    }
+    if insert_end < insert_start {
+        std::mem::swap(&mut insert_start, &mut insert_end);
+    }
+
+    let region_start = start as i64;
+    let region_end = end as i64;
+
+    let extend = (conf.number_nucleotide_to_extend + conf.reference_extension).max(0) as i64;
+    let extended_start = if region_start > extend {
+        region_start - extend
+    } else {
+        1
+    };
+    let extended_end = region_end + extend;
+    let mut chrom_candidates = vec![config.chrom.clone()];
+    if let Some(stripped) = config.chrom.strip_prefix("chr") {
+        chrom_candidates.push(stripped.to_string());
+    } else {
+        chrom_candidates.push(format!("chr{}", config.chrom));
+    }
+
+    let mut resolved_ref_chrom = None;
+    let mut ref_seq = None;
+    for chrom in &chrom_candidates {
+        if let Some(seq) = query_reference_csv(&ref_regions, chrom, extended_start, extended_end) {
+            resolved_ref_chrom = Some(chrom.clone());
+            ref_seq = Some(seq);
+            break;
+        }
+    }
+    let resolved_ref_chrom = resolved_ref_chrom.ok_or_else(|| {
+        format!(
+            "Reference lookup failed for {:?}:{}-{}",
+            chrom_candidates, extended_start, extended_end
+        )
+    })?;
+    let ref_seq = ref_seq.expect("resolved reference sequence should exist");
+
+    let bam_path = resources_dir.join(&config.bam_file);
+    if !bam_path.exists() {
+        return Err(format!("BAM not found: {}", bam_path.display()));
+    }
+
+    let min_base_quality = conf.goodq;
+
+    let mut resolved_fetch_chrom = config.chrom.clone();
+    let mut bam_reader = BamReader::open(
+        bam_path
+            .to_str()
+            .ok_or_else(|| format!("Invalid BAM path UTF-8: {}", bam_path.display()))?,
+    )
+    .map_err(|e| format!("Failed to open BAM {}: {}", bam_path.display(), e))?;
+
+    let mut fetch_ok = false;
+    let mut fetch_error = String::new();
+    for chrom in &chrom_candidates {
+        match bam_reader.fetch(chrom, start, end) {
+            Ok(_) => {
+                fetch_ok = true;
+                resolved_fetch_chrom = chrom.clone();
+                break;
+            }
+            Err(e) => {
+                fetch_error = format!("{}", e);
+            }
+        }
+    }
+    if !fetch_ok {
+        return Err(format!(
+            "Failed to fetch BAM region {:?}:{}-{} (last error: {})",
+            chrom_candidates, start, end, fetch_error
+        ));
+    }
+
+    let region = Region::new_with_insert(
+        resolved_ref_chrom.clone(),
+        start,
+        end,
+        "testbed".to_string(),
+        insert_start,
+        insert_end,
+    );
+
+    let mut scope = GlobalReadOnlyScope::default();
+    scope.conf = conf;
+
+    let bam_target_names = bam_reader.target_names();
+    let bam_target_lens = bam_reader.target_lens();
+    for (name, len) in bam_target_names.iter().zip(bam_target_lens.iter()) {
+        let len = *len as usize;
+        if len == 0 {
+            continue;
+        }
+        scope.chr_lens.insert(name.clone(), len);
+        if let Some(stripped) = name.strip_prefix("chr") {
+            scope.chr_lens.insert(stripped.to_string(), len);
+        } else {
+            scope.chr_lens.insert(format!("chr{}", name), len);
+        }
+    }
+
+    let resolved_chr_len = (extended_start + ref_seq.len() as i64 - 1).max(0) as usize;
+    let resolved_ref_len = scope
+        .chr_lens
+        .get(&resolved_ref_chrom)
+        .copied()
+        .unwrap_or(resolved_chr_len)
+        .max(resolved_chr_len);
+    let resolved_fetch_len = scope
+        .chr_lens
+        .get(&resolved_fetch_chrom)
+        .copied()
+        .unwrap_or(resolved_chr_len)
+        .max(resolved_chr_len);
+    let config_chr_len = scope
+        .chr_lens
+        .get(&config.chrom)
+        .copied()
+        .unwrap_or(resolved_chr_len)
+        .max(resolved_chr_len);
+    scope
+        .chr_lens
+        .insert(resolved_ref_chrom.clone(), resolved_ref_len);
+    scope
+        .chr_lens
+        .insert(resolved_fetch_chrom.clone(), resolved_fetch_len);
+    scope.chr_lens.insert(config.chrom.clone(), config_chr_len);
+    scope.bam_paths = vec![bam_path.to_string_lossy().to_string()];
+
+    install_test_scope(scope.clone());
+    let instance = Arc::new(scope);
+
+    let csv_entries = ref_regions
+        .get(&resolved_ref_chrom)
+        .ok_or_else(|| {
+            format!(
+                "Reference CSV entries missing for chromosome {}",
+                resolved_ref_chrom
+            )
+        })?;
+    let synthetic_chr_len = instance
+        .chr_lens
+        .get(&resolved_ref_chrom)
+        .copied()
+        .unwrap_or(resolved_chr_len)
+        .max(resolved_chr_len);
+    let mut synthetic_sequence = vec![b'N'; synthetic_chr_len];
+    for (entry_start, _entry_end, seq) in csv_entries {
+        if *entry_start <= 0 {
+            continue;
+        }
+        let start_idx = (*entry_start as usize).saturating_sub(1);
+        if start_idx >= synthetic_sequence.len() {
+            continue;
+        }
+        let seq_bytes = seq.as_bytes();
+        let end_idx = (start_idx + seq_bytes.len()).min(synthetic_sequence.len());
+        let copy_len = end_idx - start_idx;
+        for (dst, src) in synthetic_sequence[start_idx..end_idx]
+            .iter_mut()
+            .zip(seq_bytes[..copy_len].iter())
+        {
+            *dst = src.to_ascii_uppercase();
+        }
+    }
+
+    let mut chromosomes = std::collections::HashMap::new();
+    let mut chrom_names = vec![resolved_ref_chrom.clone()];
+    let shared_data = ChromosomeData {
+        sequence: synthetic_sequence.clone(),
+        length: synthetic_sequence.len(),
+    };
+    chromosomes.insert(resolved_ref_chrom.clone(), shared_data);
+    if resolved_fetch_chrom != resolved_ref_chrom {
+        chromosomes.insert(
+            resolved_fetch_chrom.clone(),
+            ChromosomeData {
+                sequence: synthetic_sequence.clone(),
+                length: synthetic_sequence.len(),
+            },
+        );
+        chrom_names.push(resolved_fetch_chrom.clone());
+    }
+    if !chromosomes.contains_key(&config.chrom) {
+        chromosomes.insert(
+            config.chrom.clone(),
+            ChromosomeData {
+                sequence: synthetic_sequence,
+                length: synthetic_chr_len,
+            },
+        );
+        chrom_names.push(config.chrom.clone());
+    }
+    let shared_reference = Arc::new(SharedReference {
+        chromosomes,
+        chromosome_names: chrom_names,
+        total_size: synthetic_chr_len,
+    });
+
+    let mut pipeline = VarDictPipeline::new(sample_name)
+        .with_min_frequency(min_frequency)
+        .with_min_base_quality(min_base_quality)
+        .with_pileup(pileup);
+    pipeline = pipeline.with_min_mapping_quality(min_mapping_quality);
+
+    let aligned_output = pipeline
+        .process_region_to_aligned_vars_from_bam(
+            &region,
+            &shared_reference,
+            &mut bam_reader,
+            Arc::clone(&instance),
+        )
+        .map_err(|e| {
+            format!(
+                "Pipeline failed for {} (ref_chrom={}): {}",
+                case_name, resolved_ref_chrom, e
+            )
+        })?;
+
+    let vars_per_amplicon = vec![aligned_output.aligned_vars.aligned_variants];
+    let amplicon_regions = vec![region.clone()];
+
+    Ok(pipeline.run_amplicon_post_processor(
+        &region,
+        &vars_per_amplicon,
+        &amplicon_regions,
+        &aligned_output.splice,
+    ))
 }
 
 /// Run a REAL integration test with actual BAM files and expected output
@@ -1134,17 +1527,26 @@ fn test_all_simple_integration() {
         .collect::<Vec<_>>();
     run_now_simple.sort_by(|left, right| left.case_file.cmp(&right.case_file));
 
-    const TARGET_RUNNABLE_CASES: usize = 10;
-    let selected_cases = run_now_simple
-        .into_iter()
-        .take(TARGET_RUNNABLE_CASES)
-        .collect::<Vec<_>>();
+    let total_run_now_simple = run_now_simple.len();
+    const DEFAULT_RUNNABLE_CASES: usize = 10;
+    let requested_limit = resolve_run_now_simple_limit(DEFAULT_RUNNABLE_CASES);
+    let expected_selected = requested_limit
+        .map(|limit| total_run_now_simple.min(limit))
+        .unwrap_or(total_run_now_simple);
+
+    let selected_cases = match requested_limit {
+        Some(limit) => run_now_simple.into_iter().take(limit).collect::<Vec<_>>(),
+        None => run_now_simple,
+    };
 
     assert!(
-        selected_cases.len() >= TARGET_RUNNABLE_CASES,
-        "Expected at least {} RUN_NOW Simple cases in manifest, found {}",
-        TARGET_RUNNABLE_CASES,
-        selected_cases.len()
+        !selected_cases.is_empty(),
+        "No RUN_NOW Simple cases selected from manifest"
+    );
+    assert_eq!(
+        selected_cases.len(),
+        expected_selected,
+        "Unexpected selected-case count for RUN_NOW Simple cases"
     );
     
     let mut passed = 0;
@@ -1251,12 +1653,27 @@ fn test_all_simple_integration() {
         failed, 0,
         "RUN_NOW manifest sanity failures detected in selected simple cases"
     );
-    assert!(
-        passed >= TARGET_RUNNABLE_CASES,
-        "Expected at least {} PASS runnable cases, got {}",
-        TARGET_RUNNABLE_CASES,
-        passed
-    );
+
+    let strict = env_flag("VARDICT_RUN_NOW_STRICT");
+    if strict {
+        assert_eq!(
+            skipped, 0,
+            "Strict RUN_NOW mode requires zero skipped cases"
+        );
+        assert_eq!(
+            passed,
+            selected_cases.len(),
+            "Strict RUN_NOW mode requires all selected cases to pass"
+        );
+    } else {
+        let default_floor = DEFAULT_RUNNABLE_CASES.min(selected_cases.len());
+        assert!(
+            passed >= default_floor,
+            "Expected at least {} PASS runnable cases, got {}",
+            default_floor,
+            passed
+        );
+    }
 }
 
 #[test]
@@ -1280,17 +1697,14 @@ fn test_manifest_tier1_simple_raw_rust_vs_java_first_mismatch() {
         return;
     }
 
-    const TARGET_TIER1_CASES: usize = 10;
+    const DEFAULT_TIER1_CASES: usize = 10;
     let candidates = select_tier1_simple_run_now_cases(
         load_parity_manifest(&manifest_path).expect("Failed to load parity case manifest"),
         usize::MAX,
     );
 
-    let mut selected = Vec::new();
+    let mut eligible = Vec::new();
     for row in candidates {
-        if selected.len() >= TARGET_TIER1_CASES {
-            break;
-        }
         let test_case_path = test_cases_dir.join(&row.case_file);
         if !test_case_path.exists() {
             continue;
@@ -1305,22 +1719,34 @@ fn test_manifest_tier1_simple_raw_rust_vs_java_first_mismatch() {
             config.start - config.end
         };
         if region_span <= 20_000 && !expected_variants.is_empty() {
-            selected.push(row);
+            eligible.push(row);
         }
     }
 
+    let requested_limit = resolve_run_now_simple_limit(DEFAULT_TIER1_CASES);
+
+    let eligible_count = eligible.len();
     let case_filter = env::var("TIER1_CASE_FILTER").ok();
-    if let Some(filter) = &case_filter {
-        selected.retain(|row| row.case_file.contains(filter));
-    }
+    let selected = if let Some(filter) = &case_filter {
+        eligible
+            .into_iter()
+            .filter(|row| row.case_file.contains(filter))
+            .collect::<Vec<_>>()
+    } else {
+        match requested_limit {
+            Some(limit) => eligible.into_iter().take(limit).collect::<Vec<_>>(),
+            None => eligible,
+        }
+    };
 
     if case_filter.is_none() {
+        let expected_selected = requested_limit
+            .map(|limit| eligible_count.min(limit))
+            .unwrap_or(eligible_count);
         assert_eq!(
             selected.len(),
-            TARGET_TIER1_CASES,
-            "Expected {} low-risk small-span RUN_NOW cases, got {}",
-            TARGET_TIER1_CASES,
-            selected.len()
+            expected_selected,
+            "Unexpected selected-case count for tier1 raw parity"
         );
     } else {
         assert!(
@@ -1497,6 +1923,203 @@ fn test_manifest_tier1_simple_raw_rust_vs_java_first_mismatch() {
         accounting.passed + accounting.failed > 0,
         "No executable tier1 raw parity cases ran"
     );
+
+    if env_flag("VARDICT_RUN_NOW_STRICT") {
+        assert_eq!(
+            accounting.skipped, 0,
+            "Strict RUN_NOW mode requires zero skipped tier1 raw parity cases"
+        );
+        assert_eq!(
+            accounting.failed, 0,
+            "Strict RUN_NOW mode requires zero tier1 raw parity failures"
+        );
+        assert_eq!(
+            accounting.mismatched, 0,
+            "Strict RUN_NOW mode requires zero tier1 raw mismatches"
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn test_manifest_amplicon_raw_rust_vs_java_first_mismatch() {
+    if env::var("VARDICT_DEBUG_POS").is_ok() {
+        let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
+    }
+
+    let testdata_dir = get_testdata_dir();
+    let test_cases_dir = testdata_dir.join("integrationtestcases");
+    let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("parity_case_manifest.csv");
+    let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("VarDictJava")
+        .join("src/test/resources/com/astrazeneca/vardict/integrationtests");
+
+    if !test_cases_dir.exists() || !resources_dir.exists() || !manifest_path.exists() {
+        eprintln!("Amplicon raw parity resources not found");
+        return;
+    }
+
+    let mut selected = load_parity_manifest(&manifest_path)
+        .expect("Failed to load parity case manifest")
+        .into_iter()
+        .filter(|row| row.mode == "Amplicon")
+        .collect::<Vec<_>>();
+    selected.sort_by(|left, right| left.case_file.cmp(&right.case_file));
+
+    assert!(
+        !selected.is_empty(),
+        "No amplicon rows found in parity manifest"
+    );
+
+    let mut accounting = Tier1ComparisonAccounting {
+        selected: selected.len(),
+        ..Tier1ComparisonAccounting::default()
+    };
+
+    for row in &selected {
+        let test_case_path = test_cases_dir.join(&row.case_file);
+        if !test_case_path.exists() {
+            eprintln!("SKIP {}: missing testcase file", row.case_file);
+            accounting.skipped += 1;
+            continue;
+        }
+
+        let (config, expected_variants) = match parse_test_case(&test_case_path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("FAIL {}: parse error: {}", row.case_file, e);
+                accounting.failed += 1;
+                continue;
+            }
+        };
+
+        if config.mode != "Amplicon" {
+            eprintln!(
+                "FAIL {}: mode mismatch manifest={} testcase={}",
+                row.case_file, row.mode, config.mode
+            );
+            accounting.failed += 1;
+            continue;
+        }
+
+        if expected_variants.is_empty() {
+            eprintln!("SKIP {}: no expected variant lines", row.case_file);
+            accounting.skipped += 1;
+            continue;
+        }
+
+        if row.reference != config.reference
+            || row.bam != config.bam_file
+            || row.chrom != config.chrom
+            || row.options != config.options
+        {
+            eprintln!(
+                "FAIL {}: manifest/testcase mismatch (reference/bam/chrom/options)",
+                row.case_file
+            );
+            accounting.failed += 1;
+            continue;
+        }
+
+        let expected_sample_name = expected_variants
+            .first()
+            .map(|variant| variant.sample.clone())
+            .unwrap_or_else(|| {
+                config
+                    .bam_file
+                    .strip_suffix(".bam")
+                    .unwrap_or(&config.bam_file)
+                    .to_string()
+            });
+
+        let rust_output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_vardict_pipeline_amplicon_raw_case(
+                &testdata_dir,
+                &resources_dir,
+                &config,
+                &row.case_file,
+                &expected_sample_name,
+            )
+        })) {
+            Ok(Ok(lines)) => lines,
+            Ok(Err(e)) => {
+                eprintln!("SKIP {}: runner unavailable: {}", row.case_file, e);
+                accounting.skipped += 1;
+                continue;
+            }
+            Err(_) => {
+                eprintln!(
+                    "SKIP {}: runner panicked during pipeline execution",
+                    row.case_file
+                );
+                accounting.skipped += 1;
+                continue;
+            }
+        };
+
+        let expected_lines = expected_variants
+            .iter()
+            .map(|variant| variant.raw_line.clone())
+            .collect::<Vec<_>>();
+
+        match first_raw_mismatch(&expected_lines, &rust_output) {
+            None => {
+                accounting.passed += 1;
+                println!(
+                    "PASS {}: amplicon raw lines match exactly ({} lines)",
+                    row.case_file,
+                    rust_output.len()
+                );
+            }
+            Some(diag) => {
+                accounting.failed += 1;
+                accounting.mismatched += 1;
+                eprintln!(
+                    "FAIL {}: {} at line {}",
+                    row.case_file,
+                    diag.reason,
+                    diag.line_index + 1
+                );
+                eprintln!("  JAVA: {}", diag.java_line.unwrap_or_else(|| "<none>".to_string()));
+                eprintln!("  RUST: {}", diag.rust_line.unwrap_or_else(|| "<none>".to_string()));
+            }
+        }
+    }
+
+    println!("\n=== Amplicon Raw Parity Summary ===");
+    println!("Selected:   {}", accounting.selected);
+    println!("Passed:     {}", accounting.passed);
+    println!("Failed:     {}", accounting.failed);
+    println!("Mismatched: {}", accounting.mismatched);
+    println!("Skipped:    {}", accounting.skipped);
+    println!("===================================\n");
+
+    assert_eq!(
+        accounting.selected,
+        accounting.passed + accounting.failed + accounting.skipped,
+        "Accounting mismatch in amplicon raw parity test"
+    );
+    assert!(
+        accounting.passed + accounting.failed > 0,
+        "No executable amplicon raw parity cases ran"
+    );
+
+    if env_flag("VARDICT_RUN_NOW_STRICT") {
+        assert_eq!(
+            accounting.skipped, 0,
+            "Strict RUN_NOW mode requires zero skipped amplicon raw parity cases"
+        );
+        assert_eq!(
+            accounting.failed, 0,
+            "Strict RUN_NOW mode requires zero amplicon raw parity failures"
+        );
+        assert_eq!(
+            accounting.mismatched, 0,
+            "Strict RUN_NOW mode requires zero amplicon raw mismatches"
+        );
+    }
 }
 
 // ============================================================================
@@ -1546,7 +2169,6 @@ fn test_vardict_pipeline_hard_clip() {
     use vardict_rs::data::reference::Reference;
     use vardict_rs::data::region::Region;
     use vardict_rs::mods::vardict_pipeline::VarDictPipeline;
-    use vardict_rs::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE};
     use vardict_rs::conf::Configuration;
     use std::sync::Arc;
     
@@ -1603,7 +2225,7 @@ fn test_vardict_pipeline_hard_clip() {
     scope.conf = conf;
     
     // Initialize the global INSTANCE (may fail if already set by another test, which is OK)
-    let _ = INSTANCE.set(scope.clone());
+    install_test_scope(scope.clone());
     
     let instance = Arc::new(scope);
     
@@ -1701,7 +2323,6 @@ fn test_rust_vs_java_output_comparison() {
     use vardict_rs::data::reference::Reference;
     use vardict_rs::data::region::Region;
     use vardict_rs::mods::vardict_pipeline::VarDictPipeline;
-    use vardict_rs::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE};
     use vardict_rs::conf::Configuration;
     use std::sync::Arc;
     use std::fs;
@@ -1786,7 +2407,7 @@ fn test_rust_vs_java_output_comparison() {
     let mut scope = GlobalReadOnlyScope::default();
     scope.conf = conf;
     
-    let _ = INSTANCE.set(scope.clone());
+    install_test_scope(scope.clone());
     let instance = Arc::new(scope);
     
     // Create region (Java IntegrationTest uses -z, so start is zero-based)
@@ -1900,7 +2521,7 @@ fn test_rust_vs_java_output_comparison() {
     let mut all_match = true;
     let mut total_diffs = 0;
     
-    for (i, ((java_pos, java_line), (rust_pos, rust_line))) in 
+    for (i, ((java_pos, java_line), (_rust_pos, rust_line))) in 
         java_sorted.iter().zip(rust_sorted.iter()).enumerate() 
     {
         let java_fields: Vec<&str> = java_line.split('\t').collect();

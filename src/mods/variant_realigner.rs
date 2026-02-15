@@ -302,13 +302,13 @@ impl VariantRealigner {
             all_mm.extend(r3.mismatches.iter().cloned());
             all_mm.extend(r5.mismatches.iter().cloned());
 
-            let insert_key = VarDesc::Ins {
-                seq: insert.as_bytes().iter().map(|b| b.to_ascii_uppercase()).collect(),
+            let vn_key = VarDesc::Ins {
+                seq: vn[1..].as_bytes().iter().map(|b| b.to_ascii_uppercase()).collect(),
             };
             let _ = crate::variants::var_utils::get_variants_from_map(
                 &mut data.insertion_variants,
                 position,
-                &insert_key,
+                &vn_key,
             );
 
             for mm in all_mm {
@@ -389,7 +389,7 @@ impl VariantRealigner {
                 if let Some(vref) = data
                     .insertion_variants
                     .get_mut(&position)
-                    .and_then(|m| m.get_mut(&insert_key))
+                    .and_then(|m| m.get_mut(&vn_key))
                 {
                     if let Some((ref_key, mut ref_var)) = ref_var {
                         adj_cnt_with_ref(vref, &tv_owned, Some(&mut ref_var));
@@ -447,7 +447,7 @@ impl VariantRealigner {
                         if let Some(vref) = data
                             .insertion_variants
                             .get_mut(&position)
-                            .and_then(|m| m.get_mut(&insert_key))
+                            .and_then(|m| m.get_mut(&vn_key))
                         {
                             adj_cnt(vref, &tv.var);
                         }
@@ -478,7 +478,10 @@ impl VariantRealigner {
                             *data.ref_coverage.entry(position).or_insert(0) += tv.var.alt_depth;
                         }
 
-                        let mut ref_var = if sc3pp > position {
+                        let use_ref_var = sc3pp > position
+                            && !(insert.len() as f64 > mean_pos);
+
+                        let ref_var = if use_ref_var {
                             self.get_ref_base(position)
                                 .map(|ref_base| VarDesc::SNV { ref_base })
                                 .and_then(|ref_key| {
@@ -490,14 +493,11 @@ impl VariantRealigner {
                         } else {
                             None
                         };
-                        if insert.len() as f64 > mean_pos {
-                            ref_var = None;
-                        }
 
                         if let Some(vref) = data
                             .insertion_variants
                             .get_mut(&position)
-                            .and_then(|m| m.get_mut(&insert_key))
+                            .and_then(|m| m.get_mut(&vn_key))
                         {
                             if let Some((ref_key, mut ref_var)) = ref_var {
                                 adj_cnt_with_ref(vref, &tv.var, Some(&mut ref_var));
@@ -559,7 +559,7 @@ impl VariantRealigner {
                     if let Some(vref) = data
                         .insertion_variants
                         .get_mut(&position)
-                        .and_then(|m| m.get_mut(&insert_key))
+                        .and_then(|m| m.get_mut(&vn_key))
                     {
                         Self::adj_ref_factor(vref, -((first3 - first5 - 1) as f64 / data.max_read_length as f64));
                     }
@@ -615,8 +615,6 @@ impl VariantRealigner {
     }
 
     pub fn realign_long_insertions_30(&self, data: &mut RealignedVariationData) {
-        let conf = &crate::scopedata::global_read_only_scope::instance().conf;
-
         let mut tmp5: Vec<(i64, usize)> = data
             .soft_clips_5end
             .iter()
@@ -632,9 +630,6 @@ impl VariantRealigner {
         tmp3.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         for (p5, cnt5) in tmp5 {
-            if cnt5 < conf.minr {
-                break;
-            }
             if data
                 .soft_clips_5end
                 .get(&p5)
@@ -1433,6 +1428,7 @@ impl VariantRealigner {
         let (dellen, extra_seq, extrains_len) = match desc {
             VarDesc::Del {
                 len,
+                match_seq,
                 ins_or_del_len,
                 mismatch_seq,
                 ..
@@ -1441,7 +1437,25 @@ impl VariantRealigner {
                 if let InsOrDelLen::DelLen(extra) = ins_or_del_len {
                     total += *extra as i64;
                 }
-                let extra = String::from_utf8_lossy(mismatch_seq).to_string();
+
+                let mut extra_bytes = Vec::new();
+                if !match_seq.is_empty() {
+                    extra_bytes.extend_from_slice(match_seq.as_slice());
+                }
+                match ins_or_del_len {
+                    InsOrDelLen::InsSeq(seq) => {
+                        extra_bytes.extend_from_slice(seq.as_slice());
+                    }
+                    InsOrDelLen::DelLen(del_len) => {
+                        extra_bytes.extend_from_slice(del_len.to_string().as_bytes());
+                    }
+                    InsOrDelLen::None => {}
+                }
+                if !mismatch_seq.is_empty() {
+                    extra_bytes.extend_from_slice(mismatch_seq.as_slice());
+                }
+
+                let extra = String::from_utf8_lossy(&extra_bytes).to_string();
                 let extrains_len = match ins_or_del_len {
                     InsOrDelLen::InsSeq(seq) => seq.len() as i64,
                     _ => 0,

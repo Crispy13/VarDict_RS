@@ -21,6 +21,25 @@ impl Region {
         }
     }
 
+    /// Create a new region with amplicon insert interval coordinates.
+    pub fn new_with_insert(
+        chrom: String,
+        start: usize,
+        end: usize,
+        gene: String,
+        ins_start: usize,
+        ins_end: usize,
+    ) -> Self {
+        Self {
+            chrom,
+            start,
+            end,
+            gene,
+            ins_start,
+            ins_end,
+        }
+    }
+
     /// Get the chromosome name
     pub fn chr(&self) -> &str {
         &self.chrom
@@ -39,6 +58,16 @@ impl Region {
     /// Get the gene name
     pub fn gene(&self) -> &str {
         &self.gene
+    }
+
+    /// Get amplicon insert start position (1-based)
+    pub fn insert_start(&self) -> usize {
+        self.ins_start
+    }
+
+    /// Get amplicon insert end position (1-based, inclusive)
+    pub fn insert_end(&self) -> usize {
+        self.ins_end
     }
 
     /// Get the region length

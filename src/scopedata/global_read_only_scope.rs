@@ -13,7 +13,7 @@ pub fn instance() -> &'static GlobalReadOnlyScope {
 
 #[derive(Default, Clone)]
 pub struct GlobalReadOnlyScope {
-    pub amplicon_based_calling: bool,
+    pub amplicon_based_calling: Option<String>,
     pub chr_lens: HashMap<String, usize>,
     pub bam_paths: Vec<String>,
     pub conf: Configuration,
