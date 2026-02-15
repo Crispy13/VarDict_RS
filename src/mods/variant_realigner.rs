@@ -171,6 +171,20 @@ impl VariantRealigner {
             .or_default();
     }
 
+    fn add_sv_split_count(data: &mut RealignedVariationData, position: i64, splits: usize) {
+        Self::ensure_sv_marker(data, position);
+        if splits == 0 {
+            return;
+        }
+        if let Some(variation_map) = data.non_insertion_variants.get_mut(&position) {
+            let key = VarDesc::Raw {
+                desc: b"SV".to_vec().into(),
+            };
+            let sv = variation_map.entry(key).or_default();
+            sv.alt_depth += splits;
+        }
+    }
+
     pub fn process_insertions(
         &self,
         data: &mut RealignedVariationData,
@@ -1016,7 +1030,7 @@ impl VariantRealigner {
                 }
 
                 bi = p - 1;
-                Self::ensure_sv_marker(data, bi);
+                Self::add_sv_split_count(data, bi, cnt);
             }
 
             let sc5_var = data
@@ -1158,7 +1172,7 @@ impl VariantRealigner {
                 ins.extend_from_slice(&extra);
 
                 bi -= 1;
-                Self::ensure_sv_marker(data, bi);
+                Self::add_sv_split_count(data, bi, cnt);
 
                 let ref_cov_p = data.ref_coverage.get(&p).copied();
                 let ref_cov_bi = data.ref_coverage.get(&bi).copied();
@@ -2090,9 +2104,20 @@ impl VariantRealigner {
         let mut bi2 = 0i64;
 
         let ref_end = self.ref_start + self.reference_seq.len() as i64 - 1;
+        let chr_len = self
+            .chromosome
+            .as_ref()
+            .and_then(|chrom| {
+                crate::scopedata::global_read_only_scope::instance()
+                    .chr_lens
+                    .get(chrom)
+                    .copied()
+            })
+            .map(|len| len as i64)
+            .unwrap_or(ref_end);
 
         for n in 6..seq.len() {
-            if position + 6 >= ref_end {
+            if position + 6 >= chr_len {
                 break;
             }
             let mut mm = 0usize;
@@ -2101,11 +2126,11 @@ impl VariantRealigner {
 
             while i + n < seq.len() {
                 let ref_pos = position + dir * i as i64 - dir_ext;
-                if ref_pos < self.ref_start || ref_pos > ref_end {
+                if ref_pos < 1 || ref_pos > chr_len {
                     break;
                 }
-                let Some(ref_base) = self.get_ref_base(ref_pos) else { break; };
-                if seq[i + n] != ref_base {
+                let ref_base = self.get_ref_base(ref_pos);
+                if ref_base.map_or(true, |base| seq[i + n] != base) {
                     mm += 1;
                 } else {
                     m.insert(seq[i + n]);
@@ -2132,12 +2157,15 @@ impl VariantRealigner {
                 while n + ept + 1 < seq.len() {
                     let pos1 = position + ept as i64 * dir - dir_ext;
                     let pos2 = position + (ept + 1) as i64 * dir - dir_ext;
-                    let ref1 = self.get_ref_base(pos1);
-                    let ref2 = self.get_ref_base(pos2);
-                    if ref1.is_none() || ref2.is_none() {
-                        break;
-                    }
-                    if seq[n + ept] == ref1.unwrap() && seq[n + ept + 1] == ref2.unwrap() {
+                    let first_matches = self
+                        .get_ref_base(pos1)
+                        .map(|base| seq[n + ept] == base)
+                        .unwrap_or(false);
+                    let second_matches = self
+                        .get_ref_base(pos2)
+                        .map(|base| seq[n + ept + 1] == base)
+                        .unwrap_or(false);
+                    if first_matches && second_matches {
                         break;
                     }
                     extra.push(seq[n + ept]);

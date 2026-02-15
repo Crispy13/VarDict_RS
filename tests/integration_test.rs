@@ -17,6 +17,8 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use crackle_kit::tracing::level_filters::LevelFilter;
+
 #[derive(Debug, Clone)]
 struct ParityManifestRow {
     case_file: String,
@@ -45,6 +47,13 @@ struct RawMismatchDiagnostic {
     reason: String,
     java_line: Option<String>,
     rust_line: Option<String>,
+}
+
+fn test_log_level() -> LevelFilter {
+    env::var("VARDICT_TEST_LOG")
+        .ok()
+        .and_then(|value| value.to_ascii_lowercase().parse::<LevelFilter>().ok())
+        .unwrap_or(LevelFilter::WARN)
 }
 
 fn load_parity_manifest(path: &Path) -> Result<Vec<ParityManifestRow>, String> {
@@ -1254,8 +1263,7 @@ fn test_all_simple_integration() {
 #[ignore]
 fn test_manifest_tier1_simple_raw_rust_vs_java_first_mismatch() {
     if env::var("VARDICT_DEBUG_POS").is_ok() {
-        use crackle_kit::tracing::level_filters::LevelFilter;
-        let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(LevelFilter::DEBUG);
+        let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
     }
 
     let testdata_dir = get_testdata_dir();
@@ -1697,9 +1705,8 @@ fn test_rust_vs_java_output_comparison() {
     use vardict_rs::conf::Configuration;
     use std::sync::Arc;
     use std::fs;
-    use crackle_kit::tracing::level_filters::LevelFilter;
 
-    let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(LevelFilter::DEBUG);
+    let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
     
     let testdata_dir = get_testdata_dir();
     

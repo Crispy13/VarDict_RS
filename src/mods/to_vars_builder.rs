@@ -276,6 +276,7 @@ impl Default for Variant {
 pub struct Vars {
     pub variants: Vec<Variant>,
     pub reference_variant: Option<Variant>,
+    pub sv: String,
     pub sv_flags: StructuralVariantFlags,
 }
 
@@ -502,6 +503,7 @@ impl ToVarsBuilder {
             let vars = Vars {
                 variants: variant_list,
                 reference_variant: None,
+                sv: String::new(),
                 sv_flags: StructuralVariantFlags::default(),
             };
 

@@ -12,6 +12,13 @@ use vardict_rs::data::shared_reference::load_shared_reference_chroms;
 use vardict_rs::mods::vardict_pipeline::VarDictPipeline;
 use vardict_rs::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE};
 
+fn test_log_level() -> LevelFilter {
+    env::var("VARDICT_TEST_LOG")
+        .ok()
+        .and_then(|value| value.to_ascii_lowercase().parse::<LevelFilter>().ok())
+        .unwrap_or(LevelFilter::WARN)
+}
+
 struct EnvGuard {
     key: &'static str,
     previous: Option<String>,
@@ -58,7 +65,7 @@ impl Drop for TempFileGuard {
 
 #[test]
 fn test_structural_variants_snapshot_fixture() {
-    crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(LevelFilter::DEBUG);
+    let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let fixture_path = manifest_dir.join("tests/fixtures/structural_variants_chr20_168600_168800.jsonl");

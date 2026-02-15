@@ -267,6 +267,15 @@ impl SimpleOutputVariant {
         }
     }
 
+    /// Create an empty variant and preserve Java-compatible SV column value
+    pub fn empty_with_sv(position: i64, region: &Region, sample: &str, sv: &str) -> Self {
+        let mut out = Self::empty(position, region, sample);
+        if !sv.is_empty() {
+            out.sv = sv.to_string();
+        }
+        out
+    }
+
     /// Format as 36-column tab-delimited string (Simple Mode without Fisher)
     pub fn to_string_36_columns(&self) -> String {
         let parts: Vec<String> = vec![

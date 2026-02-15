@@ -1377,7 +1377,7 @@ impl VarDictPipeline {
             let mut keys: Vec<VarDesc> = vars_at_pos.keys().cloned().collect();
             keys.sort_by(|a, b| a.to_key_string().cmp(&b.to_key_string()));
 
-            self.create_variant_records(
+            let sv_string = self.create_variant_records(
                 position,
                 &vars_at_pos,
                 total_pos_coverage,
@@ -1420,6 +1420,12 @@ impl VarDictPipeline {
                 reference,
                 &var_list,
             );
+
+            if let Some(sv) = sv_string {
+                if let Some(vars_entry) = aligned_variants.get_mut(&position) {
+                    vars_entry.sv = sv;
+                }
+            }
 
             if !self.do_pileup && maxfreq <= instance().conf.freq && !instance().amplicon_based_calling {
                 if trace_this_pos {
@@ -1528,11 +1534,16 @@ impl VarDictPipeline {
         keys: &[VarDesc],
         hicov: usize,
         duprate: f64,
-    ) {
+    ) -> Option<String> {
         use crate::mods::to_vars_builder::{check_strand_bias, StrandBiasFlag, StrandBiasValue};
+
+        let mut sv_string: Option<String> = None;
 
         for desc in keys {
             if matches!(desc, VarDesc::Raw { desc } if desc.as_slice() == b"SV") {
+                if let Some(sv_var) = vars_at_pos.get(desc) {
+                    sv_string = Some(format!("{}-0-0", sv_var.alt_depth));
+                }
                 continue;
             }
 
@@ -1598,6 +1609,8 @@ impl VarDictPipeline {
 
             var_list.push(variant);
         }
+
+        sv_string
     }
 
     fn create_insertion_records(
@@ -2312,7 +2325,18 @@ impl VarDictPipeline {
         let chr_len = if chr_len > 0 { chr_len } else { fallback_len };
         let tseq2 = self.get_reference_range(reference, position + 1, (position + 70).min(chr_len));
 
-        let (msi, msint, shift3) = self.find_msi(tseq1, &tseq2, Some(&leftseq));
+        let (mut msi, mut msint, shift3) = self.find_msi(tseq1, &tseq2, Some(&leftseq));
+
+        let (tmsi, tmsint, _) = self.find_msi(&leftseq, &tseq2, None);
+        if msi < tmsi {
+            msi = tmsi;
+            msint = tmsint;
+        }
+
+        if !tseq1.is_empty() && msi <= (shift3 as f64) / (tseq1.len() as f64) {
+            msi = (shift3 as f64) / (tseq1.len() as f64);
+        }
+
         (msi, shift3 as i32, msint)
     }
 
@@ -2473,6 +2497,7 @@ impl VarDictPipeline {
         Vars {
             variants,
             reference_variant: reference_variant_opt,
+            sv: String::new(),
             sv_flags: Default::default(),
         }
     }
@@ -3284,8 +3309,10 @@ impl VarDictPipeline {
             };
             event!(Level::DEBUG, "[PostProcessor] Processing position {}: {} variants", position, vars.variants.len());
 
-            // Skip positions outside region (unless SV)
-            if position < region.start() as i64 || position > region.end() as i64 {
+            // Skip positions outside region only when SV marker is absent (Java parity)
+            if (position < region.start() as i64 || position > region.end() as i64)
+                && vars.sv.is_empty()
+            {
                 event!(Level::DEBUG, "[PostProcessor] Skipping position {} - outside region {}-{}", position, region.start(), region.end());
                 continue;
             }
@@ -3302,14 +3329,15 @@ impl VarDictPipeline {
                         ref_var,
                         &output_region,
                         &self.sample_name,
-                        "",
+                        &vars.sv,
                     );
                     output_lines.push(output.to_string());
                 } else {
-                    let output = SimpleOutputVariant::empty(
+                    let output = SimpleOutputVariant::empty_with_sv(
                         position,
                         &output_region,
                         &self.sample_name,
+                        &vars.sv,
                     );
                     output_lines.push(output.to_string());
                 }
@@ -3344,14 +3372,15 @@ impl VarDictPipeline {
                             ref_var,
                             &output_region,
                             &self.sample_name,
-                            "",
+                            &vars.sv,
                         );
                         output_lines.push(output.to_string());
                     } else {
-                        let output = SimpleOutputVariant::empty(
+                        let output = SimpleOutputVariant::empty_with_sv(
                             position,
                             &output_region,
                             &self.sample_name,
+                            &vars.sv,
                         );
                         output_lines.push(output.to_string());
                     }
@@ -3379,7 +3408,7 @@ impl VarDictPipeline {
                     &variant,
                     &output_region,
                     &self.sample_name,
-                    "",
+                    &vars.sv,
                 );
                 output_lines.push(output.to_string());
             }
@@ -3604,7 +3633,7 @@ mod tests {
         let mut debug_lines = Vec::new();
         let keys = vec![desc];
 
-        pipeline.create_variant_records(
+        let _ = pipeline.create_variant_records(
             position,
             &vars_at_pos,
             10,
