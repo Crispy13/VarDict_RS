@@ -44,6 +44,9 @@
 //! 36. Structural variant info
 
 use crate::mods::to_vars_builder::{Variant, VarType, StrandBiasFlag, var_type_string};
+use crate::scopedata::global_read_only_scope::instance;
+use crate::utils::round_half_even;
+use statrs::distribution::{Discrete, DiscreteCDF, Hypergeometric};
 
 /// Region information for output
 #[derive(Debug, Clone, Default)]
@@ -384,6 +387,7 @@ pub struct AmpliconOutputVariant {
     pub total_variants_count: usize,
     pub no_coverage: usize,
     pub amplicon_flag: i32,
+    pub debug: String,
 }
 
 impl AmpliconOutputVariant {
@@ -392,7 +396,8 @@ impl AmpliconOutputVariant {
         variant: Option<&Variant>,
         region: &Region,
         good_variants: &[(Variant, String)],
-        bad_variants_count: usize,
+        bad_variants: &[(Option<Variant>, String)],
+        debug_prefix: Option<&str>,
         position: i64,
         good_variants_count: usize,
         no_coverage: usize,
@@ -449,9 +454,14 @@ impl AmpliconOutputVariant {
                 region: output_region,
                 var_type: var_type_string(&v.refallele, &v.varallele),
                 good_variants_count,
-                total_variants_count: good_variants_count + bad_variants_count,
+                total_variants_count: good_variants_count + bad_variants.len(),
                 no_coverage,
                 amplicon_flag: if amplicon_bias_flag { 1 } else { 0 },
+                debug: if instance().conf.debug {
+                    build_amplicon_debug(v, good_variants, bad_variants, debug_prefix)
+                } else {
+                    String::new()
+                },
             },
             None => AmpliconOutputVariant {
                 sample: sample.to_string(),
@@ -489,9 +499,10 @@ impl AmpliconOutputVariant {
                 region: format!("{}:{}-{}", chr, position, position),
                 var_type: String::new(),
                 good_variants_count,
-                total_variants_count: good_variants_count + bad_variants_count,
+                total_variants_count: good_variants_count + bad_variants.len(),
                 no_coverage,
                 amplicon_flag: if amplicon_bias_flag { 1 } else { 0 },
+                debug: String::new(),
             },
         }
     }
@@ -544,8 +555,905 @@ impl AmpliconOutputVariant {
 
 impl std::fmt::Display for AmpliconOutputVariant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_string_38_columns())
+        let output_variant = self.to_string_38_columns();
+        if instance().conf.debug {
+            write!(f, "{}\t{}", output_variant, self.debug)
+        } else {
+            write!(f, "{}", output_variant)
+        }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct SomaticOutputVariant {
+    pub sample: String,
+    pub gene: String,
+    pub chr: String,
+    pub start_position: i64,
+    pub end_position: i64,
+    pub ref_allele: String,
+    pub var_allele: String,
+
+    pub var1_total_coverage: usize,
+    pub var1_variant_coverage: usize,
+    pub var1_ref_forward_coverage: usize,
+    pub var1_ref_reverse_coverage: usize,
+    pub var1_variant_forward_count: usize,
+    pub var1_variant_reverse_count: usize,
+    pub var1_genotype: String,
+    pub var1_frequency: f64,
+    pub var1_strand_bias_flag: String,
+    pub var1_mean_position: f64,
+    pub var1_is_at_least_at_2_positions: i32,
+    pub var1_mean_quality: f64,
+    pub var1_has_at_least_2_diff_qualities: i32,
+    pub var1_mean_mapping_quality: f64,
+    pub var1_high_quality_to_low_quality_ratio: f64,
+    pub var1_high_quality_reads_frequency: f64,
+    pub var1_extra_frequency: f64,
+    pub var1_nm: f64,
+    pub var1_duprate: f64,
+    pub var1_sv: String,
+
+    pub var2_total_coverage: usize,
+    pub var2_variant_coverage: usize,
+    pub var2_ref_forward_coverage: usize,
+    pub var2_ref_reverse_coverage: usize,
+    pub var2_variant_forward_count: usize,
+    pub var2_variant_reverse_count: usize,
+    pub var2_genotype: String,
+    pub var2_frequency: f64,
+    pub var2_strand_bias_flag: String,
+    pub var2_mean_position: f64,
+    pub var2_is_at_least_at_2_positions: i32,
+    pub var2_mean_quality: f64,
+    pub var2_has_at_least_2_diff_qualities: i32,
+    pub var2_mean_mapping_quality: f64,
+    pub var2_high_quality_to_low_quality_ratio: f64,
+    pub var2_high_quality_reads_frequency: f64,
+    pub var2_extra_frequency: f64,
+    pub var2_nm: f64,
+    pub var2_duprate: f64,
+    pub var2_sv: String,
+
+    pub shift3: i32,
+    pub msi: f64,
+    pub msint: f64,
+    pub left_sequence: String,
+    pub right_sequence: String,
+    pub region: String,
+    pub var_label: String,
+    pub var_type: String,
+    pub debug: String,
+}
+
+impl SomaticOutputVariant {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_variants(
+        begin_variant: Option<&Variant>,
+        end_variant: Option<&Variant>,
+        tumor_variant: Option<&Variant>,
+        normal_variant: Option<&Variant>,
+        region: &Region,
+        sv1: &str,
+        sv2: &str,
+        var_label: &str,
+        sample: &str,
+    ) -> Self {
+        let mut output = SomaticOutputVariant {
+            sample: sample.to_string(),
+            gene: region.gene.clone(),
+            chr: normalize_chr_for_output(&region.chr),
+            start_position: 0,
+            end_position: 0,
+            ref_allele: String::new(),
+            var_allele: String::new(),
+
+            var1_total_coverage: 0,
+            var1_variant_coverage: 0,
+            var1_ref_forward_coverage: 0,
+            var1_ref_reverse_coverage: 0,
+            var1_variant_forward_count: 0,
+            var1_variant_reverse_count: 0,
+            var1_genotype: "0".to_string(),
+            var1_frequency: 0.0,
+            var1_strand_bias_flag: "0".to_string(),
+            var1_mean_position: 0.0,
+            var1_is_at_least_at_2_positions: 0,
+            var1_mean_quality: 0.0,
+            var1_has_at_least_2_diff_qualities: 0,
+            var1_mean_mapping_quality: 0.0,
+            var1_high_quality_to_low_quality_ratio: 0.0,
+            var1_high_quality_reads_frequency: 0.0,
+            var1_extra_frequency: 0.0,
+            var1_nm: 0.0,
+            var1_duprate: 0.0,
+            var1_sv: if sv1.is_empty() {
+                "0".to_string()
+            } else {
+                sv1.to_string()
+            },
+
+            var2_total_coverage: 0,
+            var2_variant_coverage: 0,
+            var2_ref_forward_coverage: 0,
+            var2_ref_reverse_coverage: 0,
+            var2_variant_forward_count: 0,
+            var2_variant_reverse_count: 0,
+            var2_genotype: "0".to_string(),
+            var2_frequency: 0.0,
+            var2_strand_bias_flag: "0".to_string(),
+            var2_mean_position: 0.0,
+            var2_is_at_least_at_2_positions: 0,
+            var2_mean_quality: 0.0,
+            var2_has_at_least_2_diff_qualities: 0,
+            var2_mean_mapping_quality: 0.0,
+            var2_high_quality_to_low_quality_ratio: 0.0,
+            var2_high_quality_reads_frequency: 0.0,
+            var2_extra_frequency: 0.0,
+            var2_nm: 0.0,
+            var2_duprate: 0.0,
+            var2_sv: if sv2.is_empty() {
+                "0".to_string()
+            } else {
+                sv2.to_string()
+            },
+
+            shift3: 0,
+            msi: 0.0,
+            msint: 0.0,
+            left_sequence: String::new(),
+            right_sequence: String::new(),
+            region: format!("{}:{}-{}", region.chr, region.start, region.end),
+            var_label: var_label.to_string(),
+            var_type: String::new(),
+            debug: String::new(),
+        };
+
+        if let Some(begin_variant) = begin_variant {
+            output.start_position = begin_variant.start_position;
+            output.end_position = begin_variant.end_position;
+            output.ref_allele = begin_variant.refallele.clone();
+            output.var_allele = begin_variant.varallele.clone();
+            output.var_type = var_type_string(&begin_variant.refallele, &begin_variant.varallele);
+        }
+
+        if let Some(end_variant) = end_variant {
+            output.shift3 = end_variant.shift3;
+            output.msi = end_variant.msi;
+            output.msint = end_variant.msint;
+            output.left_sequence = if end_variant.leftseq.is_empty() {
+                "0".to_string()
+            } else {
+                end_variant.leftseq.clone()
+            };
+            output.right_sequence = if end_variant.rightseq.is_empty() {
+                "0".to_string()
+            } else {
+                end_variant.rightseq.clone()
+            };
+        }
+
+        if let Some(tumor_variant) = tumor_variant {
+            output.var1_total_coverage = tumor_variant.total_pos_coverage;
+            output.var1_variant_coverage = tumor_variant.position_coverage;
+            output.var1_ref_forward_coverage = tumor_variant.ref_forward_count;
+            output.var1_ref_reverse_coverage = tumor_variant.ref_reverse_count;
+            output.var1_variant_forward_count = tumor_variant.vars_count_on_forward;
+            output.var1_variant_reverse_count = tumor_variant.vars_count_on_reverse;
+            output.var1_genotype = format_somatic_genotype(tumor_variant);
+            output.var1_frequency = tumor_variant.frequency;
+            output.var1_strand_bias_flag = format_somatic_strand_bias(tumor_variant);
+            output.var1_mean_position = tumor_variant.mean_position;
+            output.var1_is_at_least_at_2_positions =
+                if tumor_variant.is_at_least_at_2_positions { 1 } else { 0 };
+            output.var1_mean_quality = tumor_variant.mean_quality;
+            output.var1_has_at_least_2_diff_qualities =
+                if tumor_variant.has_at_least_2_diff_qualities {
+                    1
+                } else {
+                    0
+                };
+            output.var1_mean_mapping_quality = tumor_variant.mean_mapping_quality;
+            output.var1_high_quality_to_low_quality_ratio = qratio_from_counts(
+                tumor_variant.high_qual_read_cnt,
+                tumor_variant.low_qual_read_cnt,
+            );
+            output.var1_high_quality_reads_frequency = tumor_variant.high_quality_reads_frequency;
+            output.var1_extra_frequency = tumor_variant.extra_frequency;
+            output.var1_nm = tumor_variant.nm;
+            output.var1_duprate = tumor_variant.duprate;
+        }
+
+        if let Some(normal_variant) = normal_variant {
+            output.var2_total_coverage = normal_variant.total_pos_coverage;
+            output.var2_variant_coverage = normal_variant.position_coverage;
+            output.var2_ref_forward_coverage = normal_variant.ref_forward_count;
+            output.var2_ref_reverse_coverage = normal_variant.ref_reverse_count;
+            output.var2_variant_forward_count = normal_variant.vars_count_on_forward;
+            output.var2_variant_reverse_count = normal_variant.vars_count_on_reverse;
+            output.var2_genotype = format_somatic_genotype(normal_variant);
+            output.var2_frequency = normal_variant.frequency;
+            output.var2_strand_bias_flag = format_somatic_strand_bias(normal_variant);
+            output.var2_mean_position = normal_variant.mean_position;
+            output.var2_is_at_least_at_2_positions =
+                if normal_variant.is_at_least_at_2_positions { 1 } else { 0 };
+            output.var2_mean_quality = normal_variant.mean_quality;
+            output.var2_has_at_least_2_diff_qualities =
+                if normal_variant.has_at_least_2_diff_qualities {
+                    1
+                } else {
+                    0
+                };
+            output.var2_mean_mapping_quality = normal_variant.mean_mapping_quality;
+            output.var2_high_quality_to_low_quality_ratio = qratio_from_counts(
+                normal_variant.high_qual_read_cnt,
+                normal_variant.low_qual_read_cnt,
+            );
+            output.var2_high_quality_reads_frequency = normal_variant.high_quality_reads_frequency;
+            output.var2_extra_frequency = normal_variant.extra_frequency;
+            output.var2_nm = normal_variant.nm;
+            output.var2_duprate = normal_variant.duprate;
+        }
+
+        output
+    }
+
+    pub fn to_string_55_columns(&self) -> String {
+        let parts: Vec<String> = vec![
+            self.sample.clone(),
+            self.gene.clone(),
+            self.chr.clone(),
+            self.start_position.to_string(),
+            self.end_position.to_string(),
+            self.ref_allele.clone(),
+            self.var_allele.clone(),
+            self.var1_total_coverage.to_string(),
+            self.var1_variant_coverage.to_string(),
+            self.var1_ref_forward_coverage.to_string(),
+            self.var1_ref_reverse_coverage.to_string(),
+            self.var1_variant_forward_count.to_string(),
+            self.var1_variant_reverse_count.to_string(),
+            self.var1_genotype.clone(),
+            format_f64(self.var1_frequency, 4),
+            self.var1_strand_bias_flag.clone(),
+            format_f64(self.var1_mean_position, 1),
+            self.var1_is_at_least_at_2_positions.to_string(),
+            format_f64(self.var1_mean_quality, 1),
+            self.var1_has_at_least_2_diff_qualities.to_string(),
+            format_f64(self.var1_mean_mapping_quality, 1),
+            format_f64(self.var1_high_quality_to_low_quality_ratio, 3),
+            format_f64(self.var1_high_quality_reads_frequency, 4),
+            format_f64(self.var1_extra_frequency, 4),
+            format_f64(if self.var1_nm > 0.0 { self.var1_nm } else { 0.0 }, 1),
+            self.var2_total_coverage.to_string(),
+            self.var2_variant_coverage.to_string(),
+            self.var2_ref_forward_coverage.to_string(),
+            self.var2_ref_reverse_coverage.to_string(),
+            self.var2_variant_forward_count.to_string(),
+            self.var2_variant_reverse_count.to_string(),
+            self.var2_genotype.clone(),
+            format_f64(self.var2_frequency, 4),
+            self.var2_strand_bias_flag.clone(),
+            format_f64(self.var2_mean_position, 1),
+            self.var2_is_at_least_at_2_positions.to_string(),
+            format_f64(self.var2_mean_quality, 1),
+            self.var2_has_at_least_2_diff_qualities.to_string(),
+            format_f64(self.var2_mean_mapping_quality, 1),
+            format_f64(self.var2_high_quality_to_low_quality_ratio, 3),
+            format_f64(self.var2_high_quality_reads_frequency, 4),
+            format_f64(self.var2_extra_frequency, 4),
+            format_f64(if self.var2_nm > 0.0 { self.var2_nm } else { 0.0 }, 1),
+            self.shift3.to_string(),
+            format_f64(self.msi, 3),
+            format_f64(self.msint, 0),
+            self.left_sequence.clone(),
+            self.right_sequence.clone(),
+            self.region.clone(),
+            self.var_label.clone(),
+            self.var_type.clone(),
+            format_f64(self.var1_duprate, 1),
+            self.var1_sv.clone(),
+            format_f64(self.var2_duprate, 1),
+            self.var2_sv.clone(),
+        ];
+
+        parts.join("\t")
+    }
+
+    pub fn to_string_61_columns(&self) -> String {
+        let var1_nm = if self.var1_nm > 0.0 { self.var1_nm } else { 0.0 };
+        let var2_nm = if self.var2_nm > 0.0 { self.var2_nm } else { 0.0 };
+        let msi_f = if self.msi == 0.0 {
+            "0".to_string()
+        } else {
+            format!("{:.3}", self.msi)
+        };
+
+        let fisher1 = FisherExact::new(
+            self.var1_ref_forward_coverage,
+            self.var1_ref_reverse_coverage,
+            self.var1_variant_forward_count,
+            self.var1_variant_reverse_count,
+        );
+        let pvalue1 = fisher1.p_value();
+        let oddratio1 = fisher1.odd_ratio();
+
+        let fisher2 = FisherExact::new(
+            self.var2_ref_forward_coverage,
+            self.var2_ref_reverse_coverage,
+            self.var2_variant_forward_count,
+            self.var2_variant_reverse_count,
+        );
+        let pvalue2 = fisher2.p_value();
+        let oddratio2 = fisher2.odd_ratio();
+
+        let tref = self
+            .var1_total_coverage
+            .saturating_sub(self.var1_variant_coverage);
+        let rref = self
+            .var2_total_coverage
+            .saturating_sub(self.var2_variant_coverage);
+
+        let fisher = FisherExact::new(
+            self.var1_variant_coverage,
+            tref,
+            self.var2_variant_coverage,
+            rref,
+        );
+        let pvalue = fisher.p_value_less().min(fisher.p_value_greater());
+        let oddratio = fisher.odd_ratio();
+
+        let parts: Vec<String> = vec![
+            self.sample.clone(),
+            self.gene.clone(),
+            self.chr.clone(),
+            self.start_position.to_string(),
+            self.end_position.to_string(),
+            self.ref_allele.clone(),
+            self.var_allele.clone(),
+            self.var1_total_coverage.to_string(),
+            self.var1_variant_coverage.to_string(),
+            self.var1_ref_forward_coverage.to_string(),
+            self.var1_ref_reverse_coverage.to_string(),
+            self.var1_variant_forward_count.to_string(),
+            self.var1_variant_reverse_count.to_string(),
+            self.var1_genotype.clone(),
+            format_rounded_value_to_print("0.0000", self.var1_frequency),
+            self.var1_strand_bias_flag.clone(),
+            format_rounded_value_to_print("0.0", self.var1_mean_position),
+            self.var1_is_at_least_at_2_positions.to_string(),
+            format_rounded_value_to_print("0.0", self.var1_mean_quality),
+            self.var1_has_at_least_2_diff_qualities.to_string(),
+            format_rounded_value_to_print("0.0", self.var1_mean_mapping_quality),
+            format_rounded_value_to_print("0.000", self.var1_high_quality_to_low_quality_ratio),
+            format_rounded_value_to_print("0.0000", self.var1_high_quality_reads_frequency),
+            format_rounded_value_to_print("0.0000", self.var1_extra_frequency),
+            format_rounded_value_to_print("0.0", var1_nm),
+            format_rounded_value_to_print("0.00000", pvalue1),
+            oddratio1,
+            self.var2_total_coverage.to_string(),
+            self.var2_variant_coverage.to_string(),
+            self.var2_ref_forward_coverage.to_string(),
+            self.var2_ref_reverse_coverage.to_string(),
+            self.var2_variant_forward_count.to_string(),
+            self.var2_variant_reverse_count.to_string(),
+            self.var2_genotype.clone(),
+            format_rounded_value_to_print("0.0000", self.var2_frequency),
+            self.var2_strand_bias_flag.clone(),
+            format_rounded_value_to_print("0.0", self.var2_mean_position),
+            self.var2_is_at_least_at_2_positions.to_string(),
+            format_rounded_value_to_print("0.0", self.var2_mean_quality),
+            self.var2_has_at_least_2_diff_qualities.to_string(),
+            format_rounded_value_to_print("0.0", self.var2_mean_mapping_quality),
+            format_rounded_value_to_print("0.000", self.var2_high_quality_to_low_quality_ratio),
+            format_rounded_value_to_print("0.0000", self.var2_high_quality_reads_frequency),
+            format_rounded_value_to_print("0.0000", self.var2_extra_frequency),
+            format_rounded_value_to_print("0.0", var2_nm),
+            format_rounded_value_to_print("0.00000", pvalue2),
+            oddratio2,
+            self.shift3.to_string(),
+            msi_f,
+            format_f64(self.msint, 0),
+            self.left_sequence.clone(),
+            self.right_sequence.clone(),
+            self.region.clone(),
+            self.var_label.clone(),
+            self.var_type.clone(),
+            format_rounded_value_to_print("0.0", self.var1_duprate),
+            self.var1_sv.clone(),
+            format_rounded_value_to_print("0.0", self.var2_duprate),
+            self.var2_sv.clone(),
+            format_rounded_value_to_print("0.00000", pvalue),
+            oddratio,
+        ];
+
+        parts.join("\t")
+    }
+}
+
+impl std::fmt::Display for SomaticOutputVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let output_variant = if instance().conf.fisher {
+            self.to_string_61_columns()
+        } else {
+            self.to_string_55_columns()
+        };
+        if instance().conf.debug {
+            write!(f, "{}\t{}", output_variant, self.debug)
+        } else {
+            write!(f, "{}", output_variant)
+        }
+    }
+}
+
+fn build_amplicon_debug(
+    variant: &Variant,
+    good_variants: &[(Variant, String)],
+    bad_variants: &[(Option<Variant>, String)],
+    debug_prefix: Option<&str>,
+) -> String {
+    let mut debug = debug_prefix
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| format_variant_debug_content(variant));
+
+    for (index, (good_variant, region)) in good_variants.iter().enumerate() {
+        debug.push('\t');
+        debug.push_str(&format!(
+            "Good{} {} {}",
+            index,
+            format_debug_amp_variant(good_variant),
+            region
+        ));
+    }
+
+    for (index, (bad_variant, region)) in bad_variants.iter().enumerate() {
+        debug.push('\t');
+        if let Some(bad_variant) = bad_variant {
+            debug.push_str(&format!(
+                "Bad{} {} {}",
+                index,
+                format_debug_amp_variant(bad_variant),
+                region
+            ));
+        } else {
+            debug.push_str(&format!("Bad{} {}", index, region));
+        }
+    }
+
+    debug
+}
+
+fn format_variant_debug_content(variant: &Variant) -> String {
+    let mut key = variant.description_string.clone();
+    if key.starts_with('+') {
+        key = format!("I{}", key);
+    }
+
+    let total_variant_reads = variant.vars_count_on_forward + variant.vars_count_on_reverse;
+    let pstd = if variant.is_at_least_at_2_positions { 1 } else { 0 };
+    let qstd = if variant.has_at_least_2_diff_qualities { 1 } else { 0 };
+
+    format!(
+        "{}:{}:F-{}:R-{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        key,
+        total_variant_reads,
+        variant.vars_count_on_forward,
+        variant.vars_count_on_reverse,
+        format_fixed_f64(variant.frequency, 4),
+        variant.strand_bias_flag.var_bias.as_int(),
+        format_fixed_f64(variant.mean_position, 1),
+        pstd,
+        format_fixed_f64(variant.mean_quality, 1),
+        qstd,
+        format_fixed_f64(variant.high_quality_reads_frequency, 4),
+        format_fixed_f64(variant.mean_mapping_quality, 1),
+        format_fixed_f64(debug_qratio(variant), 3),
+    )
+}
+
+fn format_debug_amp_variant(variant: &Variant) -> String {
+    let genotype = if variant.genotype.is_empty() {
+        "0".to_string()
+    } else {
+        variant.genotype.clone()
+    };
+    let frequency = if variant.frequency == 0.0 {
+        "0".to_string()
+    } else {
+        format_fixed_f64(variant.frequency, 4)
+    };
+    let pstd = if variant.is_at_least_at_2_positions { 1 } else { 0 };
+    let qstd = if variant.has_at_least_2_diff_qualities { 1 } else { 0 };
+    let hifreq = if variant.high_quality_reads_frequency == 0.0 {
+        "0".to_string()
+    } else {
+        format_fixed_f64(variant.high_quality_reads_frequency, 4)
+    };
+    let extrafreq = if variant.extra_frequency == 0.0 {
+        "0".to_string()
+    } else {
+        format_fixed_f64(variant.extra_frequency, 4)
+    };
+
+    format!(
+        "{} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+        variant.total_pos_coverage,
+        variant.position_coverage,
+        variant.ref_forward_count,
+        variant.ref_reverse_count,
+        variant.vars_count_on_forward,
+        variant.vars_count_on_reverse,
+        genotype,
+        frequency,
+        variant.strand_bias_flag.to_string(),
+        format_fixed_f64(variant.mean_position, 1),
+        pstd,
+        format_fixed_f64(variant.mean_quality, 1),
+        qstd,
+        format_fixed_f64(variant.mean_mapping_quality, 1),
+        format_fixed_f64(debug_qratio(variant), 3),
+        hifreq,
+        extrafreq,
+    )
+}
+
+fn debug_qratio(variant: &Variant) -> f64 {
+    qratio_from_counts(variant.high_qual_read_cnt, variant.low_qual_read_cnt)
+}
+
+fn qratio_from_counts(high_qual_read_cnt: usize, low_qual_read_cnt: usize) -> f64 {
+    if low_qual_read_cnt > 0 {
+        high_qual_read_cnt as f64 / low_qual_read_cnt as f64
+    } else if high_qual_read_cnt > 0 {
+        high_qual_read_cnt as f64 * 2.0
+    } else {
+        0.0
+    }
+}
+
+fn is_somatic_placeholder_variant(variant: &Variant) -> bool {
+    variant.position_coverage == 0
+        && variant.vars_count_on_forward == 0
+        && variant.vars_count_on_reverse == 0
+        && variant.mean_position == 0.0
+        && variant.mean_quality == 0.0
+        && variant.mean_mapping_quality == 0.0
+        && variant.high_quality_reads_frequency == 0.0
+        && variant.extra_frequency == 0.0
+        && variant.nm == 0.0
+        && !variant.is_at_least_at_2_positions
+        && !variant.has_at_least_2_diff_qualities
+}
+
+fn format_somatic_genotype(variant: &Variant) -> String {
+    if variant.genotype.is_empty()
+        || (variant.genotype == "0/0" && is_somatic_placeholder_variant(variant))
+    {
+        "0".to_string()
+    } else {
+        variant.genotype.clone()
+    }
+}
+
+fn format_somatic_strand_bias(variant: &Variant) -> String {
+    if is_somatic_placeholder_variant(variant)
+        && variant.strand_bias_flag == StrandBiasFlag::default()
+    {
+        "0".to_string()
+    } else {
+        variant.strand_bias_flag.to_string()
+    }
+}
+
+fn format_rounded_value_to_print(pattern: &str, value: f64) -> String {
+    if value == value.round() {
+        format!("{:.0}", value)
+    } else {
+        let decimals = pattern
+            .split('.')
+            .nth(1)
+            .map(|part| part.len())
+            .unwrap_or(0);
+        let rounded = round_half_even(pattern, value);
+        let mut text = format!("{rounded:.decimals$}");
+        while text.contains('.') && text.ends_with('0') {
+            text.pop();
+        }
+        if text.ends_with('.') {
+            text.pop();
+        }
+        text
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FisherExact {
+    m: i32,
+    n: i32,
+    k: i32,
+    x: i32,
+    lo: i32,
+    hi: i32,
+    support: Vec<i32>,
+    logdc: Vec<f64>,
+    p_value_less: f64,
+    p_value_greater: f64,
+    p_value_two_sided: f64,
+}
+
+impl FisherExact {
+    fn new(ref_fwd: usize, ref_rev: usize, alt_fwd: usize, alt_rev: usize) -> Self {
+        let m = (ref_fwd + ref_rev) as i32;
+        let n = (alt_fwd + alt_rev) as i32;
+        let k = (ref_fwd + alt_fwd) as i32;
+        let x = ref_fwd as i32;
+        let lo = (k - n).max(0);
+        let hi = k.min(m);
+        let support = (lo..=hi).collect::<Vec<_>>();
+
+        let mut fisher = Self {
+            m,
+            n,
+            k,
+            x,
+            lo,
+            hi,
+            support,
+            logdc: Vec::new(),
+            p_value_less: 0.0,
+            p_value_greater: 0.0,
+            p_value_two_sided: 0.0,
+        };
+
+        fisher.logdc = fisher.logdc_dhyper();
+        fisher.calculate_pvalue();
+        fisher
+    }
+
+    fn odd_ratio(&self) -> String {
+        let odd_ratio = self.mle(self.x as f64);
+        if odd_ratio.is_infinite() {
+            "Inf".to_string()
+        } else if odd_ratio == odd_ratio.round() {
+            format!("{:.0}", odd_ratio)
+        } else {
+            self.round_as_r(odd_ratio).to_string()
+        }
+    }
+
+    fn p_value(&self) -> f64 {
+        self.round_as_r(self.p_value_two_sided)
+    }
+
+    fn p_value_greater(&self) -> f64 {
+        self.round_as_r(self.p_value_greater)
+    }
+
+    fn p_value_less(&self) -> f64 {
+        self.round_as_r(self.p_value_less)
+    }
+
+    fn calculate_pvalue(&mut self) {
+        self.p_value_less = self.pnhyper(self.x, false);
+        self.p_value_greater = self.pnhyper(self.x, true);
+
+        let rel_err = 1.0 + 1e-7;
+        let d = self.dnhyper(1.0);
+        let x_index = (self.x - self.lo) as usize;
+        let threshold = d.get(x_index).copied().unwrap_or(0.0) * rel_err;
+        let mut sum = 0.0;
+        for value in d {
+            if value <= threshold {
+                sum += value;
+            }
+        }
+        self.p_value_two_sided = sum;
+    }
+
+    fn pnhyper(&self, q: i32, upper_tail: bool) -> f64 {
+        if self.m + self.n == 0 {
+            return 1.0;
+        }
+
+        let distribution = match Hypergeometric::new(
+            (self.m + self.n) as u64,
+            self.m as u64,
+            self.k as u64,
+        ) {
+            Ok(distribution) => distribution,
+            Err(_) => return 0.0,
+        };
+
+        if upper_tail {
+            if q <= 0 {
+                1.0
+            } else {
+                1.0 - distribution.cdf((q - 1) as u64)
+            }
+        } else if q < 0 {
+            0.0
+        } else {
+            distribution.cdf(q as u64)
+        }
+    }
+
+    fn logdc_dhyper(&self) -> Vec<f64> {
+        let mut values = Vec::with_capacity(self.support.len());
+
+        for element in &self.support {
+            if self.m + self.n == 0 {
+                values.push(0.0);
+                continue;
+            }
+
+            let distribution = Hypergeometric::new(
+                (self.m + self.n) as u64,
+                self.m as u64,
+                self.k as u64,
+            );
+
+            let value = match distribution {
+                Ok(distribution) => {
+                    let value = distribution.ln_pmf(*element as u64);
+                    if value.is_finite() {
+                        value
+                    } else {
+                        0.0
+                    }
+                }
+                Err(_) => 0.0,
+            };
+            values.push(round_half_even("0.0000000", value));
+        }
+
+        values
+    }
+
+    fn dnhyper(&self, ncp: f64) -> Vec<f64> {
+        let mut result = Vec::with_capacity(self.support.len());
+        for (index, support_value) in self.support.iter().enumerate() {
+            result.push(self.logdc[index] + ncp.ln() * *support_value as f64);
+        }
+
+        let max_value = result
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        let exponent = result
+            .iter()
+            .map(|value| (*value - max_value).exp())
+            .collect::<Vec<_>>();
+        let sum: f64 = exponent.iter().sum();
+        exponent.iter().map(|value| *value / sum).collect::<Vec<_>>()
+    }
+
+    fn mnhyper(&self, ncp: f64) -> f64 {
+        if ncp == 0.0 {
+            return self.lo as f64;
+        }
+        if ncp.is_infinite() {
+            return self.hi as f64;
+        }
+
+        let dnhyper = self.dnhyper(ncp);
+        self.support
+            .iter()
+            .zip(dnhyper.iter())
+            .map(|(support_value, probability)| *support_value as f64 * *probability)
+            .sum()
+    }
+
+    fn mle(&self, x: f64) -> f64 {
+        let eps = f64::EPSILON;
+        if (x - self.lo as f64).abs() < f64::EPSILON {
+            return 0.0;
+        }
+        if (x - self.hi as f64).abs() < f64::EPSILON {
+            return f64::INFINITY;
+        }
+
+        let mu = self.mnhyper(1.0);
+        if mu > x {
+            zeroin_c(0.0, 1.0, |t| self.mnhyper(t) - x, eps.powf(0.25))
+        } else if mu < x {
+            1.0 / zeroin_c(eps, 1.0, |t| self.mnhyper(1.0 / t) - x, eps.powf(0.25))
+        } else {
+            1.0
+        }
+    }
+
+    fn round_as_r(&self, value: f64) -> f64 {
+        let mut rounded = round_half_even("0", value * 1e5);
+        rounded /= 1e5;
+        if rounded == 0.0 {
+            0.0
+        } else if rounded == 1.0 {
+            1.0
+        } else {
+            rounded
+        }
+    }
+}
+
+fn zeroin_c<F>(ax: f64, bx: f64, f: F, tol: f64) -> f64
+where
+    F: Fn(f64) -> f64,
+{
+    let mut a = ax;
+    let mut b = bx;
+    let mut fa = f(a);
+    let mut fb = f(b);
+    let mut c = a;
+    let mut fc = fa;
+    let epsilon = f64::EPSILON;
+
+    loop {
+        let prev_step = b - a;
+
+        if fc.abs() < fb.abs() {
+            a = b;
+            b = c;
+            c = a;
+            fa = fb;
+            fb = fc;
+            fc = fa;
+        }
+
+        let tol_act = 2.0 * epsilon * b.abs() + tol / 2.0;
+        let mut new_step = (c - b) / 2.0;
+
+        if new_step.abs() <= tol_act || fb == 0.0 {
+            return b;
+        }
+
+        if prev_step.abs() >= tol_act && fa.abs() > fb.abs() {
+            let cb = c - b;
+            let (mut p, mut q) = if a == c {
+                let t1 = fb / fa;
+                (cb * t1, 1.0 - t1)
+            } else {
+                let q = fa / fc;
+                let t1 = fb / fc;
+                let t2 = fb / fa;
+                (
+                    t2 * (cb * q * (q - t1) - (b - a) * (t1 - 1.0)),
+                    (q - 1.0) * (t1 - 1.0) * (t2 - 1.0),
+                )
+            };
+
+            if p > 0.0 {
+                q = -q;
+            } else {
+                p = -p;
+            }
+
+            if p < (0.75 * cb * q - (tol_act * q).abs() / 2.0)
+                && p < (prev_step * q / 2.0).abs()
+            {
+                new_step = p / q;
+            }
+        }
+
+        if new_step.abs() < tol_act {
+            new_step = if new_step > 0.0 { tol_act } else { -tol_act };
+        }
+
+        a = b;
+        fa = fb;
+        b += new_step;
+        fb = f(b);
+
+        if (fb > 0.0 && fc > 0.0) || (fb < 0.0 && fc < 0.0) {
+            c = a;
+            fc = fa;
+        }
+    }
+}
+
+fn format_fixed_f64(value: f64, decimals: usize) -> String {
+    format!("{:.1$}", value, decimals)
 }
 
 // ============================================================================
@@ -613,6 +1521,24 @@ pub fn get_amplicon_column_headers() -> Vec<&'static str> {
 
 pub fn get_amplicon_header_line() -> String {
     get_amplicon_column_headers().join("\t")
+}
+
+pub fn get_somatic_column_headers() -> Vec<&'static str> {
+    vec![
+        "Sample", "Gene", "Chr", "Start", "End", "Ref", "Alt",
+        "Depth", "AltDepth", "RefFwdReads", "RefRevReads", "AltFwdReads", "AltRevReads",
+        "Genotype", "AF", "Bias", "PMean", "PStd", "QMean", "QStd", "MQ", "Sig_Noise",
+        "HiAF", "ExtraAF", "NM",
+        "Depth", "AltDepth", "RefFwdReads", "RefRevReads", "AltFwdReads", "AltRevReads",
+        "Genotype", "AF", "Bias", "PMean", "PStd", "QMean", "QStd", "MQ", "Sig_Noise",
+        "HiAF", "ExtraAF", "NM",
+        "shift3", "MSI", "MSI_NT", "5pFlankSeq", "3pFlankSeq", "Seg", "VarLabel", "VarType",
+        "Duprate1", "SV_info1", "Duprate2", "SV_info2",
+    ]
+}
+
+pub fn get_somatic_header_line() -> String {
+    get_somatic_column_headers().join("\t")
 }
 
 // ============================================================================
@@ -821,7 +1747,8 @@ mod tests {
             Some(&variant),
             &region,
             &[],
-            2,
+            &[(None, String::new()), (None, String::new())],
+            None,
             1500,
             1,
             0,
@@ -856,7 +1783,8 @@ mod tests {
             None,
             &region,
             &[],
-            0,
+            &[],
+            None,
             1500,
             2,
             3,
@@ -871,5 +1799,88 @@ mod tests {
         assert_eq!(fields[35], "2");
         assert_eq!(fields[36], "3");
         assert_eq!(fields[37], "1");
+    }
+
+    #[test]
+    fn test_get_somatic_header_line() {
+        let header = get_somatic_header_line();
+        let fields: Vec<&str> = header.split('\t').collect();
+        assert_eq!(fields.len(), 55);
+        assert_eq!(fields[49], "VarLabel");
+        assert_eq!(fields[54], "SV_info2");
+    }
+
+    #[test]
+    fn test_somatic_output_variant_to_string_55_columns() {
+        let region = Region::new("chr1", 900, 1100, "GENE1");
+
+        let begin_variant = Variant {
+            description_string: "A>T".to_string(),
+            refallele: "A".to_string(),
+            varallele: "T".to_string(),
+            vartype: VarType::SNV('T'),
+            start_position: 1000,
+            end_position: 1000,
+            vars_count_on_forward: 3,
+            vars_count_on_reverse: 2,
+            position_coverage: 5,
+            total_pos_coverage: 20,
+            frequency: 0.25,
+            high_quality_reads_frequency: 0.20,
+            extra_frequency: 0.0,
+            mean_position: 30.0,
+            mean_quality: 35.0,
+            mean_mapping_quality: 60.0,
+            strand_bias_flag: StrandBiasFlag::default(),
+            is_at_least_at_2_positions: true,
+            has_at_least_2_diff_qualities: true,
+            leftseq: "ACGT".to_string(),
+            rightseq: "TGCA".to_string(),
+            msi: 2.0,
+            msint: 1.0,
+            shift3: 1,
+            nm: 1.0,
+            high_qual_read_cnt: 5,
+            low_qual_read_cnt: 1,
+            hicov: 20,
+            ref_forward_count: 10,
+            ref_reverse_count: 5,
+            genotype: "0/1".to_string(),
+            duprate: 0.1,
+            crispr: 0,
+        };
+
+        let end_variant = begin_variant.clone();
+
+        let mut normal_variant = begin_variant.clone();
+        normal_variant.frequency = 0.10;
+        normal_variant.position_coverage = 2;
+        normal_variant.vars_count_on_forward = 1;
+        normal_variant.vars_count_on_reverse = 1;
+        normal_variant.duprate = 0.0;
+
+        let output = SomaticOutputVariant::from_variants(
+            Some(&begin_variant),
+            Some(&end_variant),
+            Some(&begin_variant),
+            Some(&normal_variant),
+            &region,
+            "sv1",
+            "",
+            "StrongSomatic",
+            "Tumor|Normal",
+        );
+
+        let line = output.to_string_55_columns();
+        let fields: Vec<&str> = line.split('\t').collect();
+        assert_eq!(fields.len(), 55);
+        assert_eq!(fields[0], "Tumor|Normal");
+        assert_eq!(fields[6], "T");
+        assert_eq!(fields[14], "0.2500");
+        assert_eq!(fields[32], "0.1000");
+        assert_eq!(fields[49], "StrongSomatic");
+        assert_eq!(fields[50], "SNV");
+        assert_eq!(fields[52], "sv1");
+        assert_eq!(fields[54], "0");
     }
 }

@@ -637,6 +637,23 @@ fn parse_amplicon_option_value(options: &str) -> Option<String> {
     None
 }
 
+fn parse_somatic_bam_pair(bam_file: &str) -> Result<(String, String), String> {
+    let parts = bam_file
+        .split('|')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+
+    if parts.len() != 2 {
+        return Err(format!(
+            "Somatic testcase BAM field must contain two BAMs separated by '|': {}",
+            bam_file
+        ));
+    }
+
+    Ok((parts[0].to_string(), parts[1].to_string()))
+}
+
 fn apply_simple_options_to_conf_and_pipeline(
     options: &str,
     conf: &mut vardict_rs::conf::Configuration,
@@ -652,6 +669,12 @@ fn apply_simple_options_to_conf_and_pipeline(
         match token {
             "-p" => {
                 pileup = true;
+            }
+            "-D" => {
+                conf.debug = true;
+            }
+            "--fisher" | "-fisher" => {
+                conf.fisher = true;
             }
             "-u" => {
                 conf.unique_mode_alignment_enabled = true;
@@ -671,6 +694,12 @@ fn apply_simple_options_to_conf_and_pipeline(
             "-r" => {
                 if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<usize>().ok()) {
                     conf.minr = value;
+                    index += 1;
+                }
+            }
+            "-V" => {
+                if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<f64>().ok()) {
+                    conf.lofreq = value;
                     index += 1;
                 }
             }
@@ -710,6 +739,12 @@ fn apply_simple_options_to_conf_and_pipeline(
                     index += 1;
                 }
             }
+            "-X" => {
+                if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<i32>().ok()) {
+                    conf.vext = value;
+                    index += 1;
+                }
+            }
             "-Y" => {
                 if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<i32>().ok()) {
                     conf.reference_extension = value;
@@ -741,9 +776,17 @@ fn apply_simple_options_to_conf_and_pipeline(
                     if let Ok(parsed) = value.parse::<usize>() {
                         conf.minr = parsed;
                     }
+                } else if let Some(value) = token.strip_prefix("-V") {
+                    if let Ok(parsed) = value.parse::<f64>() {
+                        conf.lofreq = parsed;
+                    }
                 } else if let Some(value) = token.strip_prefix("-x") {
                     if let Ok(parsed) = value.parse::<i32>() {
                         conf.number_nucleotide_to_extend = parsed;
+                    }
+                } else if let Some(value) = token.strip_prefix("-X") {
+                    if let Ok(parsed) = value.parse::<i32>() {
+                        conf.vext = parsed;
                     }
                 } else if let Some(value) = token.strip_prefix("-Y") {
                     if let Ok(parsed) = value.parse::<i32>() {
@@ -865,7 +908,6 @@ fn run_vardict_pipeline_simple_raw_case(
     conf.mismatch = 8;
     conf.disable_sv = true;
     conf.perform_local_realignment = true;
-    conf.disable_sv = true;
     let (min_frequency, pileup, min_mapping_quality) =
         apply_simple_options_to_conf_and_pipeline(&config.options, &mut conf);
 
@@ -958,6 +1000,7 @@ fn run_vardict_pipeline_simple_raw_case(
     );
 
     let mut scope = GlobalReadOnlyScope::default();
+    scope.amplicon_based_calling = conf.amplicon_based_calling.clone();
     scope.conf = conf;
 
     let bam_target_names = bam_reader.target_names();
@@ -1116,7 +1159,6 @@ fn run_vardict_pipeline_amplicon_raw_case(
     conf.goodq = 22.5;
     conf.vext = 2;
     conf.mismatch = 8;
-    conf.disable_sv = true;
     conf.perform_local_realignment = true;
     let (min_frequency, pileup, min_mapping_quality) =
         apply_simple_options_to_conf_and_pipeline(&config.options, &mut conf);
@@ -1224,6 +1266,7 @@ fn run_vardict_pipeline_amplicon_raw_case(
     );
 
     let mut scope = GlobalReadOnlyScope::default();
+    scope.amplicon_based_calling = conf.amplicon_based_calling.clone();
     scope.conf = conf;
 
     let bam_target_names = bam_reader.target_names();
@@ -1368,6 +1411,479 @@ fn run_vardict_pipeline_amplicon_raw_case(
         &amplicon_regions,
         &aligned_output.splice,
     ))
+}
+
+fn run_vardict_pipeline_somatic_raw_case(
+    testdata_dir: &Path,
+    resources_dir: &Path,
+    config: &TestCaseConfig,
+    case_name: &str,
+    sample_name: &str,
+) -> Result<Vec<String>, String> {
+    use std::sync::Arc;
+
+    use vardict_rs::conf::Configuration;
+    use vardict_rs::data::bam_reader::BamReader;
+    use vardict_rs::data::region::Region;
+    use vardict_rs::data::shared_reference::{ChromosomeData, SharedReference};
+    use vardict_rs::mods::vardict_pipeline::{SomaticCombineLookupResult, VarDictPipeline};
+
+    let fasta_csv_path = testdata_dir
+        .join("fastas")
+        .join(format!("{}.csv", config.reference));
+    if !fasta_csv_path.exists() {
+        return Err(format!("FASTA CSV not found: {}", fasta_csv_path.display()));
+    }
+    let ref_regions = parse_fasta_csv(&fasta_csv_path)?;
+
+    let mut conf = Configuration::default();
+    conf.goodq = 22.5;
+    conf.vext = 2;
+    conf.mismatch = 8;
+    conf.disable_sv = true;
+    conf.perform_local_realignment = true;
+    let (min_frequency, pileup, min_mapping_quality) =
+        apply_simple_options_to_conf_and_pipeline(&config.options, &mut conf);
+
+    let mut start = config.start as usize;
+    let mut end = config.end as usize;
+    if start < end {
+        start += 1;
+    }
+    if start == 0 {
+        start = 1;
+    }
+    if end < start {
+        std::mem::swap(&mut start, &mut end);
+    }
+    let region_start = start as i64;
+    let region_end = end as i64;
+
+    let extend = (conf.number_nucleotide_to_extend + conf.reference_extension).max(0) as i64;
+    let extended_start = if region_start > extend {
+        region_start - extend
+    } else {
+        1
+    };
+    let extended_end = region_end + extend;
+    let mut chrom_candidates = vec![config.chrom.clone()];
+    if let Some(stripped) = config.chrom.strip_prefix("chr") {
+        chrom_candidates.push(stripped.to_string());
+    } else {
+        chrom_candidates.push(format!("chr{}", config.chrom));
+    }
+
+    let mut resolved_ref_chrom = None;
+    let mut ref_seq = None;
+    for chrom in &chrom_candidates {
+        if let Some(seq) = query_reference_csv(&ref_regions, chrom, extended_start, extended_end) {
+            resolved_ref_chrom = Some(chrom.clone());
+            ref_seq = Some(seq);
+            break;
+        }
+    }
+    let resolved_ref_chrom = resolved_ref_chrom.ok_or_else(|| {
+        format!(
+            "Reference lookup failed for {:?}:{}-{}",
+            chrom_candidates, extended_start, extended_end
+        )
+    })?;
+    let ref_seq = ref_seq.expect("resolved reference sequence should exist");
+
+    let (tumor_bam_name, normal_bam_name) = parse_somatic_bam_pair(&config.bam_file)?;
+    let tumor_bam_path = resources_dir.join(&tumor_bam_name);
+    if !tumor_bam_path.exists() {
+        return Err(format!("Tumor BAM not found: {}", tumor_bam_path.display()));
+    }
+    let normal_bam_path = resources_dir.join(&normal_bam_name);
+    if !normal_bam_path.exists() {
+        return Err(format!("Normal BAM not found: {}", normal_bam_path.display()));
+    }
+
+    let min_base_quality = conf.goodq;
+
+    let mut resolved_tumor_fetch_chrom = config.chrom.clone();
+    let mut tumor_bam_reader = BamReader::open(
+        tumor_bam_path
+            .to_str()
+            .ok_or_else(|| format!("Invalid BAM path UTF-8: {}", tumor_bam_path.display()))?,
+    )
+    .map_err(|e| format!("Failed to open BAM {}: {}", tumor_bam_path.display(), e))?;
+    let mut tumor_fetch_ok = false;
+    let mut tumor_fetch_error = String::new();
+    for chrom in &chrom_candidates {
+        match tumor_bam_reader.fetch(chrom, start, end) {
+            Ok(_) => {
+                tumor_fetch_ok = true;
+                resolved_tumor_fetch_chrom = chrom.clone();
+                break;
+            }
+            Err(e) => {
+                tumor_fetch_error = format!("{}", e);
+            }
+        }
+    }
+    if !tumor_fetch_ok {
+        return Err(format!(
+            "Failed to fetch tumor BAM region {:?}:{}-{} (last error: {})",
+            chrom_candidates, start, end, tumor_fetch_error
+        ));
+    }
+
+    let mut resolved_normal_fetch_chrom = config.chrom.clone();
+    let mut normal_bam_reader = BamReader::open(
+        normal_bam_path
+            .to_str()
+            .ok_or_else(|| format!("Invalid BAM path UTF-8: {}", normal_bam_path.display()))?,
+    )
+    .map_err(|e| format!("Failed to open BAM {}: {}", normal_bam_path.display(), e))?;
+    let mut normal_fetch_ok = false;
+    let mut normal_fetch_error = String::new();
+    for chrom in &chrom_candidates {
+        match normal_bam_reader.fetch(chrom, start, end) {
+            Ok(_) => {
+                normal_fetch_ok = true;
+                resolved_normal_fetch_chrom = chrom.clone();
+                break;
+            }
+            Err(e) => {
+                normal_fetch_error = format!("{}", e);
+            }
+        }
+    }
+    if !normal_fetch_ok {
+        return Err(format!(
+            "Failed to fetch normal BAM region {:?}:{}-{} (last error: {})",
+            chrom_candidates, start, end, normal_fetch_error
+        ));
+    }
+
+    let region = Region::new(
+        resolved_ref_chrom.clone(),
+        start,
+        end,
+        "testbed".to_string(),
+    );
+
+    let mut scope = GlobalReadOnlyScope::default();
+    scope.amplicon_based_calling = conf.amplicon_based_calling.clone();
+    scope.conf = conf;
+
+    for (names, lens) in [
+        (tumor_bam_reader.target_names(), tumor_bam_reader.target_lens()),
+        (normal_bam_reader.target_names(), normal_bam_reader.target_lens()),
+    ] {
+        for (name, len) in names.iter().zip(lens.iter()) {
+            let len = *len as usize;
+            if len == 0 {
+                continue;
+            }
+            scope.chr_lens.insert(name.clone(), len);
+            if let Some(stripped) = name.strip_prefix("chr") {
+                scope.chr_lens.insert(stripped.to_string(), len);
+            } else {
+                scope.chr_lens.insert(format!("chr{}", name), len);
+            }
+        }
+    }
+
+    let resolved_chr_len = (extended_start + ref_seq.len() as i64 - 1).max(0) as usize;
+    for chrom in [
+        resolved_ref_chrom.clone(),
+        resolved_tumor_fetch_chrom.clone(),
+        resolved_normal_fetch_chrom.clone(),
+        config.chrom.clone(),
+    ] {
+        let updated_len = scope
+            .chr_lens
+            .get(&chrom)
+            .copied()
+            .unwrap_or(resolved_chr_len)
+            .max(resolved_chr_len);
+        scope.chr_lens.insert(chrom, updated_len);
+    }
+    scope.bam_paths = vec![
+        tumor_bam_path.to_string_lossy().to_string(),
+        normal_bam_path.to_string_lossy().to_string(),
+    ];
+
+    install_test_scope(scope.clone());
+    let instance = Arc::new(scope);
+
+    let csv_entries = ref_regions
+        .get(&resolved_ref_chrom)
+        .ok_or_else(|| {
+            format!(
+                "Reference CSV entries missing for chromosome {}",
+                resolved_ref_chrom
+            )
+        })?;
+    let synthetic_chr_len = instance
+        .chr_lens
+        .get(&resolved_ref_chrom)
+        .copied()
+        .unwrap_or(resolved_chr_len)
+        .max(resolved_chr_len);
+    let mut synthetic_sequence = vec![b'N'; synthetic_chr_len];
+    for (entry_start, _entry_end, seq) in csv_entries {
+        if *entry_start <= 0 {
+            continue;
+        }
+        let start_idx = (*entry_start as usize).saturating_sub(1);
+        if start_idx >= synthetic_sequence.len() {
+            continue;
+        }
+        let seq_bytes = seq.as_bytes();
+        let end_idx = (start_idx + seq_bytes.len()).min(synthetic_sequence.len());
+        let copy_len = end_idx - start_idx;
+        for (dst, src) in synthetic_sequence[start_idx..end_idx]
+            .iter_mut()
+            .zip(seq_bytes[..copy_len].iter())
+        {
+            *dst = src.to_ascii_uppercase();
+        }
+    }
+
+    let mut chromosomes = std::collections::HashMap::new();
+    let mut chrom_names = vec![resolved_ref_chrom.clone()];
+    let shared_data = ChromosomeData {
+        sequence: synthetic_sequence.clone(),
+        length: synthetic_sequence.len(),
+    };
+    chromosomes.insert(resolved_ref_chrom.clone(), shared_data);
+
+    for chrom in [
+        resolved_tumor_fetch_chrom.clone(),
+        resolved_normal_fetch_chrom.clone(),
+        config.chrom.clone(),
+    ] {
+        if chromosomes.contains_key(&chrom) {
+            continue;
+        }
+        chromosomes.insert(
+            chrom.clone(),
+            ChromosomeData {
+                sequence: synthetic_sequence.clone(),
+                length: synthetic_chr_len,
+            },
+        );
+        chrom_names.push(chrom);
+    }
+
+    let shared_reference = Arc::new(SharedReference {
+        chromosomes,
+        chromosome_names: chrom_names,
+        total_size: synthetic_chr_len,
+    });
+
+    let mut pipeline = VarDictPipeline::new(sample_name)
+        .with_min_frequency(min_frequency)
+        .with_min_base_quality(min_base_quality)
+        .with_pileup(pileup);
+    pipeline = pipeline.with_min_mapping_quality(min_mapping_quality);
+
+    let snapshot_prefix = env::var("VARDICT_TO_VARS_JSONL_PREFIX")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let original_tovars_env = env::var("VARDICT_TO_VARS_JSONL").ok();
+    let cigar_snapshot_prefix = env::var("VARDICT_CIGAR_PARSER_JSONL_PREFIX")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let original_cigar_env = env::var("VARDICT_CIGAR_PARSER_JSONL").ok();
+    let structural_snapshot_prefix = env::var("VARDICT_STRUCTURAL_VARIANTS_JSONL_PREFIX")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let original_structural_env = env::var("VARDICT_STRUCTURAL_VARIANTS_JSONL").ok();
+
+    let restore_tovars_env = |original: Option<String>| {
+        if let Some(value) = original {
+            unsafe {
+                env::set_var("VARDICT_TO_VARS_JSONL", value);
+            }
+        } else {
+            unsafe {
+                env::remove_var("VARDICT_TO_VARS_JSONL");
+            }
+        }
+    };
+
+    let restore_cigar_env = |original: Option<String>| {
+        if let Some(value) = original {
+            unsafe {
+                env::set_var("VARDICT_CIGAR_PARSER_JSONL", value);
+            }
+        } else {
+            unsafe {
+                env::remove_var("VARDICT_CIGAR_PARSER_JSONL");
+            }
+        }
+    };
+
+    let restore_structural_env = |original: Option<String>| {
+        if let Some(value) = original {
+            unsafe {
+                env::set_var("VARDICT_STRUCTURAL_VARIANTS_JSONL", value);
+            }
+        } else {
+            unsafe {
+                env::remove_var("VARDICT_STRUCTURAL_VARIANTS_JSONL");
+            }
+        }
+    };
+
+    let mut tumor_reader = BamReader::open(
+        tumor_bam_path
+            .to_str()
+            .ok_or_else(|| format!("Invalid BAM path UTF-8: {}", tumor_bam_path.display()))?,
+    )
+    .map_err(|e| format!("Failed to open tumor BAM {}: {}", tumor_bam_path.display(), e))?;
+    if let Some(prefix) = &snapshot_prefix {
+        unsafe {
+            env::set_var("VARDICT_TO_VARS_JSONL", format!("{}.tumor.jsonl", prefix));
+        }
+    }
+    if let Some(prefix) = &cigar_snapshot_prefix {
+        unsafe {
+            env::set_var("VARDICT_CIGAR_PARSER_JSONL", format!("{}.tumor.jsonl", prefix));
+        }
+    }
+    if let Some(prefix) = &structural_snapshot_prefix {
+        unsafe {
+            env::set_var(
+                "VARDICT_STRUCTURAL_VARIANTS_JSONL",
+                format!("{}.tumor.jsonl", prefix),
+            );
+        }
+    }
+    let tumor_output = pipeline
+        .process_region_to_aligned_vars_from_bam_with_paths(
+            &region,
+            &shared_reference,
+            &mut tumor_reader,
+            Arc::clone(&instance),
+            &[tumor_bam_path.to_string_lossy().to_string()],
+        )
+        .map_err(|e| {
+            format!(
+                "Tumor pipeline failed for {} (ref_chrom={}): {}",
+                case_name, resolved_ref_chrom, e
+            )
+        })?;
+
+    let mut normal_reader = BamReader::open(
+        normal_bam_path
+            .to_str()
+            .ok_or_else(|| format!("Invalid BAM path UTF-8: {}", normal_bam_path.display()))?,
+    )
+    .map_err(|e| format!("Failed to open normal BAM {}: {}", normal_bam_path.display(), e))?;
+    if let Some(prefix) = &snapshot_prefix {
+        unsafe {
+            env::set_var("VARDICT_TO_VARS_JSONL", format!("{}.normal.jsonl", prefix));
+        }
+    }
+    if let Some(prefix) = &cigar_snapshot_prefix {
+        unsafe {
+            env::set_var("VARDICT_CIGAR_PARSER_JSONL", format!("{}.normal.jsonl", prefix));
+        }
+    }
+    if let Some(prefix) = &structural_snapshot_prefix {
+        unsafe {
+            env::set_var(
+                "VARDICT_STRUCTURAL_VARIANTS_JSONL",
+                format!("{}.normal.jsonl", prefix),
+            );
+        }
+    }
+    let normal_output = pipeline
+        .process_region_to_aligned_vars_from_bam_with_paths(
+            &region,
+            &shared_reference,
+            &mut normal_reader,
+            Arc::clone(&instance),
+            &[normal_bam_path.to_string_lossy().to_string()],
+        )
+        .map_err(|e| {
+            format!(
+                "Normal pipeline failed for {} (ref_chrom={}): {}",
+                case_name, resolved_ref_chrom, e
+            )
+        })?;
+
+    if let Some(prefix) = &snapshot_prefix {
+        unsafe {
+            env::set_var("VARDICT_TO_VARS_JSONL", format!("{}.combined.jsonl", prefix));
+        }
+    }
+    if let Some(prefix) = &cigar_snapshot_prefix {
+        unsafe {
+            env::set_var("VARDICT_CIGAR_PARSER_JSONL", format!("{}.combined.jsonl", prefix));
+        }
+    }
+    let combined_output = pipeline
+        .process_region_to_aligned_vars_from_bam_paths(
+            &region,
+            &shared_reference,
+            &[
+                tumor_bam_path.to_string_lossy().to_string(),
+                normal_bam_path.to_string_lossy().to_string(),
+            ],
+            Arc::clone(&instance),
+        )
+        .map_err(|e| {
+            format!(
+                "Combined pipeline failed for {} (ref_chrom={}): {}",
+                case_name, resolved_ref_chrom, e
+            )
+        })?;
+
+    let mut splice = std::collections::HashSet::new();
+    splice.extend(tumor_output.splice.iter().cloned());
+    splice.extend(normal_output.splice.iter().cloned());
+
+    let combined_aligned_variants = combined_output.aligned_vars.aligned_variants;
+    let combined_max_read_length = combined_output.max_read_length;
+    let initial_max_read_length = tumor_output
+        .max_read_length
+        .max(normal_output.max_read_length);
+
+    let combine_lookup = move |
+        _chr_name: &str,
+        position: i64,
+        description_string: &str,
+        max_read_length: usize,
+    | {
+        let combined_variant = combined_aligned_variants
+            .get(&position)
+            .and_then(|vars| {
+                vars.variants
+                    .iter()
+                    .find(|variant| variant.description_string == description_string)
+                    .cloned()
+            });
+
+        SomaticCombineLookupResult {
+            combined_variant,
+            max_read_length: combined_max_read_length.max(max_read_length),
+        }
+    };
+
+    let output_lines = pipeline.run_somatic_post_processor_with_combine_lookup(
+        normal_output.aligned_vars,
+        tumor_output.aligned_vars,
+        &region,
+        &splice,
+        initial_max_read_length,
+        Some(&combine_lookup),
+    );
+
+    restore_tovars_env(original_tovars_env);
+    restore_cigar_env(original_cigar_env);
+    restore_structural_env(original_structural_env);
+
+    Ok(output_lines)
 }
 
 /// Run a REAL integration test with actual BAM files and expected output
@@ -1966,6 +2482,14 @@ fn test_manifest_amplicon_raw_rust_vs_java_first_mismatch() {
         .into_iter()
         .filter(|row| row.mode == "Amplicon")
         .collect::<Vec<_>>();
+
+    if let Ok(case_filter) = env::var("VARDICT_AMP_CASE_FILTER") {
+        let needle = case_filter.trim();
+        if !needle.is_empty() {
+            selected.retain(|row| row.case_file.contains(needle));
+        }
+    }
+
     selected.sort_by(|left, right| left.case_file.cmp(&right.case_file));
 
     assert!(
@@ -2118,6 +2642,229 @@ fn test_manifest_amplicon_raw_rust_vs_java_first_mismatch() {
         assert_eq!(
             accounting.mismatched, 0,
             "Strict RUN_NOW mode requires zero amplicon raw mismatches"
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn test_manifest_somatic_raw_rust_vs_java_first_mismatch() {
+    if env::var("VARDICT_DEBUG_POS").is_ok() {
+        let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
+    }
+
+    let testdata_dir = get_testdata_dir();
+    let test_cases_dir = testdata_dir.join("integrationtestcases");
+    let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("parity_case_manifest.csv");
+    let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("VarDictJava")
+        .join("src/test/resources/com/astrazeneca/vardict/integrationtests");
+
+    if !test_cases_dir.exists() || !resources_dir.exists() || !manifest_path.exists() {
+        eprintln!("Somatic raw parity resources not found");
+        return;
+    }
+
+    let mut selected = load_parity_manifest(&manifest_path)
+        .expect("Failed to load parity case manifest")
+        .into_iter()
+        .filter(|row| row.mode == "Somatic")
+        .collect::<Vec<_>>();
+
+    if let Ok(case_filter) = env::var("VARDICT_SOMATIC_CASE_FILTER") {
+        let needle = case_filter.trim();
+        if !needle.is_empty() {
+            selected.retain(|row| row.case_file.contains(needle));
+        }
+    }
+
+    selected.sort_by(|left, right| left.case_file.cmp(&right.case_file));
+
+    assert!(
+        !selected.is_empty(),
+        "No somatic rows found in parity manifest"
+    );
+
+    let mut accounting = Tier1ComparisonAccounting {
+        selected: selected.len(),
+        ..Tier1ComparisonAccounting::default()
+    };
+
+    for row in &selected {
+        let test_case_path = test_cases_dir.join(&row.case_file);
+        if !test_case_path.exists() {
+            eprintln!("SKIP {}: missing testcase file", row.case_file);
+            accounting.skipped += 1;
+            continue;
+        }
+
+        let (config, expected_variants) = match parse_test_case(&test_case_path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("FAIL {}: parse error: {}", row.case_file, e);
+                accounting.failed += 1;
+                continue;
+            }
+        };
+
+        if config.mode != "Somatic" {
+            eprintln!(
+                "FAIL {}: mode mismatch manifest={} testcase={}",
+                row.case_file, row.mode, config.mode
+            );
+            accounting.failed += 1;
+            continue;
+        }
+
+        if expected_variants.is_empty() {
+            eprintln!("SKIP {}: no expected variant lines", row.case_file);
+            accounting.skipped += 1;
+            continue;
+        }
+
+        if row.reference != config.reference
+            || row.bam != config.bam_file
+            || row.chrom != config.chrom
+            || row.options != config.options
+        {
+            eprintln!(
+                "FAIL {}: manifest/testcase mismatch (reference/bam/chrom/options)",
+                row.case_file
+            );
+            accounting.failed += 1;
+            continue;
+        }
+
+        let expected_sample_name = expected_variants
+            .first()
+            .map(|variant| variant.sample.clone())
+            .unwrap_or_else(|| {
+                config
+                    .bam_file
+                    .split('|')
+                    .next()
+                    .unwrap_or(&config.bam_file)
+                    .strip_suffix(".bam")
+                    .unwrap_or(&config.bam_file)
+                    .to_string()
+            });
+
+        let rust_output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_vardict_pipeline_somatic_raw_case(
+                &testdata_dir,
+                &resources_dir,
+                &config,
+                &row.case_file,
+                &expected_sample_name,
+            )
+        })) {
+            Ok(Ok(lines)) => lines,
+            Ok(Err(e)) => {
+                eprintln!("SKIP {}: runner unavailable: {}", row.case_file, e);
+                accounting.skipped += 1;
+                continue;
+            }
+            Err(_) => {
+                eprintln!(
+                    "SKIP {}: runner panicked during pipeline execution",
+                    row.case_file
+                );
+                accounting.skipped += 1;
+                continue;
+            }
+        };
+
+        let expected_lines = expected_variants
+            .iter()
+            .map(|variant| variant.raw_line.clone())
+            .collect::<Vec<_>>();
+
+        let dump_lines = env::var("SOMATIC_DUMP_LINES")
+            .ok()
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if dump_lines {
+            let dump_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tmp");
+            let case_slug = row
+                .case_file
+                .chars()
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                        ch
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>();
+            let expected_dump = dump_root.join(format!("{}_somatic_java.txt", case_slug));
+            let rust_dump = dump_root.join(format!("{}_somatic_rust.txt", case_slug));
+            let _ = fs::create_dir_all(&dump_root);
+            let _ = fs::write(&expected_dump, expected_lines.join("\n"));
+            let _ = fs::write(&rust_dump, rust_output.join("\n"));
+            println!(
+                "DUMP {}: java={} rust={}",
+                row.case_file,
+                expected_dump.display(),
+                rust_dump.display()
+            );
+        }
+
+        match first_raw_mismatch(&expected_lines, &rust_output) {
+            None => {
+                accounting.passed += 1;
+                println!(
+                    "PASS {}: somatic raw lines match exactly ({} lines)",
+                    row.case_file,
+                    rust_output.len()
+                );
+            }
+            Some(diag) => {
+                accounting.failed += 1;
+                accounting.mismatched += 1;
+                eprintln!(
+                    "FAIL {}: {} at line {}",
+                    row.case_file,
+                    diag.reason,
+                    diag.line_index + 1
+                );
+                eprintln!("  JAVA: {}", diag.java_line.unwrap_or_else(|| "<none>".to_string()));
+                eprintln!("  RUST: {}", diag.rust_line.unwrap_or_else(|| "<none>".to_string()));
+            }
+        }
+    }
+
+    println!("\n=== Somatic Raw Parity Summary ===");
+    println!("Selected:   {}", accounting.selected);
+    println!("Passed:     {}", accounting.passed);
+    println!("Failed:     {}", accounting.failed);
+    println!("Mismatched: {}", accounting.mismatched);
+    println!("Skipped:    {}", accounting.skipped);
+    println!("==================================\n");
+
+    assert_eq!(
+        accounting.selected,
+        accounting.passed + accounting.failed + accounting.skipped,
+        "Accounting mismatch in somatic raw parity test"
+    );
+    assert!(
+        accounting.passed + accounting.failed > 0,
+        "No executable somatic raw parity cases ran"
+    );
+
+    if env_flag("VARDICT_RUN_NOW_STRICT") {
+        assert_eq!(
+            accounting.skipped, 0,
+            "Strict RUN_NOW mode requires zero skipped somatic raw parity cases"
+        );
+        assert_eq!(
+            accounting.failed, 0,
+            "Strict RUN_NOW mode requires zero somatic raw parity failures"
+        );
+        assert_eq!(
+            accounting.mismatched, 0,
+            "Strict RUN_NOW mode requires zero somatic raw mismatches"
         );
     }
 }

@@ -25,11 +25,14 @@ use crate::data::region::Region;
 use crate::data::shared_reference::SharedReferenceHandle;
 use crate::data::bam_reader::BamReader;
 use crate::mods::cigar_parser::CigarParser;
-use crate::mods::output_variant::{AmpliconOutputVariant, SimpleOutputVariant, Region as OutputRegion};
+use crate::mods::output_variant::{AmpliconOutputVariant, SimpleOutputVariant, SomaticOutputVariant, Region as OutputRegion};
 use crate::mods::structural_variants_processor::{StructuralVariantsProcessor, RealignedVariationData};
 use crate::mods::variant_realigner::VariantRealigner;
 use crate::scopedata::global_read_only_scope::instance;
-use crate::mods::to_vars_builder::{ToVarsBuilder, Variant, VariationData, Vars, VarType, determine_genotype, var_type_string};
+use crate::mods::to_vars_builder::{
+    ToVarsBuilder, Variant, VariationData, Vars, VarType, determine_genotype, var_type_string,
+    check_strand_bias, StrandBiasFlag,
+};
 use crate::mods::simple_variant_caller::SimpleVarKey;
 use crate::scopedata::global_read_only_scope::GlobalReadOnlyScope;
 use crate::utils::round_half_even;
@@ -613,7 +616,17 @@ pub struct AlignedVarsData {
 pub struct RegionAlignedVarsOutput {
     pub aligned_vars: AlignedVarsData,
     pub splice: HashSet<String>,
+    pub max_read_length: usize,
 }
+
+#[derive(Debug, Clone, Default)]
+pub struct SomaticCombineLookupResult {
+    pub combined_variant: Option<Variant>,
+    pub max_read_length: usize,
+}
+
+type SomaticCombineLookup =
+    dyn Fn(&str, i64, &str, usize) -> SomaticCombineLookupResult;
 
 fn java_hashmap_capacity(size: usize) -> usize {
     let mut capacity = 16usize;
@@ -767,6 +780,24 @@ impl VarDictPipeline {
         bam_reader: &mut BamReader,
         instance: Arc<GlobalReadOnlyScope>,
     ) -> Result<RegionAlignedVarsOutput> {
+        let bam_paths = instance.bam_paths.clone();
+        self.process_region_to_aligned_vars_from_bam_with_paths(
+            region,
+            shared_reference,
+            bam_reader,
+            instance,
+            &bam_paths,
+        )
+    }
+
+    pub fn process_region_to_aligned_vars_from_bam_with_paths(
+        &self,
+        region: &Region,
+        shared_reference: &SharedReferenceHandle,
+        bam_reader: &mut BamReader,
+        instance: Arc<GlobalReadOnlyScope>,
+        bam_paths: &[String],
+    ) -> Result<RegionAlignedVarsOutput> {
         let extend = (instance.conf.number_nucleotide_to_extend + instance.conf.reference_extension)
             .max(0) as usize;
         let extended_start = if region.start() > extend {
@@ -812,7 +843,58 @@ impl VarDictPipeline {
             cigar_output,
             region,
             &reference,
-            &instance.bam_paths,
+            bam_paths,
+        )
+    }
+
+    pub fn process_region_to_aligned_vars_from_bam_paths(
+        &self,
+        region: &Region,
+        shared_reference: &SharedReferenceHandle,
+        bam_paths: &[String],
+        instance: Arc<GlobalReadOnlyScope>,
+    ) -> Result<RegionAlignedVarsOutput> {
+        let extend = (instance.conf.number_nucleotide_to_extend + instance.conf.reference_extension)
+            .max(0) as usize;
+        let extended_start = if region.start() > extend {
+            region.start() - extend
+        } else {
+            1
+        };
+        let mut extended_end = region.end() + extend;
+        if let Some(&chr_len) = instance.chr_lens.get(region.chr()) {
+            if extended_end > chr_len {
+                extended_end = chr_len;
+            }
+        }
+
+        let ref_seq = match shared_reference.get_subseq(region.chr(), extended_start, extended_end) {
+            Some(seq) => seq.to_vec(),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Failed to get reference for {}:{}-{}",
+                    region.chr(), extended_start, extended_end
+                ));
+            }
+        };
+        let mut reference = Reference::new_with_start(ref_seq, extended_start as i64);
+        let chr_len = instance.chr_lens.get(region.chr()).copied();
+        reference.build_seed_map(extended_end as i64, chr_len);
+
+        let sam_filter = instance.conf.sam_filter;
+        let cigar_output = self.run_cigar_parser_from_bam_paths(
+            region,
+            &reference,
+            Arc::clone(&instance),
+            bam_paths,
+            sam_filter,
+        )?;
+
+        self.process_region_to_aligned_vars_from_cigar_output(
+            cigar_output,
+            region,
+            &reference,
+            bam_paths,
         )
     }
 
@@ -1048,6 +1130,7 @@ impl VarDictPipeline {
 
         let start_tovars = std::time::Instant::now();
         let splice = realigned_output.splice.clone();
+        let max_read_length = realigned_output.max_read_len;
         let aligned_vars = self.run_to_vars_builder(realigned_output, reference, region)?;
         let elapsed_tovars = start_tovars.elapsed();
 
@@ -1058,6 +1141,7 @@ impl VarDictPipeline {
         Ok(RegionAlignedVarsOutput {
             aligned_vars,
             splice,
+            max_read_length,
         })
     }
 
@@ -1172,7 +1256,8 @@ impl VarDictPipeline {
                                 None,
                                 &output_region,
                                 &[],
-                                0,
+                                &[],
+                                None,
                                 position,
                                 0,
                                 nocov,
@@ -1240,7 +1325,7 @@ impl VarDictPipeline {
 
                 let initial_gvscnt = self.count_variant_on_amplicons(&vref, &good_variants_on_amp);
                 let mut current_gvscnt = initial_gvscnt;
-                let mut bad_variants_count = 0usize;
+                let mut bad_variants: Vec<(Option<Variant>, String)> = Vec::new();
 
                 if initial_gvscnt != amplicon_regions_at_pos.len() || flag {
                     for (amplicon_number, amp_region) in amplicon_regions_at_pos.iter().copied() {
@@ -1258,7 +1343,23 @@ impl VarDictPipeline {
                         if vref.start_position >= amp_region.insert_start() as i64
                             && vref.end_position <= amp_region.insert_end() as i64
                         {
-                            bad_variants_count += 1;
+                            let region_string = format!(
+                                "{}:{}-{}",
+                                amp_region.chr(),
+                                amp_region.start(),
+                                amp_region.end()
+                            );
+                            let bad_variant = vars_per_amplicon
+                                .get(amplicon_number)
+                                .and_then(|vars| vars.get(&position))
+                                .and_then(|vars_at_amplicon| {
+                                    vars_at_amplicon
+                                        .variants
+                                        .first()
+                                        .cloned()
+                                        .or_else(|| vars_at_amplicon.reference_variant.clone())
+                                });
+                            bad_variants.push((bad_variant, region_string));
                         } else if (vref.start_position < amp_region.insert_end() as i64
                             && (amp_region.insert_end() as i64) < vref.end_position)
                             || (vref.start_position < amp_region.insert_start() as i64
@@ -1279,12 +1380,44 @@ impl VarDictPipeline {
                     vref.adj_complex();
                 }
 
+                let debug_prefix = if instance().conf.debug {
+                    amplicon_regions_at_pos.iter().copied().find_map(|(amplicon_number, _)| {
+                        let vars_at_amplicon = vars_per_amplicon
+                            .get(amplicon_number)
+                            .and_then(|vars| vars.get(&position))?;
+
+                        let matches_current = vars_at_amplicon
+                            .variants
+                            .iter()
+                            .any(|variant| {
+                                variant.refallele == vref.refallele
+                                    && variant.varallele == vref.varallele
+                            })
+                            || vars_at_amplicon
+                                .reference_variant
+                                .as_ref()
+                                .map_or(false, |variant| {
+                                    variant.refallele == vref.refallele
+                                        && variant.varallele == vref.varallele
+                                });
+
+                        if matches_current {
+                            Some(build_amplicon_debug_prefix(vars_at_amplicon))
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                };
+
                 output_lines.push(
                     AmpliconOutputVariant::from_variant(
                         Some(&vref),
                         &output_region,
                         &good_variants,
-                        bad_variants_count,
+                        &bad_variants,
+                        debug_prefix.as_deref(),
                         position,
                         current_gvscnt,
                         nocov,
@@ -1487,6 +1620,65 @@ impl VarDictPipeline {
         ))
     }
 
+    fn run_cigar_parser_from_bam_paths(
+        &self,
+        region: &Region,
+        reference: &Reference,
+        instance: Arc<GlobalReadOnlyScope>,
+        bam_paths: &[String],
+        sam_filter: u32,
+    ) -> Result<CigarParserOutput> {
+        let mut cigar_parser = CigarParser::new(
+            region.clone(),
+            reference.clone(),
+            instance,
+        );
+
+        let mut preprocess_state = RecordPreprocessorState::new();
+        for bam_path in bam_paths {
+            let mut bam_reader = BamReader::open(bam_path).map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to open BAM for combined processing {}: {}",
+                    bam_path,
+                    error
+                )
+            })?;
+
+            bam_reader.fetch(region.chr(), region.start(), region.end())?;
+
+            let mut record = Record::new();
+            while bam_reader.read(&mut record).unwrap_or(false) {
+                let mate_ref_name = Self::mate_reference_name(&record, &bam_reader);
+                if !self.passes_preprocess(
+                    &record,
+                    sam_filter,
+                    &mut preprocess_state,
+                    &mate_ref_name,
+                ) {
+                    continue;
+                }
+                cigar_parser.process_record(&mut record)?;
+            }
+        }
+
+        Ok(self.build_cigar_output(
+            &mut cigar_parser,
+            preprocess_state.total_reads,
+            preprocess_state.duplicate_reads,
+        ))
+    }
+
+    pub(crate) fn run_partial_cigar_for_bams(
+        &self,
+        region: &Region,
+        reference: &Reference,
+        bam_paths: &[String],
+    ) -> Result<CigarParserOutput> {
+        let scope = Arc::new(instance().clone());
+        let sam_filter = instance().conf.sam_filter;
+        self.run_cigar_parser_from_bam_paths(region, reference, scope, bam_paths, sam_filter)
+    }
+
 
     fn build_cigar_output(
         &self,
@@ -1550,6 +1742,7 @@ impl VarDictPipeline {
             ref_coverage,
             mnp,
             position_to_insertion_count,
+            position_to_deletions_count,
             max_read_len,
             duprate,
             splice,
@@ -1579,7 +1772,7 @@ impl VarDictPipeline {
         realigner.adjust_mnp(&mut sv_input, &mnp);
 
         if instance().conf.perform_local_realignment {
-            realigner.process_deletions(&mut sv_input);
+            realigner.process_deletions(&mut sv_input, &position_to_deletions_count);
             realigner.process_insertions(&mut sv_input, &position_to_insertion_count);
             realigner.realign_long_insertions_30(&mut sv_input);
             realigner.realign_long_insertions(&mut sv_input);
@@ -1734,6 +1927,16 @@ impl VarDictPipeline {
                 _ => continue,
             };
 
+            if trace_this_pos {
+                event!(
+                    Level::DEBUG,
+                    position,
+                    ref_cov_at_pos = total_pos_coverage,
+                    ref_cov_next = ref_coverage.get(&(position + 1)).copied().unwrap_or(0),
+                    "to_vars_builder: reference coverage snapshot"
+                );
+            }
+
             let hicov = self.calc_hicov(insertion_vars.get(&position), &vars_at_pos);
 
             let mut var_list: Vec<Variant> = Vec::new();
@@ -1767,11 +1970,27 @@ impl VarDictPipeline {
             );
 
             if trace_this_pos {
+                let pre_sort_summary = var_list
+                    .iter()
+                    .map(|variant| {
+                        format!(
+                            "{}|pcov={}|tot={}|fwd={}|rev={}|freq={:.4}",
+                            variant.description_string,
+                            variant.position_coverage,
+                            variant.total_pos_coverage,
+                            variant.vars_count_on_forward,
+                            variant.vars_count_on_reverse,
+                            variant.frequency
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
                 event!(
                     Level::DEBUG,
                     position,
                     variant_count = var_list.len(),
                     total_pos_coverage,
+                    pre_sort_summary = %pre_sort_summary,
                     "to_vars_builder: variants created before sorting"
                 );
             }
@@ -1796,17 +2015,19 @@ impl VarDictPipeline {
                 && maxfreq <= instance().conf.freq
                 && instance().amplicon_based_calling.is_none()
             {
-                if trace_this_pos {
-                    event!(
-                        Level::DEBUG,
-                        position,
-                        maxfreq,
-                        min_freq = instance().conf.freq,
-                        "to_vars_builder: removing position due to maxfreq threshold"
-                    );
+                if instance().bam_paths.len() < 2 {
+                    if trace_this_pos {
+                        event!(
+                            Level::DEBUG,
+                            position,
+                            maxfreq,
+                            min_freq = instance().conf.freq,
+                            "to_vars_builder: removing position due to maxfreq threshold"
+                        );
+                    }
+                    aligned_variants.remove(&position);
+                    continue;
                 }
-                aligned_variants.remove(&position);
-                continue;
             }
 
             if let Some(variations_at_pos) = aligned_variants.get_mut(&position) {
@@ -1822,11 +2043,36 @@ impl VarDictPipeline {
                     duprate,
                 );
                 if trace_this_pos {
+                    let post_ref_summary = variations_at_pos
+                        .variants
+                        .iter()
+                        .map(|variant| {
+                            format!(
+                                "{}|{}>{}|pcov={}|tot={}|fwd={}|rev={}|freq={:.4}",
+                                variant.description_string,
+                                variant.refallele,
+                                variant.varallele,
+                                variant.position_coverage,
+                                variant.total_pos_coverage,
+                                variant.vars_count_on_forward,
+                                variant.vars_count_on_reverse,
+                                variant.frequency
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let reference_variant_cov = variations_at_pos
+                        .reference_variant
+                        .as_ref()
+                        .map(|variant| variant.total_pos_coverage)
+                        .unwrap_or(0);
                     event!(
                         Level::DEBUG,
                         position,
                         variant_count_after_ref = variations_at_pos.variants.len(),
                         has_reference_variant = variations_at_pos.reference_variant.is_some(),
+                        reference_variant_cov,
+                        post_ref_summary = %post_ref_summary,
                         "to_vars_builder: position retained after reference collection"
                     );
                 }
@@ -1864,6 +2110,7 @@ impl VarDictPipeline {
             if let Some(ref_base) = reference.get(position).map(|b| (b as char).to_string()) {
                 if keys.contains(&ref_base)
                     && !self.do_pileup
+                    && instance().bam_paths.len() < 2
                     && instance().amplicon_based_calling.is_none()
                 {
                     return true;
@@ -2000,14 +2247,29 @@ impl VarDictPipeline {
             return total_pos_coverage;
         };
 
+        let mut running_hicov = hicov;
+
         let mut keys: Vec<VarDesc> = insertion_variations.keys().cloned().collect();
         keys.sort_by(|a, b| a.to_key_string().cmp(&b.to_key_string()));
 
         for desc in keys {
             let desc_str = desc.to_key_string();
             if desc_str.contains('&') {
-                if let Some(&coverage) = ref_coverage.get(&(position + 1)) {
+                let coverage_position = if let Some(without_plus) = desc_str.strip_prefix('+') {
+                    if let Some((prefix, _)) = without_plus.split_once('&') {
+                        position + prefix.len() as i64
+                    } else {
+                        position + 1
+                    }
+                } else {
+                    position + 1
+                };
+                if let Some(&coverage) = ref_coverage.get(&coverage_position) {
                     total_pos_coverage = coverage;
+                } else if coverage_position != position + 1 {
+                    if let Some(&fallback_coverage) = ref_coverage.get(&(position + 1)) {
+                        total_pos_coverage = fallback_coverage;
+                    }
                 }
             }
 
@@ -2027,9 +2289,8 @@ impl VarDictPipeline {
             let mq = round_half_even("0.0", cnt.mean_mapq / total_count as f64);
             let hicnt = cnt.high_qual_read_cnt;
             let locnt = cnt.low_qual_read_cnt;
-            let mut local_hicov = hicov;
-            if local_hicov < hicnt {
-                local_hicov = hicnt;
+            if running_hicov < hicnt {
+                running_hicov = hicnt;
             }
 
             let mut ttcov = total_pos_coverage;
@@ -2073,8 +2334,8 @@ impl VarDictPipeline {
             variant.mean_quality = vqual;
             variant.has_at_least_2_diff_qualities = cnt.qstd;
             variant.mean_mapping_quality = mq;
-            variant.high_quality_reads_frequency = if local_hicov > 0 {
-                round_half_even("0.0000", hicnt as f64 / local_hicov as f64)
+            variant.high_quality_reads_frequency = if running_hicov > 0 {
+                round_half_even("0.0000", hicnt as f64 / running_hicov as f64)
             } else {
                 0.0
             };
@@ -2088,7 +2349,7 @@ impl VarDictPipeline {
             variant.nm = round_half_even("0.0", cnt.nm / total_count as f64);
             variant.high_qual_read_cnt = hicnt;
             variant.low_qual_read_cnt = locnt;
-            variant.hicov = local_hicov;
+            variant.hicov = running_hicov;
             variant.duprate = duprate;
             variant.start_position = position;
             variant.end_position = position;
@@ -3643,6 +3904,788 @@ impl VarDictPipeline {
         count as f64
     }
 
+            pub fn run_somatic_post_processor(
+                &self,
+                normal_data: AlignedVarsData,
+                tumor_data: AlignedVarsData,
+                region: &Region,
+                splice: &HashSet<String>,
+            ) -> Vec<String> {
+                self.run_somatic_post_processor_with_combine_lookup(
+                    normal_data,
+                    tumor_data,
+                    region,
+                    splice,
+                    0,
+                    None,
+                )
+            }
+
+            pub fn run_somatic_post_processor_with_combine_lookup(
+                &self,
+                normal_data: AlignedVarsData,
+                tumor_data: AlignedVarsData,
+                region: &Region,
+                splice: &HashSet<String>,
+                initial_max_read_length: usize,
+                combine_lookup: Option<&SomaticCombineLookup>,
+            ) -> Vec<String> {
+                const STRONG_SOMATIC: &str = "StrongSomatic";
+                const SAMPLE_SPECIFIC: &str = "SampleSpecific";
+                const DELETION: &str = "Deletion";
+
+                let output_region = OutputRegion {
+                    chr: region.chr().to_string(),
+                    start: region.start() as i64,
+                    end: region.end() as i64,
+                    gene: region.gene().to_string(),
+                };
+
+                let mut output_lines = Vec::new();
+                let mut max_read_length = initial_max_read_length;
+
+                let mut all_positions: std::collections::BTreeSet<i64> =
+                    tumor_data.aligned_variants.keys().copied().collect();
+                all_positions.extend(normal_data.aligned_variants.keys().copied());
+
+                for position in all_positions {
+                    if position < region.start() as i64 || position > region.end() as i64 {
+                        continue;
+                    }
+
+                    let tumor_vars = tumor_data.aligned_variants.get(&position);
+                    let normal_vars = normal_data.aligned_variants.get(&position);
+
+                    match (tumor_vars, normal_vars) {
+                        (None, None) => {}
+                        (None, Some(variants)) => {
+                            self.calling_for_one_sample(
+                                variants,
+                                true,
+                                DELETION,
+                                &output_region,
+                                splice,
+                                &mut output_lines,
+                            );
+                        }
+                        (Some(variants), None) => {
+                            self.calling_for_one_sample(
+                                variants,
+                                false,
+                                SAMPLE_SPECIFIC,
+                                &output_region,
+                                splice,
+                                &mut output_lines,
+                            );
+                        }
+                        (Some(tumor), Some(normal)) => {
+                            self.calling_for_both_samples(
+                                position,
+                                tumor,
+                                normal,
+                                &output_region,
+                                splice,
+                                STRONG_SOMATIC,
+                                &mut max_read_length,
+                                combine_lookup,
+                                &mut output_lines,
+                            );
+                        }
+                    }
+                }
+
+                output_lines
+            }
+
+            fn calling_for_one_sample(
+                &self,
+                variants: &Vars,
+                is_first_cover: bool,
+                var_label: &str,
+                region: &OutputRegion,
+                splice: &HashSet<String>,
+                output_lines: &mut Vec<String>,
+            ) {
+                if variants.variants.is_empty() {
+                    return;
+                }
+
+                for variant in &variants.variants {
+                    if variant.refallele == variant.varallele {
+                        continue;
+                    }
+
+                    if !self.is_good_var(variant, variants.reference_variant.as_ref(), splice) {
+                        continue;
+                    }
+
+                    let mut variant = variant.clone();
+                    if var_type_string(&variant.refallele, &variant.varallele) == "Complex" {
+                        variant.adj_complex();
+                    }
+
+                    let output = if is_first_cover {
+                        SomaticOutputVariant::from_variants(
+                            Some(&variant),
+                            Some(&variant),
+                            None,
+                            Some(&variant),
+                            region,
+                            "",
+                            &variants.sv,
+                            var_label,
+                            &self.sample_name,
+                        )
+                    } else {
+                        SomaticOutputVariant::from_variants(
+                            Some(&variant),
+                            Some(&variant),
+                            Some(&variant),
+                            None,
+                            region,
+                            &variants.sv,
+                            "",
+                            var_label,
+                            &self.sample_name,
+                        )
+                    };
+                    output_lines.push(output.to_string());
+                }
+            }
+
+            fn calling_for_both_samples(
+                &self,
+                position: i64,
+                tumor_vars: &Vars,
+                normal_vars: &Vars,
+                region: &OutputRegion,
+                splice: &HashSet<String>,
+                strong_somatic_label: &str,
+                max_read_length: &mut usize,
+                combine_lookup: Option<&SomaticCombineLookup>,
+                output_lines: &mut Vec<String>,
+            ) {
+                if tumor_vars.variants.is_empty() && normal_vars.variants.is_empty() {
+                    return;
+                }
+
+                if !tumor_vars.variants.is_empty() {
+                    self.print_variations_from_first_sample(
+                        position,
+                        tumor_vars,
+                        normal_vars,
+                        region,
+                        splice,
+                        strong_somatic_label,
+                        max_read_length,
+                        combine_lookup,
+                        output_lines,
+                    );
+                } else if !normal_vars.variants.is_empty() {
+                    self.print_variations_from_second_sample(
+                        position,
+                        tumor_vars,
+                        normal_vars,
+                        region,
+                        splice,
+                        max_read_length,
+                        combine_lookup,
+                        output_lines,
+                    );
+                }
+            }
+
+            fn print_variations_from_first_sample(
+                &self,
+                position: i64,
+                tumor_vars: &Vars,
+                normal_vars: &Vars,
+                region: &OutputRegion,
+                splice: &HashSet<String>,
+                strong_somatic_label: &str,
+                max_read_length: &mut usize,
+                combine_lookup: Option<&SomaticCombineLookup>,
+                output_lines: &mut Vec<String>,
+            ) {
+                const LIKELY_LOH: &str = "LikelyLOH";
+                const GERMLINE: &str = "Germline";
+                const STRONG_LOH: &str = "StrongLOH";
+                const FALSE_VALUE: &str = "FALSE";
+                let debug_pos = env::var("VARDICT_DEBUG_POS")
+                    .ok()
+                    .and_then(|value| value.parse::<i64>().ok());
+                let trace_this_pos = debug_pos == Some(position);
+
+                let mut number_of_processed_variation = 0usize;
+                while number_of_processed_variation < tumor_vars.variants.len()
+                    && self.is_good_var(
+                        &tumor_vars.variants[number_of_processed_variation],
+                        tumor_vars.reference_variant.as_ref(),
+                        splice,
+                    )
+                {
+                    let mut tumor_variant = tumor_vars.variants[number_of_processed_variation].clone();
+                    if tumor_variant.refallele == tumor_variant.varallele {
+                        number_of_processed_variation += 1;
+                        continue;
+                    }
+
+                    let description_string = tumor_variant.description_string.clone();
+                    if var_type_string(&tumor_variant.refallele, &tumor_variant.varallele) == "Complex" {
+                        tumor_variant.adj_complex();
+                    }
+
+                    if let Some(mut normal_variant) =
+                        Self::find_variant_by_description(normal_vars, &description_string).cloned()
+                    {
+                        let var_label = self.determinate_somatic_type(
+                            normal_vars,
+                            &tumor_variant,
+                            &mut normal_variant,
+                            splice,
+                        );
+                        if trace_this_pos {
+                            event!(
+                                Level::DEBUG,
+                                position,
+                                description = %description_string,
+                                branch = "first_sample_direct_match",
+                                var_label = %var_label,
+                                tumor_pcov = tumor_variant.position_coverage,
+                                tumor_tot = tumor_variant.total_pos_coverage,
+                                tumor_fwd = tumor_variant.vars_count_on_forward,
+                                tumor_rev = tumor_variant.vars_count_on_reverse,
+                                normal_pcov = normal_variant.position_coverage,
+                                normal_tot = normal_variant.total_pos_coverage,
+                                normal_fwd = normal_variant.vars_count_on_forward,
+                                normal_rev = normal_variant.vars_count_on_reverse,
+                                "somatic_output_selection"
+                            );
+                        }
+                        let output = SomaticOutputVariant::from_variants(
+                            Some(&tumor_variant),
+                            Some(&normal_variant),
+                            Some(&tumor_variant),
+                            Some(&normal_variant),
+                            region,
+                            &tumor_vars.sv,
+                            &normal_vars.sv,
+                            &var_label,
+                            &self.sample_name,
+                        );
+                        output_lines.push(output.to_string());
+                    } else {
+                        let mut normal_variant_for_combine = Variant::default();
+                        normal_variant_for_combine.description_string = description_string.clone();
+
+                        let mut var_label = strong_somatic_label.to_string();
+                        if Self::should_run_combine_analysis(&tumor_variant) {
+                            if let Some(lookup) = combine_lookup {
+                                let combine_type = self.combine_analysis_with_lookup(
+                                    &tumor_variant,
+                                    &mut normal_variant_for_combine,
+                                    region.chr.as_str(),
+                                    position,
+                                    &description_string,
+                                    splice,
+                                    max_read_length,
+                                    lookup,
+                                );
+                                if combine_type == FALSE_VALUE {
+                                    number_of_processed_variation += 1;
+                                    continue;
+                                }
+                                if !combine_type.is_empty() {
+                                    var_label = combine_type;
+                                }
+                            }
+                        }
+
+                        let normal_variant_for_print =
+                            if let Some(first_normal_variant) = normal_vars.variants.first() {
+                                let mut placeholder = Variant::default();
+                                placeholder.total_pos_coverage = first_normal_variant.total_pos_coverage;
+                                placeholder.ref_forward_count = first_normal_variant.ref_forward_count;
+                                placeholder.ref_reverse_count = first_normal_variant.ref_reverse_count;
+                                Some(placeholder)
+                            } else {
+                                normal_vars.reference_variant.clone()
+                            };
+
+                        let output = if var_label == strong_somatic_label {
+                            SomaticOutputVariant::from_variants(
+                                Some(&tumor_variant),
+                                Some(&tumor_variant),
+                                Some(&tumor_variant),
+                                normal_variant_for_print.as_ref(),
+                                region,
+                                &tumor_vars.sv,
+                                &normal_vars.sv,
+                                strong_somatic_label,
+                                &self.sample_name,
+                            )
+                        } else {
+                            if trace_this_pos {
+                                event!(
+                                    Level::DEBUG,
+                                    position,
+                                    description = %description_string,
+                                    branch = "first_sample_combine_lookup",
+                                    var_label = %var_label,
+                                    tumor_pcov = tumor_variant.position_coverage,
+                                    tumor_tot = tumor_variant.total_pos_coverage,
+                                    tumor_fwd = tumor_variant.vars_count_on_forward,
+                                    tumor_rev = tumor_variant.vars_count_on_reverse,
+                                    normal_pcov = normal_variant_for_combine.position_coverage,
+                                    normal_tot = normal_variant_for_combine.total_pos_coverage,
+                                    normal_fwd = normal_variant_for_combine.vars_count_on_forward,
+                                    normal_rev = normal_variant_for_combine.vars_count_on_reverse,
+                                    "somatic_output_selection"
+                                );
+                            }
+                            SomaticOutputVariant::from_variants(
+                                Some(&tumor_variant),
+                                Some(&tumor_variant),
+                                Some(&tumor_variant),
+                                Some(&normal_variant_for_combine),
+                                region,
+                                &tumor_vars.sv,
+                                &normal_vars.sv,
+                                &var_label,
+                                &self.sample_name,
+                            )
+                        };
+                        output_lines.push(output.to_string());
+                    }
+
+                    number_of_processed_variation += 1;
+                }
+
+                if number_of_processed_variation == 0 {
+                    if normal_vars.variants.is_empty() {
+                        return;
+                    }
+
+                    for normal_variant in &normal_vars.variants {
+                        if !self.is_good_var(normal_variant, normal_vars.reference_variant.as_ref(), splice) {
+                            continue;
+                        }
+
+                        let mut normal_variant = normal_variant.clone();
+                        let description_string = normal_variant.description_string.clone();
+
+                        if let Some(mut tumor_variant) =
+                            Self::find_variant_by_description(tumor_vars, &description_string).cloned()
+                        {
+                            if tumor_variant.refallele == tumor_variant.varallele {
+                                continue;
+                            }
+
+                            let var_label = if tumor_variant.frequency < instance().conf.lofreq {
+                                LIKELY_LOH
+                            } else {
+                                GERMLINE
+                            };
+
+                            if var_type_string(&normal_variant.refallele, &normal_variant.varallele) == "Complex" {
+                                tumor_variant.adj_complex();
+                            }
+
+                            if trace_this_pos {
+                                event!(
+                                    Level::DEBUG,
+                                    position,
+                                    description = %description_string,
+                                    branch = "second_sample_match_when_first_not_processed",
+                                    var_label,
+                                    tumor_pcov = tumor_variant.position_coverage,
+                                    tumor_tot = tumor_variant.total_pos_coverage,
+                                    tumor_fwd = tumor_variant.vars_count_on_forward,
+                                    tumor_rev = tumor_variant.vars_count_on_reverse,
+                                    normal_pcov = normal_variant.position_coverage,
+                                    normal_tot = normal_variant.total_pos_coverage,
+                                    normal_fwd = normal_variant.vars_count_on_forward,
+                                    normal_rev = normal_variant.vars_count_on_reverse,
+                                    "somatic_output_selection"
+                                );
+                            }
+
+                            let output = SomaticOutputVariant::from_variants(
+                                Some(&tumor_variant),
+                                Some(&normal_variant),
+                                Some(&tumor_variant),
+                                Some(&normal_variant),
+                                region,
+                                &tumor_vars.sv,
+                                &normal_vars.sv,
+                                var_label,
+                                &self.sample_name,
+                            );
+                            output_lines.push(output.to_string());
+                        } else {
+                            if normal_variant.refallele == normal_variant.varallele {
+                                continue;
+                            }
+
+                            let first_tumor_variant = tumor_vars.variants.first();
+                            let total_coverage = first_tumor_variant
+                                .map(|variant| variant.total_pos_coverage)
+                                .unwrap_or(0);
+
+                            let tumor_reference_variant = tumor_vars.reference_variant.as_ref();
+                            let reference_forward = tumor_reference_variant
+                                .map(|variant| variant.vars_count_on_forward)
+                                .unwrap_or(0);
+                            let reference_reverse = tumor_reference_variant
+                                .map(|variant| variant.vars_count_on_reverse)
+                                .unwrap_or(0);
+
+                            let genotype = if let Some(variant) = first_tumor_variant {
+                                variant.genotype.clone()
+                            } else if let Some(reference_variant) = tumor_reference_variant {
+                                format!(
+                                    "{}/{}",
+                                    reference_variant.description_string,
+                                    reference_variant.description_string
+                                )
+                            } else {
+                                "N/N".to_string()
+                            };
+
+                            if var_type_string(&normal_variant.refallele, &normal_variant.varallele) == "Complex" {
+                                normal_variant.adj_complex();
+                            }
+
+                            let mut tumor_variant_for_print = Variant::default();
+                            tumor_variant_for_print.total_pos_coverage = total_coverage;
+                            tumor_variant_for_print.ref_forward_count = reference_forward;
+                            tumor_variant_for_print.ref_reverse_count = reference_reverse;
+                            tumor_variant_for_print.genotype = genotype;
+
+                            let output = SomaticOutputVariant::from_variants(
+                                Some(&normal_variant),
+                                Some(&normal_variant),
+                                Some(&tumor_variant_for_print),
+                                Some(&normal_variant),
+                                region,
+                                "",
+                                &normal_vars.sv,
+                                STRONG_LOH,
+                                &self.sample_name,
+                            );
+                            output_lines.push(output.to_string());
+                        }
+                    }
+                }
+            }
+
+            fn print_variations_from_second_sample(
+                &self,
+                position: i64,
+                tumor_vars: &Vars,
+                normal_vars: &Vars,
+                region: &OutputRegion,
+                splice: &HashSet<String>,
+                max_read_length: &mut usize,
+                combine_lookup: Option<&SomaticCombineLookup>,
+                output_lines: &mut Vec<String>,
+            ) {
+                const STRONG_LOH: &str = "StrongLOH";
+                const FALSE_VALUE: &str = "FALSE";
+
+                for normal_variant in &normal_vars.variants {
+                    if normal_variant.refallele == normal_variant.varallele {
+                        continue;
+                    }
+
+                    if !self.is_good_var(normal_variant, normal_vars.reference_variant.as_ref(), splice) {
+                        continue;
+                    }
+
+                    let mut normal_variant = normal_variant.clone();
+                    let description_string = normal_variant.description_string.clone();
+                    let mut tumor_variant_for_combine =
+                        Self::find_variant_by_description(tumor_vars, &description_string)
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                let mut variant = Variant::default();
+                                variant.description_string = description_string;
+                                variant
+                            });
+                    tumor_variant_for_combine.position_coverage = 0;
+
+                    let mut var_label = STRONG_LOH.to_string();
+                    let mut combine_type = String::new();
+                    if Self::should_run_combine_analysis(&normal_variant) {
+                        if let Some(lookup) = combine_lookup {
+                            combine_type = self.combine_analysis_with_lookup(
+                                &normal_variant,
+                                &mut tumor_variant_for_combine,
+                                region.chr.as_str(),
+                                position,
+                                &normal_variant.description_string,
+                                splice,
+                                max_read_length,
+                                lookup,
+                            );
+                            if combine_type == FALSE_VALUE {
+                                continue;
+                            }
+                        }
+                    }
+
+                    let tumor_variant_for_print = if !combine_type.is_empty() {
+                        var_label = combine_type;
+                        Some(tumor_variant_for_combine)
+                    } else {
+                        tumor_vars.reference_variant.clone()
+                    };
+
+                    if var_type_string(&normal_variant.refallele, &normal_variant.varallele) == "Complex" {
+                        normal_variant.adj_complex();
+                    }
+
+                    let output = SomaticOutputVariant::from_variants(
+                        Some(&normal_variant),
+                        Some(&normal_variant),
+                        tumor_variant_for_print.as_ref(),
+                        Some(&normal_variant),
+                        region,
+                        "",
+                        &normal_vars.sv,
+                        &var_label,
+                        &self.sample_name,
+                    );
+                    output_lines.push(output.to_string());
+                }
+            }
+
+            fn should_run_combine_analysis(variant: &Variant) -> bool {
+                let var_type = var_type_string(&variant.refallele, &variant.varallele);
+                if var_type == "SNV" {
+                    return false;
+                }
+
+                let description = variant.description_string.as_str();
+                let has_minus_num_num = Self::contains_minus_num_num(description);
+
+                (description.len() > 10 || has_minus_num_num)
+                    && variant.position_coverage < instance().conf.minr + 3
+                    && !description.contains('<')
+            }
+
+            fn contains_minus_num_num(description: &str) -> bool {
+                let bytes = description.as_bytes();
+                if bytes.len() < 3 {
+                    return false;
+                }
+
+                for idx in 0..=bytes.len() - 3 {
+                    if bytes[idx] == b'-'
+                        && bytes[idx + 1].is_ascii_digit()
+                        && bytes[idx + 2].is_ascii_digit()
+                    {
+                        return true;
+                    }
+                }
+
+                false
+            }
+
+            fn combine_analysis_with_lookup(
+                &self,
+                variant1: &Variant,
+                variant2: &mut Variant,
+                chr_name: &str,
+                position: i64,
+                description_string: &str,
+                _splice: &HashSet<String>,
+                max_read_length: &mut usize,
+                combine_lookup: &SomaticCombineLookup,
+            ) -> String {
+                const FALSE_VALUE: &str = "FALSE";
+                const GERMLINE: &str = "Germline";
+
+                if variant1.end_position.saturating_sub(variant1.start_position) as usize
+                    > instance().conf.sv_min_len
+                {
+                    return String::new();
+                }
+
+                let lookup_result =
+                    combine_lookup(chr_name, position, description_string, *max_read_length);
+                if lookup_result.max_read_length > 0 {
+                    *max_read_length = lookup_result.max_read_length;
+                }
+
+                let Some(vref) = lookup_result.combined_variant else {
+                    return FALSE_VALUE.to_string();
+                };
+
+                if vref.position_coverage.saturating_sub(variant1.position_coverage)
+                    >= instance().conf.minr
+                {
+                    variant2.total_pos_coverage =
+                        vref.total_pos_coverage.saturating_sub(variant1.total_pos_coverage);
+                    variant2.position_coverage =
+                        vref.position_coverage.saturating_sub(variant1.position_coverage);
+                    variant2.ref_forward_count =
+                        vref.ref_forward_count.saturating_sub(variant1.ref_forward_count);
+                    variant2.ref_reverse_count =
+                        vref.ref_reverse_count.saturating_sub(variant1.ref_reverse_count);
+                    variant2.vars_count_on_forward =
+                        vref.vars_count_on_forward.saturating_sub(variant1.vars_count_on_forward);
+                    variant2.vars_count_on_reverse =
+                        vref.vars_count_on_reverse.saturating_sub(variant1.vars_count_on_reverse);
+
+                    if variant2.position_coverage != 0 {
+                        let vref_cov = vref.position_coverage as f64;
+                        let variant1_cov = variant1.position_coverage as f64;
+                        let variant2_cov = variant2.position_coverage as f64;
+
+                        variant2.mean_position =
+                            (vref.mean_position * vref_cov - variant1.mean_position * variant1_cov)
+                                / variant2_cov;
+                        variant2.mean_quality =
+                            (vref.mean_quality * vref_cov - variant1.mean_quality * variant1_cov)
+                                / variant2_cov;
+                        variant2.mean_mapping_quality =
+                            (vref.mean_mapping_quality * vref_cov
+                                - variant1.mean_mapping_quality * variant1_cov)
+                                / variant2_cov;
+                        variant2.high_quality_reads_frequency =
+                            (vref.high_quality_reads_frequency * vref_cov
+                                - variant1.high_quality_reads_frequency * variant1_cov)
+                                / variant2_cov;
+                        variant2.extra_frequency =
+                            (vref.extra_frequency * vref_cov - variant1.extra_frequency * variant1_cov)
+                                / variant2_cov;
+                        variant2.nm =
+                            (vref.nm * vref_cov - variant1.nm * variant1_cov) / variant2_cov;
+                    } else {
+                        variant2.mean_position = 0.0;
+                        variant2.mean_quality = 0.0;
+                        variant2.mean_mapping_quality = 0.0;
+                        variant2.high_quality_reads_frequency = 0.0;
+                        variant2.extra_frequency = 0.0;
+                        variant2.nm = 0.0;
+                    }
+
+                    variant2.is_at_least_at_2_positions = true;
+                    variant2.has_at_least_2_diff_qualities = true;
+
+                    if variant2.total_pos_coverage == 0 {
+                        return FALSE_VALUE.to_string();
+                    }
+
+                    variant2.frequency =
+                        variant2.position_coverage as f64 / variant2.total_pos_coverage as f64;
+                    variant2.high_qual_read_cnt = variant1.high_qual_read_cnt;
+                    variant2.low_qual_read_cnt = variant1.low_qual_read_cnt;
+                    variant2.genotype = vref.genotype.clone();
+                    variant2.description_string = description_string.to_string();
+
+                    variant2.strand_bias_flag = StrandBiasFlag::new(
+                        check_strand_bias(variant2.ref_forward_count, variant2.ref_reverse_count),
+                        check_strand_bias(
+                            variant2.vars_count_on_forward,
+                            variant2.vars_count_on_reverse,
+                        ),
+                    );
+
+                    return GERMLINE.to_string();
+                }
+
+                if vref.position_coverage + 2 < variant1.position_coverage {
+                    return FALSE_VALUE.to_string();
+                }
+
+                String::new()
+            }
+
+            fn determinate_somatic_type(
+                &self,
+                variants: &Vars,
+                standard_variant: &Variant,
+                variant_to_compare: &mut Variant,
+                splice: &HashSet<String>,
+            ) -> String {
+                const STRONG_SOMATIC: &str = "StrongSomatic";
+                const LIKELY_LOH: &str = "LikelyLOH";
+                const GERMLINE: &str = "Germline";
+                const LIKELY_SOMATIC: &str = "LikelySomatic";
+                const AF_DIFF: &str = "AFDiff";
+
+                let standard_var_type = var_type_string(&standard_variant.refallele, &standard_variant.varallele);
+
+                let mut var_label = if self.is_good_var_with_type(
+                    variant_to_compare,
+                    variants.reference_variant.as_ref(),
+                    splice,
+                    Some(&standard_var_type),
+                ) {
+                    if standard_variant.frequency > (1.0 - instance().conf.lofreq)
+                        && variant_to_compare.frequency < 0.8
+                        && variant_to_compare.frequency > 0.2
+                    {
+                        LIKELY_LOH.to_string()
+                    } else if variant_to_compare.frequency < instance().conf.lofreq
+                        || variant_to_compare.position_coverage <= 1
+                    {
+                        LIKELY_SOMATIC.to_string()
+                    } else {
+                        GERMLINE.to_string()
+                    }
+                } else if variant_to_compare.frequency < instance().conf.lofreq
+                    || variant_to_compare.position_coverage <= 1
+                {
+                    LIKELY_SOMATIC.to_string()
+                } else {
+                    AF_DIFF.to_string()
+                };
+
+                if self.is_noise(variant_to_compare) && standard_var_type == "SNV" {
+                    var_label = STRONG_SOMATIC.to_string();
+                }
+
+                var_label
+            }
+
+            fn is_noise(&self, variant: &mut Variant) -> bool {
+                let mean_quality = variant.mean_quality;
+                let quality_is_low = (mean_quality < 4.5
+                    || (mean_quality < 12.0 && !variant.has_at_least_2_diff_qualities))
+                    && variant.position_coverage <= 3;
+                let low_freq_with_low_quality = mean_quality < instance().conf.goodq
+                    && variant.frequency < 2.0 * instance().conf.lofreq
+                    && variant.position_coverage <= 1;
+
+                if quality_is_low || low_freq_with_low_quality {
+                    variant.total_pos_coverage = variant
+                        .total_pos_coverage
+                        .saturating_sub(variant.position_coverage);
+                    variant.position_coverage = 0;
+                    variant.vars_count_on_forward = 0;
+                    variant.vars_count_on_reverse = 0;
+                    variant.frequency = 0.0;
+                    variant.high_quality_reads_frequency = 0.0;
+                    return true;
+                }
+
+                false
+            }
+
+            fn find_variant_by_description<'a>(vars: &'a Vars, description: &str) -> Option<&'a Variant> {
+                vars.variants
+                    .iter()
+                    .find(|variant| variant.description_string == description)
+                    .or_else(|| {
+                        vars.reference_variant
+                            .as_ref()
+                            .filter(|variant| variant.description_string == description)
+                    })
+            }
+
     /// Step 4: Run SimplePostProcessor to filter and format output
     fn run_simple_post_processor(
         &self,
@@ -3796,11 +4839,23 @@ impl VarDictPipeline {
         ref_variant: Option<&Variant>,
         splice: &HashSet<String>,
     ) -> bool {
+        self.is_good_var_with_type(variant, ref_variant, splice, None)
+    }
+
+    fn is_good_var_with_type(
+        &self,
+        variant: &Variant,
+        ref_variant: Option<&Variant>,
+        splice: &HashSet<String>,
+        forced_type: Option<&str>,
+    ) -> bool {
         if variant.refallele.is_empty() {
             return false;
         }
 
-        let var_type = var_type_string(&variant.refallele, &variant.varallele);
+        let var_type = forced_type
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| var_type_string(&variant.refallele, &variant.varallele));
 
         if variant.frequency < instance().conf.freq
             || variant.high_qual_read_cnt < instance().conf.minr
@@ -3880,6 +4935,64 @@ impl VarDictPipeline {
         }
 
         true
+    }
+}
+
+fn build_amplicon_debug_prefix(vars_at_amplicon: &Vars) -> String {
+    let mut entries: Vec<Variant> = Vec::new();
+    if let Some(reference_variant) = vars_at_amplicon.reference_variant.as_ref() {
+        entries.push(reference_variant.clone());
+    }
+    entries.extend(vars_at_amplicon.variants.iter().cloned());
+    entries.sort_by(|left, right| {
+        let left_is_insertion = left.description_string.starts_with('+');
+        let right_is_insertion = right.description_string.starts_with('+');
+        match left_is_insertion.cmp(&right_is_insertion) {
+            std::cmp::Ordering::Equal => left.description_string.cmp(&right.description_string),
+            other => other,
+        }
+    });
+
+    entries
+        .iter()
+        .map(format_amplicon_debug_prefix_variant)
+        .collect::<Vec<_>>()
+        .join(" & ")
+}
+
+fn format_amplicon_debug_prefix_variant(variant: &Variant) -> String {
+    let mut key = variant.description_string.clone();
+    if key.starts_with('+') {
+        key = format!("I{}", key);
+    }
+    let pstd = if variant.is_at_least_at_2_positions { 1 } else { 0 };
+    let qstd = if variant.has_at_least_2_diff_qualities { 1 } else { 0 };
+
+    format!(
+        "{}:{}:F-{}:R-{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        key,
+        variant.vars_count_on_forward + variant.vars_count_on_reverse,
+        variant.vars_count_on_forward,
+        variant.vars_count_on_reverse,
+        format!("{:.4}", variant.frequency),
+        variant.strand_bias_flag.var_bias.as_int(),
+        format!("{:.1}", variant.mean_position),
+        pstd,
+        format!("{:.1}", variant.mean_quality),
+        qstd,
+        format!("{:.4}", variant.high_quality_reads_frequency),
+        format!("{:.1}", variant.mean_mapping_quality),
+        format!("{:.3}", amplicon_debug_qratio(variant)),
+    )
+}
+
+fn amplicon_debug_qratio(variant: &Variant) -> f64 {
+    if variant.low_qual_read_cnt > 0 {
+        variant.high_qual_read_cnt as f64 / variant.low_qual_read_cnt as f64
+    } else if variant.high_qual_read_cnt > 0 {
+        variant.high_qual_read_cnt as f64 * 2.0
+    } else {
+        0.0
     }
 }
 
@@ -4027,6 +5140,12 @@ mod tests {
     fn parse_amplicon_output_fields(line: &str) -> Vec<String> {
         let fields: Vec<String> = line.split('\t').map(str::to_string).collect();
         assert_eq!(fields.len(), 38);
+        fields
+    }
+
+    fn parse_somatic_output_fields(line: &str) -> Vec<String> {
+        let fields: Vec<String> = line.split('\t').map(str::to_string).collect();
+        assert_eq!(fields.len(), 55);
         fields
     }
 
@@ -4578,5 +5697,166 @@ mod tests {
         assert_eq!(fields[35], "0");
         assert_eq!(fields[36], "0");
         assert_eq!(fields[37], "0");
+    }
+
+    #[test]
+    fn test_somatic_postprocessor_sample_specific_when_only_tumor_has_variant() {
+        ensure_test_scope_initialized();
+
+        let pipeline = VarDictPipeline::new("sample");
+        let region = Region::new("chr1".to_string(), 100, 110, "GENE".to_string());
+        let position = 105i64;
+
+        let tumor_variant = make_test_variant("A", "T", "A>T", 105, 105, 100, 30, 0.30);
+        let tumor_aligned = AlignedVarsData {
+            aligned_variants: make_vars_at_position(position, vec![tumor_variant], None),
+            ..AlignedVarsData::default()
+        };
+        let normal_aligned = AlignedVarsData::default();
+
+        let output_lines = pipeline.run_somatic_post_processor(
+            normal_aligned,
+            tumor_aligned,
+            &region,
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(output_lines.len(), 1);
+        let fields = parse_somatic_output_fields(&output_lines[0]);
+        assert_eq!(fields[49], "SampleSpecific");
+        assert_eq!(fields[2], "chr1");
+        assert_eq!(fields[3], "105");
+        assert_eq!(fields[6], "T");
+        assert_eq!(fields[7], "100");
+        assert_eq!(fields[25], "0");
+    }
+
+    #[test]
+    fn test_somatic_postprocessor_germline_when_variant_present_in_both_samples() {
+        ensure_test_scope_initialized();
+
+        let pipeline = VarDictPipeline::new("sample");
+        let region = Region::new("chr1".to_string(), 100, 110, "GENE".to_string());
+        let position = 105i64;
+
+        let tumor_variant = make_test_variant("A", "T", "A>T", 105, 105, 100, 60, 0.60);
+        let normal_variant = make_test_variant("A", "T", "A>T", 105, 105, 100, 55, 0.55);
+
+        let tumor_aligned = AlignedVarsData {
+            aligned_variants: make_vars_at_position(position, vec![tumor_variant], None),
+            ..AlignedVarsData::default()
+        };
+        let normal_aligned = AlignedVarsData {
+            aligned_variants: make_vars_at_position(position, vec![normal_variant], None),
+            ..AlignedVarsData::default()
+        };
+
+        let output_lines = pipeline.run_somatic_post_processor(
+            normal_aligned,
+            tumor_aligned,
+            &region,
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(output_lines.len(), 1);
+        let fields = parse_somatic_output_fields(&output_lines[0]);
+        assert_eq!(fields[49], "Germline");
+        assert_eq!(fields[14], "0.6000");
+        assert_eq!(fields[32], "0.5500");
+    }
+
+    #[test]
+    fn test_somatic_combine_analysis_promotes_to_germline() {
+        ensure_test_scope_initialized();
+
+        let pipeline = VarDictPipeline::new("sample");
+        let region = Region::new("chr1".to_string(), 100, 130, "GENE".to_string());
+        let position = 105i64;
+
+        let tumor_variant = make_test_variant("ATTT", "A", "-12AA", 105, 108, 100, 2, 0.02);
+        let normal_ref = make_test_variant("A", "A", "A", 105, 105, 120, 120, 0.0);
+
+        let tumor_aligned = AlignedVarsData {
+            aligned_variants: make_vars_at_position(position, vec![tumor_variant.clone()], None),
+            ..AlignedVarsData::default()
+        };
+        let normal_aligned = AlignedVarsData {
+            aligned_variants: make_vars_at_position(position, Vec::new(), Some(normal_ref)),
+            ..AlignedVarsData::default()
+        };
+
+        let mut combined_variant = tumor_variant.clone();
+        combined_variant.total_pos_coverage = 150;
+        combined_variant.position_coverage = 5;
+        combined_variant.ref_forward_count = 60;
+        combined_variant.ref_reverse_count = 70;
+        combined_variant.vars_count_on_forward = 3;
+        combined_variant.vars_count_on_reverse = 2;
+        combined_variant.mean_position = 80.0;
+        combined_variant.mean_quality = 70.0;
+        combined_variant.mean_mapping_quality = 65.0;
+        combined_variant.high_quality_reads_frequency = 0.3;
+        combined_variant.extra_frequency = 0.1;
+        combined_variant.nm = 2.0;
+        combined_variant.genotype = "ATTT/A".to_string();
+
+        let lookup = move |_: &str, _: i64, _: &str, max_read_length: usize| {
+            SomaticCombineLookupResult {
+                combined_variant: Some(combined_variant.clone()),
+                max_read_length,
+            }
+        };
+
+        let output_lines = pipeline.run_somatic_post_processor_with_combine_lookup(
+            normal_aligned,
+            tumor_aligned,
+            &region,
+            &std::collections::HashSet::new(),
+            150,
+            Some(&lookup),
+        );
+
+        assert_eq!(output_lines.len(), 1);
+        let fields = parse_somatic_output_fields(&output_lines[0]);
+        assert_eq!(fields[49], "Germline");
+        assert_eq!(fields[25], "50");
+        assert_eq!(fields[26], "3");
+    }
+
+    #[test]
+    fn test_somatic_combine_analysis_false_skips_second_sample_variant() {
+        ensure_test_scope_initialized();
+
+        let pipeline = VarDictPipeline::new("sample");
+        let region = Region::new("chr1".to_string(), 100, 130, "GENE".to_string());
+        let position = 105i64;
+
+        let tumor_ref = make_test_variant("A", "A", "A", 105, 105, 100, 100, 0.0);
+        let normal_variant = make_test_variant("ATTT", "A", "-12AA", 105, 108, 120, 2, 0.02);
+
+        let tumor_aligned = AlignedVarsData {
+            aligned_variants: make_vars_at_position(position, Vec::new(), Some(tumor_ref)),
+            ..AlignedVarsData::default()
+        };
+        let normal_aligned = AlignedVarsData {
+            aligned_variants: make_vars_at_position(position, vec![normal_variant], None),
+            ..AlignedVarsData::default()
+        };
+
+        let lookup = |_: &str, _: i64, _: &str, max_read_length: usize| SomaticCombineLookupResult {
+            combined_variant: None,
+            max_read_length,
+        };
+
+        let output_lines = pipeline.run_somatic_post_processor_with_combine_lookup(
+            normal_aligned,
+            tumor_aligned,
+            &region,
+            &std::collections::HashSet::new(),
+            150,
+            Some(&lookup),
+        );
+
+        assert!(output_lines.is_empty());
     }
 }

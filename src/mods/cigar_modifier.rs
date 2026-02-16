@@ -1398,27 +1398,25 @@ fn find_d_i_m_id_i(cigar: &VecDeque<Cigar>) -> Option<(usize, [Cigar; 3], Option
         return None;
     }
 
-    // Loop through valid start positions
-    for i in 0..cigar.len() - 3 {
-        let c1 = cigar[i];
-        match c1 {
-            Cigar::Del(_) | Cigar::HardClip(_) => {
-                continue;
-            }
-            _ => {}
-        }
-
-        // Use pattern matching on references
-        match (&cigar[i + 1], &cigar[i + 2], &cigar[i + 3]) {
+    // Java parity for NOTDIG_DIG_I_DIG_M_DIG_DI_DIGI:
+    // inspect only the first I-M-[ID] occurrence that has a preceding operator.
+    // If that first occurrence is preceded by D/H, do not search later occurrences.
+    for j in 1..cigar.len() - 2 {
+        match (&cigar[j], &cigar[j + 1], &cigar[j + 2]) {
             (
-                &c2 @ Cigar::Ins(_),                   // 1
-                &c3 @ Cigar::Match(_),                 // 2
-                &c4 @ (Cigar::Ins(_) | Cigar::Del(_)), // 3
+                &c2 @ Cigar::Ins(_),
+                &c3 @ Cigar::Match(_),
+                &c4 @ (Cigar::Ins(_) | Cigar::Del(_)),
             ) => {
+                let prev = cigar[j - 1];
+                if matches!(prev, Cigar::Del(_) | Cigar::HardClip(_)) {
+                    return None;
+                }
+
                 return Some((
-                    i + 1,
+                    j,
                     [c2, c3, c4],
-                    cigar.get(i + 4).copied().and_then(|c| {
+                    cigar.get(j + 3).copied().and_then(|c| {
                         if matches!(c, Cigar::Ins(_)) {
                             Some(c)
                         } else {

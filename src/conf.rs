@@ -47,6 +47,9 @@ pub struct Configuration {
     /// The threshold for allele frequency. If -p it is set to -1.
     pub freq: f64,
 
+    /// Low-frequency threshold used in somatic classification (Java: -V)
+    pub lofreq: f64,
+
     /// Minimum number of variant reads
     pub minr: usize,
 
@@ -79,6 +82,12 @@ pub struct Configuration {
 
     /// Minimum length for structural variants (Java: SVMINLEN / -L)
     pub sv_min_len: usize,
+
+    /// Include debug columns in textual output (Java: -D)
+    pub debug: bool,
+
+    /// Include Fisher exact test columns in output (Java: --fisher / -fisher)
+    pub fisher: bool,
 }
 
 impl Default for Configuration {
@@ -102,6 +111,7 @@ impl Default for Configuration {
             number_nucleotide_to_extend: 0,
             reference_extension: 1200,
             freq: 0.01,
+            lofreq: 0.05,
             minr: 2,
             read_pos_filter: 5.0,
             qratio: 1.5,
@@ -113,6 +123,8 @@ impl Default for Configuration {
             mapping_quality: None,
             move_indels_to_3: false,
             sv_min_len: 1000,
+            debug: false,
+            fisher: false,
         }
     }
 }

@@ -4,7 +4,7 @@
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
@@ -14,7 +14,7 @@ use crackle_kit::tracing_kit::{setup_logging_stderr_only, setup_logging_stderr_o
 use vardict_rs::data::bam_reader::BamReader;
 use vardict_rs::data::region::Region;
 use vardict_rs::mods::pipeline::{Pipeline, PipelineConfig};
-use vardict_rs::mods::vardict_pipeline::VarDictPipeline;
+use vardict_rs::mods::vardict_pipeline::{SomaticCombineLookupResult, VarDictPipeline};
 
 const DEFAULT_AMPLICON_PARAMETERS: &str = "10:0.95";
 
@@ -29,9 +29,9 @@ struct Args {
     #[arg(short = 'G', long = "ref", required = true)]
     reference: PathBuf,
 
-    /// Indexed BAM file
+    /// Indexed BAM file, or paired BAMs for somatic mode: tumor.bam|normal.bam
     #[arg(short = 'b', long = "bam", required = true)]
-    bam: PathBuf,
+    bam: String,
 
     /// Region of interest (chr:start-end) or BED file
     /// If a file path, reads regions from BED format
@@ -151,12 +151,15 @@ fn main() -> Result<()> {
 
     setup_logging_stderr_only(args.log_level)?;
 
+    let bam_inputs = parse_bam_inputs(&args.bam)?;
+
     // Validate input files exist
     if !args.reference.exists() {
         return Err(anyhow!("Reference file not found: {:?}", args.reference));
     }
-    if !args.bam.exists() {
-        return Err(anyhow!("BAM file not found: {:?}", args.bam));
+    validate_bam_with_index(&bam_inputs.primary_bam)?;
+    if let Some(ref secondary_bam) = bam_inputs.secondary_bam {
+        validate_bam_with_index(secondary_bam)?;
     }
 
     // Check for FASTA index
@@ -173,35 +176,13 @@ fn main() -> Result<()> {
         ));
     }
 
-    // Check for BAM index
-    let bai_path = args.bam.with_extension("bam.bai");
-    let bai_path2 = {
-        let mut p = args.bam.clone();
-        p.set_file_name(format!("{}.bai", args.bam.file_name().unwrap().to_string_lossy()));
-        p
-    };
-    if !bai_path.exists() && !bai_path2.exists() {
-        return Err(anyhow!(
-            "BAM index (.bai) not found. Please run: samtools index {:?}",
-            args.bam
-        ));
-    }
-
-    // Determine sample name - clone bam path first since we'll consume sample_name
-    let bam_path = args.bam.clone();
+    // Determine sample name from first BAM unless overridden
     let sample_name = args.sample_name.clone().unwrap_or_else(|| {
-        bam_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| {
-                // Extract sample name before first underscore
-                s.split('_').next().unwrap_or(s).to_string()
-            })
-            .unwrap_or_else(|| "SAMPLE".to_string())
+        infer_sample_name_from_bam(&bam_inputs.primary_bam)
     });
 
     // Get regions to process
-    let region_load = get_regions(&args)?;
+    let region_load = get_regions(&args, &bam_inputs.primary_bam)?;
     if region_load.regions.is_empty() {
         return Err(anyhow!("No regions specified. Provide -R option or a BED file."));
     }
@@ -216,22 +197,35 @@ fn main() -> Result<()> {
         .pileup(args.pileup)
         .build();
 
-    let execution_mode = resolve_execution_mode(&args, &region_load.amplicon_based_calling);
+    let execution_mode = resolve_execution_mode(
+        &args,
+        &region_load.amplicon_based_calling,
+        bam_inputs.secondary_bam.is_some(),
+    );
 
     // Print header if requested
     if args.print_header {
-        if execution_mode == ExecutionMode::Amplicon {
-            println!("{}", vardict_rs::mods::output_variant::get_amplicon_header_line());
-        } else {
-            let pipeline = Pipeline::new(config.clone());
-            println!("{}", pipeline.get_header());
+        match execution_mode {
+            ExecutionMode::Amplicon => {
+                println!("{}", vardict_rs::mods::output_variant::get_amplicon_header_line());
+            }
+            ExecutionMode::Somatic => {
+                println!("{}", vardict_rs::mods::output_variant::get_somatic_header_line());
+            }
+            ExecutionMode::Simple => {
+                let pipeline = Pipeline::new(config.clone());
+                println!("{}", pipeline.get_header());
+            }
         }
     }
+
+    let bam_paths = bam_inputs.to_paths();
 
     // Always use SharedReference (loaded into memory for fast access)
     run_variant_calling(
         &args,
         config,
+        bam_paths,
         region_load.regions,
         region_load.amplicon_based_calling,
         region_load.amplicon_region_groups,
@@ -248,6 +242,7 @@ fn main() -> Result<()> {
 fn run_variant_calling(
     args: &Args,
     config: PipelineConfig,
+    bam_paths: Vec<PathBuf>,
     regions: Vec<Region>,
     amplicon_based_calling: Option<String>,
     amplicon_region_groups: Option<Vec<Vec<Region>>>,
@@ -259,6 +254,15 @@ fn run_variant_calling(
     use vardict_rs::conf::Configuration;
     use std::sync::Arc;
     use std::time::Instant;
+    use std::collections::HashSet;
+
+    if bam_paths.is_empty() {
+        return Err(anyhow!("No BAM paths available for execution"));
+    }
+    let bam_paths_string = bam_paths
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
 
     let start_total = Instant::now();
     let num_threads = args.num_threads.max(1);
@@ -317,7 +321,7 @@ fn run_variant_calling(
     scope.amplicon_based_calling = conf.amplicon_based_calling.clone();
     scope.conf = conf;
     scope.chr_lens = reference.get_chromosome_lengths();
-    scope.bam_paths = vec![args.bam.to_string_lossy().to_string()];
+    scope.bam_paths = bam_paths_string.clone();
     let _ = INSTANCE.set(scope);
 
     let region_batches = select_region_batches_for_execution(
@@ -349,14 +353,15 @@ fn run_variant_calling(
 
     // Process regions
     let start_processing = Instant::now();
-    let bam_path = args.bam.to_str().unwrap().to_string();
+    let primary_bam_path = bam_paths_string[0].clone();
 
     match execution_mode {
         ExecutionMode::Simple => {
             let pipeline = ParallelPipeline::new(reference, config, num_threads);
             let mut results = Vec::new();
             for batch in region_batches {
-                let mut batch_results = pipeline.process_regions_vardict(bam_path.clone(), batch);
+                let mut batch_results =
+                    pipeline.process_regions_vardict(primary_bam_path.clone(), batch);
                 results.append(&mut batch_results);
             }
 
@@ -387,8 +392,6 @@ fn run_variant_calling(
             }
         }
         ExecutionMode::Amplicon => {
-            use std::collections::HashSet;
-
             let vardict_pipeline = VarDictPipeline::new(&config.sample_name)
                 .with_min_frequency(config.min_frequency)
                 .with_min_base_quality(config.quality_threshold)
@@ -406,7 +409,7 @@ fn run_variant_calling(
                 let mut splice: HashSet<String> = HashSet::new();
 
                 for region in &amplicon_group {
-                    let mut bam_reader = BamReader::open(&bam_path)?;
+                    let mut bam_reader = BamReader::open(&primary_bam_path)?;
                     let aligned_output = vardict_pipeline.process_region_to_aligned_vars_from_bam(
                         region,
                         &reference,
@@ -442,6 +445,114 @@ fn run_variant_calling(
                 eprintln!("[TIMING] TOTAL execution: {:.3}s", elapsed_total.as_secs_f64());
             }
         }
+        ExecutionMode::Somatic => {
+            if bam_paths_string.len() < 2 {
+                return Err(anyhow!(
+                    "Somatic execution requires paired BAM input in the format tumor.bam|normal.bam"
+                ));
+            }
+
+            let tumor_bam_path = bam_paths_string[0].clone();
+            let normal_bam_path = bam_paths_string[1].clone();
+
+            let vardict_pipeline = VarDictPipeline::new(&config.sample_name)
+                .with_min_frequency(config.min_frequency)
+                .with_min_base_quality(config.quality_threshold)
+                .with_min_mapping_quality(config.mapq_threshold)
+                .with_pileup(config.pileup);
+
+            let global_scope = Arc::new(
+                INSTANCE
+                    .get()
+                    .expect("GlobalReadOnlyScope not initialized")
+                    .clone(),
+            );
+            let mut stdout = io::stdout().lock();
+
+            for region_group in region_batches {
+                for region in &region_group {
+                    let mut splice: HashSet<String> = HashSet::new();
+                    let tumor_bam_paths = vec![tumor_bam_path.clone()];
+                    let normal_bam_paths = vec![normal_bam_path.clone()];
+                    let combined_bam_paths = vec![tumor_bam_path.clone(), normal_bam_path.clone()];
+
+                    let mut tumor_bam_reader = BamReader::open(&tumor_bam_path)?;
+                    let tumor_output = vardict_pipeline.process_region_to_aligned_vars_from_bam_with_paths(
+                        region,
+                        &reference,
+                        &mut tumor_bam_reader,
+                        Arc::clone(&global_scope),
+                        &tumor_bam_paths,
+                    )?;
+                    splice.extend(tumor_output.splice.iter().cloned());
+
+                    let mut normal_bam_reader = BamReader::open(&normal_bam_path)?;
+                    let normal_output = vardict_pipeline.process_region_to_aligned_vars_from_bam_with_paths(
+                        region,
+                        &reference,
+                        &mut normal_bam_reader,
+                        Arc::clone(&global_scope),
+                        &normal_bam_paths,
+                    )?;
+                    splice.extend(normal_output.splice.iter().cloned());
+
+                    let combined_output = vardict_pipeline.process_region_to_aligned_vars_from_bam_paths(
+                        region,
+                        &reference,
+                        &combined_bam_paths,
+                        Arc::clone(&global_scope),
+                    )?;
+
+                    let initial_max_read_length =
+                        tumor_output.max_read_length.max(normal_output.max_read_length);
+                    let combined_max_read_length = combined_output.max_read_length;
+                    let combined_aligned_variants = combined_output.aligned_vars.aligned_variants;
+
+                    let combine_lookup = move |
+                        _chr_name: &str,
+                        position: i64,
+                        description_string: &str,
+                        max_read_length: usize,
+                    | {
+                        let combined_variant = combined_aligned_variants
+                            .get(&position)
+                            .and_then(|vars| {
+                                vars.variants
+                                    .iter()
+                                    .find(|variant| variant.description_string == description_string)
+                                    .cloned()
+                            });
+
+                        SomaticCombineLookupResult {
+                            combined_variant,
+                            max_read_length: combined_max_read_length.max(max_read_length),
+                        }
+                    };
+
+                    let output_lines = vardict_pipeline.run_somatic_post_processor_with_combine_lookup(
+                        normal_output.aligned_vars,
+                        tumor_output.aligned_vars,
+                        region,
+                        &splice,
+                        initial_max_read_length,
+                        Some(&combine_lookup),
+                    );
+
+                    for line in output_lines {
+                        writeln!(stdout, "{}", line)?;
+                    }
+                }
+            }
+
+            let elapsed_processing = start_processing.elapsed();
+            let elapsed_total = start_total.elapsed();
+
+            if args.debug {
+                eprintln!("[TIMING] Processing all regions: {:.3}s", elapsed_processing.as_secs_f64());
+                eprintln!("[TIMING] Output writing: {:.3}s", 0.0f64);
+                eprintln!("[TIMING] TOTAL execution: {:.3}s", elapsed_total.as_secs_f64());
+            }
+        }
     }
 
     Ok(())
@@ -463,10 +574,17 @@ struct ParsedBedResult {
 enum ExecutionMode {
     Simple,
     Amplicon,
+    Somatic,
 }
 
-fn resolve_execution_mode(args: &Args, amplicon_based_calling: &Option<String>) -> ExecutionMode {
-    if args.region.is_some() {
+fn resolve_execution_mode(
+    args: &Args,
+    amplicon_based_calling: &Option<String>,
+    has_paired_bam: bool,
+) -> ExecutionMode {
+    if has_paired_bam {
+        ExecutionMode::Somatic
+    } else if args.region.is_some() {
         ExecutionMode::Simple
     } else if amplicon_based_calling.is_some() {
         ExecutionMode::Amplicon
@@ -481,7 +599,7 @@ fn select_region_batches_for_execution(
     amplicon_region_groups: Option<Vec<Vec<Region>>>,
 ) -> Vec<Vec<Region>> {
     match execution_mode {
-        ExecutionMode::Simple => vec![regions],
+        ExecutionMode::Simple | ExecutionMode::Somatic => vec![regions],
         ExecutionMode::Amplicon => {
             if let Some(groups) = amplicon_region_groups {
                 if groups.is_empty() {
@@ -496,10 +614,85 @@ fn select_region_batches_for_execution(
     }
 }
 
+#[derive(Debug, Clone)]
+struct BamInputs {
+    primary_bam: PathBuf,
+    secondary_bam: Option<PathBuf>,
+}
+
+impl BamInputs {
+    fn to_paths(&self) -> Vec<PathBuf> {
+        let mut paths = vec![self.primary_bam.clone()];
+        if let Some(ref secondary_bam) = self.secondary_bam {
+            paths.push(secondary_bam.clone());
+        }
+        paths
+    }
+}
+
+fn parse_bam_inputs(raw_bam: &str) -> Result<BamInputs> {
+    let parts = raw_bam
+        .split('|')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+
+    if parts.is_empty() {
+        return Err(anyhow!(
+            "BAM argument is empty. Provide -b <bam> or -b <tumor.bam|normal.bam>"
+        ));
+    }
+
+    if parts.len() > 2 {
+        return Err(anyhow!(
+            "Invalid BAM argument: expected one BAM or two BAMs separated by '|', got {} entries",
+            parts.len()
+        ));
+    }
+
+    Ok(BamInputs {
+        primary_bam: PathBuf::from(parts[0]),
+        secondary_bam: parts.get(1).map(|value| PathBuf::from(*value)),
+    })
+}
+
+fn validate_bam_with_index(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Err(anyhow!("BAM file not found: {:?}", path));
+    }
+
+    let bai_path = path.with_extension("bam.bai");
+    let bai_path2 = {
+        let mut p = path.to_path_buf();
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| anyhow!("Invalid BAM path: {:?}", path))?
+            .to_string_lossy()
+            .to_string();
+        p.set_file_name(format!("{}.bai", file_name));
+        p
+    };
+    if !bai_path.exists() && !bai_path2.exists() {
+        return Err(anyhow!(
+            "BAM index (.bai) not found. Please run: samtools index {:?}",
+            path
+        ));
+    }
+
+    Ok(())
+}
+
+fn infer_sample_name_from_bam(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.split('_').next().unwrap_or(stem).to_string())
+        .unwrap_or_else(|| "SAMPLE".to_string())
+}
+
 /// Parse regions from command line arguments
-fn get_regions(args: &Args) -> Result<RegionLoadResult> {
+fn get_regions(args: &Args, primary_bam_path: &Path) -> Result<RegionLoadResult> {
     let mut regions = Vec::new();
-    let bam_targets = BamReader::open(&args.bam)
+    let bam_targets = BamReader::open(primary_bam_path)
         .context("Failed to open BAM for region normalization")?
         .target_names();
 
@@ -1014,7 +1207,7 @@ mod tests {
             "10:0.95",
         ]);
 
-        let loaded = get_regions(&args).unwrap();
+        let loaded = get_regions(&args, Path::new("test_data/test_168714.bam")).unwrap();
         assert_eq!(loaded.amplicon_based_calling, None);
         assert_eq!(loaded.regions.len(), 1);
     }
@@ -1033,7 +1226,7 @@ mod tests {
             "10:0.95",
         ]);
 
-        let mode = resolve_execution_mode(&args, &Some("10:0.95".to_string()));
+        let mode = resolve_execution_mode(&args, &Some("10:0.95".to_string()), false);
         assert_eq!(mode, ExecutionMode::Simple);
     }
 
@@ -1047,8 +1240,46 @@ mod tests {
             "input.bam",
         ]);
 
-        let mode = resolve_execution_mode(&args, &Some("10:0.95".to_string()));
+        let mode = resolve_execution_mode(&args, &Some("10:0.95".to_string()), false);
         assert_eq!(mode, ExecutionMode::Amplicon);
+    }
+
+    #[test]
+    fn test_resolve_execution_mode_paired_bam_forces_somatic() {
+        let args = Args::parse_from([
+            "vardict",
+            "-G",
+            "reference.fa",
+            "-b",
+            "tumor.bam|normal.bam",
+            "-R",
+            "chr1:1-10",
+            "-a",
+            "10:0.95",
+        ]);
+
+        let mode = resolve_execution_mode(&args, &Some("10:0.95".to_string()), true);
+        assert_eq!(mode, ExecutionMode::Somatic);
+    }
+
+    #[test]
+    fn test_parse_bam_inputs_single_bam() {
+        let inputs = parse_bam_inputs("sample.bam").unwrap();
+        assert_eq!(inputs.primary_bam, PathBuf::from("sample.bam"));
+        assert!(inputs.secondary_bam.is_none());
+    }
+
+    #[test]
+    fn test_parse_bam_inputs_somatic_pair() {
+        let inputs = parse_bam_inputs("tumor.bam|normal.bam").unwrap();
+        assert_eq!(inputs.primary_bam, PathBuf::from("tumor.bam"));
+        assert_eq!(inputs.secondary_bam, Some(PathBuf::from("normal.bam")));
+    }
+
+    #[test]
+    fn test_parse_bam_inputs_rejects_more_than_two_entries() {
+        let parsed = parse_bam_inputs("a.bam|b.bam|c.bam");
+        assert!(parsed.is_err());
     }
 
     #[test]

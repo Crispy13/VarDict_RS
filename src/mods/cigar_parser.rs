@@ -2,6 +2,7 @@ use bio_types::genome::AbstractInterval;
 use smallvec::SmallVec;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    env,
     ops::AddAssign,
     sync::Arc,
 };
@@ -334,7 +335,21 @@ impl CigarParser {
     fn parse_cigar(&mut self, record: &mut Record) -> Result<(), Error> {
         event!(Level::DEBUG, "Starting for record at pos {}", record.pos());
         self.current_qname = Some(String::from_utf8_lossy(record.qname()).to_string());
-        let trace_target = record.qname() == b"SRR098401.96368837";
+        let trace_target = env::var("VARDICT_TRACE_QNAME")
+            .ok()
+            .map(|needle| {
+                needle == "*" || record.qname() == needle.as_bytes()
+            })
+            .unwrap_or(record.qname() == b"SRR098401.96368837");
+        if trace_target {
+            event!(
+                Level::WARN,
+                "[trace_target] qname={} parse_enter pos={} cigar={}",
+                String::from_utf8_lossy(record.qname()),
+                record.pos() + 1,
+                record.cigar().to_string()
+            );
+        }
         
         // Build query sequence and quality as owned vectors
         let mut query_seq_owned: Vec<u8> = record.seq().into_decoded_base_iter().collect();
@@ -548,10 +563,11 @@ impl CigarParser {
         if trace_target {
             event!(
                 Level::INFO,
-                "[trace_target] entering process loop start={} read_match_ins_len={} soft_len={}",
+                "[trace_target] entering process loop start={} read_match_ins_len={} soft_len={} modified_cigar={}",
                 self.start,
                 read_match_ins_len,
-                read_len_including_softclips
+                read_len_including_softclips,
+                self.last_modified_cigar.as_deref().unwrap_or("-")
             );
         }
 
@@ -1872,7 +1888,32 @@ impl CigarParser {
         mut ci: usize,
         cigar: &CigarStringView,
     ) -> Result<usize, Error> {
+        let trace_ins = env::var("VARDICT_TRACE_INS_QNAME")
+            .ok()
+            .map(|needle| {
+                needle == "*"
+                    || self
+                        .current_qname
+                        .as_deref()
+                        .map_or(false, |name| name == needle)
+            })
+            .unwrap_or(false);
+
         let ins_len = self.cigar_len as usize;
+
+        if trace_ins {
+            event!(
+                Level::WARN,
+                "[trace_ins] enter qname={} ci={} start={} read_pos_incl={} read_pos_excl={} ins_len={} cigar={}",
+                self.current_qname.as_deref().unwrap_or("-"),
+                ci,
+                self.start,
+                self.read_pos_including_softclip,
+                self.read_pos_excluding_softclip,
+                ins_len,
+                self.last_modified_cigar.as_deref().unwrap_or("-")
+            );
+        }
 
         // Ignore insertions right after introns at exon edge in RNA-seq
         if skip_indel_next_to_intron(&self.cigar, ci)? {
@@ -2015,6 +2056,19 @@ impl CigarParser {
             }
 
             let desc_string = format!("+{}", String::from_utf8_lossy(desc.as_slice()));
+            if trace_ins {
+                event!(
+                    Level::WARN,
+                    "[trace_ins] emit qname={} insertion_pos={} desc={} offset={} multoffs={} multoffp={} nmoff={}",
+                    self.current_qname.as_deref().unwrap_or("-"),
+                    insertion_pos,
+                    desc_string,
+                    self.offset,
+                    multoffs,
+                    multoffp,
+                    nmoff
+                );
+            }
             Self::increment_position_count(
                 &mut self.position_to_insertion_count,
                 insertion_pos,
@@ -2109,6 +2163,18 @@ impl CigarParser {
             }
         }
 
+        if trace_ins {
+            event!(
+                Level::WARN,
+                "[trace_ins] exit qname={} start={} read_pos_incl={} read_pos_excl={} ci={}",
+                self.current_qname.as_deref().unwrap_or("-"),
+                self.start,
+                self.read_pos_including_softclip,
+                self.read_pos_excluding_softclip,
+                ci
+            );
+        }
+
         // adjust read position by m (CIGAR segment length) + offset + multoffp
         self.read_pos_including_softclip += ins_len + self.offset + multoffp;
         self.read_pos_excluding_softclip += ins_len + self.offset + multoffp;
@@ -2135,6 +2201,14 @@ impl CigarParser {
         ddlen: usize,
         pos: i64,
     ) {
+        let debug_pos = env::var("VARDICT_DEBUG_POS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok());
+        let trace_merge_ins = env::var("VARDICT_TRACE_MERGED_INS")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         // Build VarDesc from s string
         // s format examples: "A", "A&TGC" (MNV), "+ATC" (insertion), "-2&AT" (deletion+match), etc.
         
@@ -2157,6 +2231,20 @@ impl CigarParser {
         if s.starts_with(b"+") {
             // Insertion: +ATC format
             let ins_seq: SmallVec<[u8; 32]> = s[1..].iter().copied().collect();
+
+            if trace_merge_ins {
+                event!(
+                    Level::WARN,
+                    "[trace_merged_ins] qname={} pos={} s={} read_pos={} start={} read_pos_incl={} read_pos_excl={}",
+                    self.current_qname.as_deref().unwrap_or("-"),
+                    pos,
+                    s_str,
+                    read_pos,
+                    self.start,
+                    self.read_pos_including_softclip,
+                    self.read_pos_excluding_softclip
+                );
+            }
 
             let var_desc = VarDesc::Ins { seq: ins_seq };
 
@@ -2280,6 +2368,20 @@ impl CigarParser {
                     inc_cnt(&mut self.ref_coverage, self.start + qi as i64, 1);
                 }
             }
+        }
+
+        if debug_pos == Some(pos) && s.starts_with(b"C&") {
+            event!(
+                Level::DEBUG,
+                "[cigar_debug_pos] qname={} pos={} s={} read_pos_excl={} read_pos_incl={} start={} cigar={}",
+                self.current_qname.as_deref().unwrap_or("-"),
+                pos,
+                String::from_utf8_lossy(s),
+                read_pos,
+                self.read_pos_including_softclip,
+                self.start,
+                self.last_modified_cigar.as_deref().unwrap_or("-")
+            );
         }
 
         if is_begin_atgc_amp_atgcs_end(s) {
@@ -3037,6 +3139,8 @@ fn consumes_read_and_ref(op: &Cigar) -> bool {
     matches!(op, Cigar::Match(_) | Cigar::Equal(_) | Cigar::Diff(_))
 }
 
+/// Java parity: getCigarOperator(Cigar, ci)
+/// Treat insertions at the first/last CIGAR element as soft-clipping.
 /// Skip the insertions and deletions that are right after or before introns
 /// (they indicate of aligner problem)
 fn skip_indel_next_to_intron(cigar: &CigarStringView, ci: usize) -> Result<bool, Error> {
@@ -3059,7 +3163,7 @@ fn is_followed_by_match_and_indel(cigar: &CigarStringView, ci: usize) -> bool {
     if !instance().conf.perform_local_realignment {
         return false;
     }
-    if ci + 2 >= cigar.len() {
+    if ci + 3 >= cigar.len() {
         return false;
     }
 
@@ -3068,13 +3172,7 @@ fn is_followed_by_match_and_indel(cigar: &CigarStringView, ci: usize) -> bool {
 
     matches!(n_cigar, &Cigar::Match(l) if l <= instance().conf.vext as u32)
         && matches!(nn_cigar, Cigar::Ins(_) | Cigar::Del(_))
-        && {
-            match cigar.get(ci + 3) {
-                Some(Cigar::Ins(_) | Cigar::Del(_)) => false,
-                Some(_) => true,
-                None => true,
-            }
-        }
+        && !matches!(cigar.get(ci + 3), Some(Cigar::Ins(_) | Cigar::Del(_)))
 }
 
 /// Append sequence for deletion or insertion cases to create description string

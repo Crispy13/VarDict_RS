@@ -19,6 +19,7 @@ rand = "0.8.5"
 rust-htslib = { git = "https://github.com/Crispy13/rust-htslib.git", branch = "dev", features = ["libdeflate"] }
 smallvec = "1.15.1"
 rayon = "1.11.0"
+statrs = "0.17"
 
 [profile.dev]
 incremental = true

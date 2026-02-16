@@ -3,11 +3,14 @@ use rust_htslib::bam::{record::Cigar, Record};
 
 use crate::{
     conf::Configuration,
+    data::reference::Reference,
+    data::region::Region,
     data::bam_reader::BamReader,
     data::patterns::{
-        AMP_ATGC, ATGSs_AMP_ATGSs_END, BEGIN_PLUS_ATGC, CARET_ATGC_END, DUP_NUM_ATGC, HASH_ATGC,
-        UP_NUMBER_END,
+        AMP_ATGC, ATGSs_AMP_ATGSs_END, BEGIN_PLUS_ATGC, CARET_ATGC_END, CARET_ATGNC,
+        DUP_NUM_ATGC, HASH_ATGC, UP_NUMBER_END,
     },
+    mods::vardict_pipeline::VarDictPipeline,
     mods::structural_variants_processor::RealignedVariationData,
     prelude::SmallVecBytes,
     variants::{
@@ -85,20 +88,45 @@ impl VariantRealigner {
     pub fn process_deletions(
         &self,
         data: &mut RealignedVariationData,
+        position_to_deletions_count: &std::collections::HashMap<i64, std::collections::HashMap<String, usize>>,
     ) {
-        let mut del_keys: Vec<(i64, VarDesc, String)> = Vec::new();
-        for (pos, var_map) in data.non_insertion_variants.iter() {
-            for desc in var_map.keys() {
-                if matches!(desc, VarDesc::Del { .. }) {
-                    del_keys.push((*pos, desc.clone(), desc.to_key_string()));
+        let mut del_keys: Vec<(i64, VarDesc, String, usize)> = Vec::new();
+
+        if !position_to_deletions_count.is_empty() {
+            for (pos, desc_map) in position_to_deletions_count {
+                let Some(var_map) = data.non_insertion_variants.get(pos) else {
+                    continue;
+                };
+                for (desc_str, count) in desc_map {
+                    if *count == 0 {
+                        continue;
+                    }
+                    if let Some((desc, _)) = var_map
+                        .iter()
+                        .find(|(desc, _)| desc.to_key_string() == *desc_str)
+                    {
+                        del_keys.push((*pos, desc.clone(), desc_str.clone(), *count));
+                    }
+                }
+            }
+        } else {
+            for (pos, var_map) in data.non_insertion_variants.iter() {
+                for (desc, variant) in var_map {
+                    if desc.to_key_string().starts_with('-') {
+                        del_keys.push((*pos, desc.clone(), desc.to_key_string(), variant.alt_depth));
+                    }
                 }
             }
         }
 
-        del_keys.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
+        del_keys.sort_by(|a, b| {
+            b.3.cmp(&a.3)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| b.2.cmp(&a.2))
+        });
 
-        for (pos, desc, _) in &del_keys {
-            self.realign_deletion_mismatches(*pos, desc, data);
+        for (pos, desc, _, count) in &del_keys {
+            self.realign_deletion_mismatches(*pos, desc, *count, data);
         }
 
         // Java realigndel post-pass:
@@ -106,7 +134,7 @@ impl VariantRealigner {
         //   if vn =~ /^(-\d+)&[ATGC]+$/ and vars(vn) < vars($1) then merge vn into $1
         // }
         for idx in (1..del_keys.len()).rev() {
-            let (pos, desc, desc_str) = &del_keys[idx];
+            let (pos, desc, desc_str, _) = &del_keys[idx];
             let Some(base_del_desc) = Self::minus_amp_base_desc(desc_str) else {
                 continue;
             };
@@ -182,6 +210,102 @@ impl VariantRealigner {
             };
             let sv = variation_map.entry(key).or_default();
             sv.alt_depth += splits;
+        }
+    }
+
+    fn adjust_sv_split_count(data: &mut RealignedVariationData, position: i64, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+
+        let key = VarDesc::Raw {
+            desc: b"SV".to_vec().into(),
+        };
+
+        let Some(variation_map) = data.non_insertion_variants.get_mut(&position) else {
+            return;
+        };
+
+        let Some(sv) = variation_map.get_mut(&key) else {
+            return;
+        };
+
+        if delta > 0 {
+            sv.alt_depth += delta as usize;
+        } else {
+            sv.alt_depth = sv.alt_depth.saturating_sub((-delta) as usize);
+        }
+    }
+
+    fn updated_insertion_count_after_realign(
+        before: Option<&HashMap<VarDesc, Variant>>,
+        after: Option<&HashMap<VarDesc, Variant>>,
+        original_key: &VarDesc,
+    ) -> Option<usize> {
+        let after_map = after?;
+
+        if let Some(variant) = after_map.get(original_key) {
+            return Some(variant.alt_depth);
+        }
+
+        let mut positive_candidates: Vec<usize> = Vec::new();
+
+        for (key, variant) in after_map {
+            let before_count = before
+                .and_then(|map| map.get(key))
+                .map(|v| v.alt_depth)
+                .unwrap_or(0);
+            let delta = variant.alt_depth as isize - before_count as isize;
+            if delta > 0 {
+                positive_candidates.push(variant.alt_depth);
+            }
+        }
+
+        if positive_candidates.len() == 1 {
+            positive_candidates.into_iter().next()
+        } else {
+            None
+        }
+    }
+
+    fn load_partial_ref_coverage(
+        &self,
+        data: &mut RealignedVariationData,
+        start: i64,
+        end: i64,
+    ) {
+        if self.bam_paths.is_empty() || start > end {
+            return;
+        }
+
+        let Some(chromosome) = self.chromosome.as_deref() else {
+            return;
+        };
+
+        let start = start.max(1);
+        let end = end.max(start);
+        let region = Region::new(
+            chromosome.to_string(),
+            start as usize,
+            end as usize,
+            String::new(),
+        );
+
+        let mut reference = Reference::new_with_start(self.reference_seq.clone(), self.ref_start);
+        let ref_end = reference.region_start + reference.ref_seq.len() as i64 - 1;
+        let chr_len = crate::scopedata::global_read_only_scope::instance()
+            .chr_lens
+            .get(chromosome)
+            .copied();
+        reference.build_seed_map(ref_end, chr_len);
+
+        let pipeline = VarDictPipeline::new("realigner_partial");
+        let Ok(extra) = pipeline.run_partial_cigar_for_bams(&region, &reference, &self.bam_paths) else {
+            return;
+        };
+
+        for (position, coverage) in extra.ref_coverage {
+            *data.ref_coverage.entry(position).or_insert(0) += coverage;
         }
     }
 
@@ -943,6 +1067,13 @@ impl VariantRealigner {
 
     pub fn realign_long_insertions(&self, data: &mut RealignedVariationData) {
         let conf = &crate::scopedata::global_read_only_scope::instance().conf;
+        let base_region_start = data.ref_coverage.keys().min().copied().unwrap_or(1);
+        let base_region_end = data
+            .ref_coverage
+            .keys()
+            .max()
+            .copied()
+            .unwrap_or(base_region_start);
 
         let mut tmp: Vec<(i64, usize)> = data
             .soft_clips_5end
@@ -988,6 +1119,15 @@ impl VariantRealigner {
                     && bi - p < Configuration::SVMAXLEN as i64)
                 {
                     continue;
+                }
+
+                if bi > base_region_end {
+                    let mut tts = bi - data.max_read_length as i64;
+                    let tte = bi + data.max_read_length as i64;
+                    if bi - data.max_read_length as i64 <= base_region_end {
+                        tts = base_region_end + 1;
+                    }
+                    self.load_partial_ref_coverage(data, tts, tte);
                 }
 
                 if bi - p
@@ -1046,6 +1186,7 @@ impl VariantRealigner {
             iref.pstd = true;
             iref.qstd = true;
             adj_cnt(iref, &sc5_var);
+            let original_ins_count = iref.alt_depth;
 
             if let Some(variation_map) = data.non_insertion_variants.get(&bi) {
                 if !Self::has_sv_marker(variation_map) {
@@ -1083,10 +1224,20 @@ impl VariantRealigner {
             let mut map = HashMap::new();
             map.insert(
                 format!("+{}", String::from_utf8_lossy(&ins)),
-                iref.alt_depth,
+                original_ins_count,
             );
             tins.insert(bi, map);
+            let before_insertions = data.insertion_variants.get(&bi).cloned();
             self.process_insertions(data, &tins);
+
+            let updated_ins_count = Self::updated_insertion_count_after_realign(
+                before_insertions.as_ref(),
+                data.insertion_variants.get(&bi),
+                &iref_key,
+            )
+            .unwrap_or(original_ins_count);
+            let sv_delta = updated_ins_count as isize - original_ins_count as isize;
+            Self::adjust_sv_split_count(data, bi, sv_delta);
 
         }
 
@@ -1135,6 +1286,15 @@ impl VariantRealigner {
                     && p - bi < Configuration::SVMAXLEN as i64)
                 {
                     continue;
+                }
+
+                if bi < base_region_start {
+                    let tts = bi - data.max_read_length as i64;
+                    let mut tte = bi + data.max_read_length as i64;
+                    if bi + data.max_read_length as i64 >= base_region_start {
+                        tte = base_region_start - 1;
+                    }
+                    self.load_partial_ref_coverage(data, tts, tte);
                 }
 
                 let mut shift5 = 0i64;
@@ -1255,14 +1415,26 @@ impl VariantRealigner {
                 sc3v.mark_used();
             }
 
+            let original_ins_count = iref.alt_depth;
+
             let mut tins = HashMap::new();
             let mut map = HashMap::new();
             map.insert(
                 format!("+{}", String::from_utf8_lossy(&ins)),
-                iref.alt_depth,
+                original_ins_count,
             );
             tins.insert(bi, map);
+            let before_insertions = data.insertion_variants.get(&bi).cloned();
             self.process_insertions(data, &tins);
+
+            let updated_ins_count = Self::updated_insertion_count_after_realign(
+                before_insertions.as_ref(),
+                data.insertion_variants.get(&bi),
+                &iref_key,
+            )
+            .unwrap_or(original_ins_count);
+            let sv_delta = updated_ins_count as isize - original_ins_count as isize;
+            Self::adjust_sv_split_count(data, bi, sv_delta);
 
         }
     }
@@ -1273,15 +1445,19 @@ impl VariantRealigner {
         data: &mut RealignedVariationData,
         mnp: &std::collections::HashMap<i64, std::collections::HashMap<String, usize>>,
     ) {
-        let mut tmp: Vec<(i64, String)> = Vec::new();
+        let mut tmp: Vec<(i64, String, usize)> = Vec::new();
         for (pos, desc_map) in mnp {
-            for desc in desc_map.keys() {
-                tmp.push((*pos, desc.clone()));
+            for (desc, count) in desc_map {
+                tmp.push((*pos, desc.clone(), *count));
             }
         }
-        tmp.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        tmp.sort_by(|a, b| {
+            b.2.cmp(&a.2)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| b.1.cmp(&a.1))
+        });
 
-        for (position, vn) in tmp {
+        for (position, vn, _) in tmp {
             let vref_key = VarDesc::Raw { desc: vn.as_bytes().to_vec().into() };
             let vref_cnt = match data
                 .non_insertion_variants
@@ -1423,47 +1599,45 @@ impl VariantRealigner {
         &self,
         pos: i64,
         desc: &VarDesc,
+        fixed_dcnt: usize,
         data: &mut RealignedVariationData,
     ) {
-        let (dellen, extra_seq, extrains_len) = match desc {
-            VarDesc::Del {
-                len,
-                match_seq,
-                ins_or_del_len,
-                mismatch_seq,
-                ..
-            } => {
-                let mut total = *len as i64;
-                if let InsOrDelLen::DelLen(extra) = ins_or_del_len {
-                    total += *extra as i64;
-                }
+        let desc_str = desc.to_key_string();
+        let desc_bytes = desc_str.as_bytes();
+        if desc_bytes.first() != Some(&b'-') {
+            return;
+        }
 
-                let mut extra_bytes = Vec::new();
-                if !match_seq.is_empty() {
-                    extra_bytes.extend_from_slice(match_seq.as_slice());
-                }
-                match ins_or_del_len {
-                    InsOrDelLen::InsSeq(seq) => {
-                        extra_bytes.extend_from_slice(seq.as_slice());
-                    }
-                    InsOrDelLen::DelLen(del_len) => {
-                        extra_bytes.extend_from_slice(del_len.to_string().as_bytes());
-                    }
-                    InsOrDelLen::None => {}
-                }
-                if !mismatch_seq.is_empty() {
-                    extra_bytes.extend_from_slice(mismatch_seq.as_slice());
-                }
+        let mut idx = 1usize;
+        while idx < desc_bytes.len() && desc_bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        if idx == 1 {
+            return;
+        }
 
-                let extra = String::from_utf8_lossy(&extra_bytes).to_string();
-                let extrains_len = match ins_or_del_len {
-                    InsOrDelLen::InsSeq(seq) => seq.len() as i64,
-                    _ => 0,
-                };
-                (total, extra, extrains_len)
+        let mut dellen = std::str::from_utf8(&desc_bytes[1..idx])
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        if let Some(cap) = UP_NUMBER_END.captures(&desc_str) {
+            if let Some(extra) = cap
+                .get(1)
+                .and_then(|group| group.as_str().parse::<i64>().ok())
+            {
+                dellen += extra;
             }
-            _ => return,
-        };
+        }
+
+        let extra_seq: String = desc_str[idx..]
+            .chars()
+            .filter(|ch| !matches!(*ch, '^' | '&' | '#'))
+            .collect();
+        let extrains_len = CARET_ATGNC
+            .captures(&desc_str)
+            .and_then(|cap| cap.get(1))
+            .map(|group| group.as_str().len() as i64)
+            .unwrap_or(0);
 
         let mut wupseq = self.get_ref_range(pos - 200, pos - 1);
         wupseq.extend_from_slice(extra_seq.as_bytes());
@@ -1475,14 +1649,16 @@ impl VariantRealigner {
         let r3 = self.find_mm3(pos, &sanpseq, data);
         let r5 = self.find_mm5(pos + dellen + extra_seq.len() as i64 - extrains_len - 1, &wupseq, data);
 
-        let dcnt = match data
+        if data
             .non_insertion_variants
             .get(&pos)
             .and_then(|m| m.get(desc))
+            .is_none()
         {
-            Some(vref) => vref.alt_depth,
-            None => return,
-        };
+            return;
+        }
+
+        let dcnt = fixed_dcnt;
         if dcnt == 0 {
             return;
         }
@@ -1666,17 +1842,8 @@ impl VariantRealigner {
                 if seq.is_empty() {
                     continue;
                 }
-                let offset = if sc3pp > pos {
-                    (sc3pp - pos) as usize
-                } else {
-                    0
-                };
-                let mseq = if offset <= sanpseq.len() {
-                    &sanpseq[offset..]
-                } else {
-                    &[]
-                };
-                if Self::is_match_bytes(&seq, mseq, 1) {
+                let mseq = Self::substr_bytes(&sanpseq, sc3pp - pos, None);
+                if Self::is_match_bytes(&seq, &mseq, 1) {
                     if sc3pp <= pos {
                         *data.ref_coverage.entry(pos).or_insert(0) += tv.var.alt_depth;
                     }
@@ -1885,12 +2052,14 @@ impl VariantRealigner {
 
             if mn > 1 {
                 let mut n2 = 0usize;
-                while let Some(ch) = char_at_neg(&seq, (n + 1 + n2) as isize) {
-                    if self.is_has_and_equals(position - n as i64 - 1 - n2 as i64, ch) {
-                        n2 += 1;
-                    } else {
+                while -1isize - n as isize - 1 - n2 as isize >= 0 {
+                    let Some(ch) = char_at_neg(&seq, (n + 1 + n2) as isize) else {
+                        break;
+                    };
+                    if !self.is_has_and_equals(position - n as i64 - 1 - n2 as i64, ch) {
                         break;
                     }
+                    n2 += 1;
                 }
 
                 if n2 > 2 {
@@ -2417,7 +2586,13 @@ impl VariantRealigner {
         desc: &VarDesc,
         data: &mut RealignedVariationData,
     ) {
-        self.realign_deletion_mismatches(pos, desc, data);
+        let dcnt = data
+            .non_insertion_variants
+            .get(&pos)
+            .and_then(|m| m.get(desc))
+            .map(|v| v.alt_depth)
+            .unwrap_or(0);
+        self.realign_deletion_mismatches(pos, desc, dcnt, data);
     }
 
     fn get_ref_range(&self, start: i64, end: i64) -> Vec<u8> {
@@ -3010,6 +3185,8 @@ mod tests {
             .process_records(records.iter_mut())
             .expect("process_records failed");
 
+        let position_to_deletions_count = parser.take_position_to_deletions_count();
+
         let mut sv_input = crate::mods::structural_variants_processor::RealignedVariationData {
             non_insertion_variants: parser.take_non_insertion_vars(),
             insertion_variants: parser.take_insertion_vars(),
@@ -3026,7 +3203,7 @@ mod tests {
                 reference.seed.clone(),
                 reference.region_start,
             );
-            realigner.process_deletions(&mut sv_input);
+            realigner.process_deletions(&mut sv_input, &position_to_deletions_count);
         }
 
         assert!(!reference.ref_seq.is_empty());
