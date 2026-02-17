@@ -238,7 +238,7 @@ pub enum InsOrDelLen {
     DelLen(usize),
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct SoftClip {
     pub(crate) var: Variant,
 
@@ -259,23 +259,31 @@ pub(crate) struct SoftClip {
     used: bool,
 
     /// Additional fields for structural variation
-    start: i64,
-    end: i64,
-    mstart: i64,
-    mend: i64,
-    mlen: i32,
-    disc: i32,
-    softp: i32,
+    pub(crate) start: i64,
+    pub(crate) end: i64,
+    pub(crate) mstart: i64,
+    pub(crate) mend: i64,
+    pub(crate) mlen: i32,
+    pub(crate) disc: i32,
+    pub(crate) softp: i32,
 
     /// Map of softclip positions to their counts for SV
-    soft: HashMap<i64, usize>,
-    mates: Vec<Mate>,
+    pub(crate) soft: HashMap<i64, usize>,
+    pub(crate) mates: Vec<Mate>,
 }
 
 
-#[derive(Default)]
-struct Mate {
-    // TODO: for SV.
+#[derive(Default, Clone)]
+pub(crate) struct Mate {
+    pub(crate) mate_start: i64,
+    pub(crate) mate_end: i64,
+    pub(crate) mate_len: i32,
+    pub(crate) start: i64,
+    pub(crate) end: i64,
+    pub(crate) mean_pos: f64,
+    pub(crate) mean_qual: f64,
+    pub(crate) mean_mapq: f64,
+    pub(crate) nm: f64,
 }
 
 impl SoftClip {

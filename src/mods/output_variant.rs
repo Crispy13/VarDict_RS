@@ -1883,4 +1883,84 @@ mod tests {
         assert_eq!(fields[52], "sv1");
         assert_eq!(fields[54], "0");
     }
+
+    #[test]
+    fn test_fisher_exact_logdc_java_parity() {
+        let fisher = FisherExact::new(11, 12, 1, 2);
+        let expected = vec![-2.4696392, -1.0345547, -0.8675006, -1.9661129];
+        assert_eq!(fisher.logdc.len(), expected.len());
+
+        for (actual, expected_value) in fisher.logdc.iter().zip(expected.iter()) {
+            assert!((actual - expected_value).abs() < 1e-7);
+        }
+    }
+
+    #[test]
+    fn test_fisher_exact_counts_java_parity() {
+        let cases = vec![
+            (121usize, 55usize, 18usize, 23usize, 0.00378, 0.99908, 0.00287, 2.79657),
+            (121usize, 5usize, 18usize, 23usize, 0.0, 1.0, 0.0, 29.86184),
+            (37usize, 76usize, 1usize, 1usize, 1.0, 0.55362, 0.89275, 0.49015),
+            (0usize, 0usize, 1usize, 0usize, 1.0, 1.0, 1.0, 0.0),
+            (1usize, 0usize, 1usize, 0usize, 1.0, 1.0, 1.0, 0.0),
+            (0usize, 0usize, 0usize, 0usize, 1.0, 1.0, 1.0, 0.0),
+            (0usize, 1usize, 1usize, 0usize, 1.0, 0.5, 1.0, 0.0),
+            (1usize, 1usize, 1usize, 0usize, 1.0, 0.66667, 1.0, 0.0),
+            (1usize, 1usize, 1usize, 1usize, 1.0, 0.83333, 0.83333, 1.0),
+            (10usize, 10usize, 10usize, 1usize, 0.04722, 0.02599, 0.99802, 0.10703),
+            (10usize, 10usize, 10usize, 0usize, 0.01099, 0.00615, 1.0, 0.0),
+            (69usize, 1usize, 74usize, 95usize, 0.0, 1.0, 0.0, 87.68597),
+            (41usize, 86usize, 1usize, 1usize, 0.54688, 0.54687, 0.89571, 0.47973),
+            (130usize, 189usize, 1usize, 0usize, 0.40937, 0.40937, 1.0, 0.0),
+            (83usize, 40usize, 1usize, 2usize, 0.25746, 0.96473, 0.25746, 4.09908),
+            (74usize, 117usize, 1usize, 0usize, 0.39062, 0.39063, 1.0, 0.0),
+            (60usize, 62usize, 2usize, 0usize, 0.49593, 0.24797, 1.0, 0.0),
+            (43usize, 83usize, 1usize, 1usize, 1.0, 0.57111, 0.88361, 0.52091),
+            (78usize, 40usize, 1usize, 1usize, 1.0, 0.88515, 0.56849, 1.93844),
+        ];
+
+        for (ref_fwd, ref_rev, alt_fwd, alt_rev, pvalue, p_less, p_greater, odd_ratio) in cases {
+            let fisher = FisherExact::new(ref_fwd, ref_rev, alt_fwd, alt_rev);
+            let actual_pvalue = fisher.p_value();
+            let actual_p_less = fisher.p_value_less();
+            let actual_p_greater = fisher.p_value_greater();
+
+            assert!(
+                (actual_pvalue - pvalue).abs() <= 2e-5,
+                "p_value mismatch for ({},{},{},{}): actual={} expected={}",
+                ref_fwd,
+                ref_rev,
+                alt_fwd,
+                alt_rev,
+                actual_pvalue,
+                pvalue
+            );
+            assert!(
+                (actual_p_less - p_less).abs() <= 2e-5,
+                "p_value_less mismatch for ({},{},{},{}): actual={} expected={}",
+                ref_fwd,
+                ref_rev,
+                alt_fwd,
+                alt_rev,
+                actual_p_less,
+                p_less
+            );
+            assert!(
+                (actual_p_greater - p_greater).abs() <= 2e-5,
+                "p_value_greater mismatch for ({},{},{},{}): actual={} expected={}",
+                ref_fwd,
+                ref_rev,
+                alt_fwd,
+                alt_rev,
+                actual_p_greater,
+                p_greater
+            );
+
+            let parsed_odd_ratio = fisher
+                .odd_ratio()
+                .parse::<f64>()
+                .expect("odd ratio should be numeric for Java parity cases");
+            assert_eq!(round_half_even("0.00000", parsed_odd_ratio), odd_ratio);
+        }
+    }
 }

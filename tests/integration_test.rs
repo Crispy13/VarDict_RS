@@ -886,6 +886,24 @@ fn run_vardict_pipeline_simple_raw_case(
     case_name: &str,
     sample_name: &str,
 ) -> Result<Vec<String>, String> {
+    run_vardict_pipeline_simple_raw_case_with_sv_default(
+        testdata_dir,
+        resources_dir,
+        config,
+        case_name,
+        sample_name,
+        true,
+    )
+}
+
+fn run_vardict_pipeline_simple_raw_case_with_sv_default(
+    testdata_dir: &Path,
+    resources_dir: &Path,
+    config: &TestCaseConfig,
+    case_name: &str,
+    sample_name: &str,
+    disable_sv_by_default: bool,
+) -> Result<Vec<String>, String> {
     use std::sync::Arc;
 
     use vardict_rs::conf::Configuration;
@@ -906,7 +924,7 @@ fn run_vardict_pipeline_simple_raw_case(
     conf.goodq = 22.5;
     conf.vext = 2;
     conf.mismatch = 8;
-    conf.disable_sv = true;
+    conf.disable_sv = disable_sv_by_default;
     conf.perform_local_realignment = true;
     let (min_frequency, pileup, min_mapping_quality) =
         apply_simple_options_to_conf_and_pipeline(&config.options, &mut conf);
@@ -1440,7 +1458,6 @@ fn run_vardict_pipeline_somatic_raw_case(
     conf.goodq = 22.5;
     conf.vext = 2;
     conf.mismatch = 8;
-    conf.disable_sv = true;
     conf.perform_local_realignment = true;
     let (min_frequency, pileup, min_mapping_quality) =
         apply_simple_options_to_conf_and_pipeline(&config.options, &mut conf);
@@ -1697,6 +1714,11 @@ fn run_vardict_pipeline_somatic_raw_case(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
     let original_structural_env = env::var("VARDICT_STRUCTURAL_VARIANTS_JSONL").ok();
+    let realigner_snapshot_prefix = env::var("VARDICT_VARIANT_REALIGNER_JSONL_PREFIX")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let original_realigner_env = env::var("VARDICT_VARIANT_REALIGNER_JSONL").ok();
 
     let restore_tovars_env = |original: Option<String>| {
         if let Some(value) = original {
@@ -1734,6 +1756,18 @@ fn run_vardict_pipeline_somatic_raw_case(
         }
     };
 
+    let restore_realigner_env = |original: Option<String>| {
+        if let Some(value) = original {
+            unsafe {
+                env::set_var("VARDICT_VARIANT_REALIGNER_JSONL", value);
+            }
+        } else {
+            unsafe {
+                env::remove_var("VARDICT_VARIANT_REALIGNER_JSONL");
+            }
+        }
+    };
+
     let mut tumor_reader = BamReader::open(
         tumor_bam_path
             .to_str()
@@ -1754,6 +1788,14 @@ fn run_vardict_pipeline_somatic_raw_case(
         unsafe {
             env::set_var(
                 "VARDICT_STRUCTURAL_VARIANTS_JSONL",
+                format!("{}.tumor.jsonl", prefix),
+            );
+        }
+    }
+    if let Some(prefix) = &realigner_snapshot_prefix {
+        unsafe {
+            env::set_var(
+                "VARDICT_VARIANT_REALIGNER_JSONL",
                 format!("{}.tumor.jsonl", prefix),
             );
         }
@@ -1797,6 +1839,14 @@ fn run_vardict_pipeline_somatic_raw_case(
             );
         }
     }
+    if let Some(prefix) = &realigner_snapshot_prefix {
+        unsafe {
+            env::set_var(
+                "VARDICT_VARIANT_REALIGNER_JSONL",
+                format!("{}.normal.jsonl", prefix),
+            );
+        }
+    }
     let normal_output = pipeline
         .process_region_to_aligned_vars_from_bam_with_paths(
             &region,
@@ -1820,6 +1870,14 @@ fn run_vardict_pipeline_somatic_raw_case(
     if let Some(prefix) = &cigar_snapshot_prefix {
         unsafe {
             env::set_var("VARDICT_CIGAR_PARSER_JSONL", format!("{}.combined.jsonl", prefix));
+        }
+    }
+    if let Some(prefix) = &realigner_snapshot_prefix {
+        unsafe {
+            env::set_var(
+                "VARDICT_VARIANT_REALIGNER_JSONL",
+                format!("{}.combined.jsonl", prefix),
+            );
         }
     }
     let combined_output = pipeline
@@ -1882,6 +1940,7 @@ fn run_vardict_pipeline_somatic_raw_case(
     restore_tovars_env(original_tovars_env);
     restore_cigar_env(original_cigar_env);
     restore_structural_env(original_structural_env);
+    restore_realigner_env(original_realigner_env);
 
     Ok(output_lines)
 }
@@ -2452,6 +2511,197 @@ fn test_manifest_tier1_simple_raw_rust_vs_java_first_mismatch() {
         assert_eq!(
             accounting.mismatched, 0,
             "Strict RUN_NOW mode requires zero tier1 raw mismatches"
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn test_manifest_simple_sv_core_raw_rust_vs_java_first_mismatch() {
+    if env::var("VARDICT_DEBUG_POS").is_ok() {
+        let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
+    }
+
+    let testdata_dir = get_testdata_dir();
+    let test_cases_dir = testdata_dir.join("integrationtestcases");
+    let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("parity_case_manifest.csv");
+    let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("VarDictJava")
+        .join("src/test/resources/com/astrazeneca/vardict/integrationtests");
+
+    if !test_cases_dir.exists() || !resources_dir.exists() || !manifest_path.exists() {
+        eprintln!("Simple SV-core raw parity resources not found");
+        return;
+    }
+
+    let mut selected = load_parity_manifest(&manifest_path)
+        .expect("Failed to load parity case manifest")
+        .into_iter()
+        .filter(|row| row.mode == "Simple" && row.blocker_reason == "sv_core_gap")
+        .collect::<Vec<_>>();
+
+    if let Ok(case_filter) = env::var("VARDICT_SIMPLE_SV_CASE_FILTER") {
+        let needle = case_filter.trim();
+        if !needle.is_empty() {
+            selected.retain(|row| row.case_file.contains(needle));
+        }
+    }
+
+    selected.sort_by(|left, right| left.case_file.cmp(&right.case_file));
+
+    assert!(
+        !selected.is_empty(),
+        "No simple sv_core_gap rows found in parity manifest for VARDICT_SIMPLE_SV_CASE_FILTER"
+    );
+
+    let mut accounting = Tier1ComparisonAccounting {
+        selected: selected.len(),
+        ..Tier1ComparisonAccounting::default()
+    };
+
+    for row in &selected {
+        let test_case_path = test_cases_dir.join(&row.case_file);
+        if !test_case_path.exists() {
+            eprintln!("SKIP {}: missing testcase file", row.case_file);
+            accounting.skipped += 1;
+            continue;
+        }
+
+        let (config, expected_variants) = match parse_test_case(&test_case_path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("FAIL {}: parse error: {}", row.case_file, e);
+                accounting.failed += 1;
+                continue;
+            }
+        };
+
+        if config.mode != "Simple" {
+            eprintln!(
+                "FAIL {}: mode mismatch manifest={} testcase={}",
+                row.case_file, row.mode, config.mode
+            );
+            accounting.failed += 1;
+            continue;
+        }
+
+        if expected_variants.is_empty() {
+            eprintln!("SKIP {}: no expected variant lines", row.case_file);
+            accounting.skipped += 1;
+            continue;
+        }
+
+        if row.reference != config.reference
+            || row.bam != config.bam_file
+            || row.chrom != config.chrom
+            || row.options != config.options
+        {
+            eprintln!(
+                "FAIL {}: manifest/testcase mismatch (reference/bam/chrom/options)",
+                row.case_file
+            );
+            accounting.failed += 1;
+            continue;
+        }
+
+        let expected_sample_name = expected_variants
+            .first()
+            .map(|variant| variant.sample.clone())
+            .unwrap_or_else(|| {
+                config
+                    .bam_file
+                    .strip_suffix(".bam")
+                    .unwrap_or(&config.bam_file)
+                    .to_string()
+            });
+
+        let rust_output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_vardict_pipeline_simple_raw_case_with_sv_default(
+                &testdata_dir,
+                &resources_dir,
+                &config,
+                &row.case_file,
+                &expected_sample_name,
+                false,
+            )
+        })) {
+            Ok(Ok(lines)) => lines,
+            Ok(Err(e)) => {
+                eprintln!("SKIP {}: runner unavailable: {}", row.case_file, e);
+                accounting.skipped += 1;
+                continue;
+            }
+            Err(_) => {
+                eprintln!(
+                    "SKIP {}: runner panicked during pipeline execution",
+                    row.case_file
+                );
+                accounting.skipped += 1;
+                continue;
+            }
+        };
+
+        let expected_lines = expected_variants
+            .iter()
+            .map(|variant| variant.raw_line.clone())
+            .collect::<Vec<_>>();
+
+        match first_raw_mismatch(&expected_lines, &rust_output) {
+            None => {
+                accounting.passed += 1;
+                println!(
+                    "PASS {}: simple sv_core raw lines match exactly ({} lines)",
+                    row.case_file,
+                    rust_output.len()
+                );
+            }
+            Some(diag) => {
+                accounting.failed += 1;
+                accounting.mismatched += 1;
+                eprintln!(
+                    "FAIL {}: {} at line {}",
+                    row.case_file,
+                    diag.reason,
+                    diag.line_index + 1
+                );
+                eprintln!("  JAVA: {}", diag.java_line.unwrap_or_else(|| "<none>".to_string()));
+                eprintln!("  RUST: {}", diag.rust_line.unwrap_or_else(|| "<none>".to_string()));
+            }
+        }
+    }
+
+    println!("\n=== Simple SV-Core Raw Parity Summary ===");
+    println!("Selected:   {}", accounting.selected);
+    println!("Passed:     {}", accounting.passed);
+    println!("Failed:     {}", accounting.failed);
+    println!("Mismatched: {}", accounting.mismatched);
+    println!("Skipped:    {}", accounting.skipped);
+    println!("==========================================\n");
+
+    assert_eq!(
+        accounting.selected,
+        accounting.passed + accounting.failed + accounting.skipped,
+        "Accounting mismatch in simple sv_core raw parity test"
+    );
+    assert!(
+        accounting.passed + accounting.failed > 0,
+        "No executable simple sv_core raw parity cases ran"
+    );
+
+    if env_flag("VARDICT_RUN_NOW_STRICT") {
+        assert_eq!(
+            accounting.skipped, 0,
+            "Strict RUN_NOW mode requires zero skipped simple sv_core raw parity cases"
+        );
+        assert_eq!(
+            accounting.failed, 0,
+            "Strict RUN_NOW mode requires zero simple sv_core raw parity failures"
+        );
+        assert_eq!(
+            accounting.mismatched, 0,
+            "Strict RUN_NOW mode requires zero simple sv_core raw mismatches"
         );
     }
 }

@@ -80,6 +80,15 @@ pub struct Configuration {
     /// Move indels to 3' end (Java: moveIndelsTo3 / -3)
     pub move_indels_to_3: bool,
 
+    /// Mean insert size (Java: -w / INSSIZE)
+    pub inssize: i32,
+
+    /// Insert size standard deviation (Java: -W / INSSTD)
+    pub insstd: i32,
+
+    /// Number of standard deviations for discordant filtering (Java: -A / INSSTDAMT)
+    pub insstdamt: i32,
+
     /// Minimum length for structural variants (Java: SVMINLEN / -L)
     pub sv_min_len: usize,
 
@@ -122,6 +131,9 @@ impl Default for Configuration {
             mismatch: 8,
             mapping_quality: None,
             move_indels_to_3: false,
+            inssize: 300,
+            insstd: 100,
+            insstdamt: 4,
             sv_min_len: 1000,
             debug: false,
             fisher: false,
@@ -135,6 +147,10 @@ impl Configuration {
     pub(crate) const ADSEED: i32 = 6;
     pub(crate) const SVMAXLEN: i32 = 150000;
     pub(crate) const SVFLANK: i32 = 50;
+    pub(crate) const MINSVCDIST: f64 = 1.5;
+    pub(crate) const MINMAPBASE: usize = 15;
+    pub(crate) const MINSVPOS: i32 = 25;
+    pub(crate) const DISCPAIRQUAL: f64 = 35.0;
 
     /// Any base with quality <=10 will be consider low quality in soft-clipped seq and extension will stop.
     pub(crate) const LOW_QUAL: i32 = 10;

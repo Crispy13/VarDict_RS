@@ -52,6 +52,14 @@ pub struct CigarParserOutput {
     pub soft_clips_5end: HashMap<i64, SoftClip>,
     /// 3' end soft clips by position
     pub soft_clips_3end: HashMap<i64, SoftClip>,
+    /// Forward deletion discordant clusters (Java svfdel)
+    pub svfdel: Vec<SoftClip>,
+    /// Reverse deletion discordant clusters (Java svrdel)
+    pub svrdel: Vec<SoftClip>,
+    /// Forward duplication discordant clusters (Java svfdup)
+    pub svfdup: Vec<SoftClip>,
+    /// Reverse duplication discordant clusters (Java svrdup)
+    pub svrdup: Vec<SoftClip>,
     /// Reference coverage by position
     pub ref_coverage: HashMap<i64, usize>,
     /// MNP map (position -> description -> count)
@@ -194,6 +202,10 @@ fn write_structural_variants_jsonl_snapshot(
     write_ref_cov(&mut writer, &data.ref_coverage)?;
     write_soft_clips(&mut writer, "SCLIP5", &data.soft_clips_5end, false)?;
     write_soft_clips(&mut writer, "SCLIP3", &data.soft_clips_3end, false)?;
+    write_sv_clusters(&mut writer, "SVFDEL", &data.svfdel)?;
+    write_sv_clusters(&mut writer, "SVRDEL", &data.svrdel)?;
+    write_sv_clusters(&mut writer, "SVFDUP", &data.svfdup)?;
+    write_sv_clusters(&mut writer, "SVRDUP", &data.svrdup)?;
 
     writer.flush()?;
     Ok(())
@@ -383,6 +395,34 @@ fn write_soft_clips<W: Write>(
             let data = soft_clip_json(sc, compute_consensus_if_unset);
             write_json_line(writer, line_type, pos, "-", &data)?;
         }
+    }
+    Ok(())
+}
+
+fn write_sv_clusters<W: Write>(writer: &mut W, line_type: &str, clusters: &[SoftClip]) -> Result<()> {
+    for (idx, cluster) in clusters.iter().enumerate() {
+        let mut soft_entries: Vec<(i64, usize)> = cluster.soft.iter().map(|(k, v)| (*k, *v)).collect();
+        soft_entries.sort_unstable_by_key(|(k, _)| *k);
+        let soft_json = soft_entries
+            .iter()
+            .map(|(k, v)| format!("{{\"pos\":{},\"count\":{}}}", k, v))
+            .collect::<Vec<_>>()
+            .join(",");
+        let data = format!(
+            "{{\"idx\":{},\"variant\":{},\"start\":{},\"end\":{},\"mstart\":{},\"mend\":{},\"mlen\":{},\"disc\":{},\"softp\":{},\"used\":{},\"soft\":[{}]}}",
+            idx,
+            variant_json(&cluster.var),
+            cluster.start,
+            cluster.end,
+            cluster.mstart,
+            cluster.mend,
+            cluster.mlen,
+            cluster.disc,
+            cluster.softp,
+            cluster.used(),
+            soft_json,
+        );
+        write_json_line(writer, line_type, cluster.start, &idx.to_string(), &data)?;
     }
     Ok(())
 }
@@ -602,14 +642,27 @@ pub struct RealignedOutput {
 }
 
 /// Final aligned variants data - mirrors Java AlignedVarsData
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AlignedVarsData {
     /// Variants by position
     pub aligned_variants: HashMap<i64, Vars>,
     /// Insertion order of positions into aligned_variants
     pub aligned_variants_order: Vec<i64>,
+    /// Simulated Java HashMap capacity for aligned_variants (tracks growth, never shrinks)
+    pub aligned_variants_java_capacity: usize,
     /// Reference coverage by position
     pub ref_coverage: HashMap<i64, usize>,
+}
+
+impl Default for AlignedVarsData {
+    fn default() -> Self {
+        Self {
+            aligned_variants: HashMap::new(),
+            aligned_variants_order: Vec::new(),
+            aligned_variants_java_capacity: 16,
+            ref_coverage: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -658,6 +711,33 @@ where
     I: Iterator<Item = i64>,
 {
     let capacity = java_hashmap_capacity(size);
+    let mut entries: Vec<(i64, usize, usize)> = Vec::new();
+
+    for key in keys {
+        let bucket = java_hashmap_bucket_index(key, capacity);
+        let order = insertion_index
+            .and_then(|map| map.get(&key).copied())
+            .unwrap_or(usize::MAX);
+        entries.push((key, bucket, order));
+    }
+
+    entries.sort_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    entries.into_iter().map(|(key, _, _)| key).collect()
+}
+
+fn java_hashmap_iteration_order_with_capacity<I>(
+    keys: I,
+    capacity: usize,
+    insertion_index: Option<&HashMap<i64, usize>>,
+) -> Vec<i64>
+where
+    I: Iterator<Item = i64>,
+{
     let mut entries: Vec<(i64, usize, usize)> = Vec::new();
 
     for key in keys {
@@ -1511,7 +1591,7 @@ impl VarDictPipeline {
         let mut cigar_parser = CigarParser::new(
             region.clone(),
             reference.clone(),
-            instance,
+            instance.clone(),
         );
 
         // Process each record
@@ -1631,7 +1711,7 @@ impl VarDictPipeline {
         let mut cigar_parser = CigarParser::new(
             region.clone(),
             reference.clone(),
-            instance,
+            instance.clone(),
         );
 
         let mut preprocess_state = RecordPreprocessorState::new();
@@ -1708,6 +1788,10 @@ impl VarDictPipeline {
             insertion_vars: cigar_parser.take_insertion_vars(),
             soft_clips_5end: cigar_parser.take_soft_clips_5end(),
             soft_clips_3end: cigar_parser.take_soft_clips_3end(),
+            svfdel: cigar_parser.take_svfdel(),
+            svrdel: cigar_parser.take_svrdel(),
+            svfdup: cigar_parser.take_svfdup(),
+            svrdup: cigar_parser.take_svrdup(),
             ref_coverage: cigar_parser.take_ref_coverage(),
             mnp: cigar_parser.take_mnp(),
             position_to_insertion_count: cigar_parser.take_position_to_insertion_count(),
@@ -1739,6 +1823,10 @@ impl VarDictPipeline {
             insertion_vars,
             soft_clips_5end,
             soft_clips_3end,
+            svfdel,
+            svrdel,
+            svfdup,
+            svrdup,
             ref_coverage,
             mnp,
             position_to_insertion_count,
@@ -1758,6 +1846,10 @@ impl VarDictPipeline {
             ref_coverage,
             max_read_length: max_read_len,
             duprate,
+            svfdel,
+            svrdel,
+            svfdup,
+            svrdup,
         };
 
         // Perform minimal deletion realignment using soft clips when enabled
@@ -1774,6 +1866,7 @@ impl VarDictPipeline {
         if instance().conf.perform_local_realignment {
             realigner.process_deletions(&mut sv_input, &position_to_deletions_count);
             realigner.process_insertions(&mut sv_input, &position_to_insertion_count);
+            realigner.realign_large_deletions(&mut sv_input);
             realigner.realign_long_insertions_30(&mut sv_input);
             realigner.realign_long_insertions(&mut sv_input);
         }
@@ -1783,6 +1876,7 @@ impl VarDictPipeline {
         // Run StructuralVariantsProcessor (adjSNV always runs, SV detection is unimplemented)
         let sv_processor = StructuralVariantsProcessor::new(
             reference.ref_seq.clone(),
+            reference.seed.clone(),
             reference.region_start,
         );
         let processed = sv_processor.process(sv_input);
@@ -1810,6 +1904,10 @@ impl VarDictPipeline {
     ) -> Result<AlignedVarsData> {
         let mut aligned_variants: HashMap<i64, Vars> = HashMap::new();
         let mut aligned_variants_order: Vec<i64> = Vec::new();
+        let mut aligned_variants_java_size = 0usize;
+        let mut aligned_variants_java_capacity = 16usize;
+        let mut aligned_variants_java_threshold =
+            aligned_variants_java_capacity - (aligned_variants_java_capacity >> 2);
         let RealignedOutput {
             non_insertion_vars,
             non_insertion_vars_insert_index,
@@ -1847,10 +1945,15 @@ impl VarDictPipeline {
             }
         }
 
-        let positions = java_hashmap_iteration_order(
+        let nonins_java_capacity = java_hashmap_capacity(
+            non_insertion_vars_insert_index
+                .len()
+                .max(seen_positions.len()),
+        );
+        let positions = java_hashmap_iteration_order_with_capacity(
             position_keys.into_iter(),
-            seen_positions.len(),
-            Some(&non_insertion_vars_insert_index),
+            nonins_java_capacity,
+            None,
         );
 
         for position in positions {
@@ -1882,7 +1985,12 @@ impl VarDictPipeline {
                 continue;
             }
 
-            if position < region.start() as i64 || position > region.end() as i64 {
+            let has_sv_at_position = vars_at_pos.keys().any(
+                |desc| matches!(desc, VarDesc::Raw { desc } if desc.as_slice() == b"SV"),
+            );
+
+            if !has_sv_at_position && (position < region.start() as i64 || position > region.end() as i64)
+            {
                 if trace_this_pos {
                     event!(
                         Level::DEBUG,
@@ -1997,6 +2105,8 @@ impl VarDictPipeline {
 
             self.sort_variants(&mut var_list);
 
+            let inserted_new_position = !aligned_variants.contains_key(&position);
+
             let maxfreq = self.collect_vars_at_position(
                 &mut aligned_variants,
                 &mut aligned_variants_order,
@@ -2004,6 +2114,15 @@ impl VarDictPipeline {
                 reference,
                 &var_list,
             );
+
+            if inserted_new_position && aligned_variants.contains_key(&position) {
+                aligned_variants_java_size += 1;
+                while aligned_variants_java_size > aligned_variants_java_threshold {
+                    aligned_variants_java_capacity <<= 1;
+                    aligned_variants_java_threshold =
+                        aligned_variants_java_capacity - (aligned_variants_java_capacity >> 2);
+                }
+            }
 
             if let Some(sv) = sv_string {
                 if let Some(vars_entry) = aligned_variants.get_mut(&position) {
@@ -2025,7 +2144,9 @@ impl VarDictPipeline {
                             "to_vars_builder: removing position due to maxfreq threshold"
                         );
                     }
-                    aligned_variants.remove(&position);
+                    if aligned_variants.remove(&position).is_some() {
+                        aligned_variants_java_size = aligned_variants_java_size.saturating_sub(1);
+                    }
                     continue;
                 }
             }
@@ -2082,6 +2203,7 @@ impl VarDictPipeline {
         let aligned_data = AlignedVarsData {
             aligned_variants,
             aligned_variants_order,
+            aligned_variants_java_capacity,
             ref_coverage,
         };
 
@@ -2157,7 +2279,12 @@ impl VarDictPipeline {
         for desc in keys {
             if matches!(desc, VarDesc::Raw { desc } if desc.as_slice() == b"SV") {
                 if let Some(sv_var) = vars_at_pos.get(desc) {
-                    sv_string = Some(format!("{}-0-0", sv_var.alt_depth));
+                    sv_string = Some(format!(
+                        "{}-{}-{}",
+                        sv_var.high_qual_read_cnt,
+                        sv_var.alt_depth,
+                        sv_var.low_qual_read_cnt,
+                    ));
                 }
                 continue;
             }
@@ -2255,21 +2382,8 @@ impl VarDictPipeline {
         for desc in keys {
             let desc_str = desc.to_key_string();
             if desc_str.contains('&') {
-                let coverage_position = if let Some(without_plus) = desc_str.strip_prefix('+') {
-                    if let Some((prefix, _)) = without_plus.split_once('&') {
-                        position + prefix.len() as i64
-                    } else {
-                        position + 1
-                    }
-                } else {
-                    position + 1
-                };
-                if let Some(&coverage) = ref_coverage.get(&coverage_position) {
+                if let Some(&coverage) = ref_coverage.get(&(position + 1)) {
                     total_pos_coverage = coverage;
-                } else if coverage_position != position + 1 {
-                    if let Some(&fallback_coverage) = ref_coverage.get(&(position + 1)) {
-                        total_pos_coverage = fallback_coverage;
-                    }
                 }
             }
 
@@ -4708,9 +4822,9 @@ impl VarDictPipeline {
             aligned_order_index.insert(*pos, idx);
         }
 
-        let ordered_positions = java_hashmap_iteration_order(
+        let ordered_positions = java_hashmap_iteration_order_with_capacity(
             data.aligned_variants.keys().copied(),
-            data.aligned_variants.len(),
+            data.aligned_variants_java_capacity.max(16),
             Some(&aligned_order_index),
         );
 
@@ -5117,6 +5231,31 @@ mod tests {
         variant.hicov = total_coverage;
         variant.high_quality_reads_frequency = frequency;
         variant.genotype = format!("{}/{}", ref_allele, var_allele);
+        variant
+    }
+
+    fn make_bad_test_variant(
+        ref_allele: &str,
+        var_allele: &str,
+        description: &str,
+        start_position: i64,
+        end_position: i64,
+    ) -> Variant {
+        let mut variant = make_test_variant(
+            ref_allele,
+            var_allele,
+            description,
+            start_position,
+            end_position,
+            10,
+            4,
+            0.4,
+        );
+
+        variant.mean_position = 2.2;
+        variant.mean_quality = 2.6;
+        variant.high_qual_read_cnt = 44;
+        variant.low_qual_read_cnt = 35;
         variant
     }
 
@@ -5763,6 +5902,101 @@ mod tests {
         assert_eq!(fields[49], "Germline");
         assert_eq!(fields[14], "0.6000");
         assert_eq!(fields[32], "0.5500");
+    }
+
+    #[test]
+    fn test_somatic_postprocessor_no_variants_for_both_samples_java_parity() {
+        ensure_test_scope_initialized();
+
+        let pipeline = VarDictPipeline::new("sample");
+        let region = Region::new("chr1".to_string(), 100, 110, "GENE".to_string());
+
+        let output_lines = pipeline.run_somatic_post_processor(
+            AlignedVarsData::default(),
+            AlignedVarsData::default(),
+            &region,
+            &std::collections::HashSet::new(),
+        );
+
+        assert!(output_lines.is_empty());
+    }
+
+    #[test]
+    fn test_somatic_postprocessor_bad_variants_in_both_samples_java_parity() {
+        ensure_test_scope_initialized();
+
+        let pipeline = VarDictPipeline::new("sample");
+        let region = Region::new("chr1".to_string(), 100, 110, "GENE".to_string());
+        let position = 105i64;
+
+        let tumor_bad = make_bad_test_variant("A", "T", "A>T", 105, 105);
+        let normal_bad = make_bad_test_variant("A", "T", "A>T", 105, 105);
+
+        let tumor_aligned = AlignedVarsData {
+            aligned_variants: make_vars_at_position(position, vec![tumor_bad], None),
+            ..AlignedVarsData::default()
+        };
+        let normal_aligned = AlignedVarsData {
+            aligned_variants: make_vars_at_position(position, vec![normal_bad], None),
+            ..AlignedVarsData::default()
+        };
+
+        let output_lines = pipeline.run_somatic_post_processor(
+            normal_aligned,
+            tumor_aligned,
+            &region,
+            &std::collections::HashSet::new(),
+        );
+
+        assert!(output_lines.is_empty());
+    }
+
+    #[test]
+    fn test_somatic_postprocessor_bad_variant_only_in_tumor_java_parity() {
+        ensure_test_scope_initialized();
+
+        let pipeline = VarDictPipeline::new("sample");
+        let region = Region::new("chr1".to_string(), 100, 110, "GENE".to_string());
+        let position = 105i64;
+
+        let tumor_bad = make_bad_test_variant("A", "T", "A>T", 105, 105);
+        let tumor_aligned = AlignedVarsData {
+            aligned_variants: make_vars_at_position(position, vec![tumor_bad], None),
+            ..AlignedVarsData::default()
+        };
+
+        let output_lines = pipeline.run_somatic_post_processor(
+            AlignedVarsData::default(),
+            tumor_aligned,
+            &region,
+            &std::collections::HashSet::new(),
+        );
+
+        assert!(output_lines.is_empty());
+    }
+
+    #[test]
+    fn test_somatic_postprocessor_bad_variant_only_in_normal_java_parity() {
+        ensure_test_scope_initialized();
+
+        let pipeline = VarDictPipeline::new("sample");
+        let region = Region::new("chr1".to_string(), 100, 110, "GENE".to_string());
+        let position = 105i64;
+
+        let normal_bad = make_bad_test_variant("A", "T", "A>T", 105, 105);
+        let normal_aligned = AlignedVarsData {
+            aligned_variants: make_vars_at_position(position, vec![normal_bad], None),
+            ..AlignedVarsData::default()
+        };
+
+        let output_lines = pipeline.run_somatic_post_processor(
+            normal_aligned,
+            AlignedVarsData::default(),
+            &region,
+            &std::collections::HashSet::new(),
+        );
+
+        assert!(output_lines.is_empty());
     }
 
     #[test]

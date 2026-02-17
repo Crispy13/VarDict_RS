@@ -32,7 +32,7 @@ use crate::{
     utils::{BytesExt, SliceExt, SliceExt2, aligner::Aligner},
     variants::{
         var_utils::{get_variants_from_map, get_variation_from_seq, is_has_and_equals, is_has_and_not_equals},
-        variants::{InsOrDelLen, SoftClip, VarDesc, Variant},
+        variants::{InsOrDelLen, Mate, SoftClip, VarDesc, Variant},
     },
 };
 
@@ -80,6 +80,14 @@ pub struct CigarParser {
 
     soft_clips5_end: HashMap<i64, SoftClip>,
     soft_clips3_end: HashMap<i64, SoftClip>,
+    svdelfend: i64,
+    svdelrend: i64,
+    svdupfend: i64,
+    svduprend: i64,
+    svfdel: Vec<SoftClip>,
+    svrdel: Vec<SoftClip>,
+    svfdup: Vec<SoftClip>,
+    svrdup: Vec<SoftClip>,
     current_qname: Option<String>,
     last_modified_pos: Option<i64>,
     last_modified_cigar: Option<String>,
@@ -112,6 +120,14 @@ impl Default for CigarParser {
             ref_coverage: Default::default(),
             soft_clips5_end: Default::default(),
             soft_clips3_end: Default::default(),
+            svdelfend: 0,
+            svdelrend: 0,
+            svdupfend: 0,
+            svduprend: 0,
+            svfdel: Default::default(),
+            svrdel: Default::default(),
+            svfdup: Default::default(),
+            svrdup: Default::default(),
             rev_complementor: RevComplementor::new(),
             cigar: CigarString(vec![]).into_view(0),
             current_qname: None,
@@ -153,6 +169,14 @@ impl CigarParser {
             ref_coverage: HashMap::new(),
             soft_clips5_end: HashMap::new(),
             soft_clips3_end: HashMap::new(),
+            svdelfend: 0,
+            svdelrend: 0,
+            svdupfend: 0,
+            svduprend: 0,
+            svfdel: Vec::new(),
+            svrdel: Vec::new(),
+            svfdup: Vec::new(),
+            svrdup: Vec::new(),
             rev_complementor: RevComplementor::new(),
             cigar: CigarString(vec![]).into_view(0),
             current_qname: None,
@@ -265,6 +289,24 @@ impl CigarParser {
         self.discordant_count
     }
 
+    /// Take forward deletion discordant clusters
+    pub fn take_svfdel(&mut self) -> Vec<SoftClip> {
+        std::mem::take(&mut self.svfdel)
+    }
+
+    /// Take reverse deletion discordant clusters
+    pub fn take_svrdel(&mut self) -> Vec<SoftClip> {
+        std::mem::take(&mut self.svrdel)
+    }
+
+    pub fn take_svfdup(&mut self) -> Vec<SoftClip> {
+        std::mem::take(&mut self.svfdup)
+    }
+
+    pub fn take_svrdup(&mut self) -> Vec<SoftClip> {
+        std::mem::take(&mut self.svrdup)
+    }
+
     /// Take ownership of splice counts
     pub fn take_splice_count(&mut self) -> HashMap<SplicingKey, Vec<usize>> {
         std::mem::take(&mut self.splice_count)
@@ -329,6 +371,327 @@ impl CigarParser {
         }
 
         false
+    }
+
+    fn add_discordant_cluster(
+        sdref: &mut SoftClip,
+        start: i64,
+        end: i64,
+        mate_start: i64,
+        mate_end: i64,
+        dir: i64,
+        read_len: i64,
+        mlen: i32,
+        softp: i64,
+        pmean: f64,
+        qmean: f64,
+        mapq: f64,
+        nm: f64,
+        goodq: f64,
+    ) {
+        sdref.var.alt_depth += 1;
+        sdref.var.extra_cnt += 1;
+        sdref.var.mean_pos += pmean;
+        sdref.var.mean_qual += qmean;
+        sdref.var.mean_mapq += mapq;
+        sdref.var.nm += nm;
+        if dir == 1 {
+            sdref.var.alt_depth_fwd += 1;
+        } else {
+            sdref.var.alt_depth_rev += 1;
+        }
+        if qmean >= goodq {
+            sdref.var.high_qual_read_cnt += 1;
+        } else {
+            sdref.var.low_qual_read_cnt += 1;
+        }
+        if sdref.start == 0 || sdref.start >= start {
+            sdref.start = start;
+        }
+        if sdref.end == 0 || sdref.end <= end {
+            sdref.end = end;
+        }
+        sdref.mates.push(Mate {
+            mate_start,
+            mate_end,
+            mate_len: mlen,
+            start,
+            end,
+            mean_pos: pmean,
+            mean_qual: qmean,
+            mean_mapq: mapq,
+            nm,
+        });
+        if sdref.mstart == 0 || sdref.mstart >= mate_start {
+            sdref.mstart = mate_start;
+        }
+        if sdref.mend == 0 || sdref.mend <= mate_end {
+            sdref.mend = mate_start + read_len;
+        }
+
+        if softp != 0 {
+            if dir == 1 {
+                if (softp - sdref.end).abs() < 10 {
+                    *sdref.soft.entry(softp).or_insert(0) += 1;
+                }
+            } else if (softp - sdref.start).abs() < 10 {
+                *sdref.soft.entry(softp).or_insert(0) += 1;
+            }
+        }
+    }
+
+    fn add_discordant_count(svref: &mut SoftClip) {
+        svref.disc += 1;
+    }
+
+    fn aux_as_i64(aux: &record::Aux<'_>) -> Option<i64> {
+        match aux {
+            record::Aux::I8(v) => Some(*v as i64),
+            record::Aux::U8(v) => Some(*v as i64),
+            record::Aux::I16(v) => Some(*v as i64),
+            record::Aux::U16(v) => Some(*v as i64),
+            record::Aux::I32(v) => Some(*v as i64),
+            record::Aux::U32(v) => Some(*v as i64),
+            _ => None,
+        }
+    }
+
+    fn mc_has_softclip_both_ends(mc: &str) -> bool {
+        let mut seen_softclip = false;
+        let bytes = mc.as_bytes();
+        for idx in 1..bytes.len() {
+            if bytes[idx] == b'S' && bytes[idx - 1].is_ascii_digit() {
+                if seen_softclip {
+                    return true;
+                }
+                seen_softclip = true;
+            }
+        }
+        false
+    }
+
+    fn prepare_sv_deletion_structures_for_analysis(
+        &mut self,
+        record: &Record,
+        query_qual: &[u8],
+        number_of_mismatches: i32,
+        read_direction: bool,
+        mate_direction: bool,
+        start: i64,
+        total_length_including_softclip: usize,
+        cigar: &CigarStringView,
+    ) {
+        if record.tid() != record.mtid() {
+            return;
+        }
+
+        let min_map_base = Configuration::MINMAPBASE;
+        if query_qual.len() <= min_map_base {
+            return;
+        }
+
+        let mate_start = record.mpos() + 1;
+        let mend = mate_start + total_length_including_softclip as i64;
+        let aligned_len = get_aligned_length(cigar);
+        let end = start + aligned_len;
+
+        let mut soft5 = 0i64;
+        if let Some(Cigar::SoftClip(len)) = cigar.iter().next() {
+            let tt = *len as usize;
+            if tt > 0 && tt <= query_qual.len() && query_qual[tt - 1] as f64 > instance().conf.goodq {
+                soft5 = start;
+            }
+        }
+
+        let mut soft3 = 0i64;
+        if let Some(Cigar::SoftClip(len)) = cigar.iter().last() {
+            let tt = *len as usize;
+            if tt > 0 && tt <= query_qual.len() {
+                let qi = query_qual.len().saturating_sub(tt);
+                if qi < query_qual.len() && query_qual[qi] as f64 > instance().conf.goodq {
+                    soft3 = end;
+                }
+            }
+        }
+
+        let read_dir_num = if read_direction { -1i64 } else { 1i64 };
+        let mate_dir_num = if mate_direction { 1i64 } else { -1i64 };
+        let mlen = record.insert_size();
+
+        if let Ok(Some(mc_aux)) = record.aux_option(b"MC") {
+            if let Ok(mc_tag) = mc_aux.try_get_str() {
+                if Self::mc_has_softclip_both_ends(mc_tag) {
+                    return;
+                }
+            }
+        }
+
+        if let Ok(Some(mq_aux)) = record.aux_option(b"MQ") {
+            if let Some(mq) = Self::aux_as_i64(&mq_aux) {
+                if mq < 15 {
+                    return;
+                }
+            }
+        }
+
+        let min_cluster_dist = Configuration::MINSVCDIST * self.max_read_len.max(1) as f64;
+        let min_d = 75i64;
+
+        let qmean = query_qual[min_map_base] as f64;
+        let pmean = self.max_read_len.max(1) as f64 / 2.0;
+        if read_dir_num * mate_dir_num == -1 && mlen * read_dir_num > 0 {
+            let span = if mate_start > start {
+                mend - start
+            } else {
+                end - mate_start
+            };
+            if span.abs()
+                <= (instance().conf.inssize + instance().conf.insstdamt * instance().conf.insstd) as i64
+            {
+                return;
+            }
+
+            if read_dir_num == 1 {
+                if self.svfdel.is_empty() || (start - self.svdelfend) as f64 > min_cluster_dist {
+                    self.svfdel.push(SoftClip::default());
+                }
+                if let Some(last) = self.svfdel.last_mut() {
+                    Self::add_discordant_cluster(
+                        last,
+                        start,
+                        end,
+                        mate_start,
+                        mend,
+                        read_dir_num,
+                        total_length_including_softclip as i64,
+                        span as i32,
+                        soft3,
+                        pmean,
+                        qmean,
+                        record.mapq() as f64,
+                        number_of_mismatches as f64,
+                        instance().conf.goodq,
+                    );
+                }
+                self.svdelfend = end;
+            } else {
+                if self.svrdel.is_empty() || (start - self.svdelrend) as f64 > min_cluster_dist {
+                    self.svrdel.push(SoftClip::default());
+                }
+                if let Some(last) = self.svrdel.last_mut() {
+                    Self::add_discordant_cluster(
+                        last,
+                        start,
+                        end,
+                        mate_start,
+                        mend,
+                        read_dir_num,
+                        total_length_including_softclip as i64,
+                        span as i32,
+                        soft5,
+                        pmean,
+                        qmean,
+                        record.mapq() as f64,
+                        number_of_mismatches as f64,
+                        instance().conf.goodq,
+                    );
+                }
+                self.svdelrend = end;
+            }
+
+            if !self.svfdel.is_empty() && ((start - self.svdelfend).abs() as f64) <= min_cluster_dist {
+                if let Some(last) = self.svfdel.last_mut() {
+                    Self::add_discordant_count(last);
+                }
+            }
+            if !self.svrdel.is_empty() && ((start - self.svdelrend).abs() as f64) <= min_cluster_dist {
+                if let Some(last) = self.svrdel.last_mut() {
+                    Self::add_discordant_count(last);
+                }
+            }
+            if !self.svfdup.is_empty() && (start - self.svdupfend).abs() <= min_d {
+                if let Some(last) = self.svfdup.last_mut() {
+                    Self::add_discordant_count(last);
+                }
+            }
+            if !self.svrdup.is_empty() && (start - self.svduprend).abs() <= min_d {
+                if let Some(last) = self.svrdup.last_mut() {
+                    Self::add_discordant_count(last);
+                }
+            }
+            return;
+        }
+
+        if read_dir_num * mate_dir_num == -1 && mlen * read_dir_num < 0 {
+            if read_dir_num == 1 {
+                if self.svfdup.is_empty() || (start - self.svdupfend) as f64 > min_cluster_dist {
+                    self.svfdup.push(SoftClip::default());
+                }
+                if let Some(last) = self.svfdup.last_mut() {
+                    Self::add_discordant_cluster(
+                        last,
+                        start,
+                        end,
+                        mate_start,
+                        mend,
+                        read_dir_num,
+                        total_length_including_softclip as i64,
+                        mlen as i32,
+                        soft3,
+                        pmean,
+                        qmean,
+                        record.mapq() as f64,
+                        number_of_mismatches as f64,
+                        instance().conf.goodq,
+                    );
+                }
+                self.svdupfend = end;
+            } else {
+                if self.svrdup.is_empty() || (start - self.svduprend) as f64 > min_cluster_dist {
+                    self.svrdup.push(SoftClip::default());
+                }
+                if let Some(last) = self.svrdup.last_mut() {
+                    Self::add_discordant_cluster(
+                        last,
+                        start,
+                        end,
+                        mate_start,
+                        mend,
+                        read_dir_num,
+                        total_length_including_softclip as i64,
+                        mlen as i32,
+                        soft5,
+                        pmean,
+                        qmean,
+                        record.mapq() as f64,
+                        number_of_mismatches as f64,
+                        instance().conf.goodq,
+                    );
+                }
+                self.svduprend = end;
+            }
+
+            if !self.svfdup.is_empty() && ((start - self.svdupfend).abs() as f64) <= min_cluster_dist {
+                if let Some(last) = self.svfdup.last_mut() {
+                    Self::add_discordant_count(last);
+                }
+            }
+            if !self.svrdup.is_empty() && ((start - self.svduprend).abs() as f64) <= min_cluster_dist {
+                if let Some(last) = self.svrdup.last_mut() {
+                    Self::add_discordant_count(last);
+                }
+            }
+            if !self.svfdel.is_empty() && (start - self.svdelfend).abs() <= min_d {
+                if let Some(last) = self.svfdel.last_mut() {
+                    Self::add_discordant_count(last);
+                }
+            }
+            if !self.svrdel.is_empty() && (start - self.svdelrend).abs() <= min_d {
+                if let Some(last) = self.svrdel.last_mut() {
+                    Self::add_discordant_count(last);
+                }
+            }
+        }
     }
 
 
@@ -558,6 +921,21 @@ impl CigarParser {
                 event!(Level::INFO, "[trace_target] return: skip_sites_out_region_of_interest");
             }
             return Ok(());
+        }
+
+        if !instance().conf.disable_sv {
+            if !(record.is_paired() && record.is_mate_unmapped()) && mapping_quality > 10 {
+                self.prepare_sv_deletion_structures_for_analysis(
+                    record,
+                    query_qual,
+                    nm,
+                    is_reverse,
+                    !record.is_mate_reverse(),
+                    self.start,
+                    read_len_including_softclips,
+                    &cigar,
+                );
+            }
         }
 
         if trace_target {
@@ -1093,10 +1471,13 @@ impl CigarParser {
                 4). reference and read bases match
                 5). read quality is more than 10
             */
-            let initial_start = self.start;
+            let chr_len = *instance()
+                .chr_lens
+                .get(contig.as_str())
+                .unwrap_or(&0) as i64;
             while cigar_len >= 1
                 && self.start > 1
-                && self.start - 1 <= *instance().chr_lens.get(contig.as_str()).unwrap_or(&0) as i64
+                && self.start - 1 <= chr_len
                 && self.reference.has_and_equals(
                     self.start - 1,
                     query_sequence
