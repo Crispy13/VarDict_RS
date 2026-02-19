@@ -19,6 +19,9 @@ pub struct Configuration {
 
     pub disable_sv: bool,
 
+    /// Turn on deleting of duplicate variants that can appear due to linear region work (Java: --deldupvar)
+    pub delete_duplicate_variants: bool,
+
     pub unique_mode_alignment_enabled: bool,
     pub unique_mode_second_in_pair_enabled: bool,
 
@@ -114,6 +117,7 @@ impl Default for Configuration {
             crispr_filtering_bp: 0,
             include_n_in_total_depth: false,
             disable_sv: false,
+            delete_duplicate_variants: false,
             unique_mode_alignment_enabled: false,
             unique_mode_second_in_pair_enabled: false,
             goodq: 22.5,

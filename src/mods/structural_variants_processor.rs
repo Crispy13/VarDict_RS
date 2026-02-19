@@ -1967,7 +1967,7 @@ impl StructuralVariantsProcessor {
         }
     }
 
-    fn find_dup_disc(&self, data: &mut RealignedVariationData) {
+    fn find_dup_disc(&mut self, data: &mut RealignedVariationData) {
         let minr = instance().conf.minr;
 
         for idx in 0..data.svfdup.len() {
@@ -2013,6 +2013,8 @@ impl StructuralVariantsProcessor {
             let mut mlen = end - ms + read_len_adj;
             let mut bp = ms - read_len_adj / 2;
             let mut pe = end;
+
+            self.ensure_reference_span(bp - 150, bp + 150);
 
             let mut cntf = cnt;
             let mut cntr = cnt;
@@ -2079,6 +2081,8 @@ impl StructuralVariantsProcessor {
                     }
                 }
             }
+
+            self.ensure_reference_span(bp - 150, pe + 150);
 
             let mut ins = self.join_ref(bp, bp + Configuration::SVFLANK as i64 - 1);
             let dup_len = mlen - 2 * Configuration::SVFLANK as i64;
@@ -2184,6 +2188,8 @@ impl StructuralVariantsProcessor {
             let mut pe = mlen + bp - 1;
             let mut tpe = pe;
 
+            self.ensure_reference_span(pe - 150, pe + 150);
+
             let mut cntf = cnt;
             let mut cntr = cnt;
             let mut qmeanf = qmean;
@@ -2244,6 +2250,8 @@ impl StructuralVariantsProcessor {
                     }
                 }
             }
+
+            self.ensure_reference_span(bp - 150, pe + 150);
 
             let mut ins = self.join_ref(bp, bp + Configuration::SVFLANK as i64 - 1);
             let dup_len = mlen - 2 * Configuration::SVFLANK as i64;

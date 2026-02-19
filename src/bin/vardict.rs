@@ -4,13 +4,14 @@
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 
 use crackle_kit::tracing::level_filters::LevelFilter;
-use crackle_kit::tracing_kit::{setup_logging_stderr_only, setup_logging_stderr_only_verbose};
+use crackle_kit::tracing_kit::setup_logging_stderr_only;
 use vardict_rs::data::bam_reader::BamReader;
 use vardict_rs::data::region::Region;
 use vardict_rs::mods::pipeline::{Pipeline, PipelineConfig};
@@ -96,6 +97,18 @@ struct Args {
     #[arg(short = 'U', long = "nosv")]
     no_sv: bool,
 
+    /// Keep only one read from overlapping pairs based on alignment position (Java: -u)
+    #[arg(short = 'u', long = "unique-overlap")]
+    unique_mode_alignment: bool,
+
+    /// Keep only one read from overlapping pairs based on second-in-pair flag (Java: -UN)
+    #[arg(long = "unique-second-in-pair", visible_alias = "UN")]
+    unique_mode_second_in_pair: bool,
+
+    /// Turn on deleting duplicate variants (Java: --deldupvar)
+    #[arg(long = "deldupvar")]
+    delete_duplicate_variants: bool,
+
     /// Amplicon mode parameters (Java: -a), e.g. "10:0.95"
     #[arg(short = 'a', long = "amplicon")]
     amplicon_based_calling: Option<String>,
@@ -140,14 +153,37 @@ struct Args {
     #[arg(long = "remove-duplicates")]
     remove_duplicates: bool,
 
+    /// Output splicing read counts only (Java: -i)
+    #[arg(short = 'i', long = "splice")]
+    output_splicing: bool,
+
 
     /// Log level
     #[arg(long, default_value_t = LevelFilter::WARN)]
     log_level: LevelFilter,
 }
 
+fn normalize_legacy_cli_args(raw_args: Vec<OsString>) -> Vec<OsString> {
+    raw_args
+        .into_iter()
+        .map(|arg| {
+            if arg == "-UN" {
+                OsString::from("--unique-second-in-pair")
+            } else {
+                arg
+            }
+        })
+        .collect()
+}
+
+fn parse_args() -> Args {
+    let raw_args = std::env::args_os().collect::<Vec<_>>();
+    let normalized_args = normalize_legacy_cli_args(raw_args);
+    Args::parse_from(normalized_args)
+}
+
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let args = parse_args();
 
     setup_logging_stderr_only(args.log_level)?;
 
@@ -211,6 +247,9 @@ fn main() -> Result<()> {
             }
             ExecutionMode::Somatic => {
                 println!("{}", vardict_rs::mods::output_variant::get_somatic_header_line());
+            }
+            ExecutionMode::Splicing => {
+                println!("Sample\tChr\tIntron\tIntron count");
             }
             ExecutionMode::Simple => {
                 let pipeline = Pipeline::new(config.clone());
@@ -313,6 +352,9 @@ fn run_variant_calling(
     conf.downsampling = args.downsampling;
     conf.remove_duplicated_reads = args.remove_duplicates;
     conf.disable_sv = args.no_sv;
+    conf.unique_mode_alignment_enabled = args.unique_mode_alignment;
+    conf.unique_mode_second_in_pair_enabled = args.unique_mode_second_in_pair;
+    conf.delete_duplicate_variants = args.delete_duplicate_variants;
     conf.amplicon_based_calling = amplicon_based_calling.clone();
     conf.perform_local_realignment = args.local_realignment == 1;
     conf.number_nucleotide_to_extend = args.number_nucleotide_to_extend;
@@ -553,6 +595,46 @@ fn run_variant_calling(
                 eprintln!("[TIMING] TOTAL execution: {:.3}s", elapsed_total.as_secs_f64());
             }
         }
+        ExecutionMode::Splicing => {
+            let vardict_pipeline = VarDictPipeline::new(&config.sample_name)
+                .with_min_frequency(config.min_frequency)
+                .with_min_base_quality(config.quality_threshold)
+                .with_min_mapping_quality(config.mapq_threshold)
+                .with_pileup(config.pileup);
+
+            let global_scope = Arc::new(
+                INSTANCE
+                    .get()
+                    .expect("GlobalReadOnlyScope not initialized")
+                    .clone(),
+            );
+            let mut stdout = io::stdout().lock();
+
+            for region_group in region_batches {
+                for region in &region_group {
+                    let mut bam_reader = BamReader::open(&primary_bam_path)?;
+                    let output_lines = vardict_pipeline.process_region_splicing_from_bam(
+                        region,
+                        &reference,
+                        &mut bam_reader,
+                        Arc::clone(&global_scope),
+                    )?;
+
+                    for line in output_lines {
+                        writeln!(stdout, "{}", line)?;
+                    }
+                }
+            }
+
+            let elapsed_processing = start_processing.elapsed();
+            let elapsed_total = start_total.elapsed();
+
+            if args.debug {
+                eprintln!("[TIMING] Processing all regions: {:.3}s", elapsed_processing.as_secs_f64());
+                eprintln!("[TIMING] Output writing: {:.3}s", 0.0f64);
+                eprintln!("[TIMING] TOTAL execution: {:.3}s", elapsed_total.as_secs_f64());
+            }
+        }
     }
 
     Ok(())
@@ -575,6 +657,7 @@ enum ExecutionMode {
     Simple,
     Amplicon,
     Somatic,
+    Splicing,
 }
 
 fn resolve_execution_mode(
@@ -582,7 +665,9 @@ fn resolve_execution_mode(
     amplicon_based_calling: &Option<String>,
     has_paired_bam: bool,
 ) -> ExecutionMode {
-    if has_paired_bam {
+    if args.output_splicing {
+        ExecutionMode::Splicing
+    } else if has_paired_bam {
         ExecutionMode::Somatic
     } else if args.region.is_some() {
         ExecutionMode::Simple
@@ -599,7 +684,7 @@ fn select_region_batches_for_execution(
     amplicon_region_groups: Option<Vec<Vec<Region>>>,
 ) -> Vec<Vec<Region>> {
     match execution_mode {
-        ExecutionMode::Simple | ExecutionMode::Somatic => vec![regions],
+        ExecutionMode::Simple | ExecutionMode::Somatic | ExecutionMode::Splicing => vec![regions],
         ExecutionMode::Amplicon => {
             if let Some(groups) = amplicon_region_groups {
                 if groups.is_empty() {
@@ -1025,6 +1110,16 @@ fn normalize_region_chrom(chrom: &str, bam_targets: Option<&[String]>) -> String
 mod tests {
     use super::*;
 
+    fn parse_args_for_test<I, T>(args: I) -> Args
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString>,
+    {
+        let raw_args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+        let normalized_args = normalize_legacy_cli_args(raw_args);
+        Args::parse_from(normalized_args)
+    }
+
     #[test]
     fn test_parse_region_string_full() {
         let region = parse_region_string("chr1:1000-2000", false, None).unwrap();
@@ -1057,7 +1152,7 @@ mod tests {
 
     #[test]
     fn test_parse_args_amplicon_based_calling() {
-        let args = Args::parse_from([
+        let args = parse_args_for_test([
             "vardict",
             "-G",
             "reference.fa",
@@ -1074,7 +1169,7 @@ mod tests {
 
     #[test]
     fn test_parse_args_amplicon_based_calling_absent_by_default() {
-        let args = Args::parse_from([
+        let args = parse_args_for_test([
             "vardict",
             "-G",
             "reference.fa",
@@ -1089,7 +1184,7 @@ mod tests {
 
     #[test]
     fn test_parse_args_zero_based_option_values() {
-        let args_zero = Args::parse_from([
+        let args_zero = parse_args_for_test([
             "vardict",
             "-G",
             "reference.fa",
@@ -1102,7 +1197,7 @@ mod tests {
         ]);
         assert_eq!(args_zero.zero_based, Some(1));
 
-        let args_one_based = Args::parse_from([
+        let args_one_based = parse_args_for_test([
             "vardict",
             "-G",
             "reference.fa",
@@ -1118,7 +1213,7 @@ mod tests {
 
     #[test]
     fn test_parse_bed_file_auto_detects_amplicon_and_zero_based_default() {
-        let args = Args::parse_from([
+        let args = parse_args_for_test([
             "vardict",
             "-G",
             "reference.fa",
@@ -1151,7 +1246,7 @@ mod tests {
 
     #[test]
     fn test_parse_bed_file_amplicon_groups_by_insert_overlap() {
-        let args = Args::parse_from([
+        let args = parse_args_for_test([
             "vardict",
             "-G",
             "reference.fa",
@@ -1195,7 +1290,7 @@ mod tests {
 
     #[test]
     fn test_get_regions_region_option_ignores_amplicon_setting() {
-        let args = Args::parse_from([
+        let args = parse_args_for_test([
             "vardict",
             "-G",
             "reference.fa",
@@ -1214,7 +1309,7 @@ mod tests {
 
     #[test]
     fn test_resolve_execution_mode_region_forces_simple() {
-        let args = Args::parse_from([
+        let args = parse_args_for_test([
             "vardict",
             "-G",
             "reference.fa",
@@ -1232,7 +1327,7 @@ mod tests {
 
     #[test]
     fn test_resolve_execution_mode_amplicon_without_region() {
-        let args = Args::parse_from([
+        let args = parse_args_for_test([
             "vardict",
             "-G",
             "reference.fa",
@@ -1246,7 +1341,7 @@ mod tests {
 
     #[test]
     fn test_resolve_execution_mode_paired_bam_forces_somatic() {
-        let args = Args::parse_from([
+        let args = parse_args_for_test([
             "vardict",
             "-G",
             "reference.fa",
@@ -1260,6 +1355,59 @@ mod tests {
 
         let mode = resolve_execution_mode(&args, &Some("10:0.95".to_string()), true);
         assert_eq!(mode, ExecutionMode::Somatic);
+    }
+
+    #[test]
+    fn test_resolve_execution_mode_splicing_has_highest_priority() {
+        let args = parse_args_for_test([
+            "vardict",
+            "-G",
+            "reference.fa",
+            "-b",
+            "tumor.bam|normal.bam",
+            "-R",
+            "chr1:1-10",
+            "-a",
+            "10:0.95",
+            "-i",
+        ]);
+
+        let mode = resolve_execution_mode(&args, &Some("10:0.95".to_string()), true);
+        assert_eq!(mode, ExecutionMode::Splicing);
+    }
+
+    #[test]
+    fn test_parse_args_unique_mode_alignment_flag() {
+        let args = parse_args_for_test([
+            "vardict",
+            "-G",
+            "reference.fa",
+            "-b",
+            "input.bam",
+            "-R",
+            "chr1:1-10",
+            "-u",
+        ]);
+
+        assert!(args.unique_mode_alignment);
+        assert!(!args.unique_mode_second_in_pair);
+    }
+
+    #[test]
+    fn test_parse_args_unique_mode_second_in_pair_legacy_short() {
+        let args = parse_args_for_test([
+            "vardict",
+            "-G",
+            "reference.fa",
+            "-b",
+            "input.bam",
+            "-R",
+            "chr1:1-10",
+            "-UN",
+        ]);
+
+        assert!(!args.no_sv);
+        assert!(args.unique_mode_second_in_pair);
     }
 
     #[test]

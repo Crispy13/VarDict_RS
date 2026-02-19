@@ -84,6 +84,8 @@ pub struct CigarParserOutput {
     pub splice: HashSet<String>,
     /// Splice counts by intron key ("start-end")
     pub splice_count: HashMap<String, usize>,
+    /// Java HashMap-equivalent iteration order for splice_count keys
+    pub splice_output_order: Vec<String>,
     /// Duplication rate
     pub duprate: f64,
     /// Total reads seen by preprocessor
@@ -93,6 +95,18 @@ pub struct CigarParserOutput {
 }
 
 impl CigarParserOutput {
+    pub fn to_splicing_lines(&self, sample_name: &str, chr: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        for intron in &self.splice_output_order {
+            let intron_count = self.splice_count.get(intron).copied().unwrap_or(0);
+            lines.push(format!(
+                "{}\t{}\t{}\t{}",
+                sample_name, chr, intron, intron_count
+            ));
+        }
+        lines
+    }
+
     pub fn write_jsonl_snapshot_if_enabled(&self, region: &Region) -> Result<()> {
         let path = match env::var("VARDICT_CIGAR_PARSER_JSONL") {
             Ok(val) => val.trim().to_string(),
@@ -714,6 +728,46 @@ fn java_hashmap_bucket_index(key: i64, capacity: usize) -> usize {
     (hash as usize) & (capacity - 1)
 }
 
+fn java_string_hash(s: &str) -> u32 {
+    let mut hash: u32 = 0;
+    for byte in s.bytes() {
+        hash = hash.wrapping_mul(31).wrapping_add(byte as u32);
+    }
+    hash
+}
+
+fn java_hashmap_bucket_index_for_string(key: &str, capacity: usize) -> usize {
+    let hash = java_string_hash(key);
+    let mixed = hash ^ (hash >> 16);
+    (mixed as usize) & (capacity - 1)
+}
+
+fn java_hashmap_string_iteration_order(entries: Vec<(String, usize)>) -> Vec<String> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+
+    let capacity = java_hashmap_capacity(entries.len());
+    let mut keyed_entries: Vec<(String, usize, usize)> = entries
+        .into_iter()
+        .map(|(key, order)| {
+            (
+                key.clone(),
+                java_hashmap_bucket_index_for_string(&key, capacity),
+                order,
+            )
+        })
+        .collect();
+
+    keyed_entries.sort_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    keyed_entries.into_iter().map(|(key, _, _)| key).collect()
+}
+
 fn java_hashmap_iteration_order<I>(
     keys: I,
     size: usize,
@@ -863,6 +917,52 @@ impl VarDictPipeline {
             output_lines.len());
 
         Ok(output_lines)
+    }
+
+    pub fn process_region_splicing_from_bam(
+        &self,
+        region: &Region,
+        shared_reference: &SharedReferenceHandle,
+        bam_reader: &mut BamReader,
+        instance: Arc<GlobalReadOnlyScope>,
+    ) -> Result<Vec<String>> {
+        let extend = (instance.conf.number_nucleotide_to_extend + instance.conf.reference_extension)
+            .max(0) as usize;
+        let extended_start = if region.start() > extend {
+            region.start() - extend
+        } else {
+            1
+        };
+        let mut extended_end = region.end() + extend;
+        if let Some(&chr_len) = instance.chr_lens.get(region.chr()) {
+            if extended_end > chr_len {
+                extended_end = chr_len;
+            }
+        }
+
+        let ref_seq = match shared_reference.get_subseq(region.chr(), extended_start, extended_end) {
+            Some(seq) => seq.to_vec(),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Failed to get reference for {}:{}-{}",
+                    region.chr(), extended_start, extended_end
+                ));
+            }
+        };
+        let mut reference = Reference::new_with_start(ref_seq, extended_start as i64);
+        let chr_len = instance.chr_lens.get(region.chr()).copied();
+        reference.build_seed_map(extended_end as i64, chr_len);
+
+        let sam_filter = instance.conf.sam_filter;
+        let cigar_output = self.run_cigar_parser_from_bam(
+            region,
+            &reference,
+            instance,
+            bam_reader,
+            sam_filter,
+        )?;
+
+        Ok(cigar_output.to_splicing_lines(&self.sample_name, region.chr()))
     }
 
     pub fn process_region_to_aligned_vars_from_bam(
@@ -1788,14 +1888,22 @@ impl VarDictPipeline {
         duplicate_reads: usize,
     ) -> CigarParserOutput {
         let splice_count_raw = cigar_parser.take_splice_count();
+        let splice_count_insert_index = cigar_parser.take_splice_count_insert_index();
         let mut splice: HashSet<String> = HashSet::new();
         let mut splice_count: HashMap<String, usize> = HashMap::new();
+        let mut splice_order_source: Vec<(String, usize)> = Vec::new();
         for ((start, end), counts) in splice_count_raw.into_iter() {
             let key = format!("{}-{}", start, end);
             splice.insert(key.clone());
             let count = counts.get(0).copied().unwrap_or(0);
-            splice_count.insert(key, count);
+            let insert_order = splice_count_insert_index
+                .get(&(start, end))
+                .copied()
+                .unwrap_or(usize::MAX);
+            splice_count.insert(key.clone(), count);
+            splice_order_source.push((key, insert_order));
         }
+        let splice_output_order = java_hashmap_string_iteration_order(splice_order_source);
 
         let duprate = if instance().conf.remove_duplicated_reads && total_reads != 0 {
             (duplicate_reads as f64 / total_reads as f64 * 1000.0).round() / 1000.0
@@ -1825,6 +1933,7 @@ impl VarDictPipeline {
             discordant_count: cigar_parser.get_discordant_count(),
             splice,
             splice_count,
+            splice_output_order,
             duprate,
             total_reads,
             duplicate_reads,
@@ -2032,7 +2141,8 @@ impl VarDictPipeline {
                 |desc| matches!(desc, VarDesc::Raw { desc } if desc.as_slice() == b"SV"),
             );
 
-            if !has_sv_at_position && (position < region.start() as i64 || position > region.end() as i64)
+            if (position < region.start() as i64 || position > region.end() as i64)
+                && (!has_sv_at_position || instance().conf.delete_duplicate_variants)
             {
                 if trace_this_pos {
                     event!(

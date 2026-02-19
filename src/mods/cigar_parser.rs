@@ -48,6 +48,8 @@ pub struct CigarParser {
     rev_complementor: RevComplementor,
     discordant_count: usize,
     splice_count: HashMap<SplicingKey, Vec<usize>>,
+    splice_count_insert_index: HashMap<SplicingKey, usize>,
+    next_splice_count_insert_index: usize,
 
     /// keep track the read position (offset), including softclipped
     read_pos_including_softclip: usize,
@@ -113,6 +115,8 @@ impl Default for CigarParser {
             region: Default::default(),
             discordant_count: Default::default(),
             splice_count: Default::default(),
+            splice_count_insert_index: Default::default(),
+            next_splice_count_insert_index: 0,
             read_pos_including_softclip: Default::default(),
             read_pos_excluding_softclip: Default::default(),
             start: Default::default(),
@@ -170,6 +174,8 @@ impl CigarParser {
             region,
             discordant_count: 0,
             splice_count: HashMap::new(),
+            splice_count_insert_index: HashMap::new(),
+            next_splice_count_insert_index: 0,
             read_pos_including_softclip: 0,
             read_pos_excluding_softclip: 0,
             start: 0,
@@ -352,6 +358,10 @@ impl CigarParser {
         std::mem::take(&mut self.splice_count)
     }
 
+    pub fn take_splice_count_insert_index(&mut self) -> HashMap<SplicingKey, usize> {
+        std::mem::take(&mut self.splice_count_insert_index)
+    }
+
     fn parse_cigar_with_amp_case(
         &self,
         record: &Record,
@@ -532,7 +542,7 @@ impl CigarParser {
 
         let mate_start = record.mpos() + 1;
         let mend = mate_start + total_length_including_softclip as i64;
-        let aligned_len = get_aligned_length(cigar);
+        let aligned_len = get_aligned_length_mnd(cigar);
         let end = start + aligned_len;
 
         let mut soft5 = 0i64;
@@ -2992,6 +3002,12 @@ impl CigarParser {
     fn process_not_matched(&mut self, cigar_len: u32) {
         let key = (self.start - 1, self.start + cigar_len as i64 - 1);
 
+        if !self.splice_count.contains_key(&key) {
+            self.splice_count_insert_index
+                .insert(key, self.next_splice_count_insert_index);
+            self.next_splice_count_insert_index += 1;
+        }
+
         self.splice_count
             .entry(key)
             .and_modify(|v| v[0] += 1)
@@ -3301,6 +3317,17 @@ fn get_aligned_length(cigar: &CigarStringView) -> i64 {
         .sum::<i64>()
 }
 
+#[inline]
+fn get_aligned_length_mnd(cigar: &CigarStringView) -> i64 {
+    cigar
+        .iter()
+        .map(|c| match c {
+            Cigar::Match(l) | Cigar::Del(l) | Cigar::RefSkip(l) => *l as i64,
+            _ => 0,
+        })
+        .sum::<i64>()
+}
+
 fn get_match_insertion_length(cigar: &CigarStringView) -> usize {
     cigar
         .iter()
@@ -3331,8 +3358,7 @@ fn is_paired_and_same_chromosome(record: &Record) -> bool {
 fn are_reads_overlap(record: &Record, current_start: i64, pos: i64, mate_pos: i64) -> bool {
     if pos >= mate_pos {
         let ref_len = record
-            .cigar_cached()
-            .unwrap()
+            .cigar()
             .iter()
             .map(|c| if c.consumes_reference_bases() { c.len() } else { 0 })
             .sum::<u32>() as i64;
@@ -3978,6 +4004,21 @@ mod tests {
         ]);
 
         assert_eq!(get_aligned_length(&cigar), 9); // 1 + 8
+    }
+
+    /// Test getAlignedLengthMND (Java ALIGNED_LENGTH_MND parity) - calculates sum of M + N + D lengths
+    #[test]
+    fn test_get_aligned_length_mnd() {
+        let cigar = make_cigar(vec![
+            Cigar::Match(1),
+            Cigar::SoftClip(2),
+            Cigar::Ins(4),
+            Cigar::Del(8),
+            Cigar::RefSkip(16),
+            Cigar::HardClip(32),
+        ]);
+
+        assert_eq!(get_aligned_length_mnd(&cigar), 25); // 1 + 8 + 16
     }
 
     /// Test getSoftClippedLength - calculates sum of M + I + S lengths

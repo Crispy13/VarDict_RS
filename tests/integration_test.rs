@@ -270,6 +270,21 @@ pub fn parse_test_case(path: &Path) -> Result<(TestCaseConfig, Vec<ExpectedVaria
     Ok((config, variants))
 }
 
+fn parse_test_case_raw_output_lines(path: &Path) -> Result<(TestCaseConfig, Vec<String>), String> {
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read test case: {}", e))?;
+
+    let (config, _) = parse_test_case(path)?;
+    let raw_lines = content
+        .lines()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+
+    Ok((config, raw_lines))
+}
+
 /// Parse a FASTA CSV file (from CSVReferenceManager)
 /// Format: chromosome,start,end,sequence
 pub fn parse_fasta_csv(path: &Path) -> Result<HashMap<String, Vec<(i64, i64, String)>>, String> {
@@ -654,6 +669,16 @@ fn parse_somatic_bam_pair(bam_file: &str) -> Result<(String, String), String> {
     Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
+fn has_option_flag(options: &str, short_or_long_flag: &str) -> bool {
+    options
+        .split_whitespace()
+        .any(|token| token == short_or_long_flag)
+}
+
+fn has_output_splicing_option(options: &str) -> bool {
+    has_option_flag(options, "-i") || has_option_flag(options, "--splice")
+}
+
 fn apply_simple_options_to_conf_and_pipeline(
     options: &str,
     conf: &mut vardict_rs::conf::Configuration,
@@ -684,6 +709,9 @@ fn apply_simple_options_to_conf_and_pipeline(
             }
             "-U" | "--nosv" => {
                 conf.disable_sv = true;
+            }
+            "--deldupvar" => {
+                conf.delete_duplicate_variants = true;
             }
             "-f" => {
                 if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<f64>().ok()) {
@@ -1139,6 +1167,19 @@ fn run_vardict_pipeline_simple_raw_case_with_sv_default(
         .with_min_base_quality(min_base_quality)
         .with_pileup(pileup);
     pipeline = pipeline.with_min_mapping_quality(min_mapping_quality);
+
+    let run_splicing_mode = has_output_splicing_option(&config.options);
+
+    if run_splicing_mode {
+        return pipeline
+            .process_region_splicing_from_bam(&region, &shared_reference, &mut bam_reader, instance)
+            .map_err(|e| {
+                format!(
+                    "Pipeline failed for {} (ref_chrom={}): {}",
+                    case_name, resolved_ref_chrom, e
+                )
+            });
+    }
 
     pipeline
         .process_region_from_bam(&region, &shared_reference, &mut bam_reader, instance)
@@ -2098,7 +2139,11 @@ fn test_all_simple_integration() {
     let mut run_now_simple = load_parity_manifest(&manifest_path)
         .expect("Failed to load parity case manifest")
         .into_iter()
-        .filter(|row| row.mode == "Simple" && row.status == "RUN_NOW")
+        .filter(|row| {
+            row.mode == "Simple"
+                && row.status == "RUN_NOW"
+                && !has_output_splicing_option(&row.options)
+        })
         .collect::<Vec<_>>();
     run_now_simple.sort_by(|left, right| left.case_file.cmp(&right.case_file));
 
@@ -2539,7 +2584,12 @@ fn test_manifest_simple_sv_core_raw_rust_vs_java_first_mismatch() {
     let mut selected = load_parity_manifest(&manifest_path)
         .expect("Failed to load parity case manifest")
         .into_iter()
-        .filter(|row| row.mode == "Simple" && row.blocker_reason == "sv_core_gap")
+        .filter(|row| {
+            row.mode == "Simple"
+                && row.status == "RUN_NOW"
+                && row.tags.split('|').any(|tag| tag == "sv_related")
+                && !has_output_splicing_option(&row.options)
+        })
         .collect::<Vec<_>>();
 
     if let Ok(case_filter) = env::var("VARDICT_SIMPLE_SV_CASE_FILTER") {
@@ -2553,7 +2603,7 @@ fn test_manifest_simple_sv_core_raw_rust_vs_java_first_mismatch() {
 
     assert!(
         !selected.is_empty(),
-        "No simple sv_core_gap rows found in parity manifest for VARDICT_SIMPLE_SV_CASE_FILTER"
+        "No simple RUN_NOW sv-related rows found in parity manifest for VARDICT_SIMPLE_SV_CASE_FILTER"
     );
 
     let mut accounting = Tier1ComparisonAccounting {
@@ -2702,6 +2752,595 @@ fn test_manifest_simple_sv_core_raw_rust_vs_java_first_mismatch() {
         assert_eq!(
             accounting.mismatched, 0,
             "Strict RUN_NOW mode requires zero simple sv_core raw mismatches"
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn test_manifest_simple_splicing_raw_rust_vs_java_first_mismatch() {
+    if env::var("VARDICT_DEBUG_POS").is_ok() {
+        let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
+    }
+
+    let testdata_dir = get_testdata_dir();
+    let test_cases_dir = testdata_dir.join("integrationtestcases");
+    let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("parity_case_manifest.csv");
+    let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("VarDictJava")
+        .join("src/test/resources/com/astrazeneca/vardict/integrationtests");
+
+    if !test_cases_dir.exists() || !resources_dir.exists() || !manifest_path.exists() {
+        eprintln!("Simple splicing raw parity resources not found");
+        return;
+    }
+
+    let mut selected = load_parity_manifest(&manifest_path)
+        .expect("Failed to load parity case manifest")
+        .into_iter()
+        .filter(|row| row.mode == "Simple" && has_output_splicing_option(&row.options))
+        .collect::<Vec<_>>();
+
+    if let Ok(case_filter) = env::var("VARDICT_SIMPLE_SPLICING_CASE_FILTER") {
+        let needle = case_filter.trim();
+        if !needle.is_empty() {
+            selected.retain(|row| row.case_file.contains(needle));
+        }
+    }
+
+    selected.sort_by(|left, right| left.case_file.cmp(&right.case_file));
+
+    assert!(
+        !selected.is_empty(),
+        "No simple -i/--splice rows found in parity manifest for VARDICT_SIMPLE_SPLICING_CASE_FILTER"
+    );
+
+    let mut accounting = Tier1ComparisonAccounting {
+        selected: selected.len(),
+        ..Tier1ComparisonAccounting::default()
+    };
+
+    for row in &selected {
+        let test_case_path = test_cases_dir.join(&row.case_file);
+        if !test_case_path.exists() {
+            eprintln!("SKIP {}: missing testcase file", row.case_file);
+            accounting.skipped += 1;
+            continue;
+        }
+
+        let (config, expected_lines) = match parse_test_case_raw_output_lines(&test_case_path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("FAIL {}: parse error: {}", row.case_file, e);
+                accounting.failed += 1;
+                continue;
+            }
+        };
+
+        if config.mode != "Simple" {
+            eprintln!(
+                "FAIL {}: mode mismatch manifest={} testcase={}",
+                row.case_file, row.mode, config.mode
+            );
+            accounting.failed += 1;
+            continue;
+        }
+
+        if !has_output_splicing_option(&config.options) {
+            eprintln!(
+                "FAIL {}: splicing_mode_gap row missing -i/--splice option",
+                row.case_file
+            );
+            accounting.failed += 1;
+            continue;
+        }
+
+        if expected_lines.is_empty() {
+            eprintln!("SKIP {}: no expected output lines", row.case_file);
+            accounting.skipped += 1;
+            continue;
+        }
+
+        if row.reference != config.reference
+            || row.bam != config.bam_file
+            || row.chrom != config.chrom
+            || row.options != config.options
+        {
+            eprintln!(
+                "FAIL {}: manifest/testcase mismatch (reference/bam/chrom/options)",
+                row.case_file
+            );
+            accounting.failed += 1;
+            continue;
+        }
+
+        let expected_sample_name = expected_lines
+            .first()
+            .and_then(|line| line.split('\t').next())
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| {
+                config
+                    .bam_file
+                    .strip_suffix(".bam")
+                    .unwrap_or(&config.bam_file)
+                    .to_string()
+            });
+
+        let rust_output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_vardict_pipeline_simple_raw_case_with_sv_default(
+                &testdata_dir,
+                &resources_dir,
+                &config,
+                &row.case_file,
+                &expected_sample_name,
+                false,
+            )
+        })) {
+            Ok(Ok(lines)) => lines,
+            Ok(Err(e)) => {
+                eprintln!("SKIP {}: runner unavailable: {}", row.case_file, e);
+                accounting.skipped += 1;
+                continue;
+            }
+            Err(_) => {
+                eprintln!(
+                    "SKIP {}: runner panicked during pipeline execution",
+                    row.case_file
+                );
+                accounting.skipped += 1;
+                continue;
+            }
+        };
+
+        match first_raw_mismatch(&expected_lines, &rust_output) {
+            None => {
+                accounting.passed += 1;
+                println!(
+                    "PASS {}: simple splicing raw lines match exactly ({} lines)",
+                    row.case_file,
+                    rust_output.len()
+                );
+            }
+            Some(diag) => {
+                accounting.failed += 1;
+                accounting.mismatched += 1;
+                eprintln!(
+                    "FAIL {}: {} at line {}",
+                    row.case_file,
+                    diag.reason,
+                    diag.line_index + 1
+                );
+                eprintln!("  JAVA: {}", diag.java_line.unwrap_or_else(|| "<none>".to_string()));
+                eprintln!("  RUST: {}", diag.rust_line.unwrap_or_else(|| "<none>".to_string()));
+            }
+        }
+    }
+
+    println!("\n=== Simple Splicing Raw Parity Summary ===");
+    println!("Selected:   {}", accounting.selected);
+    println!("Passed:     {}", accounting.passed);
+    println!("Failed:     {}", accounting.failed);
+    println!("Mismatched: {}", accounting.mismatched);
+    println!("Skipped:    {}", accounting.skipped);
+    println!("===========================================\n");
+
+    assert_eq!(
+        accounting.selected,
+        accounting.passed + accounting.failed + accounting.skipped,
+        "Accounting mismatch in simple splicing raw parity test"
+    );
+    assert!(
+        accounting.passed + accounting.failed > 0,
+        "No executable simple splicing raw parity cases ran"
+    );
+
+    if env_flag("VARDICT_RUN_NOW_STRICT") {
+        assert_eq!(
+            accounting.skipped, 0,
+            "Strict RUN_NOW mode requires zero skipped simple splicing raw parity cases"
+        );
+        assert_eq!(
+            accounting.failed, 0,
+            "Strict RUN_NOW mode requires zero simple splicing raw parity failures"
+        );
+        assert_eq!(
+            accounting.mismatched, 0,
+            "Strict RUN_NOW mode requires zero simple splicing raw mismatches"
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn test_manifest_simple_unique_mode_raw_rust_vs_java_first_mismatch() {
+    if env::var("VARDICT_DEBUG_POS").is_ok() {
+        let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
+    }
+
+    let testdata_dir = get_testdata_dir();
+    let test_cases_dir = testdata_dir.join("integrationtestcases");
+    let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("parity_case_manifest.csv");
+    let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("VarDictJava")
+        .join("src/test/resources/com/astrazeneca/vardict/integrationtests");
+
+    if !test_cases_dir.exists() || !resources_dir.exists() || !manifest_path.exists() {
+        eprintln!("Simple unique-mode raw parity resources not found");
+        return;
+    }
+
+    let mut selected = load_parity_manifest(&manifest_path)
+        .expect("Failed to load parity case manifest")
+        .into_iter()
+        .filter(|row| {
+            row.mode == "Simple"
+                && row.status == "RUN_NOW"
+                && row.tags.split('|').any(|tag| tag == "unique_mode")
+        })
+        .collect::<Vec<_>>();
+
+    if let Ok(case_filter) = env::var("VARDICT_SIMPLE_UNIQUE_CASE_FILTER") {
+        let needle = case_filter.trim();
+        if !needle.is_empty() {
+            selected.retain(|row| row.case_file.contains(needle));
+        }
+    }
+
+    selected.sort_by(|left, right| left.case_file.cmp(&right.case_file));
+
+    assert!(
+        !selected.is_empty(),
+        "No simple RUN_NOW unique_mode rows found in parity manifest for VARDICT_SIMPLE_UNIQUE_CASE_FILTER"
+    );
+
+    let mut accounting = Tier1ComparisonAccounting {
+        selected: selected.len(),
+        ..Tier1ComparisonAccounting::default()
+    };
+
+    for row in &selected {
+        let test_case_path = test_cases_dir.join(&row.case_file);
+        if !test_case_path.exists() {
+            eprintln!("SKIP {}: missing testcase file", row.case_file);
+            accounting.skipped += 1;
+            continue;
+        }
+
+        let (config, expected_variants) = match parse_test_case(&test_case_path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("FAIL {}: parse error: {}", row.case_file, e);
+                accounting.failed += 1;
+                continue;
+            }
+        };
+
+        if config.mode != "Simple" {
+            eprintln!(
+                "FAIL {}: mode mismatch manifest={} testcase={}",
+                row.case_file, row.mode, config.mode
+            );
+            accounting.failed += 1;
+            continue;
+        }
+
+        if expected_variants.is_empty() {
+            eprintln!("SKIP {}: no expected variant lines", row.case_file);
+            accounting.skipped += 1;
+            continue;
+        }
+
+        if row.reference != config.reference
+            || row.bam != config.bam_file
+            || row.chrom != config.chrom
+            || row.options != config.options
+        {
+            eprintln!(
+                "FAIL {}: manifest/testcase mismatch (reference/bam/chrom/options)",
+                row.case_file
+            );
+            accounting.failed += 1;
+            continue;
+        }
+
+        let expected_lines = expected_variants
+            .iter()
+            .map(|variant| variant.raw_line.clone())
+            .collect::<Vec<_>>();
+
+        let expected_sample_name = expected_lines
+            .first()
+            .and_then(|line| line.split('\t').next())
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| {
+                config
+                    .bam_file
+                    .strip_suffix(".bam")
+                    .unwrap_or(&config.bam_file)
+                    .to_string()
+            });
+
+        let rust_output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_vardict_pipeline_simple_raw_case(
+                &testdata_dir,
+                &resources_dir,
+                &config,
+                &row.case_file,
+                &expected_sample_name,
+            )
+        })) {
+            Ok(Ok(lines)) => lines,
+            Ok(Err(e)) => {
+                eprintln!("SKIP {}: runner unavailable: {}", row.case_file, e);
+                accounting.skipped += 1;
+                continue;
+            }
+            Err(_) => {
+                eprintln!(
+                    "SKIP {}: runner panicked during pipeline execution",
+                    row.case_file
+                );
+                accounting.skipped += 1;
+                continue;
+            }
+        };
+
+        match first_raw_mismatch(&expected_lines, &rust_output) {
+            None => {
+                accounting.passed += 1;
+                println!(
+                    "PASS {}: simple unique-mode raw lines match exactly ({} lines)",
+                    row.case_file,
+                    rust_output.len()
+                );
+            }
+            Some(diag) => {
+                accounting.failed += 1;
+                accounting.mismatched += 1;
+                eprintln!(
+                    "FAIL {}: {} at line {}",
+                    row.case_file,
+                    diag.reason,
+                    diag.line_index + 1
+                );
+                eprintln!("  JAVA: {}", diag.java_line.unwrap_or_else(|| "<none>".to_string()));
+                eprintln!("  RUST: {}", diag.rust_line.unwrap_or_else(|| "<none>".to_string()));
+            }
+        }
+    }
+
+    println!("\n=== Simple Unique-Mode Raw Parity Summary ===");
+    println!("Selected:   {}", accounting.selected);
+    println!("Passed:     {}", accounting.passed);
+    println!("Failed:     {}", accounting.failed);
+    println!("Mismatched: {}", accounting.mismatched);
+    println!("Skipped:    {}", accounting.skipped);
+    println!("==============================================\n");
+
+    assert_eq!(
+        accounting.selected,
+        accounting.passed + accounting.failed + accounting.skipped,
+        "Accounting mismatch in simple unique-mode raw parity test"
+    );
+    assert!(
+        accounting.passed + accounting.failed > 0,
+        "No executable simple unique-mode raw parity cases ran"
+    );
+
+    if env_flag("VARDICT_RUN_NOW_STRICT") {
+        assert_eq!(
+            accounting.skipped, 0,
+            "Strict RUN_NOW mode requires zero skipped simple unique-mode raw parity cases"
+        );
+        assert_eq!(
+            accounting.failed, 0,
+            "Strict RUN_NOW mode requires zero simple unique-mode raw parity failures"
+        );
+        assert_eq!(
+            accounting.mismatched, 0,
+            "Strict RUN_NOW mode requires zero simple unique-mode raw mismatches"
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn test_manifest_simple_realigner_complex_raw_rust_vs_java_first_mismatch() {
+    if env::var("VARDICT_DEBUG_POS").is_ok() {
+        let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
+    }
+
+    let testdata_dir = get_testdata_dir();
+    let test_cases_dir = testdata_dir.join("integrationtestcases");
+    let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("parity_case_manifest.csv");
+    let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("VarDictJava")
+        .join("src/test/resources/com/astrazeneca/vardict/integrationtests");
+
+    if !test_cases_dir.exists() || !resources_dir.exists() || !manifest_path.exists() {
+        eprintln!("Simple realigner-complex raw parity resources not found");
+        return;
+    }
+
+    let mut selected = load_parity_manifest(&manifest_path)
+        .expect("Failed to load parity case manifest")
+        .into_iter()
+        .filter(|row| {
+            row.mode == "Simple"
+                && row.tags.split('|').any(|tag| tag == "realigner_complex")
+                && (row.status == "RUN_NOW" || row.blocker_reason == "realigner_complex_gap")
+        })
+        .collect::<Vec<_>>();
+
+    if let Ok(case_filter) = env::var("VARDICT_SIMPLE_REALIGNER_COMPLEX_CASE_FILTER") {
+        let needle = case_filter.trim();
+        if !needle.is_empty() {
+            selected.retain(|row| row.case_file.contains(needle));
+        }
+    }
+
+    selected.sort_by(|left, right| left.case_file.cmp(&right.case_file));
+
+    assert!(
+        !selected.is_empty(),
+        "No simple realigner_complex rows found in parity manifest for VARDICT_SIMPLE_REALIGNER_COMPLEX_CASE_FILTER"
+    );
+
+    let mut accounting = Tier1ComparisonAccounting {
+        selected: selected.len(),
+        ..Tier1ComparisonAccounting::default()
+    };
+
+    for row in &selected {
+        let test_case_path = test_cases_dir.join(&row.case_file);
+        if !test_case_path.exists() {
+            eprintln!("SKIP {}: missing testcase file", row.case_file);
+            accounting.skipped += 1;
+            continue;
+        }
+
+        let (config, expected_variants) = match parse_test_case(&test_case_path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("FAIL {}: parse error: {}", row.case_file, e);
+                accounting.failed += 1;
+                continue;
+            }
+        };
+
+        if config.mode != "Simple" {
+            eprintln!(
+                "FAIL {}: mode mismatch manifest={} testcase={}",
+                row.case_file, row.mode, config.mode
+            );
+            accounting.failed += 1;
+            continue;
+        }
+
+        if expected_variants.is_empty() {
+            eprintln!("SKIP {}: no expected variant lines", row.case_file);
+            accounting.skipped += 1;
+            continue;
+        }
+
+        if row.reference != config.reference
+            || row.bam != config.bam_file
+            || row.chrom != config.chrom
+            || row.options != config.options
+        {
+            eprintln!(
+                "FAIL {}: manifest/testcase mismatch (reference/bam/chrom/options)",
+                row.case_file
+            );
+            accounting.failed += 1;
+            continue;
+        }
+
+        let expected_lines = expected_variants
+            .iter()
+            .map(|variant| variant.raw_line.clone())
+            .collect::<Vec<_>>();
+
+        let expected_sample_name = expected_lines
+            .first()
+            .and_then(|line| line.split('\t').next())
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| {
+                config
+                    .bam_file
+                    .strip_suffix(".bam")
+                    .unwrap_or(&config.bam_file)
+                    .to_string()
+            });
+
+        let rust_output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_vardict_pipeline_simple_raw_case(
+                &testdata_dir,
+                &resources_dir,
+                &config,
+                &row.case_file,
+                &expected_sample_name,
+            )
+        })) {
+            Ok(Ok(lines)) => lines,
+            Ok(Err(e)) => {
+                eprintln!("SKIP {}: runner unavailable: {}", row.case_file, e);
+                accounting.skipped += 1;
+                continue;
+            }
+            Err(_) => {
+                eprintln!(
+                    "SKIP {}: runner panicked during pipeline execution",
+                    row.case_file
+                );
+                accounting.skipped += 1;
+                continue;
+            }
+        };
+
+        match first_raw_mismatch(&expected_lines, &rust_output) {
+            None => {
+                accounting.passed += 1;
+                println!(
+                    "PASS {}: simple realigner-complex raw lines match exactly ({} lines)",
+                    row.case_file,
+                    rust_output.len()
+                );
+            }
+            Some(diag) => {
+                accounting.failed += 1;
+                accounting.mismatched += 1;
+                eprintln!(
+                    "FAIL {}: {} at line {}",
+                    row.case_file,
+                    diag.reason,
+                    diag.line_index + 1
+                );
+                eprintln!("  JAVA: {}", diag.java_line.unwrap_or_else(|| "<none>".to_string()));
+                eprintln!("  RUST: {}", diag.rust_line.unwrap_or_else(|| "<none>".to_string()));
+            }
+        }
+    }
+
+    println!("\n=== Simple Realigner-Complex Raw Parity Summary ===");
+    println!("Selected:   {}", accounting.selected);
+    println!("Passed:     {}", accounting.passed);
+    println!("Failed:     {}", accounting.failed);
+    println!("Mismatched: {}", accounting.mismatched);
+    println!("Skipped:    {}", accounting.skipped);
+    println!("====================================================\n");
+
+    assert_eq!(
+        accounting.selected,
+        accounting.passed + accounting.failed + accounting.skipped,
+        "Accounting mismatch in simple realigner-complex raw parity test"
+    );
+    assert!(
+        accounting.passed + accounting.failed > 0,
+        "No executable simple realigner-complex raw parity cases ran"
+    );
+
+    if env_flag("VARDICT_RUN_NOW_STRICT") {
+        assert_eq!(
+            accounting.skipped, 0,
+            "Strict RUN_NOW mode requires zero skipped simple realigner-complex raw parity cases"
+        );
+        assert_eq!(
+            accounting.failed, 0,
+            "Strict RUN_NOW mode requires zero simple realigner-complex raw parity failures"
+        );
+        assert_eq!(
+            accounting.mismatched, 0,
+            "Strict RUN_NOW mode requires zero simple realigner-complex raw mismatches"
         );
     }
 }
