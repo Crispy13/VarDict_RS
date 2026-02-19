@@ -1364,6 +1364,13 @@ impl VariantRealigner {
         let conf = &crate::scopedata::global_read_only_scope::instance().conf;
         let longmm = 3usize;
         let indel_size = 50i64;
+        let base_region_start = data.ref_coverage.keys().min().copied().unwrap_or(1);
+        let base_region_end = data
+            .ref_coverage
+            .keys()
+            .max()
+            .copied()
+            .unwrap_or(base_region_start);
 
         let mut tmp5: Vec<(i64, usize)> = data
             .soft_clips_5end
@@ -1394,34 +1401,49 @@ impl VariantRealigner {
                 continue;
             }
 
-            if Self::is_low_complex_seq(&String::from_utf8_lossy(&seq)) {
-                continue;
+            let mut bp = self.find_bp(&seq, position - 5, -1);
+            let mut matched_extra: Vec<u8> = Vec::new();
+            let mut svcov = 0usize;
+
+            if bp == 0 {
+                if Self::is_low_complex_seq(&String::from_utf8_lossy(&seq)) {
+                    continue;
+                }
+
+                let matched = self.find_match(&seq, position, -1, Configuration::SEED_1 as usize, 1);
+                bp = matched.base_position;
+                matched_extra = matched.matched_sequence;
+                if !(bp != 0
+                    && position - bp > 15
+                    && position - bp < Configuration::SVMAXLEN as i64)
+                {
+                    continue;
+                }
+
+                bp += 1;
+
+                let (cov_f, clusters_f, pairs_f) =
+                    Self::mark_sv_clusters(bp, position, &mut data.svfdel, data.max_read_length as i64);
+                let (cov_r, clusters_r, pairs_r) =
+                    Self::mark_sv_clusters(bp, position, &mut data.svrdel, data.max_read_length as i64);
+                svcov = cov_f + cov_r;
+                let clusters = clusters_f + clusters_r;
+                let pairs = pairs_f + pairs_r;
+
+                if svcov == 0 && cnt <= conf.minr {
+                    continue;
+                }
+                Self::add_sv_counts(data, bp, pairs, cnt, clusters);
+
+                if bp < base_region_start {
+                    let tts = bp - data.max_read_length as i64;
+                    let mut tte = bp + data.max_read_length as i64;
+                    if bp + data.max_read_length as i64 >= base_region_start {
+                        tte = base_region_start - 1;
+                    }
+                    self.load_partial_ref_coverage(data, tts, tte);
+                }
             }
-
-            let matched = self.find_match(&seq, position, -1, Configuration::SEED_1 as usize, 1);
-            let mut bp = matched.base_position;
-            let matched_extra = matched.matched_sequence;
-            if !(bp != 0
-                && position - bp > 15
-                && position - bp < Configuration::SVMAXLEN as i64)
-            {
-                continue;
-            }
-
-            bp += 1;
-
-            let (cov_f, clusters_f, pairs_f) =
-                Self::mark_sv_clusters(bp, position, &mut data.svfdel, data.max_read_length as i64);
-            let (cov_r, clusters_r, pairs_r) =
-                Self::mark_sv_clusters(bp, position, &mut data.svrdel, data.max_read_length as i64);
-            let svcov = cov_f + cov_r;
-            let clusters = clusters_f + clusters_r;
-            let pairs = pairs_f + pairs_r;
-
-            if svcov == 0 && cnt <= conf.minr {
-                continue;
-            }
-            Self::add_sv_counts(data, bp, pairs, cnt, clusters);
 
             let mut dellen = position - bp;
             let mut extra = Vec::<u8>::new();
@@ -1675,40 +1697,55 @@ impl VariantRealigner {
                 continue;
             }
 
-            if Self::is_low_complex_seq(&String::from_utf8_lossy(&seq)) {
-                continue;
-            }
+            let mut breakpoint = self.find_bp(&seq, position + 5, 1);
+            let mut matched_extra: Vec<u8> = Vec::new();
+            let mut svcov = 0usize;
 
-            let matched = self.find_match(&seq, position, 1, Configuration::SEED_1 as usize, 1);
-            let mut breakpoint = matched.base_position;
-            let matched_extra = matched.matched_sequence;
-            if !(breakpoint != 0
-                && breakpoint - position > 15
-                && position - breakpoint < Configuration::SVMAXLEN as i64)
-            {
-                continue;
-            }
+            if breakpoint == 0 {
+                if Self::is_low_complex_seq(&String::from_utf8_lossy(&seq)) {
+                    continue;
+                }
 
-            let (cov_f, clusters_f, pairs_f) = Self::mark_sv_clusters(
-                position,
-                breakpoint,
-                &mut data.svfdel,
-                data.max_read_length as i64,
-            );
-            let (cov_r, clusters_r, pairs_r) = Self::mark_sv_clusters(
-                position,
-                breakpoint,
-                &mut data.svrdel,
-                data.max_read_length as i64,
-            );
-            let svcov = cov_f + cov_r;
-            let clusters = clusters_f + clusters_r;
-            let pairs = pairs_f + pairs_r;
+                let matched = self.find_match(&seq, position, 1, Configuration::SEED_1 as usize, 1);
+                breakpoint = matched.base_position;
+                matched_extra = matched.matched_sequence;
+                if !(breakpoint != 0
+                    && breakpoint - position > 15
+                    && position - breakpoint < Configuration::SVMAXLEN as i64)
+                {
+                    continue;
+                }
 
-            if svcov == 0 && cnt <= conf.minr {
-                continue;
+                let (cov_f, clusters_f, pairs_f) = Self::mark_sv_clusters(
+                    position,
+                    breakpoint,
+                    &mut data.svfdel,
+                    data.max_read_length as i64,
+                );
+                let (cov_r, clusters_r, pairs_r) = Self::mark_sv_clusters(
+                    position,
+                    breakpoint,
+                    &mut data.svrdel,
+                    data.max_read_length as i64,
+                );
+                svcov = cov_f + cov_r;
+                let clusters = clusters_f + clusters_r;
+                let pairs = pairs_f + pairs_r;
+
+                if svcov == 0 && cnt <= conf.minr {
+                    continue;
+                }
+                Self::add_sv_counts(data, position, pairs, cnt, clusters);
+
+                if breakpoint > base_region_end {
+                    let mut tts = breakpoint - data.max_read_length as i64;
+                    let tte = breakpoint + data.max_read_length as i64;
+                    if breakpoint - data.max_read_length as i64 <= base_region_end {
+                        tts = base_region_end + 1;
+                    }
+                    self.load_partial_ref_coverage(data, tts, tte);
+                }
             }
-            Self::add_sv_counts(data, position, pairs, cnt, clusters);
 
             let mut deleted_len = breakpoint - position;
             let mut extra = Vec::<u8>::new();
@@ -3247,6 +3284,77 @@ impl VariantRealigner {
             insertion_sequence: ins,
             base_insert2: bi2,
         }
+    }
+
+    fn find_bp(&self, sequence: &[u8], start_position: i64, direction: i64) -> i64 {
+        let max_mm = 3i64;
+        let mut bp = 0i64;
+        let mut score = 0i64;
+        let chr_len = self
+            .chromosome
+            .as_ref()
+            .and_then(|chrom| {
+                crate::scopedata::global_read_only_scope::instance()
+                    .chr_lens
+                    .get(chrom)
+                    .copied()
+            })
+            .map(|len| len as i64)
+            .unwrap_or(0);
+
+        if chr_len <= 0 {
+            return 0;
+        }
+
+        for n in 0..50i64 {
+            let mut mm = 0i64;
+            let mut i = 0usize;
+            let mut matched_bases: std::collections::HashSet<u8> = std::collections::HashSet::new();
+
+            while i < sequence.len() {
+                let ref_pos = start_position + direction * n + direction * i as i64;
+                if ref_pos < 1 || ref_pos > chr_len {
+                    break;
+                }
+
+                let seq_base = sequence[i];
+                if self.get_ref_base(ref_pos).map(|base| base == seq_base).unwrap_or(false) {
+                    matched_bases.insert(seq_base);
+                } else {
+                    mm += 1;
+                }
+
+                if mm > max_mm - n / 100 {
+                    break;
+                }
+
+                i += 1;
+            }
+
+            if matched_bases.len() < 3 {
+                continue;
+            }
+
+            if i == 0 {
+                continue;
+            }
+
+            if mm <= max_mm - n / 100
+                && i >= sequence.len().saturating_sub(2)
+                && i >= (8 + n / 10) as usize
+                && (mm as f64 / i as f64) < 0.12
+            {
+                let lbp = start_position + direction * n - if direction < 0 { direction } else { 0 };
+                if mm == 0 && i == sequence.len() {
+                    return lbp;
+                } else if (i as i64 - mm) > score {
+                    bp = lbp;
+                    score = i as i64 - mm;
+                }
+            }
+        }
+
+        bp
     }
 
     fn find_match(&self, seq: &[u8], _position: i64, dir: i64, seed_len: usize, mm: usize) -> Match {

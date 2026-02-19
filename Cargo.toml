@@ -14,6 +14,7 @@ clap = { version = "4.5", features = ["derive"] }
 crackle-kit = { git = "https://github.com/Crispy13/crackle-kit", features = [
     "tracing",
 ] }
+indexmap = "2.11.1"
 regex = "1.12.2"
 rand = "0.8.5"
 rust-htslib = { git = "https://github.com/Crispy13/rust-htslib.git", branch = "dev", features = ["libdeflate"] }

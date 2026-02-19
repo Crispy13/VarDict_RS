@@ -924,6 +924,7 @@ impl VarDictPipeline {
             region,
             &reference,
             bam_paths,
+            Some(shared_reference),
         )
     }
 
@@ -975,6 +976,7 @@ impl VarDictPipeline {
             region,
             &reference,
             bam_paths,
+            Some(shared_reference),
         )
     }
 
@@ -1174,6 +1176,7 @@ impl VarDictPipeline {
             region,
             reference,
             bam_paths,
+            None,
         )?;
 
         let start_post = std::time::Instant::now();
@@ -1197,10 +1200,16 @@ impl VarDictPipeline {
         region: &Region,
         reference: &Reference,
         bam_paths: &[String],
+        shared_reference: Option<&SharedReferenceHandle>,
     ) -> Result<RegionAlignedVarsOutput> {
         let start_realign = std::time::Instant::now();
-        let realigned_output =
-            self.run_variant_realigner_and_sv_processor(cigar_output, region, reference, bam_paths)?;
+        let (realigned_output, structural_reference) = self.run_variant_realigner_and_sv_processor(
+            cigar_output,
+            region,
+            reference,
+            bam_paths,
+            shared_reference,
+        )?;
         let elapsed_realign = start_realign.elapsed();
 
         event!(Level::INFO, "[TIMING] VariantRealigner+SVProcessor: {:.3}s - {} non_insertion_vars, {} ref_coverage",
@@ -1211,7 +1220,7 @@ impl VarDictPipeline {
         let start_tovars = std::time::Instant::now();
         let splice = realigned_output.splice.clone();
         let max_read_length = realigned_output.max_read_len;
-        let aligned_vars = self.run_to_vars_builder(realigned_output, reference, region)?;
+        let aligned_vars = self.run_to_vars_builder(realigned_output, &structural_reference, region)?;
         let elapsed_tovars = start_tovars.elapsed();
 
         event!(Level::INFO, "[TIMING] ToVarsBuilder: {:.3}s - {} variants",
@@ -1813,7 +1822,8 @@ impl VarDictPipeline {
         region: &Region,
         reference: &Reference,
         bam_paths: &[String],
-    ) -> Result<RealignedOutput> {
+        shared_reference: Option<&SharedReferenceHandle>,
+    ) -> Result<(RealignedOutput, Reference)> {
         // TODO: Integrate actual VariantRealigner for soft clip realignment
         // For now, we pass through to StructuralVariantsProcessor
 
@@ -1874,17 +1884,20 @@ impl VarDictPipeline {
         write_realigned_jsonl_snapshot_if_enabled(&sv_input, region)?;
         
         // Run StructuralVariantsProcessor (adjSNV always runs, SV detection is unimplemented)
-        let sv_processor = StructuralVariantsProcessor::new(
+        let mut sv_processor = StructuralVariantsProcessor::new_with_context(
             reference.ref_seq.clone(),
             reference.seed.clone(),
             reference.region_start,
+            Some(region.chr().to_string()),
+            shared_reference.cloned(),
         );
         let processed = sv_processor.process(sv_input);
+        let structural_reference = sv_processor.current_reference();
 
         write_structural_variants_jsonl_snapshot_if_enabled(&processed, region)?;
         
         // Convert back to RealignedOutput
-        Ok(RealignedOutput {
+        Ok((RealignedOutput {
             non_insertion_vars: processed.non_insertion_variants,
             non_insertion_vars_insert_index,
             insertion_vars: processed.insertion_variants,
@@ -1892,7 +1905,7 @@ impl VarDictPipeline {
             duprate: processed.duprate,
             max_read_len: processed.max_read_length,
             splice,
-        })
+        }, structural_reference))
     }
 
     /// Step 3: Run ToVarsBuilder to calculate statistics

@@ -1,6 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use crackle_kit::nuc_base_map::NucBaseMap;
+use indexmap::IndexMap;
 use smallvec::SmallVec;
 
 use crate::prelude::SmallVecBytes;
@@ -267,8 +268,9 @@ pub(crate) struct SoftClip {
     pub(crate) disc: i32,
     pub(crate) softp: i32,
 
-    /// Map of softclip positions to their counts for SV
-    pub(crate) soft: HashMap<i64, usize>,
+    /// Map of softclip positions to their counts for SV.
+    /// Java uses LinkedHashMap here, so insertion order is significant.
+    pub(crate) soft: IndexMap<i64, usize>,
     pub(crate) mates: Vec<Mate>,
 }
 

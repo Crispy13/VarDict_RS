@@ -49,13 +49,13 @@ pub(crate) static ATGSs_AMP_ATGSs_END: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(\+[ATGC]+)&[ATGC]+$").unwrap());
 
 pub(crate) static DUP_NUM_ATGC: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<dup(\d+)>([ATGC]+)$").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)<dup(\d+)>([atgc]+)$").unwrap());
 
 pub(crate) static DUP_NUM: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<dup(\d+)").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)<dup(\d+)").unwrap());
 
 pub(crate) static INV_NUM: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<inv(\d+)").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)<inv(\d+)").unwrap());
 
 pub(crate) static SOME_SV_NUMBERS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<(...)\d+>").unwrap());
@@ -70,4 +70,4 @@ pub(crate) static SA_CIGAR_D_S_3CLIP: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\d\dS$").unwrap());
 
 pub(crate) static SA_CIGAR_D_S_5CLIP: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\d\d+S$").unwrap());
+    LazyLock::new(|| Regex::new(r"^\d\d+S").unwrap());

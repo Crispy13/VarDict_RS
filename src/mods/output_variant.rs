@@ -155,7 +155,7 @@ impl SimpleOutputVariant {
             )
         } else {
             (
-                variant.vars_count_on_forward + variant.vars_count_on_reverse,  // Total variant count
+                variant.position_coverage,
                 variant.ref_forward_count,  // Reference forward counts from same position
                 variant.ref_reverse_count,  // Reference reverse counts from same position
                 variant.vars_count_on_forward,

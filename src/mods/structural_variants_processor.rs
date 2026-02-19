@@ -10,9 +10,12 @@
 //! ```
 
 use std::collections::HashMap;
+use indexmap::IndexMap;
 use crackle_kit::tracing::{event, Level};
 
 use crate::conf::Configuration;
+use crate::data::reference::Reference;
+use crate::data::shared_reference::SharedReferenceHandle;
 use crate::scopedata::global_read_only_scope::instance;
 use crate::variants::variants::{VarDesc, Variant, SoftClip};
 
@@ -54,6 +57,10 @@ pub struct StructuralVariantsProcessor {
     reference_seed: HashMap<Vec<u8>, Vec<i64>>,
     /// Reference start position (1-based)
     ref_start: i64,
+    /// Chromosome name for on-demand reference extension
+    chromosome: Option<String>,
+    /// Shared reference handle for on-demand reference extension
+    shared_reference: Option<SharedReferenceHandle>,
 }
 
 impl StructuralVariantsProcessor {
@@ -67,13 +74,32 @@ impl StructuralVariantsProcessor {
             reference_seq,
             reference_seed,
             ref_start,
+            chromosome: None,
+            shared_reference: None,
+        }
+    }
+
+    /// Create a StructuralVariantsProcessor with optional on-demand reference extension context.
+    pub fn new_with_context(
+        reference_seq: Vec<u8>,
+        reference_seed: HashMap<Vec<u8>, Vec<i64>>,
+        ref_start: i64,
+        chromosome: Option<String>,
+        shared_reference: Option<SharedReferenceHandle>,
+    ) -> Self {
+        StructuralVariantsProcessor {
+            reference_seq,
+            reference_seed,
+            ref_start,
+            chromosome,
+            shared_reference,
         }
     }
 
     /// Process realigned variation data
     /// 
     /// This is equivalent to Java StructuralVariantsProcessor.process()
-    pub fn process(&self, mut data: RealignedVariationData) -> ProcessedVariationData {
+    pub fn process(&mut self, mut data: RealignedVariationData) -> ProcessedVariationData {
         // If SV is enabled, find structural variants
         if !instance().conf.disable_sv {
             self.find_all_svs(&mut data);
@@ -85,27 +111,36 @@ impl StructuralVariantsProcessor {
         data
     }
 
+    pub fn current_reference(&self) -> Reference {
+        Reference {
+            ref_seq: self.reference_seq.clone(),
+            seed: self.reference_seed.clone(),
+            region_start: self.ref_start,
+        }
+    }
+
     /// Find all structural variants (DEL, INV, DUP)
     /// 
     /// Called when SV detection is enabled
-    fn find_all_svs(&self, data: &mut RealignedVariationData) {
+    fn find_all_svs(&mut self, data: &mut RealignedVariationData) {
         self.find_del(data);
         self.find_svs_del_candidates(data);
         self.find_del_disc(data);
         self.find_dup_disc(data);
     }
 
-    fn find_del(&self, data: &mut RealignedVariationData) {
+    fn find_del(&mut self, data: &mut RealignedVariationData) {
         let minr = instance().conf.minr;
 
         for idx in 0..data.svfdel.len() {
-            let (used, vars_count, end, mstart, mean_qual, mean_pos, mean_mapq, nm, soft_map) = {
+            let (used, vars_count, end, mstart, mend, mean_qual, mean_pos, mean_mapq, nm, soft_map) = {
                 let del = &data.svfdel[idx];
                 (
                     del.used(),
                     del.var.alt_depth,
                     del.end,
                     del.mstart,
+                    del.mend,
                     del.var.mean_qual,
                     del.var.mean_pos,
                     del.var.mean_mapq,
@@ -117,6 +152,8 @@ impl StructuralVariantsProcessor {
             if used || vars_count < minr {
                 continue;
             }
+
+            self.ensure_reference_span(mstart - 300, mend + 300);
 
             let softp = Self::select_primary_soft_pos(&soft_map).unwrap_or(0);
             event!(
@@ -219,9 +256,21 @@ impl StructuralVariantsProcessor {
                 }
 
                 if let Some(scv) = data.soft_clips_3end.get(&softp) {
+                    let scv_var = scv.var.clone();
                     let variation =
                         Self::get_or_create_variation(&mut data.non_insertion_variants, p5, &del_key);
-                    adj_cnt_from_variant(variation, &scv.var);
+                    adj_cnt_from_variant(variation, &scv_var);
+
+                    if let Some(ref_base) = self.get_ref_base(p5) {
+                        let ref_key = (ref_base as char).to_string();
+                        if let Some(pos_map) = data.non_insertion_variants.get_mut(&p5) {
+                            if let Some(reference_var) =
+                                Self::get_variation_mut_by_key_string(pos_map, &ref_key)
+                            {
+                                sub_cnt_from_variant(reference_var, &scv_var);
+                            }
+                        }
+                    }
                 }
 
                 let mut tv = Variant::default();
@@ -390,13 +439,14 @@ impl StructuralVariantsProcessor {
         }
 
         for idx in 0..data.svrdel.len() {
-            let (used, vars_count, mend, start, mean_qual, mean_pos, mean_mapq, nm, soft_map) = {
+            let (used, vars_count, mend, start, mstart, mean_qual, mean_pos, mean_mapq, nm, soft_map) = {
                 let del = &data.svrdel[idx];
                 (
                     del.used(),
                     del.var.alt_depth,
                     del.mend,
                     del.start,
+                    del.mstart,
                     del.var.mean_qual,
                     del.var.mean_pos,
                     del.var.mean_mapq,
@@ -408,6 +458,8 @@ impl StructuralVariantsProcessor {
             if used || vars_count < minr {
                 continue;
             }
+
+            self.ensure_reference_span(mstart - 300, mend + 300);
 
             let softp = Self::select_primary_soft_pos(&soft_map).unwrap_or(0);
             event!(
@@ -1492,7 +1544,7 @@ impl StructuralVariantsProcessor {
         out
     }
 
-    fn select_primary_soft_pos(soft: &HashMap<i64, usize>) -> Option<i64> {
+    fn select_primary_soft_pos(soft: &IndexMap<i64, usize>) -> Option<i64> {
         soft.iter().max_by_key(|(_, count)| *count).map(|(pos, _)| *pos)
     }
 
@@ -1510,6 +1562,17 @@ impl StructuralVariantsProcessor {
                 desc: key_str.as_bytes().to_vec().into(),
             });
         pos_map.entry(key).or_default()
+    }
+
+    fn get_variation_mut_by_key_string<'a>(
+        pos_map: &'a mut HashMap<VarDesc, Variant>,
+        key_str: &str,
+    ) -> Option<&'a mut Variant> {
+        let key = pos_map
+            .keys()
+            .find(|k| k.to_key_string() == key_str)
+            .cloned()?;
+        pos_map.get_mut(&key)
     }
 
     fn add_sv_counts(
@@ -2004,6 +2067,62 @@ impl StructuralVariantsProcessor {
         let idx = (pos - self.ref_start) as usize;
         self.reference_seq.get(idx).copied()
     }
+
+    fn ensure_reference_span(&mut self, start: i64, end: i64) {
+        if start > end {
+            return;
+        }
+
+        let Some(chromosome) = self.chromosome.as_deref() else {
+            return;
+        };
+        let Some(shared_reference) = self.shared_reference.as_ref() else {
+            return;
+        };
+
+        let requested_start = start.max(1);
+        let requested_end = end.max(requested_start);
+
+        let current_start = self.ref_start;
+        let current_end = if self.reference_seq.is_empty() {
+            self.ref_start - 1
+        } else {
+            self.ref_start + self.reference_seq.len() as i64 - 1
+        };
+
+        if !self.reference_seq.is_empty()
+            && requested_start >= current_start
+            && requested_end <= current_end
+        {
+            return;
+        }
+
+        let new_start = if self.reference_seq.is_empty() {
+            requested_start
+        } else {
+            requested_start.min(current_start)
+        };
+        let new_end = if self.reference_seq.is_empty() {
+            requested_end
+        } else {
+            requested_end.max(current_end)
+        };
+
+        let Some(sequence) = shared_reference
+            .get_subseq(chromosome, new_start as usize, new_end as usize)
+            .map(|seq| seq.to_vec())
+        else {
+            return;
+        };
+
+        let chr_len = instance().chr_lens.get(chromosome).copied();
+        let mut reference = Reference::new_with_start(sequence, new_start);
+        reference.build_seed_map(new_end, chr_len);
+
+        self.reference_seq = reference.ref_seq;
+        self.reference_seed = reference.seed;
+        self.ref_start = new_start;
+    }
 }
 
 #[derive(Default)]
@@ -2068,6 +2187,20 @@ fn adj_cnt_from_variant(dest: &mut Variant, src: &Variant) {
         src.alt_depth_fwd,
         src.alt_depth_rev,
     );
+}
+
+fn sub_cnt_from_variant(dest: &mut Variant, src: &Variant) {
+    dest.alt_depth = dest.alt_depth.saturating_sub(src.alt_depth);
+    dest.high_qual_read_cnt = dest
+        .high_qual_read_cnt
+        .saturating_sub(src.high_qual_read_cnt);
+    dest.low_qual_read_cnt = dest.low_qual_read_cnt.saturating_sub(src.low_qual_read_cnt);
+    dest.mean_pos = (dest.mean_pos - src.mean_pos).max(0.0);
+    dest.mean_qual = (dest.mean_qual - src.mean_qual).max(0.0);
+    dest.mean_mapq = (dest.mean_mapq - src.mean_mapq).max(0.0);
+    dest.nm = (dest.nm - src.nm).max(0.0);
+    dest.alt_depth_fwd = dest.alt_depth_fwd.saturating_sub(src.alt_depth_fwd);
+    dest.alt_depth_rev = dest.alt_depth_rev.saturating_sub(src.alt_depth_rev);
 }
 
 #[cfg(test)]
