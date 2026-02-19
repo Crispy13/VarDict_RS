@@ -60,6 +60,14 @@ pub struct CigarParserOutput {
     pub svfdup: Vec<SoftClip>,
     /// Reverse duplication discordant clusters (Java svrdup)
     pub svrdup: Vec<SoftClip>,
+    /// Forward inversion 5' discordant clusters (Java svfinv5)
+    pub svfinv5: Vec<SoftClip>,
+    /// Reverse inversion 5' discordant clusters (Java svrinv5)
+    pub svrinv5: Vec<SoftClip>,
+    /// Forward inversion 3' discordant clusters (Java svfinv3)
+    pub svfinv3: Vec<SoftClip>,
+    /// Reverse inversion 3' discordant clusters (Java svrinv3)
+    pub svrinv3: Vec<SoftClip>,
     /// Reference coverage by position
     pub ref_coverage: HashMap<i64, usize>,
     /// MNP map (position -> description -> count)
@@ -206,6 +214,10 @@ fn write_structural_variants_jsonl_snapshot(
     write_sv_clusters(&mut writer, "SVRDEL", &data.svrdel)?;
     write_sv_clusters(&mut writer, "SVFDUP", &data.svfdup)?;
     write_sv_clusters(&mut writer, "SVRDUP", &data.svrdup)?;
+    write_sv_clusters(&mut writer, "SVFINV5", &data.svfinv5)?;
+    write_sv_clusters(&mut writer, "SVRINV5", &data.svrinv5)?;
+    write_sv_clusters(&mut writer, "SVFINV3", &data.svfinv3)?;
+    write_sv_clusters(&mut writer, "SVRINV3", &data.svrinv3)?;
 
     writer.flush()?;
     Ok(())
@@ -1801,6 +1813,10 @@ impl VarDictPipeline {
             svrdel: cigar_parser.take_svrdel(),
             svfdup: cigar_parser.take_svfdup(),
             svrdup: cigar_parser.take_svrdup(),
+            svfinv5: cigar_parser.take_svfinv5(),
+            svrinv5: cigar_parser.take_svrinv5(),
+            svfinv3: cigar_parser.take_svfinv3(),
+            svrinv3: cigar_parser.take_svrinv3(),
             ref_coverage: cigar_parser.take_ref_coverage(),
             mnp: cigar_parser.take_mnp(),
             position_to_insertion_count: cigar_parser.take_position_to_insertion_count(),
@@ -1837,6 +1853,10 @@ impl VarDictPipeline {
             svrdel,
             svfdup,
             svrdup,
+            svfinv5,
+            svrinv5,
+            svfinv3,
+            svrinv3,
             ref_coverage,
             mnp,
             position_to_insertion_count,
@@ -1860,6 +1880,10 @@ impl VarDictPipeline {
             svrdel,
             svfdup,
             svrdup,
+            svfinv5,
+            svrinv5,
+            svfinv3,
+            svrinv3,
         };
 
         // Perform minimal deletion realignment using soft clips when enabled
@@ -1871,6 +1895,11 @@ impl VarDictPipeline {
             Some(region.chr().to_string()),
             bam_paths.to_vec(),
         );
+
+        if !instance().conf.disable_sv {
+            realigner.filter_all_sv_structures(&mut sv_input);
+        }
+
         realigner.adjust_mnp(&mut sv_input, &mnp);
 
         if instance().conf.perform_local_realignment {
@@ -1889,6 +1918,7 @@ impl VarDictPipeline {
             reference.seed.clone(),
             reference.region_start,
             Some(region.chr().to_string()),
+            bam_paths.to_vec(),
             shared_reference.cloned(),
         );
         let processed = sv_processor.process(sv_input);

@@ -7,3 +7,10 @@ rust_chr20.var
 test_data/
 tmp_compare/
 tmp/
+
+.github/
+copilot-chat-logs/
+copilot-desk/
+copilot_current_plan.md
+full_parity_plan1.md
+note.md

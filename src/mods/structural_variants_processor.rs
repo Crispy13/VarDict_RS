@@ -11,11 +11,15 @@
 
 use std::collections::HashMap;
 use indexmap::IndexMap;
-use crackle_kit::tracing::{event, Level};
+use crackle_kit::{
+    data::bases::rev_comp::RevComplementor,
+    tracing::{event, Level},
+};
 
 use crate::conf::Configuration;
 use crate::data::reference::Reference;
 use crate::data::shared_reference::SharedReferenceHandle;
+use crate::mods::variant_realigner::VariantRealigner;
 use crate::scopedata::global_read_only_scope::instance;
 use crate::variants::variants::{VarDesc, Variant, SoftClip};
 
@@ -44,6 +48,14 @@ pub struct RealignedVariationData {
     pub svfdup: Vec<SoftClip>,
     /// Reverse duplication discordant clusters
     pub svrdup: Vec<SoftClip>,
+    /// Forward inversion 5' discordant clusters
+    pub svfinv5: Vec<SoftClip>,
+    /// Reverse inversion 5' discordant clusters
+    pub svrinv5: Vec<SoftClip>,
+    /// Forward inversion 3' discordant clusters
+    pub svfinv3: Vec<SoftClip>,
+    /// Reverse inversion 3' discordant clusters
+    pub svrinv3: Vec<SoftClip>,
 }
 
 /// Output data from StructuralVariantsProcessor (same structure, possibly modified)
@@ -59,6 +71,8 @@ pub struct StructuralVariantsProcessor {
     ref_start: i64,
     /// Chromosome name for on-demand reference extension
     chromosome: Option<String>,
+    /// BAM paths used by realignment parity paths
+    bam_paths: Vec<String>,
     /// Shared reference handle for on-demand reference extension
     shared_reference: Option<SharedReferenceHandle>,
 }
@@ -75,6 +89,7 @@ impl StructuralVariantsProcessor {
             reference_seed,
             ref_start,
             chromosome: None,
+            bam_paths: Vec::new(),
             shared_reference: None,
         }
     }
@@ -85,6 +100,7 @@ impl StructuralVariantsProcessor {
         reference_seed: HashMap<Vec<u8>, Vec<i64>>,
         ref_start: i64,
         chromosome: Option<String>,
+        bam_paths: Vec<String>,
         shared_reference: Option<SharedReferenceHandle>,
     ) -> Self {
         StructuralVariantsProcessor {
@@ -92,6 +108,7 @@ impl StructuralVariantsProcessor {
             reference_seed,
             ref_start,
             chromosome,
+            bam_paths,
             shared_reference,
         }
     }
@@ -124,8 +141,10 @@ impl StructuralVariantsProcessor {
     /// Called when SV detection is enabled
     fn find_all_svs(&mut self, data: &mut RealignedVariationData) {
         self.find_del(data);
+        self.find_inv(data);
         self.find_svs_del_candidates(data);
         self.find_del_disc(data);
+        self.find_inv_disc(data);
         self.find_dup_disc(data);
     }
 
@@ -732,6 +751,298 @@ impl StructuralVariantsProcessor {
         }
     }
 
+    fn find_inv(&mut self, data: &mut RealignedVariationData) {
+        self.find_inv_sub(data, InversionClusterKind::Forward5, 1, InversionSide::End5);
+        self.find_inv_sub(data, InversionClusterKind::Reverse5, -1, InversionSide::End5);
+        self.find_inv_sub(data, InversionClusterKind::Forward3, 1, InversionSide::End3);
+        self.find_inv_sub(data, InversionClusterKind::Reverse3, -1, InversionSide::End3);
+    }
+
+    fn find_inv_sub(
+        &mut self,
+        data: &mut RealignedVariationData,
+        kind: InversionClusterKind,
+        dir: i64,
+        side: InversionSide,
+    ) {
+        let min_cluster_dist = (Configuration::MINSVCDIST * data.max_read_length as f64) as i64;
+
+        for idx in 0..Self::inv_cluster_len(data, kind) {
+            let Some(inv) = Self::inv_cluster_snapshot(data, kind, idx) else {
+                continue;
+            };
+
+            if inv.used || inv.vars_count < instance().conf.minr {
+                continue;
+            }
+
+            let inv_span_preloaded =
+                self.get_ref_base(inv.mstart).is_some() && self.get_ref_base(inv.mend).is_some();
+            self.ensure_reference_span(inv.mstart - 500, inv.mend + 500);
+
+            if !inv_span_preloaded {
+                let realigner = VariantRealigner::new_with_context(
+                    self.reference_seq.clone(),
+                    self.reference_seed.clone(),
+                    self.ref_start,
+                    self.chromosome.clone(),
+                    self.bam_paths.clone(),
+                );
+                realigner.load_partial_ref_coverage(data, inv.mstart - 200, inv.mend + 200);
+            }
+
+            let mut softp = Self::select_primary_soft_pos(&inv.soft_map).unwrap_or(0);
+            let mut bp = 0i64;
+            let mut seq: Vec<u8>;
+            let mut extra = Vec::new();
+            let mut scv_var: Option<Variant> = None;
+            let mut source_softp = 0i64;
+
+            if softp != 0 {
+                if dir == 1 {
+                    let Some(scv) = data.soft_clips_3end.get_mut(&softp) else {
+                        continue;
+                    };
+                    if scv.used() {
+                        continue;
+                    }
+                    source_softp = softp;
+                    seq = self.find_conseq(scv);
+                    if seq.is_empty() {
+                        continue;
+                    }
+                    scv_var = Some(scv.var.clone());
+                } else {
+                    let Some(scv) = data.soft_clips_5end.get_mut(&softp) else {
+                        continue;
+                    };
+                    if scv.used() {
+                        continue;
+                    }
+                    source_softp = softp;
+                    seq = self.find_conseq(scv);
+                    if seq.is_empty() {
+                        continue;
+                    }
+                    scv_var = Some(scv.var.clone());
+                }
+
+                let mut m = self.find_match_rev(&seq, softp, dir, Configuration::SEED_1 as usize, 3);
+                if m.base_position == 0 {
+                    m = self.find_match_rev(&seq, softp, dir, Configuration::SEED_2 as usize, 0);
+                }
+                if m.base_position == 0 {
+                    continue;
+                }
+                bp = m.base_position;
+                extra = m.matched_sequence;
+            } else {
+                let sp = if dir == 1 { inv.end } else { inv.start };
+                for i in 1..=2 * data.max_read_length {
+                    let cp = sp + i as i64 * dir;
+
+                    if dir == 1 {
+                        let Some(scv) = data.soft_clips_3end.get_mut(&cp) else {
+                            continue;
+                        };
+                        if scv.used() {
+                            continue;
+                        }
+                        source_softp = cp;
+                        seq = self.find_conseq(scv);
+                        if seq.is_empty() {
+                            continue;
+                        }
+                        scv_var = Some(scv.var.clone());
+                    } else {
+                        let Some(scv) = data.soft_clips_5end.get_mut(&cp) else {
+                            continue;
+                        };
+                        if scv.used() {
+                            continue;
+                        }
+                        source_softp = cp;
+                        seq = self.find_conseq(scv);
+                        if seq.is_empty() {
+                            continue;
+                        }
+                        scv_var = Some(scv.var.clone());
+                    }
+
+                    let mut m = self.find_match_rev(&seq, cp, dir, Configuration::SEED_1 as usize, 3);
+                    if m.base_position == 0 {
+                        m = self.find_match_rev(&seq, cp, dir, Configuration::SEED_2 as usize, 0);
+                    }
+                    if m.base_position == 0 {
+                        continue;
+                    }
+
+                    softp = cp;
+                    bp = m.base_position;
+                    extra = m.matched_sequence;
+
+                    if (dir == 1 && (bp - inv.mend).abs() < min_cluster_dist)
+                        || (dir == -1 && (bp - inv.mstart).abs() < min_cluster_dist)
+                    {
+                        break;
+                    }
+                }
+                if bp == 0 {
+                    continue;
+                }
+            }
+
+            let Some(scv_var) = scv_var else {
+                continue;
+            };
+
+            if side == InversionSide::End5 {
+                if dir == -1 {
+                    bp -= 1;
+                }
+            } else if dir == 1 {
+                bp += 1;
+                if bp != 0 {
+                    softp -= 1;
+                }
+            } else {
+                softp -= 1;
+            }
+
+            if side == InversionSide::End3 {
+                std::mem::swap(&mut bp, &mut softp);
+            }
+
+            if (dir == -1 && side == InversionSide::End5)
+                || (dir == 1 && side == InversionSide::End3)
+            {
+                while self.get_ref_base(softp).is_some()
+                    && self.get_ref_base(bp).is_some()
+                    && self.get_ref_base(softp).map(Self::complement_base_u8)
+                        == self.get_ref_base(bp)
+                {
+                    softp += 1;
+                    if softp != 0 {
+                        bp -= 1;
+                    }
+                }
+            }
+
+            while self.get_ref_base(softp - 1).is_some()
+                && self.get_ref_base(bp + 1).is_some()
+                && self.get_ref_base(softp - 1).map(Self::complement_base_u8)
+                    == self.get_ref_base(bp + 1)
+            {
+                softp -= 1;
+                if softp != 0 {
+                    bp += 1;
+                }
+            }
+
+            let mlen_abs = inv.mlen.abs() as f64;
+            let ratio = if mlen_abs == 0.0 {
+                f64::INFINITY
+            } else {
+                (bp - softp) as f64 / mlen_abs
+            };
+
+            if !(bp > softp && bp - softp > 150 && ratio < 1.5) {
+                continue;
+            }
+
+            let len = bp - softp + 1;
+            let flank = Configuration::SVFLANK as i64;
+
+            let mut rc = RevComplementor::new();
+            let ins = if len - 2 * flank <= 0 {
+                let seq_rc = rc.reverse_complement(&self.join_ref(softp, bp));
+                String::from_utf8_lossy(&seq_rc).to_string()
+            } else {
+                let ins5 = rc
+                    .reverse_complement(&self.join_ref(bp - flank + 1, bp))
+                    .to_vec();
+                let ins3 = rc
+                    .reverse_complement(&self.join_ref(softp, softp + flank - 1))
+                    .to_vec();
+                format!(
+                    "{}<inv{}>{}",
+                    String::from_utf8_lossy(&ins5),
+                    len - 2 * flank,
+                    String::from_utf8_lossy(&ins3),
+                )
+            };
+
+            let mut ins_final = ins;
+            if dir == 1 && !extra.is_empty() {
+                let rc_extra = rc.reverse_complement(&extra).to_vec();
+                ins_final = format!("{}{}", String::from_utf8_lossy(&rc_extra), ins_final);
+            } else if dir == -1 && !extra.is_empty() {
+                ins_final = format!("{}{}", ins_final, String::from_utf8_lossy(&extra));
+            }
+
+            let gt = format!("-{}^{}", len, ins_final);
+            Self::add_sv_counts(
+                &mut data.non_insertion_variants,
+                softp,
+                inv.vars_count,
+                scv_var.alt_depth,
+                1,
+            );
+
+            let vref =
+                Self::get_or_create_variation(&mut data.non_insertion_variants, softp, &gt);
+            vref.pstd = true;
+            vref.qstd = true;
+
+            adj_cnt_from_variant(vref, &scv_var);
+
+            if dir == -1 {
+                if let Some(ref_base) = self.get_ref_base(softp) {
+                    let ref_key = (ref_base as char).to_string();
+                    if let Some(pos_map) = data.non_insertion_variants.get_mut(&softp) {
+                        if let Some(reference_var) =
+                            Self::get_variation_mut_by_key_string(pos_map, &ref_key)
+                        {
+                            sub_cnt_from_variant(reference_var, &scv_var);
+                        }
+                    }
+                }
+            }
+
+            let cov = data
+                .ref_coverage
+                .get(&(softp - 1))
+                .copied()
+                .unwrap_or(inv.vars_count);
+            data.ref_coverage.insert(softp, cov);
+
+            Self::mark_inv_cluster_used(data, kind, idx);
+
+            if dir == 1 {
+                if let Some(scv) = data.soft_clips_3end.get_mut(&source_softp) {
+                    scv.mark_used();
+                }
+            } else if let Some(scv) = data.soft_clips_5end.get_mut(&source_softp) {
+                scv.mark_used();
+            }
+
+            let mut dels5: HashMap<i64, HashMap<String, usize>> = HashMap::new();
+            let mut del_map = HashMap::new();
+            del_map.insert(gt.clone(), inv.vars_count);
+            dels5.insert(softp, del_map);
+
+            let realigner = VariantRealigner::new_with_context(
+                self.reference_seq.clone(),
+                self.reference_seed.clone(),
+                self.ref_start,
+                self.chromosome.clone(),
+                self.bam_paths.clone(),
+            );
+            realigner.process_deletions(data, &dels5);
+            return;
+        }
+    }
+
     fn find_svs_del_candidates(&self, data: &mut RealignedVariationData) {
         let minr = instance().conf.minr;
 
@@ -761,6 +1072,9 @@ impl StructuralVariantsProcessor {
             {
                 continue;
             }
+            if Self::is_softp2sv_first_used(data, p5) {
+                continue;
+            }
 
             let seq = {
                 let Some(sc5v) = data.soft_clips_5end.get_mut(&p5) else {
@@ -773,7 +1087,7 @@ impl StructuralVariantsProcessor {
             }
 
             let m = self.find_match(&seq, p5, -1, Configuration::SEED_1 as usize, 3);
-            let bp = m.base_position;
+            let mut bp = m.base_position;
             event!(
                 Level::DEBUG,
                 phase = "findsv_5_candidate",
@@ -781,73 +1095,166 @@ impl StructuralVariantsProcessor {
                 cnt5,
                 bp,
             );
-            if bp != 0 && bp < p5 {
-                let pairs_data = Self::check_pairs(
-                    bp,
-                    p5,
-                    &mut data.svfdel,
-                    &mut data.svrdel,
-                    data.max_read_length as i64,
-                );
-                if pairs_data.pairs == 0 {
-                    event!(
-                        Level::DEBUG,
-                        phase = "findsv_5_pairs_zero",
-                        p5,
+            if bp != 0 {
+                if bp < p5 {
+                    let pairs_data = Self::check_pairs(
                         bp,
+                        p5,
+                        &mut data.svfdel,
+                        &mut data.svrdel,
+                        data.max_read_length as i64,
                     );
+                    if pairs_data.pairs == 0 {
+                        event!(
+                            Level::DEBUG,
+                            phase = "findsv_5_pairs_zero",
+                            p5,
+                            bp,
+                        );
+                        continue;
+                    }
+
+                    let p5_adj = p5 - 1;
+                    let bp_adj = bp + 1;
+                    let dellen = p5_adj - bp_adj + 1;
+                    if dellen <= 0 {
+                        continue;
+                    }
+
+                    let del_key = format!("-{}", dellen);
+                    let vref = Self::get_or_create_variation(
+                        &mut data.non_insertion_variants,
+                        bp_adj,
+                        &del_key,
+                    );
+                    vref.alt_depth = 0;
+
+                    Self::add_sv_counts(
+                        &mut data.non_insertion_variants,
+                        bp_adj,
+                        pairs_data.pairs,
+                        cnt5,
+                        1,
+                    );
+
+                    if !data.ref_coverage.contains_key(&bp_adj) {
+                        data.ref_coverage.insert(bp_adj, pairs_data.pairs + cnt5);
+                    }
+                    if let Some(cov_p5) = data.ref_coverage.get(&(p5_adj + 1)).copied() {
+                        let cov_bp = data.ref_coverage.get(&bp_adj).copied().unwrap_or(0);
+                        if cov_bp < cov_p5 {
+                            data.ref_coverage.insert(bp_adj, cov_p5);
+                        }
+                    }
+
+                    if let Some(sc5v) = data.soft_clips_5end.get(&p5) {
+                        let variation = Self::get_or_create_variation(
+                            &mut data.non_insertion_variants,
+                            bp_adj,
+                            &del_key,
+                        );
+                        adj_cnt_from_variant(variation, &sc5v.var);
+                    }
+
+                    let mut tmp = Variant::default();
+                    tmp.alt_depth = pairs_data.pairs;
+                    tmp.high_qual_read_cnt = pairs_data.pairs;
+                    tmp.alt_depth_fwd = pairs_data.pairs / 2;
+                    tmp.alt_depth_rev = pairs_data.pairs - pairs_data.pairs / 2;
+                    tmp.mean_pos = pairs_data.pmean;
+                    tmp.mean_qual = pairs_data.qmean;
+                    tmp.mean_mapq = pairs_data.q_mean;
+                    tmp.nm = pairs_data.nm;
+
+                    let variation = Self::get_or_create_variation(
+                        &mut data.non_insertion_variants,
+                        bp_adj,
+                        &del_key,
+                    );
+                    adj_cnt_from_variant(variation, &tmp);
+                } else {
+                    // candidate duplication
+                }
+            } else {
+                let mut m_rev =
+                    self.find_match_rev(&seq, p5, -1, Configuration::SEED_1 as usize, 3);
+                bp = m_rev.base_position;
+                let mut extra = m_rev.matched_sequence;
+                if bp == 0 {
+                    m_rev = self.find_match_rev(&seq, p5, -1, Configuration::SEED_2 as usize, 0);
+                    bp = m_rev.base_position;
+                    extra = m_rev.matched_sequence;
+                }
+                if bp == 0 {
+                    continue;
+                }
+                if (bp - p5).abs() <= Configuration::SVFLANK as i64 {
                     continue;
                 }
 
-                let p5_adj = p5 - 1;
-                let bp_adj = bp + 1;
-                let dellen = p5_adj - bp_adj + 1;
-                if dellen <= 0 {
-                    continue;
+                let sc5_var = data.soft_clips_5end.get(&p5).map(|sc| sc.var.clone());
+
+                let mut p5_inv = p5;
+                if bp <= p5_inv {
+                    std::mem::swap(&mut bp, &mut p5_inv);
                 }
+                bp -= 1;
 
-                let del_key = format!("-{}", dellen);
-                let vref =
-                    Self::get_or_create_variation(&mut data.non_insertion_variants, bp_adj, &del_key);
-                vref.alt_depth = 0;
-
-                Self::add_sv_counts(
-                    &mut data.non_insertion_variants,
-                    bp_adj,
-                    pairs_data.pairs,
-                    cnt5,
-                    1,
-                );
-
-                if !data.ref_coverage.contains_key(&bp_adj) {
-                    data.ref_coverage.insert(bp_adj, pairs_data.pairs + cnt5);
-                }
-                if let Some(cov_p5) = data.ref_coverage.get(&(p5_adj + 1)).copied() {
-                    let cov_bp = data.ref_coverage.get(&bp_adj).copied().unwrap_or(0);
-                    if cov_bp < cov_p5 {
-                        data.ref_coverage.insert(bp_adj, cov_p5);
+                while self.get_ref_base(bp + 1).is_some()
+                    && self.get_ref_base(p5_inv - 1).is_some()
+                    && self.get_ref_base(bp + 1).map(Self::complement_base_u8)
+                        == self.get_ref_base(p5_inv - 1)
+                {
+                    p5_inv -= 1;
+                    if p5_inv != 0 {
+                        bp += 1;
                     }
                 }
 
-                if let Some(sc5v) = data.soft_clips_5end.get(&p5) {
-                    let variation =
-                        Self::get_or_create_variation(&mut data.non_insertion_variants, bp_adj, &del_key);
-                    adj_cnt_from_variant(variation, &sc5v.var);
+                let flank = Configuration::SVFLANK as i64;
+                let mut rc = RevComplementor::new();
+                let ins5 = rc
+                    .reverse_complement(&self.join_ref(bp - flank + 1, bp))
+                    .to_vec();
+                let ins3 = rc
+                    .reverse_complement(&self.join_ref(p5_inv, p5_inv + flank - 1))
+                    .to_vec();
+                let mid = bp - p5_inv - ins5.len() as i64 - ins3.len() as i64 + 1;
+
+                let mut vn = format!(
+                    "-{}^{}<inv{}>{}{}",
+                    bp - p5_inv + 1,
+                    String::from_utf8_lossy(&ins5),
+                    mid,
+                    String::from_utf8_lossy(&ins3),
+                    String::from_utf8_lossy(&extra),
+                );
+                if mid <= 0 {
+                    let tins = rc.reverse_complement(&self.join_ref(p5_inv, bp)).to_vec();
+                    vn = format!(
+                        "-{}^{}{}",
+                        bp - p5_inv + 1,
+                        String::from_utf8_lossy(&tins),
+                        String::from_utf8_lossy(&extra),
+                    );
                 }
 
-                let mut tmp = Variant::default();
-                tmp.alt_depth = pairs_data.pairs;
-                tmp.high_qual_read_cnt = pairs_data.pairs;
-                tmp.alt_depth_fwd = pairs_data.pairs / 2;
-                tmp.alt_depth_rev = pairs_data.pairs - pairs_data.pairs / 2;
-                tmp.mean_pos = pairs_data.pmean;
-                tmp.mean_qual = pairs_data.qmean;
-                tmp.mean_mapq = pairs_data.q_mean;
-                tmp.nm = pairs_data.nm;
+                let _ = Self::get_or_create_variation(&mut data.non_insertion_variants, p5_inv, &vn);
+                Self::add_sv_counts(&mut data.non_insertion_variants, p5_inv, 0, cnt5, 0);
 
-                let variation =
-                    Self::get_or_create_variation(&mut data.non_insertion_variants, bp_adj, &del_key);
-                adj_cnt_from_variant(variation, &tmp);
+                if let Some(sc5_var) = sc5_var {
+                    let variation =
+                        Self::get_or_create_variation(&mut data.non_insertion_variants, p5_inv, &vn);
+                    adj_cnt_from_variant(variation, &sc5_var);
+                }
+
+                Self::inc_ref_coverage(&mut data.ref_coverage, p5_inv, cnt5);
+                if let Some(bp_cov) = data.ref_coverage.get(&bp).copied() {
+                    let p5_cov = data.ref_coverage.get(&p5_inv).copied().unwrap_or(0);
+                    if p5_cov < bp_cov {
+                        data.ref_coverage.insert(p5_inv, bp_cov);
+                    }
+                }
             }
         }
 
@@ -877,6 +1284,9 @@ impl StructuralVariantsProcessor {
             {
                 continue;
             }
+            if Self::is_softp2sv_first_used(data, p3) {
+                continue;
+            }
 
             let seq = {
                 let Some(sc3v) = data.soft_clips_3end.get_mut(&p3) else {
@@ -897,86 +1307,230 @@ impl StructuralVariantsProcessor {
                 cnt3,
                 bp,
             );
-            if bp != 0 && bp > p3 {
-                let pairs_data = Self::check_pairs(
-                    p3,
-                    bp,
-                    &mut data.svfdel,
-                    &mut data.svrdel,
-                    data.max_read_length as i64,
-                );
-                if pairs_data.pairs == 0 {
-                    event!(
-                        Level::DEBUG,
-                        phase = "findsv_3_pairs_zero",
+            if bp != 0 {
+                if bp > p3 {
+                    let pairs_data = Self::check_pairs(
                         p3,
                         bp,
+                        &mut data.svfdel,
+                        &mut data.svrdel,
+                        data.max_read_length as i64,
                     );
-                    continue;
-                }
-
-                let dellen = bp - p3;
-                bp -= 1;
-
-                while self.get_ref_base(bp).is_some()
-                    && self.get_ref_base(p3 - 1).is_some()
-                    && self.get_ref_base(bp) == self.get_ref_base(p3 - 1)
-                {
-                    bp -= 1;
-                    if bp != 0 {
-                        p3 -= 1;
+                    if pairs_data.pairs == 0 {
+                        event!(
+                            Level::DEBUG,
+                            phase = "findsv_3_pairs_zero",
+                            p3,
+                            bp,
+                        );
+                        continue;
                     }
-                }
 
-                if dellen <= 0 {
-                    continue;
-                }
+                    let dellen = bp - p3;
+                    bp -= 1;
 
-                let del_key = format!("-{}", dellen);
-                let vref =
-                    Self::get_or_create_variation(&mut data.non_insertion_variants, p3, &del_key);
-                vref.alt_depth = 0;
-
-                Self::add_sv_counts(
-                    &mut data.non_insertion_variants,
-                    p3,
-                    pairs_data.pairs,
-                    cnt3,
-                    1,
-                );
-
-                if !data.ref_coverage.contains_key(&p3) {
-                    data.ref_coverage.insert(p3, pairs_data.pairs + cnt3);
-                }
-                if let Some(cov_p3) = data.ref_coverage.get(&p3).copied() {
-                    if let Some(cov_bp) = data.ref_coverage.get(&bp).copied() {
-                        if cov_bp < cov_p3 {
-                            data.ref_coverage.insert(bp, cov_p3);
+                    while self.get_ref_base(bp).is_some()
+                        && self.get_ref_base(p3 - 1).is_some()
+                        && self.get_ref_base(bp) == self.get_ref_base(p3 - 1)
+                    {
+                        bp -= 1;
+                        if bp != 0 {
+                            p3 -= 1;
                         }
                     }
+
+                    if dellen <= 0 {
+                        continue;
+                    }
+
+                    let del_key = format!("-{}", dellen);
+                    let vref = Self::get_or_create_variation(
+                        &mut data.non_insertion_variants,
+                        p3,
+                        &del_key,
+                    );
+                    vref.alt_depth = 0;
+
+                    Self::add_sv_counts(
+                        &mut data.non_insertion_variants,
+                        p3,
+                        pairs_data.pairs,
+                        cnt3,
+                        1,
+                    );
+
+                    if !data.ref_coverage.contains_key(&p3) {
+                        data.ref_coverage.insert(p3, pairs_data.pairs + cnt3);
+                    }
+                    if let Some(cov_p3) = data.ref_coverage.get(&p3).copied() {
+                        if let Some(cov_bp) = data.ref_coverage.get(&bp).copied() {
+                            if cov_bp < cov_p3 {
+                                data.ref_coverage.insert(bp, cov_p3);
+                            }
+                        }
+                    }
+
+                    if let Some(sc3v) = data.soft_clips_3end.get(&tuple3.position) {
+                        let variation = Self::get_or_create_variation(
+                            &mut data.non_insertion_variants,
+                            p3,
+                            &del_key,
+                        );
+                        adj_cnt_from_variant(variation, &sc3v.var);
+                    }
+
+                    let mut tmp = Variant::default();
+                    tmp.alt_depth = pairs_data.pairs;
+                    tmp.high_qual_read_cnt = pairs_data.pairs;
+                    tmp.alt_depth_fwd = pairs_data.pairs / 2;
+                    tmp.alt_depth_rev = pairs_data.pairs - pairs_data.pairs / 2;
+                    tmp.mean_pos = pairs_data.pmean;
+                    tmp.mean_qual = pairs_data.qmean;
+                    tmp.mean_mapq = pairs_data.q_mean;
+                    tmp.nm = pairs_data.nm;
+
+                    let variation = Self::get_or_create_variation(
+                        &mut data.non_insertion_variants,
+                        p3,
+                        &del_key,
+                    );
+                    adj_cnt_from_variant(variation, &tmp);
+                } else {
+                    // candidate duplication
+                }
+            } else {
+                let mut m_rev =
+                    self.find_match_rev(&seq, p3, 1, Configuration::SEED_1 as usize, 3);
+                bp = m_rev.base_position;
+                let mut extra = m_rev.matched_sequence;
+                if bp == 0 {
+                    m_rev = self.find_match_rev(&seq, p3, 1, Configuration::SEED_2 as usize, 0);
+                    bp = m_rev.base_position;
+                    extra = m_rev.matched_sequence;
+                }
+                if bp == 0 {
+                    continue;
+                }
+                if (bp - p3).abs() <= Configuration::SVFLANK as i64 {
+                    continue;
                 }
 
-                if let Some(sc3v) = data.soft_clips_3end.get(&tuple3.position) {
+                let sc3_var = data.soft_clips_3end.get(&p3).map(|sc| sc.var.clone());
+
+                if bp < p3 {
+                    std::mem::swap(&mut bp, &mut p3);
+                    p3 += 1;
+                    bp -= 1;
+                }
+
+                while self.get_ref_base(bp + 1).is_some()
+                    && self.get_ref_base(p3 - 1).is_some()
+                    && self.get_ref_base(bp + 1).map(Self::complement_base_u8)
+                        == self.get_ref_base(p3 - 1)
+                {
+                    p3 -= 1;
+                    if p3 != 0 {
+                        bp += 1;
+                    }
+                }
+
+                let flank = Configuration::SVFLANK as i64;
+                let mut rc = RevComplementor::new();
+                let ins5 = rc
+                    .reverse_complement(&self.join_ref(bp - flank + 1, bp))
+                    .to_vec();
+                let ins3 = rc
+                    .reverse_complement(&self.join_ref(p3, p3 + flank - 1))
+                    .to_vec();
+                let mid = bp - p3 - 2 * flank + 1;
+
+                let mut vn = format!(
+                    "-{}^{}{}<inv{}>{}",
+                    bp - p3 + 1,
+                    String::from_utf8_lossy(&extra),
+                    String::from_utf8_lossy(&ins5),
+                    mid,
+                    String::from_utf8_lossy(&ins3),
+                );
+                if mid <= 0 {
+                    let tins = rc.reverse_complement(&self.join_ref(p3, bp)).to_vec();
+                    vn = format!(
+                        "-{}^{}{}",
+                        bp - p3 + 1,
+                        String::from_utf8_lossy(&extra),
+                        String::from_utf8_lossy(&tins),
+                    );
+                }
+
+                let _ = Self::get_or_create_variation(&mut data.non_insertion_variants, p3, &vn);
+                Self::add_sv_counts(&mut data.non_insertion_variants, p3, 0, cnt3, 0);
+
+                if let Some(sc3_var) = sc3_var {
                     let variation =
-                        Self::get_or_create_variation(&mut data.non_insertion_variants, p3, &del_key);
-                    adj_cnt_from_variant(variation, &sc3v.var);
+                        Self::get_or_create_variation(&mut data.non_insertion_variants, p3, &vn);
+                    adj_cnt_from_variant(variation, &sc3_var);
                 }
 
-                let mut tmp = Variant::default();
-                tmp.alt_depth = pairs_data.pairs;
-                tmp.high_qual_read_cnt = pairs_data.pairs;
-                tmp.alt_depth_fwd = pairs_data.pairs / 2;
-                tmp.alt_depth_rev = pairs_data.pairs - pairs_data.pairs / 2;
-                tmp.mean_pos = pairs_data.pmean;
-                tmp.mean_qual = pairs_data.qmean;
-                tmp.mean_mapq = pairs_data.q_mean;
-                tmp.nm = pairs_data.nm;
-
-                let variation =
-                    Self::get_or_create_variation(&mut data.non_insertion_variants, p3, &del_key);
-                adj_cnt_from_variant(variation, &tmp);
+                Self::inc_ref_coverage(&mut data.ref_coverage, p3, cnt3);
+                if let Some(bp_cov) = data.ref_coverage.get(&bp).copied() {
+                    let p3_cov = data.ref_coverage.get(&p3).copied().unwrap_or(0);
+                    if p3_cov < bp_cov {
+                        data.ref_coverage.insert(p3, bp_cov);
+                    }
+                }
             }
         }
+    }
+
+    /// Java parity helper for `SOFTP2SV{p}->[0].used` checks used by `findsv()`.
+    ///
+    /// Java builds `SOFTP2SV` by soft-position, sorts each bucket by `varsCount` descending,
+    /// then skips candidate processing when the first item is already used.
+    /// Rust computes the same check on demand from SV cluster vectors.
+    fn is_softp2sv_first_used(data: &RealignedVariationData, softp: i64) -> bool {
+        let mut best: Option<(usize, bool)> = None;
+
+        let mut consider = |sv: &SoftClip| {
+            if sv.softp as i64 != softp {
+                return;
+            }
+            let candidate = (sv.var.alt_depth, sv.used());
+            match best {
+                None => best = Some(candidate),
+                Some((current_depth, _)) => {
+                    if candidate.0 > current_depth {
+                        best = Some(candidate);
+                    }
+                }
+            }
+        };
+
+        for sv in &data.svfinv3 {
+            consider(sv);
+        }
+        for sv in &data.svrinv3 {
+            consider(sv);
+        }
+        for sv in &data.svfinv5 {
+            consider(sv);
+        }
+        for sv in &data.svrinv5 {
+            consider(sv);
+        }
+        for sv in &data.svfdel {
+            consider(sv);
+        }
+        for sv in &data.svrdel {
+            consider(sv);
+        }
+        for sv in &data.svfdup {
+            consider(sv);
+        }
+        for sv in &data.svrdup {
+            consider(sv);
+        }
+
+        best.map(|(_, used)| used).unwrap_or(false)
     }
 
     fn find_del_disc(&self, data: &mut RealignedVariationData) {
@@ -1138,6 +1692,278 @@ impl StructuralVariantsProcessor {
                 del.mark_used();
             }
             Self::mark_sv(mend, start, &mut data.svfdel, data.max_read_length as i64);
+        }
+    }
+
+    fn find_inv_disc(&mut self, data: &mut RealignedVariationData) {
+        let minr = instance().conf.minr;
+        let mut rev_complementor = RevComplementor::new();
+
+        for f_idx in 0..data.svfinv5.len() {
+            let (f_used, cnt, me, ms, end, start, nm, pmean, qmean, q_mean) = {
+                let invf5 = &data.svfinv5[f_idx];
+                (
+                    invf5.used(),
+                    invf5.var.alt_depth,
+                    invf5.mend,
+                    invf5.mstart,
+                    invf5.end,
+                    invf5.start,
+                    invf5.var.nm,
+                    invf5.var.mean_pos,
+                    invf5.var.mean_qual,
+                    invf5.var.mean_mapq,
+                )
+            };
+
+            if f_used || cnt == 0 {
+                continue;
+            }
+            if q_mean / cnt as f64 <= Configuration::DISCPAIRQUAL {
+                continue;
+            }
+
+            for r_idx in 0..data.svrinv5.len() {
+                let (r_used, rcnt, rstart, rms, rnm, rpmean, rqmean, r_q_mean) = {
+                    let invr5 = &data.svrinv5[r_idx];
+                    (
+                        invr5.used(),
+                        invr5.var.alt_depth,
+                        invr5.start,
+                        invr5.mstart,
+                        invr5.var.nm,
+                        invr5.var.mean_pos,
+                        invr5.var.mean_qual,
+                        invr5.var.mean_mapq,
+                    )
+                };
+
+                if r_used || rcnt == 0 {
+                    continue;
+                }
+                if r_q_mean / rcnt as f64 <= Configuration::DISCPAIRQUAL {
+                    continue;
+                }
+                if cnt + rcnt <= minr + 5 {
+                    continue;
+                }
+                if !Self::is_overlap(end, me, rstart, rms, data.max_read_length as i64) {
+                    continue;
+                }
+
+                let bp = ((end + rstart) / 2).abs();
+                let pe = ((me + rms) / 2).abs();
+                if pe < bp {
+                    continue;
+                }
+                self.ensure_reference_span(bp - 150, pe + 150);
+
+                let len = pe - bp + 1;
+                if len <= 0 {
+                    continue;
+                }
+
+                let flank = Configuration::SVFLANK as i64;
+                let ins = if len - 2 * flank <= 0 {
+                    let rc = rev_complementor.reverse_complement(&self.join_ref(bp, pe));
+                    String::from_utf8_lossy(&rc).to_string()
+                } else {
+                    let ins5 = rev_complementor
+                        .reverse_complement(&self.join_ref(bp, bp + flank - 1))
+                        .to_vec();
+                    let ins3 = rev_complementor
+                        .reverse_complement(&self.join_ref(pe - flank + 1, pe))
+                        .to_vec();
+                    format!(
+                        "{}<inv{}>{}",
+                        String::from_utf8_lossy(&ins3),
+                        len - 2 * flank,
+                        String::from_utf8_lossy(&ins5),
+                    )
+                };
+
+                let inv_key = format!("-{}^{}", len, ins);
+                let vref =
+                    Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &inv_key);
+                vref.pstd = true;
+                vref.qstd = true;
+
+                let mut tmp = Variant::default();
+                tmp.alt_depth = cnt + rcnt;
+                tmp.high_qual_read_cnt = cnt + rcnt;
+                tmp.alt_depth_fwd = cnt;
+                tmp.alt_depth_rev = rcnt;
+                tmp.mean_qual = qmean + rqmean;
+                tmp.mean_pos = pmean + rpmean;
+                tmp.mean_mapq = q_mean + r_q_mean;
+                tmp.nm = nm + rnm;
+                adj_cnt_from_variant(vref, &tmp);
+
+                let splits = data
+                    .soft_clips_5end
+                    .get(&start)
+                    .map(|s| s.var.alt_depth)
+                    .unwrap_or(0)
+                    + data
+                        .soft_clips_5end
+                        .get(&ms)
+                        .map(|s| s.var.alt_depth)
+                        .unwrap_or(0);
+                Self::add_sv_counts(&mut data.non_insertion_variants, bp, cnt, splits, 1);
+
+                if !data.ref_coverage.contains_key(&bp) {
+                    data.ref_coverage.insert(bp, 2 * cnt);
+                }
+
+                if let Some(invf5) = data.svfinv5.get_mut(f_idx) {
+                    invf5.mark_used();
+                }
+                if let Some(invr5) = data.svrinv5.get_mut(r_idx) {
+                    invr5.mark_used();
+                }
+                event!(
+                    Level::DEBUG,
+                    phase = "find_inv_disc_emit_5",
+                    bp,
+                    pe,
+                    cnt,
+                    rcnt,
+                    inv_key = %inv_key,
+                );
+                Self::mark_sv(bp, pe, &mut data.svfinv3, data.max_read_length as i64);
+                Self::mark_sv(bp, pe, &mut data.svrinv3, data.max_read_length as i64);
+            }
+        }
+
+        for f_idx in 0..data.svfinv3.len() {
+            let (f_used, cnt, me, end, nm, pmean, qmean, q_mean) = {
+                let invf3 = &data.svfinv3[f_idx];
+                (
+                    invf3.used(),
+                    invf3.var.alt_depth,
+                    invf3.mend,
+                    invf3.end,
+                    invf3.var.nm,
+                    invf3.var.mean_pos,
+                    invf3.var.mean_qual,
+                    invf3.var.mean_mapq,
+                )
+            };
+
+            if f_used || cnt == 0 {
+                continue;
+            }
+
+            for r_idx in 0..data.svrinv3.len() {
+                let (r_used, rcnt, rstart, rms, rnm, rpmean, rqmean, r_q_mean) = {
+                    let invr3 = &data.svrinv3[r_idx];
+                    (
+                        invr3.used(),
+                        invr3.var.alt_depth,
+                        invr3.start,
+                        invr3.mstart,
+                        invr3.var.nm,
+                        invr3.var.mean_pos,
+                        invr3.var.mean_qual,
+                        invr3.var.mean_mapq,
+                    )
+                };
+
+                if r_used || rcnt == 0 {
+                    continue;
+                }
+                if r_q_mean / rcnt as f64 <= Configuration::DISCPAIRQUAL {
+                    continue;
+                }
+                if cnt + rcnt <= minr + 5 {
+                    continue;
+                }
+                if !Self::is_overlap(me, end, rms, rstart, data.max_read_length as i64) {
+                    continue;
+                }
+
+                let pe = ((end + rstart) / 2).abs();
+                let bp = ((me + rms) / 2).abs();
+                if pe < bp {
+                    continue;
+                }
+                self.ensure_reference_span(bp - 150, pe + 150);
+
+                let len = pe - bp + 1;
+                if len <= 0 {
+                    continue;
+                }
+
+                let flank = Configuration::SVFLANK as i64;
+                let ins = if len - 2 * flank <= 0 {
+                    let rc = rev_complementor.reverse_complement(&self.join_ref(bp, pe));
+                    String::from_utf8_lossy(&rc).to_string()
+                } else {
+                    let ins5 = rev_complementor
+                        .reverse_complement(&self.join_ref(bp, bp + flank - 1))
+                        .to_vec();
+                    let ins3 = rev_complementor
+                        .reverse_complement(&self.join_ref(pe - flank + 1, pe))
+                        .to_vec();
+                    format!(
+                        "{}<inv{}>{}",
+                        String::from_utf8_lossy(&ins3),
+                        len - 2 * flank,
+                        String::from_utf8_lossy(&ins5),
+                    )
+                };
+
+                let inv_key = format!("-{}^{}", len, ins);
+                let vref =
+                    Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &inv_key);
+                vref.pstd = true;
+                vref.qstd = true;
+
+                let mut tmp = Variant::default();
+                tmp.alt_depth = cnt + rcnt;
+                tmp.high_qual_read_cnt = cnt + rcnt;
+                tmp.alt_depth_fwd = cnt;
+                tmp.alt_depth_rev = rcnt;
+                tmp.mean_qual = qmean + rqmean;
+                tmp.mean_pos = pmean + rpmean;
+                tmp.mean_mapq = q_mean + r_q_mean;
+                tmp.nm = nm + rnm;
+                adj_cnt_from_variant(vref, &tmp);
+
+                let splits = data
+                    .soft_clips_3end
+                    .get(&(end + 1))
+                    .map(|s| s.var.alt_depth)
+                    .unwrap_or(0)
+                    + data
+                        .soft_clips_3end
+                        .get(&(me + 1))
+                        .map(|s| s.var.alt_depth)
+                        .unwrap_or(0);
+                Self::add_sv_counts(&mut data.non_insertion_variants, bp, cnt, splits, 1);
+
+                if !data.ref_coverage.contains_key(&bp) {
+                    data.ref_coverage.insert(bp, 2 * cnt);
+                }
+
+                if let Some(invf3) = data.svfinv3.get_mut(f_idx) {
+                    invf3.mark_used();
+                }
+                if let Some(invr3) = data.svrinv3.get_mut(r_idx) {
+                    invr3.mark_used();
+                }
+                event!(
+                    Level::DEBUG,
+                    phase = "find_inv_disc_emit_3",
+                    bp,
+                    pe,
+                    cnt,
+                    rcnt,
+                    inv_key = %inv_key,
+                );
+                Self::mark_sv(bp, pe, &mut data.svfinv5, data.max_read_length as i64);
+                Self::mark_sv(bp, pe, &mut data.svrinv5, data.max_read_length as i64);
+            }
         }
     }
 
@@ -1483,6 +2309,172 @@ impl StructuralVariantsProcessor {
         }
     }
 
+    fn inv_cluster_len(data: &RealignedVariationData, kind: InversionClusterKind) -> usize {
+        match kind {
+            InversionClusterKind::Forward5 => data.svfinv5.len(),
+            InversionClusterKind::Reverse5 => data.svrinv5.len(),
+            InversionClusterKind::Forward3 => data.svfinv3.len(),
+            InversionClusterKind::Reverse3 => data.svrinv3.len(),
+        }
+    }
+
+    fn inv_cluster_snapshot(
+        data: &RealignedVariationData,
+        kind: InversionClusterKind,
+        idx: usize,
+    ) -> Option<InversionClusterSnapshot> {
+        let cluster = match kind {
+            InversionClusterKind::Forward5 => data.svfinv5.get(idx),
+            InversionClusterKind::Reverse5 => data.svrinv5.get(idx),
+            InversionClusterKind::Forward3 => data.svfinv3.get(idx),
+            InversionClusterKind::Reverse3 => data.svrinv3.get(idx),
+        }?;
+
+        Some(InversionClusterSnapshot {
+            used: cluster.used(),
+            vars_count: cluster.var.alt_depth,
+            start: cluster.start,
+            end: cluster.end,
+            mstart: cluster.mstart,
+            mend: cluster.mend,
+            mlen: cluster.mlen,
+            mean_pos: cluster.var.mean_pos,
+            mean_qual: cluster.var.mean_qual,
+            mean_mapq: cluster.var.mean_mapq,
+            nm: cluster.var.nm,
+            soft_map: cluster.soft.clone(),
+        })
+    }
+
+    fn mark_inv_cluster_used(
+        data: &mut RealignedVariationData,
+        kind: InversionClusterKind,
+        idx: usize,
+    ) {
+        let cluster = match kind {
+            InversionClusterKind::Forward5 => data.svfinv5.get_mut(idx),
+            InversionClusterKind::Reverse5 => data.svrinv5.get_mut(idx),
+            InversionClusterKind::Forward3 => data.svfinv3.get_mut(idx),
+            InversionClusterKind::Reverse3 => data.svrinv3.get_mut(idx),
+        };
+        if let Some(cluster) = cluster {
+            cluster.mark_used();
+        }
+    }
+
+    fn complement_base_u8(base: u8) -> u8 {
+        match base.to_ascii_uppercase() {
+            b'A' => b'T',
+            b'T' => b'A',
+            b'C' => b'G',
+            b'G' => b'C',
+            _ => b'N',
+        }
+    }
+
+    fn find_match_rev(
+        &self,
+        seq: &[u8],
+        _position: i64,
+        dir: i64,
+        seed_len: usize,
+        mm: usize,
+    ) -> MatchResult {
+        let mut seq_work = seq.to_vec();
+        if dir == 1 {
+            seq_work.reverse();
+        }
+        seq_work = seq_work
+            .iter()
+            .map(|b| Self::complement_base_u8(*b))
+            .collect();
+
+        if seq_work.len() < seed_len {
+            return MatchResult::default();
+        }
+
+        for i in (0..=seq_work.len() - seed_len).rev() {
+            let seed = &seq_work[i..i + seed_len];
+            let Some(seeds) = self.reference_seed.get(seed) else {
+                continue;
+            };
+            if seeds.len() != 1 {
+                continue;
+            }
+
+            let first_seed = seeds[0];
+            let mut bp = if dir == 1 {
+                first_seed + seq_work.len() as i64 - i as i64 - 1
+            } else {
+                first_seed - i as i64
+            };
+
+            if self.is_match_ref(&seq_work, bp, -dir, mm) {
+                return MatchResult {
+                    base_position: bp,
+                    matched_sequence: Vec::new(),
+                };
+            }
+
+            let mut sseq = seq_work.clone();
+            let mut eqcnt = 0usize;
+            for j in 1..=15 {
+                bp -= dir;
+                sseq = if dir == -1 {
+                    Self::substr_bytes(&sseq, 1, None)
+                } else {
+                    Self::substr_bytes(&sseq, 0, Some(-1))
+                };
+                if sseq.is_empty() {
+                    break;
+                }
+
+                let extra = if dir == -1 {
+                    let Some(ch0) = sseq.first().copied() else {
+                        continue;
+                    };
+                    if self.is_has_and_not_equals(bp, ch0) {
+                        continue;
+                    }
+                    eqcnt += 1;
+                    let ch1 = sseq.get(1).copied().unwrap_or(b'N');
+                    if sseq.len() < 2 || self.is_has_and_not_equals(bp + 1, ch1) {
+                        continue;
+                    }
+                    Self::substr_bytes(&seq_work, 0, Some(j as i64))
+                } else {
+                    let Some(ch_last) = Self::char_at(&sseq, -1) else {
+                        continue;
+                    };
+                    if self.is_has_and_not_equals(bp, ch_last) {
+                        continue;
+                    }
+                    eqcnt += 1;
+                    let Some(ch_prev) = Self::char_at(&sseq, -2) else {
+                        continue;
+                    };
+                    if self.is_has_and_not_equals(bp - 1, ch_prev) {
+                        continue;
+                    }
+                    Self::substr_bytes(&seq_work, -(j as i64), None)
+                };
+
+                if eqcnt >= 3 && (eqcnt as f64 / j as f64) > 0.5 {
+                    break;
+                }
+
+                if self.is_match_ref(&sseq, bp, -dir, 1) {
+                    return MatchResult {
+                        base_position: bp,
+                        matched_sequence: extra,
+                    };
+                }
+            }
+        }
+
+        MatchResult::default()
+    }
+
     fn inc_ref_coverage(ref_coverage: &mut HashMap<i64, usize>, pos: i64, cnt: usize) {
         let entry = ref_coverage.entry(pos).or_insert(0);
         *entry += cnt;
@@ -1545,7 +2537,15 @@ impl StructuralVariantsProcessor {
     }
 
     fn select_primary_soft_pos(soft: &IndexMap<i64, usize>) -> Option<i64> {
-        soft.iter().max_by_key(|(_, count)| *count).map(|(pos, _)| *pos)
+        let mut best: Option<(i64, usize)> = None;
+        for (pos, count) in soft.iter() {
+            match best {
+                None => best = Some((*pos, *count)),
+                Some((_, best_count)) if *count > best_count => best = Some((*pos, *count)),
+                _ => {}
+            }
+        }
+        best.map(|(pos, _)| pos)
     }
 
     fn get_or_create_variation<'a>(
@@ -2134,6 +3134,35 @@ struct MatchResult {
 struct SortPositionSoftClip {
     position: i64,
     count: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InversionSide {
+    End5,
+    End3,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InversionClusterKind {
+    Forward5,
+    Reverse5,
+    Forward3,
+    Reverse3,
+}
+
+struct InversionClusterSnapshot {
+    used: bool,
+    vars_count: usize,
+    start: i64,
+    end: i64,
+    mstart: i64,
+    mend: i64,
+    mlen: i32,
+    mean_pos: f64,
+    mean_qual: f64,
+    mean_mapq: f64,
+    nm: f64,
+    soft_map: IndexMap<i64, usize>,
 }
 
 #[derive(Default)]

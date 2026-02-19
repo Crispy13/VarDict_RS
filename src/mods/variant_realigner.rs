@@ -56,6 +56,20 @@ struct MismatchResult {
     misnt: Option<u8>,
 }
 
+#[derive(Default, Debug, Clone)]
+struct SvCluster {
+    mate_start: i64,
+    mate_end: i64,
+    cnt: usize,
+    mate_len: i32,
+    start: i64,
+    end: i64,
+    mean_pos: f64,
+    mean_qual: f64,
+    mean_mapq: f64,
+    nm: f64,
+}
+
 pub struct VariantRealigner {
     reference_seq: Vec<u8>,
     reference_seed: HashMap<Vec<u8>, Vec<i64>>,
@@ -184,6 +198,130 @@ impl VariantRealigner {
                     }
                 }
             }
+        }
+    }
+
+    pub fn filter_all_sv_structures(&self, data: &mut RealignedVariationData) {
+        Self::filter_sv(&mut data.svfinv3, data.max_read_length);
+        Self::filter_sv(&mut data.svrinv3, data.max_read_length);
+        Self::filter_sv(&mut data.svfinv5, data.max_read_length);
+        Self::filter_sv(&mut data.svrinv5, data.max_read_length);
+        Self::filter_sv(&mut data.svfdel, data.max_read_length);
+        Self::filter_sv(&mut data.svrdel, data.max_read_length);
+        Self::filter_sv(&mut data.svfdup, data.max_read_length);
+        Self::filter_sv(&mut data.svrdup, data.max_read_length);
+    }
+
+    fn filter_sv(sv_list: &mut [SoftClip], max_read_length: usize) {
+        for sv in sv_list.iter_mut() {
+            let cluster = Self::check_cluster(&mut sv.mates, max_read_length);
+
+            if cluster.mate_start != 0 {
+                sv.mstart = cluster.mate_start;
+                sv.mend = cluster.mate_end;
+                sv.var.alt_depth = cluster.cnt;
+                sv.mlen = cluster.mate_len;
+                sv.start = cluster.start;
+                sv.end = cluster.end;
+                sv.var.mean_pos = cluster.mean_pos;
+                sv.var.mean_qual = cluster.mean_qual;
+                sv.var.mean_mapq = cluster.mean_mapq;
+                sv.var.nm = cluster.nm;
+            } else {
+                sv.mark_used();
+            }
+
+            if sv.disc != 0 {
+                let ratio = sv.var.alt_depth as f64 / sv.disc as f64;
+                if ratio < 0.5 && !(ratio >= 0.35 && sv.var.alt_depth >= 5) {
+                    sv.mark_used();
+                }
+            }
+
+            let mut soft: Vec<(i64, usize)> = sv.soft.iter().map(|(p, c)| (*p, *c)).collect();
+            soft.sort_by(|a, b| b.1.cmp(&a.1));
+            sv.softp = soft.first().map(|(p, _)| *p as i32).unwrap_or(0);
+        }
+    }
+
+    fn check_cluster(mates: &mut [crate::variants::variants::Mate], read_len: usize) -> SvCluster {
+        if mates.is_empty() {
+            return SvCluster::default();
+        }
+
+        mates.sort_by(|a, b| a.mate_start.cmp(&b.mate_start));
+
+        let first = &mates[0];
+        let mut clusters = vec![SvCluster {
+            mate_start: first.mate_start,
+            mate_end: first.mate_end,
+            cnt: 0,
+            mate_len: 0,
+            start: first.start,
+            end: first.end,
+            mean_pos: 0.0,
+            mean_qual: 0.0,
+            mean_mapq: 0.0,
+            nm: 0.0,
+        }];
+
+        let mut cur = 0usize;
+        let min_sv_dist = (Configuration::MINSVCDIST * read_len as f64) as i64;
+
+        for mate in mates.iter() {
+            if mate.mate_start - clusters[cur].mate_end > min_sv_dist {
+                cur += 1;
+                clusters.push(SvCluster {
+                    mate_start: mate.mate_start,
+                    mate_end: mate.mate_end,
+                    cnt: 0,
+                    mate_len: 0,
+                    start: mate.start,
+                    end: mate.end,
+                    mean_pos: 0.0,
+                    mean_qual: 0.0,
+                    mean_mapq: 0.0,
+                    nm: 0.0,
+                });
+            }
+
+            let current = &mut clusters[cur];
+            current.cnt += 1;
+            current.mate_len += mate.mate_len;
+
+            if mate.mate_end > current.mate_end {
+                current.mate_end = mate.mate_end;
+            }
+            if mate.start < current.start {
+                current.start = mate.start;
+            }
+            if mate.end > current.end {
+                current.end = mate.end;
+            }
+            current.mean_pos += mate.mean_pos;
+            current.mean_qual += mate.mean_qual;
+            current.mean_mapq += mate.mean_mapq;
+            current.nm += mate.nm;
+        }
+
+        clusters.sort_by(|a, b| b.cnt.cmp(&a.cnt));
+        let first_cluster = &clusters[0];
+
+        if first_cluster.cnt as f64 / mates.len() as f64 >= 0.60 {
+            SvCluster {
+                mate_start: first_cluster.mate_start,
+                mate_end: first_cluster.mate_end,
+                cnt: first_cluster.cnt,
+                mate_len: first_cluster.mate_len / first_cluster.cnt as i32,
+                start: first_cluster.start,
+                end: first_cluster.end,
+                mean_pos: first_cluster.mean_pos,
+                mean_qual: first_cluster.mean_qual,
+                mean_mapq: first_cluster.mean_mapq,
+                nm: first_cluster.nm,
+            }
+        } else {
+            SvCluster::default()
         }
     }
 
@@ -467,7 +605,7 @@ impl VariantRealigner {
         }
     }
 
-    fn load_partial_ref_coverage(
+    pub fn load_partial_ref_coverage(
         &self,
         data: &mut RealignedVariationData,
         start: i64,
@@ -512,6 +650,36 @@ impl VariantRealigner {
         for (position, coverage) in extra.ref_coverage {
             *data.ref_coverage.entry(position).or_insert(0) += coverage;
         }
+    }
+
+    fn extract_inv_flanks(desc_str: &str) -> Option<(String, String)> {
+        let caret_idx = desc_str.find('^')?;
+        let tail = &desc_str[caret_idx + 1..];
+        let tail_lower = tail.to_ascii_lowercase();
+        let inv_tag_idx = tail_lower.find("<inv")?;
+        let inv_tail = &tail[inv_tag_idx..];
+        let close_rel = inv_tail.find('>')?;
+
+        let left = &tail[..inv_tag_idx];
+        let right = &inv_tail[close_rel + 1..];
+        if left.is_empty() || right.is_empty() {
+            return None;
+        }
+
+        let is_atgnc = |s: &str| {
+            s.as_bytes().iter().all(|base| {
+                matches!(
+                    base.to_ascii_uppercase(),
+                    b'A' | b'C' | b'G' | b'T' | b'N'
+                )
+            })
+        };
+
+        if !is_atgnc(left) || !is_atgnc(right) {
+            return None;
+        }
+
+        Some((left.to_string(), right.to_string()))
     }
 
     fn merge_variant_maps(
@@ -2464,18 +2632,27 @@ impl VariantRealigner {
             }
         }
 
-        let extra_seq: String = desc_str[idx..]
+        let mut extra_seq: String = desc_str[idx..]
             .chars()
             .filter(|ch| !matches!(*ch, '^' | '&' | '#'))
             .collect();
-        let extrains_len = CARET_ATGNC
+        let mut extrains_len = CARET_ATGNC
             .captures(&desc_str)
             .and_then(|cap| cap.get(1))
             .map(|group| group.as_str().len() as i64)
             .unwrap_or(0);
 
+        let inv_flanks = Self::extract_inv_flanks(&desc_str);
+        if inv_flanks.is_some() {
+            extra_seq.clear();
+            extrains_len = 0;
+        }
+
         let mut wupseq = self.get_ref_range(pos - 200, pos - 1);
         wupseq.extend_from_slice(extra_seq.as_bytes());
+        if let Some((_, inv3)) = inv_flanks.as_ref() {
+            wupseq = inv3.as_bytes().to_vec();
+        }
 
         let san_start = pos + dellen + extra_seq.len() as i64 - extrains_len;
         let ref_end = self.ref_start + self.reference_seq.len() as i64 - 1;
@@ -2485,6 +2662,9 @@ impl VariantRealigner {
         }
         let mut sanpseq = extra_seq.as_bytes().to_vec();
         sanpseq.extend_from_slice(&self.get_ref_range(san_start, san_end));
+        if let Some((inv5, _)) = inv_flanks.as_ref() {
+            sanpseq = inv5.as_bytes().to_vec();
+        }
 
         let r3 = self.find_mm3(pos, &sanpseq, data);
         let r5 = self.find_mm5(pos + dellen + extra_seq.len() as i64 - extrains_len - 1, &wupseq, data);
@@ -2654,7 +2834,8 @@ impl VariantRealigner {
                 if seq.is_empty() {
                     continue;
                 }
-                if Self::is_match_bytes(&seq, &wupseq, -1) {
+                let is_match = Self::is_match_bytes(&seq, &wupseq, -1);
+                if is_match {
                     if sc5pp > pos {
                         *data.ref_coverage.entry(pos).or_insert(0) += tv.var.alt_depth;
                     }
@@ -2683,7 +2864,8 @@ impl VariantRealigner {
                     continue;
                 }
                 let mseq = Self::substr_bytes(&sanpseq, sc3pp - pos, None);
-                if Self::is_match_bytes(&seq, &mseq, 1) {
+                let is_match = Self::is_match_bytes(&seq, &mseq, 1);
+                if is_match {
                     if sc3pp <= pos {
                         *data.ref_coverage.entry(pos).or_insert(0) += tv.var.alt_depth;
                     }
@@ -4135,6 +4317,10 @@ mod tests {
             svrdel: parser.take_svrdel(),
             svfdup: parser.take_svfdup(),
             svrdup: parser.take_svrdup(),
+            svfinv5: parser.take_svfinv5(),
+            svrinv5: parser.take_svrinv5(),
+            svfinv3: parser.take_svfinv3(),
+            svrinv3: parser.take_svrinv3(),
         };
 
         if instance().conf.perform_local_realignment {
