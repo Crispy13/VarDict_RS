@@ -2913,6 +2913,16 @@ impl StructuralVariantsProcessor {
             // Get first base
             let bp = seq[0];
 
+            let vars_count = sclip.var.alt_depth;
+            let high_qual_cnt = sclip.var.high_qual_read_cnt;
+            let low_qual_cnt = sclip.var.low_qual_read_cnt;
+            let mean_pos = sclip.var.mean_pos;
+            let mean_qual = sclip.var.mean_qual;
+            let mean_mapq = sclip.var.mean_mapq;
+            let nm = sclip.var.nm;
+            let fwd_cnt = sclip.var.alt_depth_fwd;
+            let rev_cnt = sclip.var.alt_depth_rev;
+
             // Check if there's a matching SNV at the previous position
             let prev_pos = position - 1;
             
@@ -2937,18 +2947,6 @@ impl StructuralVariantsProcessor {
                             }
                         }
                     }
-
-                    // Get the soft clip variant counts
-                    let sclip = data.soft_clips_5end.get(&position).unwrap();
-                    let vars_count = sclip.var.alt_depth;
-                    let high_qual_cnt = sclip.var.high_qual_read_cnt;
-                    let low_qual_cnt = sclip.var.low_qual_read_cnt;
-                    let mean_pos = sclip.var.mean_pos;
-                    let mean_qual = sclip.var.mean_qual;
-                    let mean_mapq = sclip.var.mean_mapq;
-                    let nm = sclip.var.nm;
-                    let fwd_cnt = sclip.var.alt_depth_fwd;
-                    let rev_cnt = sclip.var.alt_depth_rev;
 
                     // Adjust the variant counts
                     if let Some(variant) = var_map.get_mut(&var_key) {
@@ -3004,6 +3002,16 @@ impl StructuralVariantsProcessor {
             // Get first base
             let bp = seq[0];
 
+            let vars_count = sclip.var.alt_depth;
+            let high_qual_cnt = sclip.var.high_qual_read_cnt;
+            let low_qual_cnt = sclip.var.low_qual_read_cnt;
+            let mean_pos = sclip.var.mean_pos;
+            let mean_qual = sclip.var.mean_qual;
+            let mean_mapq = sclip.var.mean_mapq;
+            let nm = sclip.var.nm;
+            let fwd_cnt = sclip.var.alt_depth_fwd;
+            let rev_cnt = sclip.var.alt_depth_rev;
+
             // Create the variant description key for the first base
             let var_key = VarDesc::snv_key(bp);
 
@@ -3024,18 +3032,6 @@ impl StructuralVariantsProcessor {
                             }
                         }
                     }
-
-                    // Get the soft clip variant counts
-                    let sclip = data.soft_clips_3end.get(&position).unwrap();
-                    let vars_count = sclip.var.alt_depth;
-                    let high_qual_cnt = sclip.var.high_qual_read_cnt;
-                    let low_qual_cnt = sclip.var.low_qual_read_cnt;
-                    let mean_pos = sclip.var.mean_pos;
-                    let mean_qual = sclip.var.mean_qual;
-                    let mean_mapq = sclip.var.mean_mapq;
-                    let nm = sclip.var.nm;
-                    let fwd_cnt = sclip.var.alt_depth_fwd;
-                    let rev_cnt = sclip.var.alt_depth_rev;
 
                     // Adjust the variant counts
                     if let Some(variant) = var_map.get_mut(&var_key) {

@@ -13,6 +13,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
+use crackle_kit::tracing::{event, Level};
 use rust_htslib::faidx;
 
 /// Normalize chromosome name to match reference
@@ -143,7 +144,11 @@ impl SharedReference {
             let ref_chrom = match normalize_chrom_name(&reader, chrom) {
                 Some(name) => name,
                 None => {
-                    eprintln!("Warning: Chromosome '{}' not found in reference (tried with/without 'chr' prefix)", chrom);
+                    event!(
+                        Level::WARN,
+                        "Chromosome '{}' not found in reference (tried with/without 'chr' prefix)",
+                        chrom
+                    );
                     continue;
                 }
             };
@@ -217,7 +222,7 @@ impl SharedReference {
             chromosome_names.push(chrom_name);
         }
 
-        eprintln!("Loaded {} chromosomes, total size: {:.2} GB", 
+        event!(Level::INFO, "Loaded {} chromosomes, total size: {:.2} GB", 
             chromosome_names.len(),
             total_size as f64 / 1_073_741_824.0);
 

@@ -24,17 +24,16 @@
 use std::sync::Arc;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rayon::prelude::*;
 
-use crate::data::shared_reference::{SharedReference, SharedReferenceHandle};
+use crate::data::shared_reference::SharedReferenceHandle;
 use crate::data::region::Region;
 use crate::data::bam_reader::BamReader;
 use crate::mods::pipeline::{Pipeline, PipelineConfig};
 use crate::mods::simple_variant_caller::SimpleVariantCaller;
 use crate::mods::vardict_pipeline::VarDictPipeline;
-use crate::mods::output_variant::Region as OutputRegion;
-use crate::scopedata::global_read_only_scope::{GlobalReadOnlyScope, instance};
+use crate::scopedata::global_read_only_scope::instance;
 
 /// Result from processing a single region
 #[derive(Debug)]
@@ -238,6 +237,19 @@ fn process_region_chunk_vardict<P: AsRef<Path>>(
 
     let start_thread = std::time::Instant::now();
     let mut results = Vec::new();
+    let bam_path_str = match bam_path.as_ref().to_str() {
+        Some(path) => path,
+        None => {
+            for region in regions {
+                results.push(RegionResult {
+                    region,
+                    output_lines: Vec::new(),
+                    error: Some("BAM path is not valid UTF-8".to_string()),
+                });
+            }
+            return results;
+        }
+    };
 
     let vardict_pipeline = VarDictPipeline::new(&config.sample_name)
         .with_min_frequency(config.min_frequency)
@@ -247,7 +259,7 @@ fn process_region_chunk_vardict<P: AsRef<Path>>(
     let global_scope = Arc::new(instance().clone());
 
     for region in regions {
-        let mut bam_reader = match BamReader::open(bam_path.as_ref().to_str().unwrap()) {
+        let mut bam_reader = match BamReader::open(bam_path_str) {
             Ok(reader) => reader,
             Err(e) => {
                 results.push(RegionResult {
@@ -294,8 +306,23 @@ fn process_region_chunk<P: AsRef<Path>>(
     config: PipelineConfig,
     bam_path: P,
 ) -> Vec<RegionResult> {
+    let bam_path_str = match bam_path.as_ref().to_str() {
+        Some(path) => path,
+        None => {
+            let mut results = Vec::new();
+            for region in regions {
+                results.push(RegionResult {
+                    region,
+                    output_lines: Vec::new(),
+                    error: Some("BAM path is not valid UTF-8".to_string()),
+                });
+            }
+            return results;
+        }
+    };
+
     // Each thread opens its own BAM reader
-    let mut bam_reader = match BamReader::open(bam_path.as_ref().to_str().unwrap()) {
+    let mut bam_reader = match BamReader::open(bam_path_str) {
         Ok(reader) => reader,
         Err(e) => {
             let mut results = Vec::new();
@@ -373,6 +400,7 @@ fn process_single_region(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::shared_reference::SharedReference;
     use std::collections::HashMap;
 
     #[test]

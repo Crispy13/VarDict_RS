@@ -11,10 +11,11 @@ use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 
 use crackle_kit::tracing::level_filters::LevelFilter;
+use crackle_kit::tracing::{event, Level};
 use crackle_kit::tracing_kit::setup_logging_stderr_only;
 use vardict_rs::data::bam_reader::BamReader;
 use vardict_rs::data::region::Region;
-use vardict_rs::mods::pipeline::{Pipeline, PipelineConfig};
+use vardict_rs::mods::pipeline::PipelineConfig;
 use vardict_rs::mods::vardict_pipeline::{SomaticCombineLookupResult, VarDictPipeline};
 
 const DEFAULT_AMPLICON_PARAMETERS: &str = "10:0.95";
@@ -117,6 +118,18 @@ struct Args {
     #[arg(short = 'D', long = "debug")]
     debug: bool,
 
+    /// Experimental feature: compute Fisher exact test columns in Java parity mode
+    #[arg(long = "fisher")]
+    fisher: bool,
+
+    /// CRISPR cutting site position (Java: -J / --crispr)
+    #[arg(short = 'J', long = "crispr", default_value = "0")]
+    crispr_cutting_site: i32,
+
+    /// CRISPR filtering bp overlap (Java: -j)
+    #[arg(short = 'j', default_value = "0")]
+    crispr_filtering_bp: i32,
+
     /// Output all variants including reference calls (pileup mode)
     #[arg(short = 'p', long = "pileup")]
     pileup: bool,
@@ -169,6 +182,8 @@ fn normalize_legacy_cli_args(raw_args: Vec<OsString>) -> Vec<OsString> {
         .map(|arg| {
             if arg == "-UN" {
                 OsString::from("--unique-second-in-pair")
+            } else if arg == "-fisher" {
+                OsString::from("--fisher")
             } else {
                 arg
             }
@@ -202,7 +217,11 @@ fn main() -> Result<()> {
     let fai_path = args.reference.with_extension("fa.fai");
     let fai_path2 = {
         let mut p = args.reference.clone();
-        p.set_file_name(format!("{}.fai", args.reference.file_name().unwrap().to_string_lossy()));
+        let reference_name = args
+            .reference
+            .file_name()
+            .ok_or_else(|| anyhow!("Invalid reference path: {:?}", args.reference))?;
+        p.set_file_name(format!("{}.fai", reference_name.to_string_lossy()));
         p
     };
     if !fai_path.exists() && !fai_path2.exists() {
@@ -252,8 +271,12 @@ fn main() -> Result<()> {
                 println!("Sample\tChr\tIntron\tIntron count");
             }
             ExecutionMode::Simple => {
-                let pipeline = Pipeline::new(config.clone());
-                println!("{}", pipeline.get_header());
+                println!(
+                    "{}",
+                    vardict_rs::mods::output_variant::get_simple_header_line(
+                        args.crispr_cutting_site != 0,
+                    )
+                );
             }
         }
     }
@@ -307,7 +330,7 @@ fn run_variant_calling(
     let num_threads = args.num_threads.max(1);
     
     if args.debug {
-        eprintln!("Loading reference genome into memory...");
+        event!(Level::INFO, "Loading reference genome into memory...");
     }
 
     // Get unique chromosomes from regions
@@ -316,10 +339,14 @@ fn run_variant_calling(
         .map(|r| r.chr())
         .collect();
     let chrom_vec: Vec<&str> = chroms.into_iter().collect();
+    let reference_path = args
+        .reference
+        .to_str()
+        .ok_or_else(|| anyhow!("Reference path is not valid UTF-8: {:?}", args.reference))?;
 
     // Load only the needed chromosomes for efficiency
     let reference = load_shared_reference_chroms(
-        args.reference.to_str().unwrap(),
+        reference_path,
         &chrom_vec,
     ).context("Failed to load reference genome")?;
     
@@ -355,6 +382,9 @@ fn run_variant_calling(
     conf.unique_mode_alignment_enabled = args.unique_mode_alignment;
     conf.unique_mode_second_in_pair_enabled = args.unique_mode_second_in_pair;
     conf.delete_duplicate_variants = args.delete_duplicate_variants;
+    conf.fisher = args.fisher;
+    conf.crispr_cutting_site = args.crispr_cutting_site;
+    conf.crispr_filtering_bp = args.crispr_filtering_bp;
     conf.amplicon_based_calling = amplicon_based_calling.clone();
     conf.perform_local_realignment = args.local_realignment == 1;
     conf.number_nucleotide_to_extend = args.number_nucleotide_to_extend;
@@ -373,20 +403,20 @@ fn run_variant_calling(
     );
 
     if args.debug {
-        eprintln!("[TIMING] Reference loading: {:.3}s", elapsed_ref_load.as_secs_f64());
-        eprintln!("Loaded {} chromosome(s), {:.2} MB total",
+        event!(Level::INFO, "[TIMING] Reference loading: {:.3}s", elapsed_ref_load.as_secs_f64());
+        event!(Level::INFO, "Loaded {} chromosome(s), {:.2} MB total",
             reference.num_chromosomes(),
             reference.total_size() as f64 / 1_048_576.0);
-        eprintln!("Execution mode: {:?}", execution_mode);
-        eprintln!("Execution batches: {}", region_batches.len());
+        event!(Level::INFO, "Execution mode: {:?}", execution_mode);
+        event!(Level::INFO, "Execution batches: {}", region_batches.len());
         if num_threads > 1 {
-            eprintln!(
+            event!(Level::INFO,
                 "Processing {} regions with {} threads...",
                 region_batches.iter().map(Vec::len).sum::<usize>(),
                 num_threads
             );
         } else {
-            eprintln!(
+            event!(Level::INFO,
                 "Processing {} regions...",
                 region_batches.iter().map(Vec::len).sum::<usize>()
             );
@@ -414,7 +444,7 @@ fn run_variant_calling(
             for result in results {
                 if let Some(error) = result.error {
                     if args.debug {
-                        eprintln!("Error processing {}:{}-{}: {}",
+                        event!(Level::WARN, "Error processing {}:{}-{}: {}",
                             result.region.chr(), result.region.start(), result.region.end(), error);
                     }
                 } else {
@@ -428,9 +458,9 @@ fn run_variant_calling(
             let elapsed_total = start_total.elapsed();
 
             if args.debug {
-                eprintln!("[TIMING] Processing all regions: {:.3}s", elapsed_processing.as_secs_f64());
-                eprintln!("[TIMING] Output writing: {:.3}s", elapsed_output.as_secs_f64());
-                eprintln!("[TIMING] TOTAL execution: {:.3}s", elapsed_total.as_secs_f64());
+                event!(Level::INFO, "[TIMING] Processing all regions: {:.3}s", elapsed_processing.as_secs_f64());
+                event!(Level::INFO, "[TIMING] Output writing: {:.3}s", elapsed_output.as_secs_f64());
+                event!(Level::INFO, "[TIMING] TOTAL execution: {:.3}s", elapsed_total.as_secs_f64());
             }
         }
         ExecutionMode::Amplicon => {
@@ -482,9 +512,9 @@ fn run_variant_calling(
             let elapsed_total = start_total.elapsed();
 
             if args.debug {
-                eprintln!("[TIMING] Processing all regions: {:.3}s", elapsed_processing.as_secs_f64());
-                eprintln!("[TIMING] Output writing: {:.3}s", 0.0f64);
-                eprintln!("[TIMING] TOTAL execution: {:.3}s", elapsed_total.as_secs_f64());
+                event!(Level::INFO, "[TIMING] Processing all regions: {:.3}s", elapsed_processing.as_secs_f64());
+                event!(Level::INFO, "[TIMING] Output writing: {:.3}s", 0.0f64);
+                event!(Level::INFO, "[TIMING] TOTAL execution: {:.3}s", elapsed_total.as_secs_f64());
             }
         }
         ExecutionMode::Somatic => {
@@ -590,9 +620,9 @@ fn run_variant_calling(
             let elapsed_total = start_total.elapsed();
 
             if args.debug {
-                eprintln!("[TIMING] Processing all regions: {:.3}s", elapsed_processing.as_secs_f64());
-                eprintln!("[TIMING] Output writing: {:.3}s", 0.0f64);
-                eprintln!("[TIMING] TOTAL execution: {:.3}s", elapsed_total.as_secs_f64());
+                event!(Level::INFO, "[TIMING] Processing all regions: {:.3}s", elapsed_processing.as_secs_f64());
+                event!(Level::INFO, "[TIMING] Output writing: {:.3}s", 0.0f64);
+                event!(Level::INFO, "[TIMING] TOTAL execution: {:.3}s", elapsed_total.as_secs_f64());
             }
         }
         ExecutionMode::Splicing => {
@@ -630,9 +660,9 @@ fn run_variant_calling(
             let elapsed_total = start_total.elapsed();
 
             if args.debug {
-                eprintln!("[TIMING] Processing all regions: {:.3}s", elapsed_processing.as_secs_f64());
-                eprintln!("[TIMING] Output writing: {:.3}s", 0.0f64);
-                eprintln!("[TIMING] TOTAL execution: {:.3}s", elapsed_total.as_secs_f64());
+                event!(Level::INFO, "[TIMING] Processing all regions: {:.3}s", elapsed_processing.as_secs_f64());
+                event!(Level::INFO, "[TIMING] Output writing: {:.3}s", 0.0f64);
+                event!(Level::INFO, "[TIMING] TOTAL execution: {:.3}s", elapsed_total.as_secs_f64());
             }
         }
     }
@@ -667,12 +697,10 @@ fn resolve_execution_mode(
 ) -> ExecutionMode {
     if args.output_splicing {
         ExecutionMode::Splicing
+    } else if args.region.is_none() && amplicon_based_calling.is_some() {
+        ExecutionMode::Amplicon
     } else if has_paired_bam {
         ExecutionMode::Somatic
-    } else if args.region.is_some() {
-        ExecutionMode::Simple
-    } else if amplicon_based_calling.is_some() {
-        ExecutionMode::Amplicon
     } else {
         ExecutionMode::Simple
     }
@@ -962,7 +990,7 @@ fn parse_standard_regions(
 
         if fields.len() <= chr_idx || fields.len() <= start_idx || fields.len() <= end_idx {
             if args.debug {
-                eprintln!("Skipping malformed BED line {}: {}", line_num + 1, line);
+                event!(Level::WARN, "Skipping malformed BED line {}: {}", line_num + 1, line);
             }
             continue;
         }
@@ -1340,6 +1368,20 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_execution_mode_amplicon_without_region_overrides_paired_bam() {
+        let args = parse_args_for_test([
+            "vardict",
+            "-G",
+            "reference.fa",
+            "-b",
+            "tumor.bam|normal.bam",
+        ]);
+
+        let mode = resolve_execution_mode(&args, &Some("10:0.95".to_string()), true);
+        assert_eq!(mode, ExecutionMode::Amplicon);
+    }
+
+    #[test]
     fn test_resolve_execution_mode_paired_bam_forces_somatic() {
         let args = parse_args_for_test([
             "vardict",
@@ -1408,6 +1450,58 @@ mod tests {
 
         assert!(!args.no_sv);
         assert!(args.unique_mode_second_in_pair);
+    }
+
+    #[test]
+    fn test_parse_args_fisher_long_option() {
+        let args = parse_args_for_test([
+            "vardict",
+            "-G",
+            "reference.fa",
+            "-b",
+            "input.bam",
+            "-R",
+            "chr1:1-10",
+            "--fisher",
+        ]);
+
+        assert!(args.fisher);
+    }
+
+    #[test]
+    fn test_parse_args_fisher_legacy_single_dash_option() {
+        let args = parse_args_for_test([
+            "vardict",
+            "-G",
+            "reference.fa",
+            "-b",
+            "input.bam",
+            "-R",
+            "chr1:1-10",
+            "-fisher",
+        ]);
+
+        assert!(args.fisher);
+    }
+
+    #[test]
+    fn test_parse_args_crispr_options() {
+        let args = parse_args_for_test([
+            "vardict",
+            "-G",
+            "reference.fa",
+            "-b",
+            "input.bam",
+            "-R",
+            "chr1:1-10",
+            "-J",
+            "50454941",
+            "-j",
+            "25",
+        ]);
+
+        assert_eq!(args.crispr_cutting_site, 50_454_941);
+        assert_eq!(args.crispr_filtering_bp, 25);
     }
 
     #[test]

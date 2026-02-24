@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
     ops::AddAssign,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
 };
 
@@ -230,7 +231,38 @@ impl CigarParser {
 
     /// Process a single BAM record (streaming)
     pub fn process_record(&mut self, record: &mut Record) -> Result<(), Error> {
-        self.parse_cigar(record)
+        let record_name = String::from_utf8_lossy(record.qname()).to_string();
+        match catch_unwind(AssertUnwindSafe(|| self.parse_cigar(record))) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => crate::utils::print_exception_and_continue(
+                &error,
+                "record",
+                &record_name,
+                Some(&self.region),
+                &self.instance.conf,
+            ),
+            Err(payload) => {
+                let panic_message = if let Some(message) = payload.downcast_ref::<&str>() {
+                    (*message).to_string()
+                } else if let Some(message) = payload.downcast_ref::<String>() {
+                    message.clone()
+                } else {
+                    "unknown panic payload".to_string()
+                };
+                let error = anyhow!(
+                    "panic while processing record '{}': {}",
+                    record_name,
+                    panic_message
+                );
+                crate::utils::print_exception_and_continue(
+                    &error,
+                    "record",
+                    &record_name,
+                    Some(&self.region),
+                    &self.instance.conf,
+                )
+            }
+        }
     }
 
     /// Get the collected non-insertion variants
@@ -1997,7 +2029,7 @@ impl CigarParser {
                 mlen,
                 indel_len,
                 false,
-            );
+            )?;
 
             // add length of next segment to both read and reference offsets
             // add length of next-next segment to reference position (for insertion) or to
@@ -3809,7 +3841,7 @@ fn append_segments(
         mismatch_seq: _,
     } = var_desc
     else {
-        panic!("Not deletion description: {:?}", var_desc)
+        return Err(anyhow!("Not deletion description: {:?}", var_desc));
     };
 
     // begin is n + m for insertion and n for deletion
@@ -3823,7 +3855,11 @@ fn append_segments(
     // corresponding
     // to next-next segment otherwise (deletion) append '^' + length of a next-next
     // segment
-    if matches!(cigar.get(ci + 2).unwrap(), Cigar::Ins(_)) {
+    let next_next_cigar = cigar
+        .get(ci + 2)
+        .ok_or_else(|| anyhow!("Missing ci+2 CIGAR segment at index {}", ci + 2))?;
+
+    if matches!(next_next_cigar, Cigar::Ins(_)) {
         *ins_or_del_len = InsOrDelLen::InsSeq(
             query_seq
                 .get_or_err(begin + mlen..begin + mlen + indel_len)?
@@ -3837,7 +3873,7 @@ fn append_segments(
     // corresponding to next-next segment otherwise (deletion)
     // append first quality score of next segment or return empty string
     // Quality handling
-    if matches!(cigar.get(ci + 2).unwrap(), Cigar::Ins(_)) {
+    if matches!(next_next_cigar, Cigar::Ins(_)) {
         // ci+2 is Insertion → always append slice
         qual_seg.extend_from_slice(query_qual.get_or_err(begin + mlen..begin + mlen + indel_len)?);
     } else {
@@ -3955,6 +3991,32 @@ mod tests {
     /// Helper to create a CigarStringView from CIGAR elements
     fn make_cigar(elements: Vec<Cigar>) -> CigarStringView {
         CigarString(elements).into_view(0)
+    }
+
+    #[test]
+    fn test_append_segments_returns_error_for_non_deletion_var_desc() {
+        let query_seq = b"ACGT";
+        let query_qual = b"!!!!";
+        let cigar = make_cigar(vec![Cigar::Del(1), Cigar::Match(1), Cigar::Ins(1)]);
+        let mut var_desc = VarDesc::Ins {
+            seq: SmallVec::new(),
+        };
+        let mut qual_seg = SmallVecBytes::new();
+
+        let result = append_segments(
+            query_seq,
+            query_qual,
+            &cigar,
+            0,
+            &mut var_desc,
+            &mut qual_seg,
+            0,
+            1,
+            1,
+            false,
+        );
+
+        assert!(result.is_err());
     }
 
     // Tests ported from CigarModifierTest.java

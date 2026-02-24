@@ -1,13 +1,63 @@
 use anyhow::{Error, anyhow};
+use crackle_kit::tracing::{Level, event};
 use std::{
     cmp::Ordering,
     fmt::Debug,
     ops::{Range, RangeFrom},
     slice::SliceIndex,
+    sync::atomic::Ordering as AtomicOrdering,
     str::Utf8Error,
 };
 
 pub mod aligner;
+
+pub fn print_exception_and_continue(
+    exception: &Error,
+    place: &str,
+    place_def: &str,
+    region: Option<&crate::data::region::Region>,
+    conf: &crate::conf::Configuration,
+) -> Result<(), Error> {
+    match region {
+        Some(region) => {
+            event!(
+                Level::ERROR,
+                "There was Exception while processing {} on {} on region {}. The processing will be continued from the next {}.\n{:#}",
+                place,
+                place_def,
+                region.to_region_string(),
+                place,
+                exception
+            );
+        }
+        None => {
+            event!(
+                Level::ERROR,
+                "There was Exception while processing {} on {} but region is undefined. The processing will be continued from the next {}.\n{:#}",
+                place,
+                place_def,
+                place,
+                exception
+            );
+        }
+    }
+
+    let current_count = conf
+        .exception_counter
+        .fetch_add(1, AtomicOrdering::SeqCst)
+        + 1;
+
+    if current_count > crate::conf::Configuration::MAX_EXCEPTION_COUNT {
+        event!(
+            Level::ERROR,
+            "VarDict-rs fails (there were {} continued exceptions during the run).",
+            current_count
+        );
+        return Err(anyhow!("Too many continued exceptions: {}", current_count));
+    }
+
+    Ok(())
+}
 
 pub fn round_half_even(pattern: &str, value: f64) -> f64 {
     let decimals = pattern
@@ -239,6 +289,8 @@ impl BytesExt for &[u8] {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, atomic::AtomicUsize};
+
     use super::*;
 
     #[test]
@@ -333,5 +385,38 @@ mod tests {
         let data = [1, 2, 3];
         let l = 2 as usize;
         assert_eq!(data.get_with_int(-(l as i32)..).unwrap(), &[2, 3]);
+    }
+
+    #[test]
+    fn test_print_exception_and_continue_threshold() {
+        let mut conf = crate::conf::Configuration::default();
+        conf.exception_counter = Arc::new(AtomicUsize::new(0));
+        let region = crate::data::region::Region::new(
+            "chr1".to_string(),
+            1,
+            10,
+            "GENE".to_string(),
+        );
+
+        for _ in 0..crate::conf::Configuration::MAX_EXCEPTION_COUNT {
+            print_exception_and_continue(
+                &anyhow!("test error"),
+                "record",
+                "read1",
+                Some(&region),
+                &conf,
+            )
+            .expect("should continue before threshold is exceeded");
+        }
+
+        let result = print_exception_and_continue(
+            &anyhow!("test error"),
+            "record",
+            "read1",
+            Some(&region),
+            &conf,
+        );
+
+        assert!(result.is_err());
     }
 }

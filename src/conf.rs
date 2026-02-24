@@ -1,3 +1,5 @@
+use std::sync::{Arc, atomic::AtomicUsize};
+
 #[derive(Clone)]
 pub struct Configuration {
     /// Amplicon activation parameters (Java: -a), e.g. "10:0.95".
@@ -100,6 +102,9 @@ pub struct Configuration {
 
     /// Include Fisher exact test columns in output (Java: --fisher / -fisher)
     pub fisher: bool,
+
+    /// Number of continued exceptions during current run (Java: exceptionCounter)
+    pub exception_counter: Arc<AtomicUsize>,
 }
 
 impl Default for Configuration {
@@ -141,6 +146,7 @@ impl Default for Configuration {
             sv_min_len: 1000,
             debug: false,
             fisher: false,
+            exception_counter: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -152,6 +158,7 @@ impl Configuration {
     pub(crate) const SVMAXLEN: i32 = 150000;
     pub(crate) const SVFLANK: i32 = 50;
     pub(crate) const MINSVCDIST: f64 = 1.5;
+    pub(crate) const MAX_EXCEPTION_COUNT: usize = 10;
     pub(crate) const MINMAPBASE: usize = 15;
     pub(crate) const MINSVPOS: i32 = 25;
     pub(crate) const DISCPAIRQUAL: f64 = 35.0;

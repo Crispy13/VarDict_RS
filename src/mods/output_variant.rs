@@ -44,7 +44,7 @@
 //! 36. Structural variant info
 
 use crate::mods::to_vars_builder::{Variant, VarType, StrandBiasFlag, var_type_string};
-use crate::scopedata::global_read_only_scope::instance;
+use crate::scopedata::global_read_only_scope::{instance, INSTANCE};
 use crate::utils::round_half_even;
 use statrs::distribution::{Discrete, DiscreteCDF, Hypergeometric};
 
@@ -129,6 +129,7 @@ pub struct SimpleOutputVariant {
     pub region: String,
     pub var_type: String,
     pub duprate: f64,
+    pub crispr: i32,
     pub sv: String,
 }
 
@@ -218,6 +219,7 @@ impl SimpleOutputVariant {
             region: format!("{}:{}-{}", chr, region.start, region.end),
             var_type: final_var_type,
             duprate: variant.duprate,
+            crispr: variant.crispr,
             sv: if sv.is_empty() { "0".to_string() } else { sv.to_string() },
         }
     }
@@ -266,6 +268,7 @@ impl SimpleOutputVariant {
             region: format!("{}:{}-{}", chr, region.start, region.end),
             var_type: String::new(),
             duprate: 0.0,
+            crispr: 0,
             sv: "0".to_string(),
         }
     }
@@ -339,11 +342,98 @@ impl SimpleOutputVariant {
 
         parts.join("\t")
     }
+
+    fn to_string_38_columns(&self) -> String {
+        let fisher = FisherExact::new(
+            self.reference_forward_count,
+            self.reference_reverse_count,
+            self.variant_forward_count,
+            self.variant_reverse_count,
+        );
+        let pvalue = fisher.p_value();
+        let oddratio = fisher.odd_ratio();
+
+        let hifreq = if self.hifreq == 0.0 {
+            "0".to_string()
+        } else {
+            format!("{:.4}", self.hifreq)
+        };
+
+        let nm = if self.nm > 0.0 { self.nm } else { 0.0 };
+        let nmf = if nm == 0.0 {
+            "0".to_string()
+        } else {
+            format!("{:.1}", nm)
+        };
+
+        let parts: Vec<String> = vec![
+            self.sample.clone(),
+            self.gene.clone(),
+            self.chr.clone(),
+            self.start_position.to_string(),
+            self.end_position.to_string(),
+            self.ref_allele.clone(),
+            self.var_allele.clone(),
+            self.total_coverage.to_string(),
+            self.variant_coverage.to_string(),
+            self.reference_forward_count.to_string(),
+            self.reference_reverse_count.to_string(),
+            self.variant_forward_count.to_string(),
+            self.variant_reverse_count.to_string(),
+            self.genotype.clone(),
+            format_rounded_value_to_print("0.0000", self.frequency),
+            self.bias.clone(),
+            format_rounded_value_to_print("0.0", self.pmean),
+            self.pstd.to_string(),
+            format_rounded_value_to_print("0.0", self.qual),
+            self.qstd.to_string(),
+            format_rounded_value_to_print("0.00000", pvalue),
+            oddratio,
+            format_rounded_value_to_print("0.0", self.mapq),
+            format_rounded_value_to_print("0.000", self.qratio),
+            hifreq,
+            format_rounded_value_to_print("0.0000", self.extrafreq),
+            self.shift3.to_string(),
+            format_rounded_value_to_print("0.000", self.msi),
+            format_f64(self.msint, 0),
+            nmf,
+            self.hicnt.to_string(),
+            self.hicov.to_string(),
+            self.left_sequence.clone(),
+            self.right_sequence.clone(),
+            self.region.clone(),
+            self.var_type.clone(),
+            format_rounded_value_to_print("0.00", self.duprate),
+            self.sv.clone(),
+        ];
+
+        parts.join("\t")
+    }
+
+    fn to_string_with_flags(&self, fisher_enabled: bool, crispr_enabled: bool) -> String {
+        let mut output_variant = if fisher_enabled {
+            self.to_string_38_columns()
+        } else {
+            self.to_string_36_columns()
+        };
+
+        if crispr_enabled {
+            output_variant.push('\t');
+            output_variant.push_str(&self.crispr.to_string());
+        }
+
+        output_variant
+    }
 }
 
 impl std::fmt::Display for SimpleOutputVariant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_string_36_columns())
+        let fisher_enabled = INSTANCE.get().map(|scope| scope.conf.fisher).unwrap_or(false);
+        let crispr_enabled = INSTANCE
+            .get()
+            .map(|scope| scope.conf.crispr_cutting_site != 0)
+            .unwrap_or(false);
+        write!(f, "{}", self.to_string_with_flags(fisher_enabled, crispr_enabled))
     }
 }
 
@@ -551,16 +641,96 @@ impl AmpliconOutputVariant {
 
         parts.join("\t")
     }
+
+    fn to_string_40_columns(&self) -> String {
+        let fisher = FisherExact::new(
+            self.reference_forward_count,
+            self.reference_reverse_count,
+            self.variant_forward_count,
+            self.variant_reverse_count,
+        );
+        let pvalue = fisher.p_value();
+        let oddratio = fisher.odd_ratio();
+
+        let hifreq = if self.hifreq == 0.0 {
+            "0".to_string()
+        } else {
+            format!("{:.4}", self.hifreq)
+        };
+
+        let nm = if self.nm > 0.0 { self.nm } else { 0.0 };
+        let nmf = if nm == 0.0 {
+            "0".to_string()
+        } else {
+            format!("{:.1}", nm)
+        };
+
+        let parts: Vec<String> = vec![
+            self.sample.clone(),
+            self.gene.clone(),
+            self.chr.clone(),
+            self.start_position.to_string(),
+            self.end_position.to_string(),
+            self.ref_allele.clone(),
+            self.var_allele.clone(),
+            self.total_coverage.to_string(),
+            self.variant_coverage.to_string(),
+            self.reference_forward_count.to_string(),
+            self.reference_reverse_count.to_string(),
+            self.variant_forward_count.to_string(),
+            self.variant_reverse_count.to_string(),
+            self.genotype.clone(),
+            format_rounded_value_to_print("0.0000", self.frequency),
+            self.bias.clone(),
+            format_rounded_value_to_print("0.0", self.pmean),
+            self.pstd.to_string(),
+            format_rounded_value_to_print("0.0", self.qual),
+            self.qstd.to_string(),
+            format_rounded_value_to_print("0.00000", pvalue),
+            oddratio,
+            format_rounded_value_to_print("0.0", self.mapq),
+            format_rounded_value_to_print("0.000", self.qratio),
+            hifreq,
+            format_rounded_value_to_print("0.0000", self.extrafreq),
+            self.shift3.to_string(),
+            format_rounded_value_to_print("0.000", self.msi),
+            format_f64(self.msint, 0),
+            nmf,
+            self.hicnt.to_string(),
+            self.hicov.to_string(),
+            self.left_sequence.clone(),
+            self.right_sequence.clone(),
+            self.region.clone(),
+            self.var_type.clone(),
+            self.good_variants_count.to_string(),
+            self.total_variants_count.to_string(),
+            self.no_coverage.to_string(),
+            self.amplicon_flag.to_string(),
+        ];
+
+        parts.join("\t")
+    }
+
+    fn to_string_with_flags(&self, fisher_enabled: bool, debug_enabled: bool) -> String {
+        let output_variant = if fisher_enabled {
+            self.to_string_40_columns()
+        } else {
+            self.to_string_38_columns()
+        };
+
+        if debug_enabled {
+            format!("{}\t{}", output_variant, self.debug)
+        } else {
+            output_variant
+        }
+    }
 }
 
 impl std::fmt::Display for AmpliconOutputVariant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let output_variant = self.to_string_38_columns();
-        if instance().conf.debug {
-            write!(f, "{}\t{}", output_variant, self.debug)
-        } else {
-            write!(f, "{}", output_variant)
-        }
+        let fisher_enabled = INSTANCE.get().map(|scope| scope.conf.fisher).unwrap_or(false);
+        let debug_enabled = INSTANCE.get().map(|scope| scope.conf.debug).unwrap_or(false);
+        write!(f, "{}", self.to_string_with_flags(fisher_enabled, debug_enabled))
     }
 }
 
@@ -1488,20 +1658,34 @@ fn format_var_type(var_type: &VarType) -> String {
 pub fn get_column_headers() -> Vec<&'static str> {
     vec![
         "Sample", "Gene", "Chr", "Start", "End", "Ref", "Alt",
-        "Depth", "AltDepth", "RefFwd", "RefRev", "AltFwd", "AltRev",
+        "Depth", "AltDepth", "RefFwdReads", "RefRevReads", "AltFwdReads", "AltRevReads",
         "Genotype", "AF", "Bias",
         "PMean", "PStd",
-        "Qual", "QStd",
-        "MQ", "QRatio", "HiFreq", "ExtraFreq",
-        "Shift3", "MSI", "MSILen", "NM",
+        "QMean", "QStd",
+        "MQ", "Sig_Noise", "HiAF", "ExtraAF",
+        "shift3", "MSI", "MSI_NT", "NM",
         "HiCnt", "HiCov",
-        "LeftSeq", "RightSeq", "Region", "VarType", "DupRate", "SV"
+        "5pFlankSeq", "3pFlankSeq", "Seg", "VarType", "Duprate", "SV_info"
     ]
+}
+
+/// Get simple-mode column headers with optional CRISPR suffix (Java parity)
+pub fn get_simple_column_headers(crispr_enabled: bool) -> Vec<&'static str> {
+    let mut headers = get_column_headers();
+    if crispr_enabled {
+        headers.push("CRISPR");
+    }
+    headers
 }
 
 /// Get column headers as tab-delimited string
 pub fn get_header_line() -> String {
     get_column_headers().join("\t")
+}
+
+/// Get simple-mode header line with optional CRISPR suffix (Java parity)
+pub fn get_simple_header_line(crispr_enabled: bool) -> String {
+    get_simple_column_headers(crispr_enabled).join("\t")
 }
 
 pub fn get_amplicon_column_headers() -> Vec<&'static str> {
@@ -1694,8 +1878,15 @@ mod tests {
         let headers = get_column_headers();
         assert_eq!(headers.len(), 36);
         assert_eq!(headers[0], "Sample");
+        assert_eq!(headers[9], "RefFwdReads");
+        assert_eq!(headers[18], "QMean");
+        assert_eq!(headers[21], "Sig_Noise");
+        assert_eq!(headers[24], "shift3");
+        assert_eq!(headers[30], "5pFlankSeq");
         assert_eq!(headers[13], "Genotype");
         assert_eq!(headers[33], "VarType");
+        assert_eq!(headers[34], "Duprate");
+        assert_eq!(headers[35], "SV_info");
     }
 
     #[test]
@@ -1703,6 +1894,58 @@ mod tests {
         let header = get_header_line();
         let fields: Vec<&str> = header.split('\t').collect();
         assert_eq!(fields.len(), 36);
+    }
+
+    #[test]
+    fn test_get_simple_header_line_crispr_suffix_java_parity() {
+        let header = get_simple_header_line(true);
+        let fields: Vec<&str> = header.split('\t').collect();
+        assert_eq!(fields.len(), 37);
+        assert_eq!(fields[36], "CRISPR");
+    }
+
+    #[test]
+    fn test_simple_output_variant_to_string_38_columns_fisher_parity() {
+        let region = Region::new("chr1", 1000, 2000, "GENE1");
+        let mut output = SimpleOutputVariant::empty(1500, &region, "sample1");
+        output.ref_allele = "A".to_string();
+        output.var_allele = "T".to_string();
+        output.total_coverage = 100;
+        output.variant_coverage = 10;
+        output.reference_forward_count = 20;
+        output.reference_reverse_count = 15;
+        output.variant_forward_count = 6;
+        output.variant_reverse_count = 4;
+        output.genotype = "0/1".to_string();
+        output.frequency = 0.10;
+        output.var_type = "SNV".to_string();
+
+        let line = output.to_string_38_columns();
+        let fields: Vec<&str> = line.split('\t').collect();
+
+        assert_eq!(fields.len(), 38);
+        assert_eq!(fields[0], "sample1");
+        assert_eq!(fields[14], "0.1");
+        assert!(fields[20].parse::<f64>().is_ok());
+        assert!(fields[21] == "Inf" || fields[21].parse::<f64>().is_ok());
+        assert_eq!(fields[37], "0");
+    }
+
+    #[test]
+    fn test_simple_output_variant_crispr_column_behavior_parity() {
+        let region = Region::new("chr1", 1000, 2000, "GENE1");
+        let mut output = SimpleOutputVariant::empty(1500, &region, "sample1");
+        output.crispr = 7;
+
+        let line_no_fisher = output.to_string_with_flags(false, true);
+        let fields_no_fisher: Vec<&str> = line_no_fisher.split('\t').collect();
+        assert_eq!(fields_no_fisher.len(), 37);
+        assert_eq!(fields_no_fisher[36], "7");
+
+        let line_with_fisher = output.to_string_with_flags(true, true);
+        let fields_with_fisher: Vec<&str> = line_with_fisher.split('\t').collect();
+        assert_eq!(fields_with_fisher.len(), 39);
+        assert_eq!(fields_with_fisher[38], "7");
     }
 
     #[test]
@@ -1774,6 +2017,67 @@ mod tests {
         assert_eq!(fields.len(), 38);
         assert_eq!(fields[34], "GoodVarCount");
         assert_eq!(fields[37], "Ampflag");
+    }
+
+    #[test]
+    fn test_amplicon_output_variant_to_string_40_columns_fisher_parity() {
+        let region = Region::new("chr1", 1000, 2000, "GENE1");
+        let variant = Variant {
+            description_string: "A>T".to_string(),
+            refallele: "A".to_string(),
+            varallele: "T".to_string(),
+            vartype: VarType::SNV('T'),
+            start_position: 1500,
+            end_position: 1500,
+            vars_count_on_forward: 5,
+            vars_count_on_reverse: 5,
+            position_coverage: 10,
+            total_pos_coverage: 100,
+            frequency: 0.10,
+            high_quality_reads_frequency: 0.08,
+            extra_frequency: 0.0,
+            mean_position: 25.0,
+            mean_quality: 30.0,
+            mean_mapping_quality: 60.0,
+            strand_bias_flag: StrandBiasFlag::default(),
+            is_at_least_at_2_positions: true,
+            has_at_least_2_diff_qualities: true,
+            leftseq: "ACGT".to_string(),
+            rightseq: "TGCA".to_string(),
+            msi: 0.0,
+            msint: 0.0,
+            shift3: 0,
+            nm: 1.0,
+            high_qual_read_cnt: 10,
+            low_qual_read_cnt: 0,
+            hicov: 90,
+            ref_forward_count: 20,
+            ref_reverse_count: 15,
+            genotype: "0/1".to_string(),
+            duprate: 0.0,
+            crispr: 0,
+        };
+        let output = AmpliconOutputVariant::from_variant(
+            Some(&variant),
+            &region,
+            &[],
+            &[(None, String::new()), (None, String::new())],
+            None,
+            1500,
+            1,
+            0,
+            false,
+            "sample1",
+        );
+
+        let line = output.to_string_40_columns();
+        let fields: Vec<&str> = line.split('\t').collect();
+        assert_eq!(fields.len(), 40);
+        assert_eq!(fields[0], "sample1");
+        assert!(fields[20].parse::<f64>().is_ok());
+        assert!(fields[21] == "Inf" || fields[21].parse::<f64>().is_ok());
+        assert_eq!(fields[36], "1");
+        assert_eq!(fields[39], "0");
     }
 
     #[test]

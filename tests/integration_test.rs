@@ -323,6 +323,25 @@ fn get_testdata_dir() -> PathBuf {
         .join("testdata")
 }
 
+fn resolve_manifest_case_file_path(test_cases_dir: &Path, case_file: &str) -> PathBuf {
+    let canonical = test_cases_dir.join(case_file);
+    if canonical.exists() {
+        return canonical;
+    }
+
+    let workspace_relative = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join(case_file);
+    if workspace_relative.exists() {
+        return workspace_relative;
+    }
+
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("parity_case_inputs")
+        .join(case_file)
+}
+
 // ============================================================================
 // Test Case Parsing Tests
 // ============================================================================
@@ -679,6 +698,26 @@ fn has_output_splicing_option(options: &str) -> bool {
     has_option_flag(options, "-i") || has_option_flag(options, "--splice")
 }
 
+fn has_manifest_tag(tags: &str, tag: &str) -> bool {
+    tags.split('|').any(|value| value == tag)
+}
+
+fn expected_sample_name_for_case(config: &TestCaseConfig, expected: &[ExpectedVariant]) -> String {
+    expected
+        .first()
+        .map(|variant| variant.sample.clone())
+        .unwrap_or_else(|| {
+            config
+                .bam_file
+                .split('|')
+                .next()
+                .unwrap_or(&config.bam_file)
+                .strip_suffix(".bam")
+                .unwrap_or(&config.bam_file)
+                .to_string()
+        })
+}
+
 fn apply_simple_options_to_conf_and_pipeline(
     options: &str,
     conf: &mut vardict_rs::conf::Configuration,
@@ -709,6 +748,18 @@ fn apply_simple_options_to_conf_and_pipeline(
             }
             "-U" | "--nosv" => {
                 conf.disable_sv = true;
+            }
+            "-J" | "--crispr" => {
+                if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<i32>().ok()) {
+                    conf.crispr_cutting_site = value;
+                    index += 1;
+                }
+            }
+            "-j" => {
+                if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<i32>().ok()) {
+                    conf.crispr_filtering_bp = value;
+                    index += 1;
+                }
             }
             "--deldupvar" => {
                 conf.delete_duplicate_variants = true;
@@ -820,6 +871,18 @@ fn apply_simple_options_to_conf_and_pipeline(
                     if let Ok(parsed) = value.parse::<i32>() {
                         conf.reference_extension = parsed;
                     }
+                } else if let Some(value) = token.strip_prefix("--crispr=") {
+                    if let Ok(parsed) = value.parse::<i32>() {
+                        conf.crispr_cutting_site = parsed;
+                    }
+                } else if let Some(value) = token.strip_prefix("-J") {
+                    if let Ok(parsed) = value.parse::<i32>() {
+                        conf.crispr_cutting_site = parsed;
+                    }
+                } else if let Some(value) = token.strip_prefix("-j") {
+                    if let Ok(parsed) = value.parse::<i32>() {
+                        conf.crispr_filtering_bp = parsed;
+                    }
                 }
             }
         }
@@ -839,6 +902,24 @@ fn apply_simple_options_to_conf_and_pipeline(
     (min_frequency, pileup, min_mapping_quality)
 }
 
+#[test]
+fn test_apply_simple_options_to_conf_parses_crispr_short_flags() {
+    let mut conf = vardict_rs::conf::Configuration::default();
+    let _ = apply_simple_options_to_conf_and_pipeline("-f 0.001 -J 50454941 -j 25", &mut conf);
+
+    assert_eq!(conf.crispr_cutting_site, 50_454_941);
+    assert_eq!(conf.crispr_filtering_bp, 25);
+}
+
+#[test]
+fn test_apply_simple_options_to_conf_parses_crispr_compact_and_long_flags() {
+    let mut conf = vardict_rs::conf::Configuration::default();
+    let _ = apply_simple_options_to_conf_and_pipeline("-J50454941 --crispr=50454942 -j25", &mut conf);
+
+    assert_eq!(conf.crispr_cutting_site, 50_454_942);
+    assert_eq!(conf.crispr_filtering_bp, 25);
+}
+
 fn is_low_risk_simple_tier1_row(row: &ParityManifestRow) -> bool {
     if row.mode != "Simple" || row.status != "RUN_NOW" {
         return false;
@@ -856,13 +937,19 @@ fn is_low_risk_simple_tier1_row(row: &ParityManifestRow) -> bool {
             ""
                 | "-f 0.0"
                 | "-f 0.001"
+                | "-f0.001"
                 | "-f 0.001 --fisher"
                 | "-f 0.001 -Q 10 -F 0x700"
                 | "-f 0.0025 -F 0x700 -Q 10"
+                | "-f0.0025 -F1792 -Q10"
                 | "-f 0.01 -Q 10 -F 0x700"
+                | "-f 0.01 -Q10 -F1792"
                 | "-f 0.1"
+                | "-f 0.001 --crispr=50454941 -j25"
+                | "-f 0.001 --crispr 50454941 -j25"
                 | "-k 0 -f 0.001"
                 | "-q 20"
+                | "-q20"
         )
 }
 
@@ -2174,7 +2261,7 @@ fn test_all_simple_integration() {
     let mut skipped = 0;
 
     for row in &selected_cases {
-        let test_case_path = test_cases_dir.join(&row.case_file);
+        let test_case_path = resolve_manifest_case_file_path(&test_cases_dir, &row.case_file);
         if !test_case_path.exists() {
             eprintln!(
                 "SKIP {}: missing testcase file (manifest blocker_reason='{}')",
@@ -2227,11 +2314,57 @@ fn test_all_simple_integration() {
         }
 
         if expected.is_empty() {
-            eprintln!(
-                "FAIL {}: expected output is empty for RUN_NOW case",
-                row.case_file
-            );
-            failed += 1;
+            if !has_manifest_tag(&row.tags, "expected_empty") {
+                eprintln!(
+                    "FAIL {}: expected output is empty for untagged RUN_NOW case",
+                    row.case_file
+                );
+                failed += 1;
+                continue;
+            }
+
+            let expected_sample_name = expected_sample_name_for_case(&config, &expected);
+            let disable_sv_by_default = !has_manifest_tag(&row.tags, "sv_related");
+            let rust_output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_vardict_pipeline_simple_raw_case_with_sv_default(
+                    &testdata_dir,
+                    &resources_dir,
+                    &config,
+                    &row.case_file,
+                    &expected_sample_name,
+                    disable_sv_by_default,
+                )
+            })) {
+                Ok(Ok(lines)) => lines,
+                Ok(Err(e)) => {
+                    eprintln!("SKIP {}: runner unavailable: {}", row.case_file, e);
+                    skipped += 1;
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!(
+                        "SKIP {}: runner panicked during pipeline execution",
+                        row.case_file
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            if rust_output.is_empty() {
+                println!(
+                    "PASS {}: expected_empty fixture confirmed (0 output lines)",
+                    row.case_file
+                );
+                passed += 1;
+            } else {
+                eprintln!(
+                    "FAIL {}: expected_empty fixture but rust produced {} output lines",
+                    row.case_file,
+                    rust_output.len()
+                );
+                failed += 1;
+            }
             continue;
         }
 
@@ -2325,7 +2458,7 @@ fn test_manifest_tier1_simple_raw_rust_vs_java_first_mismatch() {
 
     let mut eligible = Vec::new();
     for row in candidates {
-        let test_case_path = test_cases_dir.join(&row.case_file);
+        let test_case_path = resolve_manifest_case_file_path(&test_cases_dir, &row.case_file);
         if !test_case_path.exists() {
             continue;
         }
@@ -2382,7 +2515,7 @@ fn test_manifest_tier1_simple_raw_rust_vs_java_first_mismatch() {
     };
 
     for row in &selected {
-        let test_case_path = test_cases_dir.join(&row.case_file);
+        let test_case_path = resolve_manifest_case_file_path(&test_cases_dir, &row.case_file);
         if !test_case_path.exists() {
             eprintln!("SKIP {}: missing testcase file", row.case_file);
             accounting.skipped += 1;
@@ -2426,21 +2559,61 @@ fn test_manifest_tier1_simple_raw_rust_vs_java_first_mismatch() {
         }
 
         if expected_variants.is_empty() {
-            eprintln!("SKIP {}: no expected variant lines", row.case_file);
-            accounting.skipped += 1;
+            if !has_manifest_tag(&row.tags, "expected_empty") {
+                eprintln!(
+                    "FAIL {}: no expected variant lines for untagged RUN_NOW case",
+                    row.case_file
+                );
+                accounting.failed += 1;
+                continue;
+            }
+
+            let expected_sample_name = expected_sample_name_for_case(&config, &expected_variants);
+            let rust_output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_vardict_pipeline_simple_raw_case_with_sv_default(
+                    &testdata_dir,
+                    &resources_dir,
+                    &config,
+                    &row.case_file,
+                    &expected_sample_name,
+                    false,
+                )
+            })) {
+                Ok(Ok(lines)) => lines,
+                Ok(Err(e)) => {
+                    eprintln!("SKIP {}: runner unavailable: {}", row.case_file, e);
+                    accounting.skipped += 1;
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!(
+                        "SKIP {}: runner panicked during pipeline execution",
+                        row.case_file
+                    );
+                    accounting.skipped += 1;
+                    continue;
+                }
+            };
+
+            if rust_output.is_empty() {
+                accounting.passed += 1;
+                println!(
+                    "PASS {}: simple sv_core expected_empty fixture confirmed (0 output lines)",
+                    row.case_file
+                );
+            } else {
+                accounting.failed += 1;
+                accounting.mismatched += 1;
+                eprintln!(
+                    "FAIL {}: expected_empty fixture but rust produced {} output lines",
+                    row.case_file,
+                    rust_output.len()
+                );
+            }
             continue;
         }
 
-        let expected_sample_name = expected_variants
-            .first()
-            .map(|variant| variant.sample.clone())
-            .unwrap_or_else(|| {
-                config
-                    .bam_file
-                    .strip_suffix(".bam")
-                    .unwrap_or(&config.bam_file)
-                    .to_string()
-            });
+        let expected_sample_name = expected_sample_name_for_case(&config, &expected_variants);
 
         let rust_output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_vardict_pipeline_simple_raw_case(
@@ -2612,7 +2785,7 @@ fn test_manifest_simple_sv_core_raw_rust_vs_java_first_mismatch() {
     };
 
     for row in &selected {
-        let test_case_path = test_cases_dir.join(&row.case_file);
+        let test_case_path = resolve_manifest_case_file_path(&test_cases_dir, &row.case_file);
         if !test_case_path.exists() {
             eprintln!("SKIP {}: missing testcase file", row.case_file);
             accounting.skipped += 1;
@@ -2638,8 +2811,57 @@ fn test_manifest_simple_sv_core_raw_rust_vs_java_first_mismatch() {
         }
 
         if expected_variants.is_empty() {
-            eprintln!("SKIP {}: no expected variant lines", row.case_file);
-            accounting.skipped += 1;
+            if !has_manifest_tag(&row.tags, "expected_empty") {
+                eprintln!(
+                    "FAIL {}: no expected variant lines for untagged RUN_NOW case",
+                    row.case_file
+                );
+                accounting.failed += 1;
+                continue;
+            }
+
+            let expected_sample_name = expected_sample_name_for_case(&config, &expected_variants);
+            let rust_output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_vardict_pipeline_simple_raw_case_with_sv_default(
+                    &testdata_dir,
+                    &resources_dir,
+                    &config,
+                    &row.case_file,
+                    &expected_sample_name,
+                    false,
+                )
+            })) {
+                Ok(Ok(lines)) => lines,
+                Ok(Err(e)) => {
+                    eprintln!("SKIP {}: runner unavailable: {}", row.case_file, e);
+                    accounting.skipped += 1;
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!(
+                        "SKIP {}: runner panicked during pipeline execution",
+                        row.case_file
+                    );
+                    accounting.skipped += 1;
+                    continue;
+                }
+            };
+
+            if rust_output.is_empty() {
+                accounting.passed += 1;
+                println!(
+                    "PASS {}: simple sv_core expected_empty fixture confirmed (0 output lines)",
+                    row.case_file
+                );
+            } else {
+                accounting.failed += 1;
+                accounting.mismatched += 1;
+                eprintln!(
+                    "FAIL {}: expected_empty fixture but rust produced {} output lines",
+                    row.case_file,
+                    rust_output.len()
+                );
+            }
             continue;
         }
 
@@ -2656,16 +2878,7 @@ fn test_manifest_simple_sv_core_raw_rust_vs_java_first_mismatch() {
             continue;
         }
 
-        let expected_sample_name = expected_variants
-            .first()
-            .map(|variant| variant.sample.clone())
-            .unwrap_or_else(|| {
-                config
-                    .bam_file
-                    .strip_suffix(".bam")
-                    .unwrap_or(&config.bam_file)
-                    .to_string()
-            });
+        let expected_sample_name = expected_sample_name_for_case(&config, &expected_variants);
 
         let rust_output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_vardict_pipeline_simple_raw_case_with_sv_default(
@@ -2803,7 +3016,7 @@ fn test_manifest_simple_splicing_raw_rust_vs_java_first_mismatch() {
     };
 
     for row in &selected {
-        let test_case_path = test_cases_dir.join(&row.case_file);
+        let test_case_path = resolve_manifest_case_file_path(&test_cases_dir, &row.case_file);
         if !test_case_path.exists() {
             eprintln!("SKIP {}: missing testcase file", row.case_file);
             accounting.skipped += 1;
@@ -3004,7 +3217,7 @@ fn test_manifest_simple_unique_mode_raw_rust_vs_java_first_mismatch() {
     };
 
     for row in &selected {
-        let test_case_path = test_cases_dir.join(&row.case_file);
+        let test_case_path = resolve_manifest_case_file_path(&test_cases_dir, &row.case_file);
         if !test_case_path.exists() {
             eprintln!("SKIP {}: missing testcase file", row.case_file);
             accounting.skipped += 1;
@@ -3200,7 +3413,7 @@ fn test_manifest_simple_realigner_complex_raw_rust_vs_java_first_mismatch() {
     };
 
     for row in &selected {
-        let test_case_path = test_cases_dir.join(&row.case_file);
+        let test_case_path = resolve_manifest_case_file_path(&test_cases_dir, &row.case_file);
         if !test_case_path.exists() {
             eprintln!("SKIP {}: missing testcase file", row.case_file);
             accounting.skipped += 1;
@@ -3392,7 +3605,7 @@ fn test_manifest_amplicon_raw_rust_vs_java_first_mismatch() {
     };
 
     for row in &selected {
-        let test_case_path = test_cases_dir.join(&row.case_file);
+        let test_case_path = resolve_manifest_case_file_path(&test_cases_dir, &row.case_file);
         if !test_case_path.exists() {
             eprintln!("SKIP {}: missing testcase file", row.case_file);
             accounting.skipped += 1;
@@ -3582,7 +3795,7 @@ fn test_manifest_somatic_raw_rust_vs_java_first_mismatch() {
     };
 
     for row in &selected {
-        let test_case_path = test_cases_dir.join(&row.case_file);
+        let test_case_path = resolve_manifest_case_file_path(&test_cases_dir, &row.case_file);
         if !test_case_path.exists() {
             eprintln!("SKIP {}: missing testcase file", row.case_file);
             accounting.skipped += 1;

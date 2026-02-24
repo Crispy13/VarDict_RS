@@ -3171,26 +3171,15 @@ impl VarDictPipeline {
     }
 
     fn validate_refallele(&self, refallele: &str) -> String {
-        let mut out = refallele.to_string();
-        let replacements = [
-            ('M', 'A'),
-            ('R', 'A'),
-            ('W', 'A'),
-            ('S', 'C'),
-            ('Y', 'C'),
-            ('K', 'G'),
-            ('V', 'A'),
-            ('H', 'A'),
-            ('D', 'A'),
-            ('B', 'C'),
-        ];
-
-        for (from, to) in replacements {
-            if out.contains(from) {
-                out = out.replacen(from, &to.to_string(), 1);
-            }
-        }
-        out
+        refallele
+            .chars()
+            .map(|base| match base {
+                'M' | 'R' | 'W' | 'V' | 'H' | 'D' => 'A',
+                'S' | 'Y' | 'B' => 'C',
+                'K' => 'G',
+                _ => base,
+            })
+            .collect()
     }
 
     fn proceed_vref_is_deletion(

@@ -1,8 +1,11 @@
 case_file,mode,status,blocker_reason,reference,bam,chrom,options,tags
 Amplicon;GRCh37.fa;MRE11a.bam;chr11;94153228-94153388;94153261-94153357;-a 100.95 -p;.txt,Amplicon,RUN_NOW,,GRCh37.fa,MRE11a.bam,chr11,-a 10:0.95 -p,amplicon|pileup
 Amplicon;hg19.fa;Colo829-18_S3-sort.bam;chr1;933866-934466;933866-934466;-a 100.95 -D;.txt,Amplicon,RUN_NOW,,hg19.fa,Colo829-18_S3-sort.bam,chr1,-a 10:0.95 -D,amplicon
+parity_case_inputs/Amplicon;hg19.fa;Colo829-18_S3-sort.bam;chr1;933866-934466;933866-934466;-a100.95-D-compact-matrix20260224.txt,Amplicon,RUN_NOW,,hg19.fa,Colo829-18_S3-sort.bam,chr1,-a10:0.95 -D,amplicon|matrix_batch_2026_02_24|java_backed|options_alias
 Simple;GRCh37.fa;HCC2218_C_position_bug.bam;chr2;179260451-179260596;-f 0.001.txt,Simple,RUN_NOW,,GRCh37.fa,HCC2218_C_position_bug.bam,chr2,-f 0.001,simple
+parity_case_inputs/Simple;GRCh37.fa;HCC2218_C_position_bug.bam;chr2;179260451-179260596;-f0.001-compact-matrix20260224.txt,Simple,RUN_NOW,,GRCh37.fa,HCC2218_C_position_bug.bam,chr2,-f0.001,simple|matrix_batch_2026_02_24|java_backed|options_alias
 Simple;GRCh37.fa;N13532.TwoDels1InsStringBoundError.bam;chr11;1280138-1280341;-f0.0025-F0x700-Q10.txt,Simple,RUN_NOW,,GRCh37.fa,N13532.TwoDels1InsStringBoundError.bam,chr11,-f 0.0025 -F 0x700 -Q 10,simple
+parity_case_inputs/Simple;GRCh37.fa;N13532.TwoDels1InsStringBoundError.bam;chr11;1280138-1280341;-f0.0025-F1792-Q10-matrix20260224.txt,Simple,RUN_NOW,,GRCh37.fa,N13532.TwoDels1InsStringBoundError.bam,chr11,-f0.0025 -F1792 -Q10,simple|matrix_batch_2026_02_24|java_backed|options_alias
 Simple;GRCh37.fa;NA24385.REF.SVDEL.bam;chr1;9011935-9017839;-f 0.001.txt,Simple,RUN_NOW,,GRCh37.fa,NA24385.REF.SVDEL.bam,chr1,-f 0.001,simple|sv_related
 Simple;GRCh37.fa;NA24385_Insertion_chr20_60464465_60470068.bam;chr20;60464465-60470068;-f 0.001.txt,Simple,RUN_NOW,,GRCh37.fa,NA24385_Insertion_chr20_60465664_60468868.bam,chr20,-f 0.001,simple
 Simple;GRCh37.fa;NA24385_chr_19_58559581-58567861.bam;chr20;58559581;58567861;-f0.001.txt,Simple,RUN_NOW,,GRCh37.fa,NA24385_chr_19_58559581_58567861.bam,chr19,-f 0.001,simple|sv_related
@@ -15,7 +18,7 @@ Simple;GRCh37.fa;NA24385_cnt0.bam;chr11;3379106-3382196;-f 0.001.txt,Simple,RUN_
 Simple;GRCh37.fa;NA24385_tcov_empty.bam;chr8;122660146-122660347;-f 0.001.txt,Simple,RUN_NOW,,GRCh37.fa,NA24385_tcov_empty.bam,chr8,-f 0.001,simple|sv_related
 Simple;GRCh37.fa;NA24631_sorted.chr1.1000k.bam;chr1;1;499702;-f0.001.txt,Simple,RUN_NOW,,GRCh37.fa,NA24631_sorted.chr1.1000k.bam,chr1,-f 0.001,simple
 Simple;GRCh37.fa;NPE_insertion_adjust_ref.bam;chr3;145521599-145521750;-f 0.1--nosv--deldupvar-Q10-F0x700.txt,Simple,RUN_NOW,,GRCh37.fa,NPE_insertion_adjust_ref.bam,chr3,-f 0.1 -Q 10 -F 0x700 --nosv --deldupvar,simple|sv_related|no_sv_flag
-Simple;GRCh37.fa;short_quality_seq_in_sv.bam;chr1;17420079-17420230;-f 0.001.txt,Simple,BLOCKED_RESOURCE,expected_output_empty,GRCh37.fa,short_quality_seq_in_sv.bam,chr1,-f 0.001,simple|sv_related
+Simple;GRCh37.fa;short_quality_seq_in_sv.bam;chr1;17420079-17420230;-f 0.001.txt,Simple,RUN_NOW,,GRCh37.fa,short_quality_seq_in_sv.bam,chr1,-f 0.001,simple|sv_related|expected_empty
 Simple;hard_clip_case.fa;hard_clip_next_to_del_test1.bam;test;6674-6824;-f 0.0 -p -r 1.txt,Simple,RUN_NOW,,hard_clip_case.fa,hard_clip_next_to_del_test1.bam,test,-f 0.0 -p -r 1,simple|pileup|hard_clip
 Simple;hard_clip_case.fa;hard_clip_next_to_del_test2.bam;test;6434-6564;-f 0.0 -p -r 1.txt,Simple,RUN_NOW,,hard_clip_case.fa,hard_clip_next_to_del_test2.bam,test,-f 0.0 -p -r 1,simple|pileup|hard_clip
 Simple;hard_clip_case.fa;test_reads.hardclipped.bam;example_genome;160-280;-f 0.0 -P 0.txt,Simple,RUN_NOW,,hard_clip_case.fa,test_reads.hardclipped.bam,example_genome,-f 0.0 -P 0,simple|pileup|hard_clip
@@ -37,16 +40,17 @@ Simple;hg19.fa;Colo829.chr20.DUPDiscSV.bam;chr20;47124929-47131802;-f 0.001;.txt
 Simple;hg19.fa;Colo829.chr20.INVSV.bam;chr20;46841555-46845755;-f 0.001;.txt,Simple,RUN_NOW,,hg19.fa,Colo829.chr20.INVSV.bam,chr20,-f 0.001,simple|sv_related
 Simple;hg19.fa;Colo829.chr20.MarkingDUPSV.bam;chr20;47131954-47132045;-f 0.001;.txt,Simple,RUN_NOW,,hg19.fa,Colo829.chr20.MarkingDUPSV.bam,chr20,-f 0.001,simple|sv_related
 Simple;hg19.fa;Colo829.chr20.OverlapSV.bam;chr20;31260388-31262431;-f 0.001;.txt,Simple,RUN_NOW,,hg19.fa,Colo829.chr20.OverlapSV.bam,chr20,-f 0.001,simple|sv_related
-Simple;hg19.fa;Colo829.chr20.SVBP.bam;chr20;3251475-3252255;-f 0.001;.txt,Simple,BLOCKED_RESOURCE,expected_output_empty,hg19.fa,Colo829.chr20.SVBP.bam,chr20,-f 0.001,simple|sv_related
-Simple;hg19.fa;Colo829.chr20.SVBPReverse.bam;chr20;318511-318527;-f 0.001;.txt,Simple,BLOCKED_RESOURCE,expected_output_empty,hg19.fa,Colo829.chr20.SVBPReverse.bam,chr20,-f 0.001,simple|sv_related
+Simple;hg19.fa;Colo829.chr20.SVBP.bam;chr20;3251475-3252255;-f 0.001;.txt,Simple,RUN_NOW,,hg19.fa,Colo829.chr20.SVBP.bam,chr20,-f 0.001,simple|sv_related|expected_empty
+Simple;hg19.fa;Colo829.chr20.SVBPReverse.bam;chr20;318511-318527;-f 0.001;.txt,Simple,RUN_NOW,,hg19.fa,Colo829.chr20.SVBPReverse.bam,chr20,-f 0.001,simple|sv_related|expected_empty
 Simple;hg19.fa;HardClipInSV.S2.clipped.bam;chr7;1855769-1856455;-f 0.001;.txt,Simple,RUN_NOW,,hg19.fa,HardClipInSV.S2.clipped.bam,chr7,-f 0.001,simple|hard_clip|sv_related
 Simple;hg19.fa;L861Q.bam;chr7;55259400-55259600;-UN.txt,Simple,RUN_NOW,,hg19.fa,L861Q.bam,chr7,-UN,simple|no_sv_flag|unique_mode
 Simple;hg19.fa;L861Q.bam;chr7;55259400-55259600;-u.txt,Simple,RUN_NOW,,hg19.fa,L861Q.bam,chr7,-u,simple|no_sv_flag|unique_mode
 Simple;hg19.fa;L861Q.bam;chr7;55259400-55259600;.txt,Simple,RUN_NOW,,hg19.fa,L861Q.bam,chr7,,simple
 Simple;hg38.fa;2-364738.chr21.Negative.bam;chr21;28366637-28367427;-f0.01-Q10-F0x700.txt,Simple,RUN_NOW,,hg38.fa,2-364738.chr21.Negative.bam,chr21,-f 0.01 -Q 10 -F 0x700,simple|realigner_complex
+parity_case_inputs/Simple;hg38.fa;2-364738.chr21.Negative.bam;chr21;28366637-28367427;-f0.01-Q10-F1792-matrix20260224.txt,Simple,RUN_NOW,,hg38.fa,2-364738.chr21.Negative.bam,chr21,-f 0.01 -Q10 -F1792,simple|realigner_complex|matrix_batch_2026_02_24|java_backed|options_alias
 Simple;hg38.fa;2-420233.chr7.Negative.bam;chr7;157482463-157483329;-f0.01-Q10-F0x700.txt,Simple,RUN_NOW,,hg38.fa,2-420233.chr7.Negative.bam,chr7,-f 0.01 -Q 10 -F 0x700,simple|realigner_complex
 Simple;hg38.fa;AMP_allele.bam;chr19;19542710-19542720;-f0.0.txt,Simple,RUN_NOW,,hg38.fa,AMP_allele.bam,chr19,-f 0.0,simple|realigner_complex
-Simple;hg38.fa;CIGAR_Three_Indels_DLEN.bam;chr9;107331700-107331701;-f0.001.txt,Simple,BLOCKED_RESOURCE,expected_output_empty,hg38.fa,CIGAR_Three_Indels_DLEN.bam,chr9,-f 0.001,simple
+Simple;hg38.fa;CIGAR_Three_Indels_DLEN.bam;chr9;107331700-107331701;-f0.001.txt,Simple,RUN_NOW,,hg38.fa,CIGAR_Three_Indels_DLEN.bam,chr9,-f 0.001,simple|expected_empty
 Simple;hg38.fa;DELDiscPairRreference.bam;chr1;43894440-43894460;-f 0.001.txt,Simple,RUN_NOW,,hg38.fa,DELDiscPairRreference.bam,chr1,-f 0.001,simple|sv_related
 Simple;hg38.fa;DelOutOfBound.bam;chr1;150578117-150578617;-f0.001--deldupvar.txt,Simple,RUN_NOW,,hg38.fa,DelOutOfBound.chr1_150578117_150578617.bam,chr1,-f 0.001 --deldupvar,simple|sv_related
 Simple;hg38.fa;DelOutOfBound.bam;chr1;150578117-150578617;-f0.001.txt,Simple,RUN_NOW,,hg38.fa,DelOutOfBound.chr1_150578117_150578617.bam,chr1,-f 0.001,simple|sv_related
@@ -59,7 +63,7 @@ Simple;hg38.fa;Tcov_zero_SV_DEL_candidate3.bam;chr8;90534611;90620070;-f 0.1 -i.
 Simple;hg38.fa;Tcov_zero_SV_DEL_candidate3.bam;chr8;90534611;90620070;-f 0.1.txt,Simple,RUN_NOW,,hg38.fa,Tcov_zero_SV_DEL_candidate3.bam,chr8,-f 0.1,simple|sv_related
 Simple;hg38.fa;invalid-char.bam;chr9;107331070-107331095;-f0.001.txt,Simple,RUN_NOW,,hg38.fa,invalid-char.bam,chr9,-f 0.001,simple|sv_related
 Simple;hg38.fa;norealign-stringindex-oob.bam;chr22;20566544;20566545;-f 0.001-k0.txt,Simple,RUN_NOW,,hg38.fa,norealign-stringindex-oob.bam,chr22,-k 0 -f 0.001,simple|sv_related
-Simple;hg38.fa;test-malformed-cigar-and-string-eor.bam;chr4;25001600-25001607;-f0.001.txt,Simple,BLOCKED_RESOURCE,expected_output_empty,hg38.fa,test-malformed-cigar-and-string-eor.bam,chr4,-f 0.001,simple
+Simple;hg38.fa;test-malformed-cigar-and-string-eor.bam;chr4;25001600-25001607;-f0.001.txt,Simple,RUN_NOW,,hg38.fa,test-malformed-cigar-and-string-eor.bam,chr4,-f 0.001,simple|expected_empty
 Simple;hs37d5.fa;NA21144.chrom11.Duplicates.bam;11;402283-410793;-F 0;.txt,Simple,RUN_NOW,,hs37d5.fa,NA21144.chrom11.Duplicates.bam,chr11, -F 0,simple|sv_related
 Simple;hs37d5.fa;NA21144.chrom11.Duplicates.bam;11;402283-410793;.txt,Simple,RUN_NOW,,hs37d5.fa,NA21144.chrom11.Duplicates.bam,chr11,,simple|sv_related
 Simple;hs38DH.fa;Count-Depth-With-Ns.bam;chr1;391310-391333;-K -p -r 1 -q 2 -f 0.0;.txt,Simple,RUN_NOW,,hs38DH.fa,Count-Depth-With-Ns.bam,chr1,-K -p -r 1 -q 2 -f 0.0 -k 0,simple|pileup
@@ -68,6 +72,7 @@ Simple;hs38DH.fa;NA12878.chrom20.DELSV.bam;chr20;62596000-62598000;-f 0.001.txt,
 Simple;hs38DH.fa;NA12878.chrom20.INVFullSV.bam;chr20;5927052-5927179;-f 0.001.txt,Simple,RUN_NOW,,hs38DH.fa,NA12878.chrom20.INVFullSV.bam,chr20,-f 0.001,simple|sv_related
 Simple;hs38DH.fa;NA12878.chrom20.INVSimpleSV.bam;chr20;1961100-1961400;-f 0.001.txt,Simple,RUN_NOW,,hs38DH.fa,NA12878.chrom20.INVSimpleSV.bam,chr20,-f 0.001,simple|sv_related
 Simple;hs38DH.fa;NA12878.chrom20.Unmapped.reads.bam;chr20;62597650-62597750;-q 20.txt,Simple,RUN_NOW,,hs38DH.fa,NA12878.chrom20.Unmapped.reads.bam,chr20,-q 20,simple
+parity_case_inputs/Simple;hs38DH.fa;NA12878.chrom20.Unmapped.reads.bam;chr20;62597650-62597750;-q20-compact-matrix20260224.txt,Simple,RUN_NOW,,hs38DH.fa,NA12878.chrom20.Unmapped.reads.bam,chr20,-q20,simple|matrix_batch_2026_02_24|java_backed|options_alias
 Simple;hs38DH.fa;NA12878.chrom5.DUPSV.bam;chr5;140594296-140594495;-f0.001.txt,Simple,RUN_NOW,,hs38DH.fa,NA12878.chrom5.DUPSV.140594296-140594495.bam,chr5,-f 0.001,simple|sv_related
 Simple;hs38DH.fa;NA21144.chrom11.DUPDiscF.bam;chr11;77614410-77614671;-f 0.001.txt,Simple,RUN_NOW,,hs38DH.fa,NA21144.chrom11.DUPDiscF.bam,chr11,-f 0.001,simple|sv_related
 Simple;hs38DH.fa;NA21144.chrom11.INV3Disc.bam;chr11;57982617-57982816;-f 0.001.txt,Simple,RUN_NOW,,hs38DH.fa,NA21144.chrom11.INV3Disc.bam,chr11,-f 0.001,simple|sv_related
@@ -89,5 +94,6 @@ Somatic;hg19.fa;HCC2218_BL_realigins.bam-HCC2218_C_realigins.bam;chrX;7811670-78
 Somatic;hg19.fa;Zero_in_DUPSV_TUMOUR.bam-Zero_in_DUPSV_NORMAL.bam;chr19;290742-291636;-f0.001-X3.txt,Somatic,RUN_NOW,,hg19.fa,Zero_in_DUPSV_TUMOUR.bam|Zero_in_DUPSV_NORMAL.bam,chr19,-f 0.001 -X 3,somatic|sv_related
 Somatic;hg1k.fa;TumorA.StrongLOH.bam-NormalA.StrongLOH.bam;chr21;10996701-11186054;-Q10-f0.01-r2-V0.05;.txt,Somatic,RUN_NOW,,hg1k.fa,TumorA.StrongLOH.chr21.bam|NormalA.StrongLOH.chr21.bam,chr21,-Q 10 -f 0.01 -r 2 -F 0x500 -V 0.05 --nosv,somatic|sv_related|no_sv_flag
 Somatic;hs37d5.fa;NA12878.part1.1956957-1957177.bam-NA12889.part1.1956957-1957177.bam;chr1;1956957-1957177;-f0.001;.txt,Somatic,RUN_NOW,,hs37d5.fa,NA12878.part1.1956957-1957177.bam|NA12889.part1.1956957-1957177.bam,chr1,-f 0.001 --fisher,somatic|fisher
+parity_case_inputs/Somatic;hs37d5.fa;NA12878.part1.1956957-1957177.bam-NA12889.part1.1956957-1957177.bam;chr1;1956957-1957177;-f0.001-legacyfisher-matrix20260224.txt,Somatic,RUN_NOW,,hs37d5.fa,NA12878.part1.1956957-1957177.bam|NA12889.part1.1956957-1957177.bam,chr1,-f 0.001 -fisher,somatic|fisher|matrix_batch_2026_02_24|java_backed|options_alias
 Somatic;hs38DH.fa;172T_S8.final.chr1.bam-172N_S7.final.chr1.bam;chr1;11182030-11182188;;.txt,Somatic,RUN_NOW,,hs38DH.fa,172T_S8.final.chr1_sliced_SOOBE.bam|172N_S7.final.chr1_sliced_SOOBE.bam,chr1,,somatic
 Somatic;hs38DH.fa;NA12889.StrSomSamSpec.bam-NA12878.StrSomSamSpec.bam;chr20;43246926-43280248;-f0.001.txt,Somatic,RUN_NOW,,hs38DH.fa,NA12889.chrom20.StrSomSamSpec.bam|NA12878.chrom20.StrSomSamSpec.bam,chr20, -f 0.001,somatic
