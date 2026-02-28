@@ -851,6 +851,27 @@ impl RecordPreprocessorState {
 }
 
 impl VarDictPipeline {
+    fn merge_raw_variant(acc: &mut RawVariant, raw: &RawVariant) {
+        acc.alt_depth += raw.alt_depth;
+        acc.alt_depth_fwd += raw.alt_depth_fwd;
+        acc.alt_depth_rev += raw.alt_depth_rev;
+        acc.extra_cnt += raw.extra_cnt;
+        acc.mean_pos += raw.mean_pos;
+        acc.mean_qual += raw.mean_qual;
+        acc.mean_mapq += raw.mean_mapq;
+        acc.nm += raw.nm;
+        acc.low_qual_read_cnt += raw.low_qual_read_cnt;
+        acc.high_qual_read_cnt += raw.high_qual_read_cnt;
+        acc.pstd = acc.pstd || raw.pstd || (acc.pp > 0 && raw.pp > 0 && acc.pp != raw.pp);
+        acc.qstd = acc.qstd || raw.qstd || (acc.pq > 0.0 && raw.pq > 0.0 && acc.pq != raw.pq);
+        if raw.pp > 0 {
+            acc.pp = raw.pp;
+        }
+        if raw.pq > 0.0 {
+            acc.pq = raw.pq;
+        }
+    }
+
     /// Create a new pipeline with default settings
     pub fn new(sample_name: &str) -> Self {
         Self {
@@ -2426,8 +2447,10 @@ impl VarDictPipeline {
         duprate: f64,
     ) -> Option<String> {
         use crate::mods::to_vars_builder::{check_strand_bias, StrandBiasFlag, StrandBiasValue};
+        use std::collections::BTreeMap;
 
         let mut sv_string: Option<String> = None;
+        let mut merged: BTreeMap<String, RawVariant> = BTreeMap::new();
 
         for desc in keys {
             if matches!(desc, VarDesc::Raw { desc } if desc.as_slice() == b"SV") {
@@ -2445,13 +2468,17 @@ impl VarDictPipeline {
             let Some(raw_var) = vars_at_pos.get(desc) else {
                 continue;
             };
+            let desc_str = desc.to_key_string();
+            merged
+                .entry(desc_str)
+                .and_modify(|acc| Self::merge_raw_variant(acc, raw_var))
+                .or_insert_with(|| raw_var.clone());
+        }
+
+        for (desc_str, raw_var) in merged {
             let fwd = raw_var.alt_depth_fwd;
             let rev = raw_var.alt_depth_rev;
-            let total_count = if raw_var.alt_depth > 0 {
-                raw_var.alt_depth
-            } else {
-                fwd + rev
-            };
+            let total_count = raw_var.alt_depth;
             if total_count == 0 {
                 continue;
             }
@@ -2471,7 +2498,7 @@ impl VarDictPipeline {
             }
 
             let mut variant = Variant::new();
-            variant.description_string = desc.to_key_string();
+            variant.description_string = desc_str;
             variant.position_coverage = total_count;
             variant.vars_count_on_forward = fwd;
             variant.vars_count_on_reverse = rev;
@@ -2522,6 +2549,7 @@ impl VarDictPipeline {
         duprate: f64,
     ) -> usize {
         use crate::mods::to_vars_builder::{check_strand_bias, StrandBiasFlag, StrandBiasValue};
+        use std::collections::BTreeMap;
 
         let Some(insertion_variations) = insertion_vars else {
             return total_pos_coverage;
@@ -2529,25 +2557,31 @@ impl VarDictPipeline {
 
         let mut running_hicov = hicov;
 
+        let mut merged: BTreeMap<String, RawVariant> = BTreeMap::new();
         let mut keys: Vec<VarDesc> = insertion_variations.keys().cloned().collect();
         keys.sort_by(|a, b| a.to_key_string().cmp(&b.to_key_string()));
-
         for desc in keys {
             let desc_str = desc.to_key_string();
+            let Some(cnt) = insertion_variations.get(&desc) else {
+                continue;
+            };
+            merged
+                .entry(desc_str)
+                .and_modify(|acc| Self::merge_raw_variant(acc, cnt))
+                .or_insert_with(|| cnt.clone());
+        }
+
+        for (desc_str, cnt) in merged {
             if desc_str.contains('&') {
                 if let Some(&coverage) = ref_coverage.get(&(position + 1)) {
                     total_pos_coverage = coverage;
                 }
             }
 
-            let Some(cnt) = insertion_variations.get(&desc) else {
-                continue;
-            };
-
             let fwd = cnt.alt_depth_fwd;
             let rev = cnt.alt_depth_rev;
             let bias = check_strand_bias(fwd, rev);
-            let total_count = if cnt.alt_depth > 0 { cnt.alt_depth } else { fwd + rev };
+            let total_count = cnt.alt_depth;
             if total_count == 0 {
                 continue;
             }

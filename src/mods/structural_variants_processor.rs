@@ -2685,6 +2685,8 @@ impl StructuralVariantsProcessor {
             seq_work.reverse();
         }
 
+        let mut persistent_extra: Vec<u8> = Vec::new();
+
         if seq_work.len() < seed_len {
             return MatchResult::default();
         }
@@ -2706,26 +2708,25 @@ impl StructuralVariantsProcessor {
             };
 
             if self.is_match_ref(&seq_work, bp, dir, mm) {
-                let mut extra: Vec<u8> = Vec::new();
                 let mut mm_idx: i64 = if dir == -1 { -1 } else { 0 };
                 loop {
                     let Some(ch) = Self::char_at(&seq_work, mm_idx) else {
                         break;
                     };
                     if self.is_has_and_not_equals(bp, ch) {
-                        extra.push(ch);
+                        persistent_extra.push(ch);
                         bp += dir;
                         mm_idx += dir;
                     } else {
                         break;
                     }
                 }
-                if !extra.is_empty() && dir == -1 {
-                    extra.reverse();
+                if !persistent_extra.is_empty() && dir == -1 {
+                    persistent_extra.reverse();
                 }
                 return MatchResult {
                     base_position: bp,
-                    matched_sequence: extra,
+                    matched_sequence: persistent_extra,
                 };
             }
 
@@ -2771,6 +2772,8 @@ impl StructuralVariantsProcessor {
                     }
                     Self::substr_bytes(&seq_work, -(ii as i64), None)
                 };
+
+                persistent_extra = extra.clone();
 
                 if eqcnt >= 3 && (eqcnt as f64 / ii as f64) > 0.5 {
                     break;
