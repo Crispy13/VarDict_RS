@@ -2091,7 +2091,7 @@ impl VarDictPipeline {
             ..
         } = input;
         let mut non_insertion_vars = non_insertion_vars;
-        let mut insertion_vars = insertion_vars;
+        let insertion_vars = insertion_vars;
 
         let debug_pos = env::var("VARDICT_DEBUG_POS")
             .ok()
@@ -2110,23 +2110,14 @@ impl VarDictPipeline {
             );
         }
 
-        let mut position_keys: Vec<i64> = non_insertion_vars.keys().copied().collect();
-        let mut seen_positions: HashSet<i64> = position_keys.iter().copied().collect();
-        for pos in insertion_vars.keys().copied() {
-            if seen_positions.insert(pos) {
-                position_keys.push(pos);
-            }
-        }
+        let position_keys: Vec<i64> = non_insertion_vars.keys().copied().collect();
 
-        let nonins_java_capacity = java_hashmap_capacity(
-            non_insertion_vars_insert_index
-                .len()
-                .max(seen_positions.len()),
-        );
+        let nonins_java_capacity =
+            java_hashmap_capacity(non_insertion_vars_insert_index.len().max(position_keys.len()));
         let positions = java_hashmap_iteration_order_with_capacity(
             position_keys.into_iter(),
             nonins_java_capacity,
-            None,
+            Some(&non_insertion_vars_insert_index),
         );
 
         for position in positions {
@@ -4041,7 +4032,7 @@ impl VarDictPipeline {
         
         // Get tseq (from position to position + deletion_len + 70)
         // For deletions, tseq1 is the deleted portion, tseq2 is what follows
-        let tseq = self.get_reference_range(reference, position, position + (del_len as i64) - 1 + 70);
+        let tseq = self.get_reference_range(reference, position, position + (del_len as i64) + 70);
         
         if tseq.len() < del_len {
             return (0.0, 0.0, 0);
@@ -5098,6 +5089,7 @@ impl VarDictPipeline {
                 }
 
                 let mut variant = variant.clone();
+                variant.vartype = var_type_label_to_enum(&var_type, &variant.varallele);
                 if var_type == "Complex" {
                     variant.adj_complex();
                 }
@@ -5354,6 +5346,18 @@ fn infer_var_type_from_alleles(refallele: &str, varallele: &str) -> VarType {
     VarType::Complex {
         insertion: varallele.to_string(),
         deletion: refallele.len(),
+    }
+}
+
+fn var_type_label_to_enum(var_type: &str, varallele: &str) -> VarType {
+    match var_type {
+        "SNV" => VarType::SNV(varallele.chars().next().unwrap_or('N')),
+        "Insertion" => VarType::Insertion(String::new()),
+        "Deletion" => VarType::Deletion(0),
+        _ => VarType::Complex {
+            insertion: String::new(),
+            deletion: 0,
+        },
     }
 }
 

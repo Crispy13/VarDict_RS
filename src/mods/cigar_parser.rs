@@ -2608,7 +2608,7 @@ impl CigarParser {
 
             if is_next_after_num_matched(cigar, ci, 3) {
                 let seg_len = cigar.get(ci + 3).unwrap().len() as usize;
-                if let Some((offset, tnm, seq, qual)) = self.find_offset(
+                if let Some((offset, _tnm, seq, qual)) = self.find_offset(
                     self.start as usize + multoffs,
                     self.read_pos_including_softclip + ins_len + multoffp,
                     seg_len,
@@ -2616,7 +2616,6 @@ impl CigarParser {
                     query_qual,
                 )? {
                     self.offset = offset;
-                    nmoff += tnm;
                     ss = seq;
                     qual_seg.extend_from_slice(&qual);
                 }

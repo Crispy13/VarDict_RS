@@ -136,7 +136,7 @@ pub struct SimpleOutputVariant {
 impl SimpleOutputVariant {
     /// Create a SimpleOutputVariant from a Variant and Region
     pub fn from_variant(variant: &Variant, region: &Region, sample: &str, sv: &str) -> Self {
-        let var_type_str = var_type_string(&variant.refallele, &variant.varallele);
+        let var_type_str = format_var_type(&variant.vartype);
         
         // Detect reference call (ref == alt)
         let is_ref_call = variant.refallele == variant.varallele;
