@@ -5,8 +5,8 @@ use std::{
     fmt::Debug,
     ops::{Range, RangeFrom},
     slice::SliceIndex,
-    sync::atomic::Ordering as AtomicOrdering,
     str::Utf8Error,
+    sync::atomic::Ordering as AtomicOrdering,
 };
 
 pub mod aligner;
@@ -42,10 +42,7 @@ pub fn print_exception_and_continue(
         }
     }
 
-    let current_count = conf
-        .exception_counter
-        .fetch_add(1, AtomicOrdering::SeqCst)
-        + 1;
+    let current_count = conf.exception_counter.fetch_add(1, AtomicOrdering::SeqCst) + 1;
 
     if current_count > crate::conf::Configuration::MAX_EXCEPTION_COUNT {
         event!(
@@ -60,11 +57,7 @@ pub fn print_exception_and_continue(
 }
 
 pub fn round_half_even(pattern: &str, value: f64) -> f64 {
-    let decimals = pattern
-        .split('.')
-        .nth(1)
-        .map(|s| s.len())
-        .unwrap_or(0);
+    let decimals = pattern.split('.').nth(1).map(|s| s.len()).unwrap_or(0);
     if decimals == 0 {
         return round_half_even_with_scale(value, 1.0).0;
     }
@@ -84,7 +77,9 @@ fn round_half_even_with_scale(value: f64, scale: f64) -> (f64, bool) {
 
     let scale_int = scale.round() as u64;
     if (scale - scale_int as f64).abs() < f64::EPSILON {
-        if let Some((floor, frac_cmp_half)) = exact_scaled_floor_and_frac_cmp_half(value.abs(), scale_int) {
+        if let Some((floor, frac_cmp_half)) =
+            exact_scaled_floor_and_frac_cmp_half(value.abs(), scale_int)
+        {
             let rounded = match frac_cmp_half {
                 Ordering::Less => floor,
                 Ordering::Greater => floor.saturating_add(1),
@@ -391,12 +386,8 @@ mod tests {
     fn test_print_exception_and_continue_threshold() {
         let mut conf = crate::conf::Configuration::default();
         conf.exception_counter = Arc::new(AtomicUsize::new(0));
-        let region = crate::data::region::Region::new(
-            "chr1".to_string(),
-            1,
-            10,
-            "GENE".to_string(),
-        );
+        let region =
+            crate::data::region::Region::new("chr1".to_string(), 1, 10, "GENE".to_string());
 
         for _ in 0..crate::conf::Configuration::MAX_EXCEPTION_COUNT {
             print_exception_and_continue(

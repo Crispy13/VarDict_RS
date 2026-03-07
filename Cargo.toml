@@ -21,6 +21,12 @@ rust-htslib = { git = "https://github.com/Crispy13/rust-htslib.git", branch = "d
 smallvec = "1.15.1"
 rayon = "1.11.0"
 statrs = "0.17"
+rustc-hash = { version = "2.1", default-features = false }
+mimalloc = { version = "0.1.48", features = ["secure"], optional = true }
+
+[features]
+default = []
+mimalloc-global = ["dep:mimalloc"]
 
 [profile.dev]
 incremental = true

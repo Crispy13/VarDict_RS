@@ -13,9 +13,9 @@
 use std::collections::HashMap;
 
 use crate::mods::{
-    to_vars_builder::{ToVarsBuilder, Variant, VariationData, Vars, VarType},
-    output_variant::{SimpleOutputVariant, Region},
+    output_variant::{Region, SimpleOutputVariant},
     simple_variant_caller::SimpleVarKey,
+    to_vars_builder::{ToVarsBuilder, VarType, Variant, VariationData, Vars},
 };
 
 /// Pipeline configuration
@@ -156,7 +156,7 @@ impl Pipeline {
     }
 
     /// Process variations and generate output variants
-    /// 
+    ///
     /// Input: Raw variation data grouped by (position, SimpleVarKey)
     /// Output: Formatted output lines ready for writing
     pub fn process_variations(
@@ -170,7 +170,7 @@ impl Pipeline {
 
         // Step 2: Convert to output format
         let mut output_lines = Vec::new();
-        
+
         // Sort positions for consistent output
         let mut positions: Vec<i64> = vars_by_position.keys().cloned().collect();
         positions.sort();
@@ -225,7 +225,7 @@ impl Pipeline {
 // ============================================================================
 
 /// Convert raw cigar parser variant data to VariationData for ToVarsBuilder
-/// 
+///
 /// This bridges the gap between the low-level CigarParser output and
 /// the higher-level ToVarsBuilder input.
 pub fn convert_raw_variant_to_variation_data(
@@ -337,7 +337,7 @@ mod tests {
         let config = PipelineConfig::new("my_sample")
             .with_min_frequency(0.05)
             .with_quality_threshold(22.5);
-        
+
         assert_eq!(config.sample_name, "my_sample");
         assert_eq!(config.min_frequency, 0.05);
         assert_eq!(config.quality_threshold, 22.5);
@@ -352,10 +352,8 @@ mod tests {
 
     #[test]
     fn test_convert_raw_variant() {
-        let data = convert_raw_variant_to_variation_data(
-            10, 30, 60, false, "read1"
-        );
-        
+        let data = convert_raw_variant_to_variation_data(10, 30, 60, false, "read1");
+
         assert_eq!(data.position_in_read, 10);
         assert_eq!(data.quality, 30);
         assert_eq!(data.mapping_quality, 60);
@@ -365,10 +363,8 @@ mod tests {
 
     #[test]
     fn test_create_snv_entry() {
-        let (pos, key, data) = create_variation_entry(
-            1000, "A", "T", 10, 30, 60, false, "read1"
-        );
-        
+        let (pos, key, data) = create_variation_entry(1000, "A", "T", 10, 30, 60, false, "read1");
+
         assert_eq!(pos, 1000);
         assert_eq!(key.to_key_string(), "A>T");
         assert_eq!(data.position_in_read, 10);
@@ -376,10 +372,8 @@ mod tests {
 
     #[test]
     fn test_create_insertion_entry() {
-        let (pos, key, data) = create_insertion_entry(
-            1000, "ATG", 10, 30, 60, true, "read1"
-        );
-        
+        let (pos, key, data) = create_insertion_entry(1000, "ATG", 10, 30, 60, true, "read1");
+
         assert_eq!(pos, 1000);
         assert_eq!(key.to_key_string(), "+ATG");
         assert!(data.is_reverse);
@@ -387,10 +381,8 @@ mod tests {
 
     #[test]
     fn test_create_deletion_entry() {
-        let (pos, key, data) = create_deletion_entry(
-            1000, "ACGTG", 10, 30, 60, false, "read1"
-        );
-        
+        let (pos, key, data) = create_deletion_entry(1000, "ACGTG", 10, 30, 60, false, "read1");
+
         assert_eq!(pos, 1000);
         assert_eq!(key.to_key_string(), "-5");
         assert_eq!(data.quality, 30);
@@ -415,7 +407,7 @@ mod tests {
 
         // Should have one output line (one variant type at one position)
         assert_eq!(output.len(), 1);
-        
+
         // Check output contains expected fields
         let line = &output[0];
         assert!(line.contains("test_sample"));
@@ -449,8 +441,7 @@ mod tests {
 
     #[test]
     fn test_pipeline_process_and_filter() {
-        let config = PipelineConfig::new("sample1")
-            .with_min_frequency(0.05);
+        let config = PipelineConfig::new("sample1").with_min_frequency(0.05);
         let pipeline = Pipeline::new(config);
         let region = create_test_region();
 
@@ -458,18 +449,32 @@ mod tests {
         // Position 1000: 5 reads out of 100 = 5% (passes filter)
         // Position 1010: 2 reads out of 100 = 2% (fails filter)
         let mut variations = Vec::new();
-        
+
         // 5 reads at position 1000
         for i in 0..5 {
             variations.push(create_variation_entry(
-                1000, "A", "T", 10 + i, 30, 60, i % 2 == 0, &format!("read_{}", i)
+                1000,
+                "A",
+                "T",
+                10 + i,
+                30,
+                60,
+                i % 2 == 0,
+                &format!("read_{}", i),
             ));
         }
-        
+
         // 2 reads at position 1010
         for i in 0..2 {
             variations.push(create_variation_entry(
-                1010, "C", "G", 10 + i, 30, 60, false, &format!("read_b_{}", i)
+                1010,
+                "C",
+                "G",
+                10 + i,
+                30,
+                60,
+                false,
+                &format!("read_b_{}", i),
             ));
         }
 
@@ -488,7 +493,7 @@ mod tests {
     fn test_pipeline_get_header() {
         let pipeline = Pipeline::new(PipelineConfig::default());
         let header = pipeline.get_header();
-        
+
         // Header should have 36 columns
         let cols: Vec<&str> = header.split('\t').collect();
         assert_eq!(cols.len(), 36);
@@ -515,21 +520,35 @@ mod tests {
         // meanPosition = 9, meanQuality = 26, meanMappingQuality = 7.8
         // strandBiasFlag = "2" (strong bias), hicnt = 44
         // highQualityToLowQualityRatio = 2.5, numberOfMismatches = 2.0
-        
+
         // Create 8 variations (3 forward + 5 reverse) with properties that produce Java values
         let mut variations = Vec::new();
-        
+
         // 3 forward strand reads
         for i in 0..3 {
             variations.push(create_variation_entry(
-                1, "T", "A", 9, 26, 8, false, &format!("fwd_{}", i)
+                1,
+                "T",
+                "A",
+                9,
+                26,
+                8,
+                false,
+                &format!("fwd_{}", i),
             ));
         }
-        
+
         // 5 reverse strand reads
         for i in 0..5 {
             variations.push(create_variation_entry(
-                1, "T", "A", 9, 26, 8, true, &format!("rev_{}", i)
+                1,
+                "T",
+                "A",
+                9,
+                26,
+                8,
+                true,
+                &format!("rev_{}", i),
             ));
         }
 
@@ -540,13 +559,13 @@ mod tests {
 
         // Should have one output line
         assert_eq!(output.len(), 1);
-        
+
         let line = &output[0];
         let cols: Vec<&str> = line.split('\t').collect();
-        
+
         // Verify 36 columns
         assert_eq!(cols.len(), 36, "Expected 36 columns, got {}", cols.len());
-        
+
         // Verify key fields match Java output format:
         // "test_bam\tgene_name\t1\t0\t0\tT\tA\t0\t4\t0\t0\t3\t5\tT/A\t0.4000..."
         assert_eq!(cols[0], "test_bam", "Sample name");
@@ -604,8 +623,12 @@ mod tests {
         let output = pipeline.process_variations(variations, &coverage, &region);
 
         // Should have 2 output lines (2 different variants at same position)
-        assert_eq!(output.len(), 2, "Expected 2 output lines for 2 variant types");
-        
+        assert_eq!(
+            output.len(),
+            2,
+            "Expected 2 output lines for 2 variant types"
+        );
+
         // Both should be for the same sample and gene
         for line in &output {
             assert!(line.starts_with("test_bam\tgene_name\t1"));
@@ -616,8 +639,7 @@ mod tests {
     /// Variants with strong strand bias and low quality should be filtered
     #[test]
     fn test_bad_variant_filtering() {
-        let config = PipelineConfig::new("test_bam")
-            .with_min_frequency(0.1); // Require 10% frequency
+        let config = PipelineConfig::new("test_bam").with_min_frequency(0.1); // Require 10% frequency
         let pipeline = Pipeline::new(config);
         let region = Region::new("1", 1, 10, "gene_name");
 
@@ -633,6 +655,9 @@ mod tests {
         let filtered = pipeline.process_and_filter(variations, &coverage, &region);
 
         // Should be filtered out (2% < 10%)
-        assert!(filtered.is_empty(), "Low frequency variant should be filtered");
+        assert!(
+            filtered.is_empty(),
+            "Low frequency variant should be filtered"
+        );
     }
 }

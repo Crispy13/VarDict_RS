@@ -2,15 +2,16 @@ use std::collections::{HashMap, VecDeque};
 
 use rust_htslib::bam::record::Cigar;
 
+use crate::prelude::LibDefaultHasher;
 use crate::variants::variants::Variant;
 
+pub mod bam_reader;
 pub(crate) mod patterns;
 pub mod reference;
 pub mod region;
-pub mod bam_reader;
 pub mod shared_reference;
 
-pub(crate) type VariantMap = HashMap<String, Variant>;
+pub(crate) type VariantMap = HashMap<String, Variant, LibDefaultHasher>;
 
 pub(crate) struct ModifiedCigar<'a> {
     pub(crate) align_start_pos: i64,

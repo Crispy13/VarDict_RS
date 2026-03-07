@@ -43,8 +43,8 @@
 //! 35. Duplicate rate
 //! 36. Structural variant info
 
-use crate::mods::to_vars_builder::{Variant, VarType, StrandBiasFlag, var_type_string};
-use crate::scopedata::global_read_only_scope::{instance, INSTANCE};
+use crate::mods::to_vars_builder::{StrandBiasFlag, VarType, Variant, var_type_string};
+use crate::scopedata::global_read_only_scope::{INSTANCE, instance};
 use crate::utils::round_half_even;
 use statrs::distribution::{Discrete, DiscreteCDF, Hypergeometric};
 
@@ -101,27 +101,27 @@ pub struct SimpleOutputVariant {
     // Genotype & Frequency
     pub genotype: String,
     pub frequency: f64,
-    pub bias: String,  // "flag;flag" format
+    pub bias: String, // "flag;flag" format
 
     // Position metrics
-    pub pmean: f64,    // Mean position in read
-    pub pstd: i32,     // Position std flag (0 or 1)
+    pub pmean: f64, // Mean position in read
+    pub pstd: i32,  // Position std flag (0 or 1)
 
     // Quality metrics
-    pub qual: f64,     // Mean base quality
-    pub qstd: i32,     // Quality std flag (0 or 1)
-    pub mapq: f64,     // Mean mapping quality
-    pub qratio: f64,   // High/low quality ratio
-    pub hifreq: f64,   // High-quality frequency
-    pub extrafreq: f64,// Extra frequency
+    pub qual: f64,      // Mean base quality
+    pub qstd: i32,      // Quality std flag (0 or 1)
+    pub mapq: f64,      // Mean mapping quality
+    pub qratio: f64,    // High/low quality ratio
+    pub hifreq: f64,    // High-quality frequency
+    pub extrafreq: f64, // Extra frequency
 
     // Special metrics
     pub shift3: i32,
     pub msi: f64,
     pub msint: f64,
-    pub nm: f64,       // Number of mismatches
-    pub hicnt: usize,  // High-quality count
-    pub hicov: usize,  // High-quality coverage
+    pub nm: f64,      // Number of mismatches
+    pub hicnt: usize, // High-quality count
+    pub hicov: usize, // High-quality coverage
 
     // Context
     pub left_sequence: String,
@@ -137,36 +137,40 @@ impl SimpleOutputVariant {
     /// Create a SimpleOutputVariant from a Variant and Region
     pub fn from_variant(variant: &Variant, region: &Region, sample: &str, sv: &str) -> Self {
         let var_type_str = format_var_type(&variant.vartype);
-        
+
         // Detect reference call (ref == alt)
         let is_ref_call = variant.refallele == variant.varallele;
-        
+
         // Bias is "ref_bias;var_bias" format for all calls (Java uses variant.strandBiasFlag)
         let bias = format_strand_bias(variant.strand_bias_flag);
-        
+
         // For reference calls, counts go to ref_fwd/ref_rev, not var_fwd/var_rev
         let (variant_coverage, ref_fwd, ref_rev, var_fwd, var_rev, frequency) = if is_ref_call {
             (
-                0,  // variant_coverage = 0 for ref calls
+                0, // variant_coverage = 0 for ref calls
                 variant.ref_forward_count,
                 variant.ref_reverse_count,
-                0,  // var counts = 0
+                0, // var counts = 0
                 0,
-                0.0,  // frequency = 0 for ref calls
+                0.0, // frequency = 0 for ref calls
             )
         } else {
             (
                 variant.position_coverage,
-                variant.ref_forward_count,  // Reference forward counts from same position
-                variant.ref_reverse_count,  // Reference reverse counts from same position
+                variant.ref_forward_count, // Reference forward counts from same position
+                variant.ref_reverse_count, // Reference reverse counts from same position
                 variant.vars_count_on_forward,
                 variant.vars_count_on_reverse,
                 variant.frequency,
             )
         };
-        
+
         // For reference calls, vartype should be empty
-        let final_var_type = if is_ref_call { String::new() } else { var_type_str };
+        let final_var_type = if is_ref_call {
+            String::new()
+        } else {
+            var_type_str
+        };
 
         let chr = normalize_chr_for_output(&region.chr);
         SimpleOutputVariant {
@@ -190,9 +194,17 @@ impl SimpleOutputVariant {
             bias,
 
             pmean: variant.mean_position,
-            pstd: if variant.is_at_least_at_2_positions { 1 } else { 0 },
+            pstd: if variant.is_at_least_at_2_positions {
+                1
+            } else {
+                0
+            },
             qual: variant.mean_quality,
-            qstd: if variant.has_at_least_2_diff_qualities { 1 } else { 0 },
+            qstd: if variant.has_at_least_2_diff_qualities {
+                1
+            } else {
+                0
+            },
             mapq: variant.mean_mapping_quality,
             // qratio: high_qual_read_cnt / low_qual_read_cnt (handle divide by zero)
             // For ref calls with no reads, qratio should be 0; otherwise calculate normally
@@ -214,13 +226,25 @@ impl SimpleOutputVariant {
             hicnt: variant.high_qual_read_cnt,
             hicov: variant.hicov,
 
-            left_sequence: if variant.leftseq.is_empty() { "0".to_string() } else { variant.leftseq.clone() },
-            right_sequence: if variant.rightseq.is_empty() { "0".to_string() } else { variant.rightseq.clone() },
+            left_sequence: if variant.leftseq.is_empty() {
+                "0".to_string()
+            } else {
+                variant.leftseq.clone()
+            },
+            right_sequence: if variant.rightseq.is_empty() {
+                "0".to_string()
+            } else {
+                variant.rightseq.clone()
+            },
             region: format!("{}:{}-{}", chr, region.start, region.end),
             var_type: final_var_type,
             duprate: variant.duprate,
             crispr: variant.crispr,
-            sv: if sv.is_empty() { "0".to_string() } else { sv.to_string() },
+            sv: if sv.is_empty() {
+                "0".to_string()
+            } else {
+                sv.to_string()
+            },
         }
     }
 
@@ -293,7 +317,6 @@ impl SimpleOutputVariant {
             self.end_position.to_string(),
             self.ref_allele.clone(),
             self.var_allele.clone(),
-
             // 8-13: Coverage
             self.total_coverage.to_string(),
             self.variant_coverage.to_string(),
@@ -301,36 +324,29 @@ impl SimpleOutputVariant {
             self.reference_reverse_count.to_string(),
             self.variant_forward_count.to_string(),
             self.variant_reverse_count.to_string(),
-
             // 14-16: Genotype, frequency, bias
             self.genotype.clone(),
             format_f64(self.frequency, 4),
             self.bias.clone(),
-
             // 17-18: Position metrics
             format_f64(self.pmean, 1),
             self.pstd.to_string(),
-
             // 19-20: Quality metrics
             format_f64(self.qual, 1),
             self.qstd.to_string(),
-
             // 21-24: More quality metrics
             format_f64(self.mapq, 1),
             format_f64(self.qratio, 3),
             format_f64(self.hifreq, 4),
             format_f64(self.extrafreq, 4),
-
             // 25-28: Special metrics
             self.shift3.to_string(),
             format_f64(self.msi, 3),
             format_f64(self.msint, 0),
             format_f64(self.nm, 1),
-
             // 29-30: High-quality counts
             self.hicnt.to_string(),
             self.hicov.to_string(),
-
             // 31-36: Context and type
             self.left_sequence.clone(),
             self.right_sequence.clone(),
@@ -428,12 +444,19 @@ impl SimpleOutputVariant {
 
 impl std::fmt::Display for SimpleOutputVariant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let fisher_enabled = INSTANCE.get().map(|scope| scope.conf.fisher).unwrap_or(false);
+        let fisher_enabled = INSTANCE
+            .get()
+            .map(|scope| scope.conf.fisher)
+            .unwrap_or(false);
         let crispr_enabled = INSTANCE
             .get()
             .map(|scope| scope.conf.crispr_cutting_site != 0)
             .unwrap_or(false);
-        write!(f, "{}", self.to_string_with_flags(fisher_enabled, crispr_enabled))
+        write!(
+            f,
+            "{}",
+            self.to_string_with_flags(fisher_enabled, crispr_enabled)
+        )
     }
 }
 
@@ -516,13 +539,21 @@ impl AmpliconOutputVariant {
                 reference_reverse_count: v.ref_reverse_count,
                 variant_forward_count: v.vars_count_on_forward,
                 variant_reverse_count: v.vars_count_on_reverse,
-                genotype: if v.genotype.is_empty() { "0".to_string() } else { v.genotype.clone() },
+                genotype: if v.genotype.is_empty() {
+                    "0".to_string()
+                } else {
+                    v.genotype.clone()
+                },
                 frequency: v.frequency,
                 bias: v.strand_bias_flag.to_string(),
                 pmean: v.mean_position,
                 pstd: if v.is_at_least_at_2_positions { 1 } else { 0 },
                 qual: v.mean_quality,
-                qstd: if v.has_at_least_2_diff_qualities { 1 } else { 0 },
+                qstd: if v.has_at_least_2_diff_qualities {
+                    1
+                } else {
+                    0
+                },
                 mapq: v.mean_mapping_quality,
                 qratio: if v.low_qual_read_cnt > 0 {
                     v.high_qual_read_cnt as f64 / v.low_qual_read_cnt as f64
@@ -539,8 +570,16 @@ impl AmpliconOutputVariant {
                 nm: if v.nm > 0.0 { v.nm } else { 0.0 },
                 hicnt: v.high_qual_read_cnt,
                 hicov: v.hicov,
-                left_sequence: if v.leftseq.is_empty() { "0".to_string() } else { v.leftseq.clone() },
-                right_sequence: if v.rightseq.is_empty() { "0".to_string() } else { v.rightseq.clone() },
+                left_sequence: if v.leftseq.is_empty() {
+                    "0".to_string()
+                } else {
+                    v.leftseq.clone()
+                },
+                right_sequence: if v.rightseq.is_empty() {
+                    "0".to_string()
+                } else {
+                    v.rightseq.clone()
+                },
                 region: output_region,
                 var_type: var_type_string(&v.refallele, &v.varallele),
                 good_variants_count,
@@ -728,9 +767,19 @@ impl AmpliconOutputVariant {
 
 impl std::fmt::Display for AmpliconOutputVariant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let fisher_enabled = INSTANCE.get().map(|scope| scope.conf.fisher).unwrap_or(false);
-        let debug_enabled = INSTANCE.get().map(|scope| scope.conf.debug).unwrap_or(false);
-        write!(f, "{}", self.to_string_with_flags(fisher_enabled, debug_enabled))
+        let fisher_enabled = INSTANCE
+            .get()
+            .map(|scope| scope.conf.fisher)
+            .unwrap_or(false);
+        let debug_enabled = INSTANCE
+            .get()
+            .map(|scope| scope.conf.debug)
+            .unwrap_or(false);
+        write!(
+            f,
+            "{}",
+            self.to_string_with_flags(fisher_enabled, debug_enabled)
+        )
     }
 }
 
@@ -915,8 +964,11 @@ impl SomaticOutputVariant {
             output.var1_frequency = tumor_variant.frequency;
             output.var1_strand_bias_flag = format_somatic_strand_bias(tumor_variant);
             output.var1_mean_position = tumor_variant.mean_position;
-            output.var1_is_at_least_at_2_positions =
-                if tumor_variant.is_at_least_at_2_positions { 1 } else { 0 };
+            output.var1_is_at_least_at_2_positions = if tumor_variant.is_at_least_at_2_positions {
+                1
+            } else {
+                0
+            };
             output.var1_mean_quality = tumor_variant.mean_quality;
             output.var1_has_at_least_2_diff_qualities =
                 if tumor_variant.has_at_least_2_diff_qualities {
@@ -946,8 +998,11 @@ impl SomaticOutputVariant {
             output.var2_frequency = normal_variant.frequency;
             output.var2_strand_bias_flag = format_somatic_strand_bias(normal_variant);
             output.var2_mean_position = normal_variant.mean_position;
-            output.var2_is_at_least_at_2_positions =
-                if normal_variant.is_at_least_at_2_positions { 1 } else { 0 };
+            output.var2_is_at_least_at_2_positions = if normal_variant.is_at_least_at_2_positions {
+                1
+            } else {
+                0
+            };
             output.var2_mean_quality = normal_variant.mean_quality;
             output.var2_has_at_least_2_diff_qualities =
                 if normal_variant.has_at_least_2_diff_qualities {
@@ -995,7 +1050,14 @@ impl SomaticOutputVariant {
             format_f64(self.var1_high_quality_to_low_quality_ratio, 3),
             format_f64(self.var1_high_quality_reads_frequency, 4),
             format_f64(self.var1_extra_frequency, 4),
-            format_f64(if self.var1_nm > 0.0 { self.var1_nm } else { 0.0 }, 1),
+            format_f64(
+                if self.var1_nm > 0.0 {
+                    self.var1_nm
+                } else {
+                    0.0
+                },
+                1,
+            ),
             self.var2_total_coverage.to_string(),
             self.var2_variant_coverage.to_string(),
             self.var2_ref_forward_coverage.to_string(),
@@ -1013,7 +1075,14 @@ impl SomaticOutputVariant {
             format_f64(self.var2_high_quality_to_low_quality_ratio, 3),
             format_f64(self.var2_high_quality_reads_frequency, 4),
             format_f64(self.var2_extra_frequency, 4),
-            format_f64(if self.var2_nm > 0.0 { self.var2_nm } else { 0.0 }, 1),
+            format_f64(
+                if self.var2_nm > 0.0 {
+                    self.var2_nm
+                } else {
+                    0.0
+                },
+                1,
+            ),
             self.shift3.to_string(),
             format_f64(self.msi, 3),
             format_f64(self.msint, 0),
@@ -1032,8 +1101,16 @@ impl SomaticOutputVariant {
     }
 
     pub fn to_string_61_columns(&self) -> String {
-        let var1_nm = if self.var1_nm > 0.0 { self.var1_nm } else { 0.0 };
-        let var2_nm = if self.var2_nm > 0.0 { self.var2_nm } else { 0.0 };
+        let var1_nm = if self.var1_nm > 0.0 {
+            self.var1_nm
+        } else {
+            0.0
+        };
+        let var2_nm = if self.var2_nm > 0.0 {
+            self.var2_nm
+        } else {
+            0.0
+        };
         let msi_f = if self.msi == 0.0 {
             "0".to_string()
         } else {
@@ -1201,8 +1278,16 @@ fn format_variant_debug_content(variant: &Variant) -> String {
     }
 
     let total_variant_reads = variant.vars_count_on_forward + variant.vars_count_on_reverse;
-    let pstd = if variant.is_at_least_at_2_positions { 1 } else { 0 };
-    let qstd = if variant.has_at_least_2_diff_qualities { 1 } else { 0 };
+    let pstd = if variant.is_at_least_at_2_positions {
+        1
+    } else {
+        0
+    };
+    let qstd = if variant.has_at_least_2_diff_qualities {
+        1
+    } else {
+        0
+    };
 
     format!(
         "{}:{}:F-{}:R-{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
@@ -1233,8 +1318,16 @@ fn format_debug_amp_variant(variant: &Variant) -> String {
     } else {
         format_fixed_f64(variant.frequency, 4)
     };
-    let pstd = if variant.is_at_least_at_2_positions { 1 } else { 0 };
-    let qstd = if variant.has_at_least_2_diff_qualities { 1 } else { 0 };
+    let pstd = if variant.is_at_least_at_2_positions {
+        1
+    } else {
+        0
+    };
+    let qstd = if variant.has_at_least_2_diff_qualities {
+        1
+    } else {
+        0
+    };
     let hifreq = if variant.high_quality_reads_frequency == 0.0 {
         "0".to_string()
     } else {
@@ -1426,14 +1519,11 @@ impl FisherExact {
             return 1.0;
         }
 
-        let distribution = match Hypergeometric::new(
-            (self.m + self.n) as u64,
-            self.m as u64,
-            self.k as u64,
-        ) {
-            Ok(distribution) => distribution,
-            Err(_) => return 0.0,
-        };
+        let distribution =
+            match Hypergeometric::new((self.m + self.n) as u64, self.m as u64, self.k as u64) {
+                Ok(distribution) => distribution,
+                Err(_) => return 0.0,
+            };
 
         if upper_tail {
             if q <= 0 {
@@ -1457,20 +1547,13 @@ impl FisherExact {
                 continue;
             }
 
-            let distribution = Hypergeometric::new(
-                (self.m + self.n) as u64,
-                self.m as u64,
-                self.k as u64,
-            );
+            let distribution =
+                Hypergeometric::new((self.m + self.n) as u64, self.m as u64, self.k as u64);
 
             let value = match distribution {
                 Ok(distribution) => {
                     let value = distribution.ln_pmf(*element as u64);
-                    if value.is_finite() {
-                        value
-                    } else {
-                        0.0
-                    }
+                    if value.is_finite() { value } else { 0.0 }
                 }
                 Err(_) => 0.0,
             };
@@ -1486,17 +1569,17 @@ impl FisherExact {
             result.push(self.logdc[index] + ncp.ln() * *support_value as f64);
         }
 
-        let max_value = result
-            .iter()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max);
+        let max_value = result.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
         let exponent = result
             .iter()
             .map(|value| (*value - max_value).exp())
             .collect::<Vec<_>>();
         let sum: f64 = exponent.iter().sum();
-        exponent.iter().map(|value| *value / sum).collect::<Vec<_>>()
+        exponent
+            .iter()
+            .map(|value| *value / sum)
+            .collect::<Vec<_>>()
     }
 
     fn mnhyper(&self, ncp: f64) -> f64 {
@@ -1599,9 +1682,7 @@ where
                 p = -p;
             }
 
-            if p < (0.75 * cb * q - (tol_act * q).abs() / 2.0)
-                && p < (prev_step * q / 2.0).abs()
-            {
+            if p < (0.75 * cb * q - (tol_act * q).abs() / 2.0) && p < (prev_step * q / 2.0).abs() {
                 new_step = p / q;
             }
         }
@@ -1657,15 +1738,42 @@ fn format_var_type(var_type: &VarType) -> String {
 /// Get column headers for 36-column format
 pub fn get_column_headers() -> Vec<&'static str> {
     vec![
-        "Sample", "Gene", "Chr", "Start", "End", "Ref", "Alt",
-        "Depth", "AltDepth", "RefFwdReads", "RefRevReads", "AltFwdReads", "AltRevReads",
-        "Genotype", "AF", "Bias",
-        "PMean", "PStd",
-        "QMean", "QStd",
-        "MQ", "Sig_Noise", "HiAF", "ExtraAF",
-        "shift3", "MSI", "MSI_NT", "NM",
-        "HiCnt", "HiCov",
-        "5pFlankSeq", "3pFlankSeq", "Seg", "VarType", "Duprate", "SV_info"
+        "Sample",
+        "Gene",
+        "Chr",
+        "Start",
+        "End",
+        "Ref",
+        "Alt",
+        "Depth",
+        "AltDepth",
+        "RefFwdReads",
+        "RefRevReads",
+        "AltFwdReads",
+        "AltRevReads",
+        "Genotype",
+        "AF",
+        "Bias",
+        "PMean",
+        "PStd",
+        "QMean",
+        "QStd",
+        "MQ",
+        "Sig_Noise",
+        "HiAF",
+        "ExtraAF",
+        "shift3",
+        "MSI",
+        "MSI_NT",
+        "NM",
+        "HiCnt",
+        "HiCov",
+        "5pFlankSeq",
+        "3pFlankSeq",
+        "Seg",
+        "VarType",
+        "Duprate",
+        "SV_info",
     ]
 }
 
@@ -1690,16 +1798,44 @@ pub fn get_simple_header_line(crispr_enabled: bool) -> String {
 
 pub fn get_amplicon_column_headers() -> Vec<&'static str> {
     vec![
-        "Sample", "Gene", "Chr", "Start", "End", "Ref", "Alt",
-        "Depth", "AltDepth", "RefFwdReads", "RefRevReads", "AltFwdReads", "AltRevReads",
-        "Genotype", "AF", "Bias",
-        "PMean", "PStd",
-        "QMean", "QStd",
-        "MQ", "Sig_Noise", "HiAF", "ExtraAF",
-        "shift3", "MSI", "MSI_NT", "NM",
-        "HiCnt", "HiCov",
-        "5pFlankSeq", "3pFlankSeq", "Seg", "VarType",
-        "GoodVarCount", "TotalVarCount", "Nocov", "Ampflag",
+        "Sample",
+        "Gene",
+        "Chr",
+        "Start",
+        "End",
+        "Ref",
+        "Alt",
+        "Depth",
+        "AltDepth",
+        "RefFwdReads",
+        "RefRevReads",
+        "AltFwdReads",
+        "AltRevReads",
+        "Genotype",
+        "AF",
+        "Bias",
+        "PMean",
+        "PStd",
+        "QMean",
+        "QStd",
+        "MQ",
+        "Sig_Noise",
+        "HiAF",
+        "ExtraAF",
+        "shift3",
+        "MSI",
+        "MSI_NT",
+        "NM",
+        "HiCnt",
+        "HiCov",
+        "5pFlankSeq",
+        "3pFlankSeq",
+        "Seg",
+        "VarType",
+        "GoodVarCount",
+        "TotalVarCount",
+        "Nocov",
+        "Ampflag",
     ]
 }
 
@@ -1709,15 +1845,61 @@ pub fn get_amplicon_header_line() -> String {
 
 pub fn get_somatic_column_headers() -> Vec<&'static str> {
     vec![
-        "Sample", "Gene", "Chr", "Start", "End", "Ref", "Alt",
-        "Depth", "AltDepth", "RefFwdReads", "RefRevReads", "AltFwdReads", "AltRevReads",
-        "Genotype", "AF", "Bias", "PMean", "PStd", "QMean", "QStd", "MQ", "Sig_Noise",
-        "HiAF", "ExtraAF", "NM",
-        "Depth", "AltDepth", "RefFwdReads", "RefRevReads", "AltFwdReads", "AltRevReads",
-        "Genotype", "AF", "Bias", "PMean", "PStd", "QMean", "QStd", "MQ", "Sig_Noise",
-        "HiAF", "ExtraAF", "NM",
-        "shift3", "MSI", "MSI_NT", "5pFlankSeq", "3pFlankSeq", "Seg", "VarLabel", "VarType",
-        "Duprate1", "SV_info1", "Duprate2", "SV_info2",
+        "Sample",
+        "Gene",
+        "Chr",
+        "Start",
+        "End",
+        "Ref",
+        "Alt",
+        "Depth",
+        "AltDepth",
+        "RefFwdReads",
+        "RefRevReads",
+        "AltFwdReads",
+        "AltRevReads",
+        "Genotype",
+        "AF",
+        "Bias",
+        "PMean",
+        "PStd",
+        "QMean",
+        "QStd",
+        "MQ",
+        "Sig_Noise",
+        "HiAF",
+        "ExtraAF",
+        "NM",
+        "Depth",
+        "AltDepth",
+        "RefFwdReads",
+        "RefRevReads",
+        "AltFwdReads",
+        "AltRevReads",
+        "Genotype",
+        "AF",
+        "Bias",
+        "PMean",
+        "PStd",
+        "QMean",
+        "QStd",
+        "MQ",
+        "Sig_Noise",
+        "HiAF",
+        "ExtraAF",
+        "NM",
+        "shift3",
+        "MSI",
+        "MSI_NT",
+        "5pFlankSeq",
+        "3pFlankSeq",
+        "Seg",
+        "VarLabel",
+        "VarType",
+        "Duprate1",
+        "SV_info1",
+        "Duprate2",
+        "SV_info2",
     ]
 }
 
@@ -1755,17 +1937,44 @@ mod tests {
     fn test_format_strand_bias() {
         use crate::mods::to_vars_builder::StrandBiasValue;
         // Test with new struct format
-        assert_eq!(format_strand_bias(StrandBiasFlag::new(StrandBiasValue::CantAssess, StrandBiasValue::CantAssess)), "0;0");
-        assert_eq!(format_strand_bias(StrandBiasFlag::new(StrandBiasValue::NoBias, StrandBiasValue::NoBias)), "2;2");
-        assert_eq!(format_strand_bias(StrandBiasFlag::new(StrandBiasValue::NoBias, StrandBiasValue::HasBias)), "2;1");
+        assert_eq!(
+            format_strand_bias(StrandBiasFlag::new(
+                StrandBiasValue::CantAssess,
+                StrandBiasValue::CantAssess
+            )),
+            "0;0"
+        );
+        assert_eq!(
+            format_strand_bias(StrandBiasFlag::new(
+                StrandBiasValue::NoBias,
+                StrandBiasValue::NoBias
+            )),
+            "2;2"
+        );
+        assert_eq!(
+            format_strand_bias(StrandBiasFlag::new(
+                StrandBiasValue::NoBias,
+                StrandBiasValue::HasBias
+            )),
+            "2;1"
+        );
     }
 
     #[test]
     fn test_format_var_type() {
         assert_eq!(format_var_type(&VarType::SNV('A')), "SNV");
-        assert_eq!(format_var_type(&VarType::Insertion("ATG".to_string())), "Insertion");
+        assert_eq!(
+            format_var_type(&VarType::Insertion("ATG".to_string())),
+            "Insertion"
+        );
         assert_eq!(format_var_type(&VarType::Deletion(3)), "Deletion");
-        assert_eq!(format_var_type(&VarType::Complex { insertion: "A".to_string(), deletion: 2 }), "Complex");
+        assert_eq!(
+            format_var_type(&VarType::Complex {
+                insertion: "A".to_string(),
+                deletion: 2
+            }),
+            "Complex"
+        );
     }
 
     #[test]
@@ -1832,7 +2041,7 @@ mod tests {
         assert_eq!(output.variant_reverse_count, 5);
         assert_eq!(output.genotype, "0/1");
         assert!((output.frequency - 0.10).abs() < 0.001);
-        assert_eq!(output.bias, "2;2");  // NoBias for both ref and var
+        assert_eq!(output.bias, "2;2"); // NoBias for both ref and var
         assert_eq!(output.pstd, 1);
         assert_eq!(output.qstd, 1);
         assert_eq!(output.left_sequence, "ACGT");
@@ -1861,16 +2070,16 @@ mod tests {
         assert_eq!(fields.len(), 36);
 
         // Check key fields
-        assert_eq!(fields[0], "sample1");          // Sample
-        assert_eq!(fields[1], "GENE1");            // Gene
-        assert_eq!(fields[2], "chr1");             // Chr
-        assert_eq!(fields[3], "1500");             // Start
-        assert_eq!(fields[5], "A");                // Ref
-        assert_eq!(fields[6], "T");                // Alt
-        assert_eq!(fields[7], "100");              // Total coverage
-        assert_eq!(fields[13], "0/1");             // Genotype
-        assert_eq!(fields[14], "0.1000");          // Frequency
-        assert_eq!(fields[33], "SNV");             // VarType
+        assert_eq!(fields[0], "sample1"); // Sample
+        assert_eq!(fields[1], "GENE1"); // Gene
+        assert_eq!(fields[2], "chr1"); // Chr
+        assert_eq!(fields[3], "1500"); // Start
+        assert_eq!(fields[5], "A"); // Ref
+        assert_eq!(fields[6], "T"); // Alt
+        assert_eq!(fields[7], "100"); // Total coverage
+        assert_eq!(fields[13], "0/1"); // Genotype
+        assert_eq!(fields[14], "0.1000"); // Frequency
+        assert_eq!(fields[33], "SNV"); // VarType
     }
 
     #[test]
@@ -2202,25 +2411,45 @@ mod tests {
     #[test]
     fn test_fisher_exact_counts_java_parity() {
         let cases = vec![
-            (121usize, 55usize, 18usize, 23usize, 0.00378, 0.99908, 0.00287, 2.79657),
+            (
+                121usize, 55usize, 18usize, 23usize, 0.00378, 0.99908, 0.00287, 2.79657,
+            ),
             (121usize, 5usize, 18usize, 23usize, 0.0, 1.0, 0.0, 29.86184),
-            (37usize, 76usize, 1usize, 1usize, 1.0, 0.55362, 0.89275, 0.49015),
+            (
+                37usize, 76usize, 1usize, 1usize, 1.0, 0.55362, 0.89275, 0.49015,
+            ),
             (0usize, 0usize, 1usize, 0usize, 1.0, 1.0, 1.0, 0.0),
             (1usize, 0usize, 1usize, 0usize, 1.0, 1.0, 1.0, 0.0),
             (0usize, 0usize, 0usize, 0usize, 1.0, 1.0, 1.0, 0.0),
             (0usize, 1usize, 1usize, 0usize, 1.0, 0.5, 1.0, 0.0),
             (1usize, 1usize, 1usize, 0usize, 1.0, 0.66667, 1.0, 0.0),
             (1usize, 1usize, 1usize, 1usize, 1.0, 0.83333, 0.83333, 1.0),
-            (10usize, 10usize, 10usize, 1usize, 0.04722, 0.02599, 0.99802, 0.10703),
-            (10usize, 10usize, 10usize, 0usize, 0.01099, 0.00615, 1.0, 0.0),
+            (
+                10usize, 10usize, 10usize, 1usize, 0.04722, 0.02599, 0.99802, 0.10703,
+            ),
+            (
+                10usize, 10usize, 10usize, 0usize, 0.01099, 0.00615, 1.0, 0.0,
+            ),
             (69usize, 1usize, 74usize, 95usize, 0.0, 1.0, 0.0, 87.68597),
-            (41usize, 86usize, 1usize, 1usize, 0.54688, 0.54687, 0.89571, 0.47973),
-            (130usize, 189usize, 1usize, 0usize, 0.40937, 0.40937, 1.0, 0.0),
-            (83usize, 40usize, 1usize, 2usize, 0.25746, 0.96473, 0.25746, 4.09908),
-            (74usize, 117usize, 1usize, 0usize, 0.39062, 0.39063, 1.0, 0.0),
+            (
+                41usize, 86usize, 1usize, 1usize, 0.54688, 0.54687, 0.89571, 0.47973,
+            ),
+            (
+                130usize, 189usize, 1usize, 0usize, 0.40937, 0.40937, 1.0, 0.0,
+            ),
+            (
+                83usize, 40usize, 1usize, 2usize, 0.25746, 0.96473, 0.25746, 4.09908,
+            ),
+            (
+                74usize, 117usize, 1usize, 0usize, 0.39062, 0.39063, 1.0, 0.0,
+            ),
             (60usize, 62usize, 2usize, 0usize, 0.49593, 0.24797, 1.0, 0.0),
-            (43usize, 83usize, 1usize, 1usize, 1.0, 0.57111, 0.88361, 0.52091),
-            (78usize, 40usize, 1usize, 1usize, 1.0, 0.88515, 0.56849, 1.93844),
+            (
+                43usize, 83usize, 1usize, 1usize, 1.0, 0.57111, 0.88361, 0.52091,
+            ),
+            (
+                78usize, 40usize, 1usize, 1usize, 1.0, 0.88515, 0.56849, 1.93844,
+            ),
         ];
 
         for (ref_fwd, ref_rev, alt_fwd, alt_rev, pvalue, p_less, p_greater, odd_ratio) in cases {

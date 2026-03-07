@@ -2,16 +2,23 @@
 //!
 //! Usage: vardict -G <reference.fa> -b <input.bam> [options] <region or BED file>
 
+#[cfg(feature = "mimalloc-global")]
+use mimalloc::MiMalloc;
+
+#[cfg(feature = "mimalloc-global")]
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 
 use crackle_kit::tracing::level_filters::LevelFilter;
-use crackle_kit::tracing::{event, Level};
+use crackle_kit::tracing::{Level, event};
 use crackle_kit::tracing_kit::setup_logging_stderr_only;
 use vardict_rs::data::bam_reader::BamReader;
 use vardict_rs::data::region::Region;
@@ -170,7 +177,6 @@ struct Args {
     #[arg(short = 'i', long = "splice")]
     output_splicing: bool,
 
-
     /// Log level
     #[arg(long, default_value_t = LevelFilter::WARN)]
     log_level: LevelFilter,
@@ -232,14 +238,17 @@ fn main() -> Result<()> {
     }
 
     // Determine sample name from first BAM unless overridden
-    let sample_name = args.sample_name.clone().unwrap_or_else(|| {
-        infer_sample_name_from_bam(&bam_inputs.primary_bam)
-    });
+    let sample_name = args
+        .sample_name
+        .clone()
+        .unwrap_or_else(|| infer_sample_name_from_bam(&bam_inputs.primary_bam));
 
     // Get regions to process
     let region_load = get_regions(&args, &bam_inputs.primary_bam)?;
     if region_load.regions.is_empty() {
-        return Err(anyhow!("No regions specified. Provide -R option or a BED file."));
+        return Err(anyhow!(
+            "No regions specified. Provide -R option or a BED file."
+        ));
     }
 
     // Build pipeline configuration
@@ -262,10 +271,16 @@ fn main() -> Result<()> {
     if args.print_header {
         match execution_mode {
             ExecutionMode::Amplicon => {
-                println!("{}", vardict_rs::mods::output_variant::get_amplicon_header_line());
+                println!(
+                    "{}",
+                    vardict_rs::mods::output_variant::get_amplicon_header_line()
+                );
             }
             ExecutionMode::Somatic => {
-                println!("{}", vardict_rs::mods::output_variant::get_somatic_header_line());
+                println!(
+                    "{}",
+                    vardict_rs::mods::output_variant::get_somatic_header_line()
+                );
             }
             ExecutionMode::Splicing => {
                 println!("Sample\tChr\tIntron\tIntron count");
@@ -298,7 +313,7 @@ fn main() -> Result<()> {
 }
 
 /// Run variant calling using SharedReference (loaded into memory)
-/// 
+///
 /// SharedReference is the default for both single and multi-threaded modes.
 /// The reference is loaded once and shared across all threads for fast access.
 fn run_variant_calling(
@@ -310,13 +325,13 @@ fn run_variant_calling(
     amplicon_region_groups: Option<Vec<Vec<Region>>>,
     execution_mode: ExecutionMode,
 ) -> Result<()> {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use vardict_rs::conf::Configuration;
     use vardict_rs::data::shared_reference::load_shared_reference_chroms;
     use vardict_rs::mods::parallel_pipeline::ParallelPipeline;
     use vardict_rs::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE};
-    use vardict_rs::conf::Configuration;
-    use std::sync::Arc;
-    use std::time::Instant;
-    use std::collections::HashSet;
 
     if bam_paths.is_empty() {
         return Err(anyhow!("No BAM paths available for execution"));
@@ -328,16 +343,14 @@ fn run_variant_calling(
 
     let start_total = Instant::now();
     let num_threads = args.num_threads.max(1);
-    
+
     if args.debug {
         event!(Level::INFO, "Loading reference genome into memory...");
     }
 
     // Get unique chromosomes from regions
     let start_ref_load = Instant::now();
-    let chroms: std::collections::HashSet<&str> = regions.iter()
-        .map(|r| r.chr())
-        .collect();
+    let chroms: std::collections::HashSet<&str> = regions.iter().map(|r| r.chr()).collect();
     let chrom_vec: Vec<&str> = chroms.into_iter().collect();
     let reference_path = args
         .reference
@@ -345,29 +358,36 @@ fn run_variant_calling(
         .ok_or_else(|| anyhow!("Reference path is not valid UTF-8: {:?}", args.reference))?;
 
     // Load only the needed chromosomes for efficiency
-    let reference = load_shared_reference_chroms(
-        reference_path,
-        &chrom_vec,
-    ).context("Failed to load reference genome")?;
-    
+    let reference = load_shared_reference_chroms(reference_path, &chrom_vec)
+        .context("Failed to load reference genome")?;
+
     let elapsed_ref_load = start_ref_load.elapsed();
 
     // Initialize GlobalReadOnlyScope (required by VarDictPipeline)
     // Must be done AFTER loading reference to populate chr_lens
     let mut conf = Configuration::default();
-    let sam_filter = if let Some(hex) = args.sam_filter.strip_prefix("0x")
+    let sam_filter = if let Some(hex) = args
+        .sam_filter
+        .strip_prefix("0x")
         .or_else(|| args.sam_filter.strip_prefix("0X"))
     {
-        u32::from_str_radix(hex, 16)
-            .context("Failed to parse sam_filter as hex")?
+        u32::from_str_radix(hex, 16).context("Failed to parse sam_filter as hex")?
     } else {
         args.sam_filter
             .parse::<u32>()
             .context("Failed to parse sam_filter as decimal")?
     };
     conf.goodq = args.min_base_quality;
-    conf.freq = if args.pileup { -1.0 } else { args.min_frequency };
-    conf.minr = if args.pileup { 0 } else { args.min_variant_reads };
+    conf.freq = if args.pileup {
+        -1.0
+    } else {
+        args.min_frequency
+    };
+    conf.minr = if args.pileup {
+        0
+    } else {
+        args.min_variant_reads
+    };
     conf.vext = args.vext;
     conf.mismatch = args.mismatch;
     conf.mapping_quality = if args.min_mapping_quality > 0 {
@@ -396,27 +416,33 @@ fn run_variant_calling(
     scope.bam_paths = bam_paths_string.clone();
     let _ = INSTANCE.set(scope);
 
-    let region_batches = select_region_batches_for_execution(
-        execution_mode,
-        regions,
-        amplicon_region_groups,
-    );
+    let region_batches =
+        select_region_batches_for_execution(execution_mode, regions, amplicon_region_groups);
 
     if args.debug {
-        event!(Level::INFO, "[TIMING] Reference loading: {:.3}s", elapsed_ref_load.as_secs_f64());
-        event!(Level::INFO, "Loaded {} chromosome(s), {:.2} MB total",
+        event!(
+            Level::INFO,
+            "[TIMING] Reference loading: {:.3}s",
+            elapsed_ref_load.as_secs_f64()
+        );
+        event!(
+            Level::INFO,
+            "Loaded {} chromosome(s), {:.2} MB total",
             reference.num_chromosomes(),
-            reference.total_size() as f64 / 1_048_576.0);
+            reference.total_size() as f64 / 1_048_576.0
+        );
         event!(Level::INFO, "Execution mode: {:?}", execution_mode);
         event!(Level::INFO, "Execution batches: {}", region_batches.len());
         if num_threads > 1 {
-            event!(Level::INFO,
+            event!(
+                Level::INFO,
                 "Processing {} regions with {} threads...",
                 region_batches.iter().map(Vec::len).sum::<usize>(),
                 num_threads
             );
         } else {
-            event!(Level::INFO,
+            event!(
+                Level::INFO,
                 "Processing {} regions...",
                 region_batches.iter().map(Vec::len).sum::<usize>()
             );
@@ -444,8 +470,14 @@ fn run_variant_calling(
             for result in results {
                 if let Some(error) = result.error {
                     if args.debug {
-                        event!(Level::WARN, "Error processing {}:{}-{}: {}",
-                            result.region.chr(), result.region.start(), result.region.end(), error);
+                        event!(
+                            Level::WARN,
+                            "Error processing {}:{}-{}: {}",
+                            result.region.chr(),
+                            result.region.start(),
+                            result.region.end(),
+                            error
+                        );
                     }
                 } else {
                     for line in result.output_lines {
@@ -458,9 +490,21 @@ fn run_variant_calling(
             let elapsed_total = start_total.elapsed();
 
             if args.debug {
-                event!(Level::INFO, "[TIMING] Processing all regions: {:.3}s", elapsed_processing.as_secs_f64());
-                event!(Level::INFO, "[TIMING] Output writing: {:.3}s", elapsed_output.as_secs_f64());
-                event!(Level::INFO, "[TIMING] TOTAL execution: {:.3}s", elapsed_total.as_secs_f64());
+                event!(
+                    Level::INFO,
+                    "[TIMING] Processing all regions: {:.3}s",
+                    elapsed_processing.as_secs_f64()
+                );
+                event!(
+                    Level::INFO,
+                    "[TIMING] Output writing: {:.3}s",
+                    elapsed_output.as_secs_f64()
+                );
+                event!(
+                    Level::INFO,
+                    "[TIMING] TOTAL execution: {:.3}s",
+                    elapsed_total.as_secs_f64()
+                );
             }
         }
         ExecutionMode::Amplicon => {
@@ -469,7 +513,12 @@ fn run_variant_calling(
                 .with_min_base_quality(config.quality_threshold)
                 .with_min_mapping_quality(config.mapq_threshold);
 
-            let global_scope = Arc::new(INSTANCE.get().expect("GlobalReadOnlyScope not initialized").clone());
+            let global_scope = Arc::new(
+                INSTANCE
+                    .get()
+                    .expect("GlobalReadOnlyScope not initialized")
+                    .clone(),
+            );
             let mut stdout = io::stdout().lock();
 
             for amplicon_group in region_batches {
@@ -512,9 +561,17 @@ fn run_variant_calling(
             let elapsed_total = start_total.elapsed();
 
             if args.debug {
-                event!(Level::INFO, "[TIMING] Processing all regions: {:.3}s", elapsed_processing.as_secs_f64());
+                event!(
+                    Level::INFO,
+                    "[TIMING] Processing all regions: {:.3}s",
+                    elapsed_processing.as_secs_f64()
+                );
                 event!(Level::INFO, "[TIMING] Output writing: {:.3}s", 0.0f64);
-                event!(Level::INFO, "[TIMING] TOTAL execution: {:.3}s", elapsed_total.as_secs_f64());
+                event!(
+                    Level::INFO,
+                    "[TIMING] TOTAL execution: {:.3}s",
+                    elapsed_total.as_secs_f64()
+                );
             }
         }
         ExecutionMode::Somatic => {
@@ -549,66 +606,71 @@ fn run_variant_calling(
                     let combined_bam_paths = vec![tumor_bam_path.clone(), normal_bam_path.clone()];
 
                     let mut tumor_bam_reader = BamReader::open(&tumor_bam_path)?;
-                    let tumor_output = vardict_pipeline.process_region_to_aligned_vars_from_bam_with_paths(
-                        region,
-                        &reference,
-                        &mut tumor_bam_reader,
-                        Arc::clone(&global_scope),
-                        &tumor_bam_paths,
-                    )?;
+                    let tumor_output = vardict_pipeline
+                        .process_region_to_aligned_vars_from_bam_with_paths(
+                            region,
+                            &reference,
+                            &mut tumor_bam_reader,
+                            Arc::clone(&global_scope),
+                            &tumor_bam_paths,
+                        )?;
                     splice.extend(tumor_output.splice.iter().cloned());
 
                     let mut normal_bam_reader = BamReader::open(&normal_bam_path)?;
-                    let normal_output = vardict_pipeline.process_region_to_aligned_vars_from_bam_with_paths(
-                        region,
-                        &reference,
-                        &mut normal_bam_reader,
-                        Arc::clone(&global_scope),
-                        &normal_bam_paths,
-                    )?;
+                    let normal_output = vardict_pipeline
+                        .process_region_to_aligned_vars_from_bam_with_paths(
+                            region,
+                            &reference,
+                            &mut normal_bam_reader,
+                            Arc::clone(&global_scope),
+                            &normal_bam_paths,
+                        )?;
                     splice.extend(normal_output.splice.iter().cloned());
 
-                    let combined_output = vardict_pipeline.process_region_to_aligned_vars_from_bam_paths(
-                        region,
-                        &reference,
-                        &combined_bam_paths,
-                        Arc::clone(&global_scope),
-                    )?;
+                    let combined_output = vardict_pipeline
+                        .process_region_to_aligned_vars_from_bam_paths(
+                            region,
+                            &reference,
+                            &combined_bam_paths,
+                            Arc::clone(&global_scope),
+                        )?;
 
-                    let initial_max_read_length =
-                        tumor_output.max_read_length.max(normal_output.max_read_length);
+                    let initial_max_read_length = tumor_output
+                        .max_read_length
+                        .max(normal_output.max_read_length);
                     let combined_max_read_length = combined_output.max_read_length;
                     let combined_aligned_variants = combined_output.aligned_vars.aligned_variants;
 
-                    let combine_lookup = move |
-                        _chr_name: &str,
-                        position: i64,
-                        description_string: &str,
-                        max_read_length: usize,
-                    | {
-                        let combined_variant = combined_aligned_variants
-                            .get(&position)
-                            .and_then(|vars| {
-                                vars.variants
-                                    .iter()
-                                    .find(|variant| variant.description_string == description_string)
-                                    .cloned()
-                            });
+                    let combine_lookup =
+                        move |_chr_name: &str,
+                              position: i64,
+                              description_string: &str,
+                              max_read_length: usize| {
+                            let combined_variant =
+                                combined_aligned_variants.get(&position).and_then(|vars| {
+                                    vars.variants
+                                        .iter()
+                                        .find(|variant| {
+                                            variant.description_string == description_string
+                                        })
+                                        .cloned()
+                                });
 
-                        SomaticCombineLookupResult {
-                            combined_variant,
-                            max_read_length: combined_max_read_length.max(max_read_length),
-                        }
-                    };
+                            SomaticCombineLookupResult {
+                                combined_variant,
+                                max_read_length: combined_max_read_length.max(max_read_length),
+                            }
+                        };
 
-                    let output_lines = vardict_pipeline.run_somatic_post_processor_with_combine_lookup(
-                        normal_output.aligned_vars,
-                        tumor_output.aligned_vars,
-                        region,
-                        &splice,
-                        initial_max_read_length,
-                        Some(&combine_lookup),
-                    );
+                    let output_lines = vardict_pipeline
+                        .run_somatic_post_processor_with_combine_lookup(
+                            normal_output.aligned_vars,
+                            tumor_output.aligned_vars,
+                            region,
+                            &splice,
+                            initial_max_read_length,
+                            Some(&combine_lookup),
+                        );
 
                     for line in output_lines {
                         writeln!(stdout, "{}", line)?;
@@ -620,9 +682,17 @@ fn run_variant_calling(
             let elapsed_total = start_total.elapsed();
 
             if args.debug {
-                event!(Level::INFO, "[TIMING] Processing all regions: {:.3}s", elapsed_processing.as_secs_f64());
+                event!(
+                    Level::INFO,
+                    "[TIMING] Processing all regions: {:.3}s",
+                    elapsed_processing.as_secs_f64()
+                );
                 event!(Level::INFO, "[TIMING] Output writing: {:.3}s", 0.0f64);
-                event!(Level::INFO, "[TIMING] TOTAL execution: {:.3}s", elapsed_total.as_secs_f64());
+                event!(
+                    Level::INFO,
+                    "[TIMING] TOTAL execution: {:.3}s",
+                    elapsed_total.as_secs_f64()
+                );
             }
         }
         ExecutionMode::Splicing => {
@@ -660,9 +730,17 @@ fn run_variant_calling(
             let elapsed_total = start_total.elapsed();
 
             if args.debug {
-                event!(Level::INFO, "[TIMING] Processing all regions: {:.3}s", elapsed_processing.as_secs_f64());
+                event!(
+                    Level::INFO,
+                    "[TIMING] Processing all regions: {:.3}s",
+                    elapsed_processing.as_secs_f64()
+                );
                 event!(Level::INFO, "[TIMING] Output writing: {:.3}s", 0.0f64);
-                event!(Level::INFO, "[TIMING] TOTAL execution: {:.3}s", elapsed_total.as_secs_f64());
+                event!(
+                    Level::INFO,
+                    "[TIMING] TOTAL execution: {:.3}s",
+                    elapsed_total.as_secs_f64()
+                );
             }
         }
     }
@@ -862,7 +940,10 @@ fn parse_region_string(
     // Format: chr:start-end or chr:start
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() != 2 {
-        return Err(anyhow!("Invalid region format: {}. Expected chr:start-end", s));
+        return Err(anyhow!(
+            "Invalid region format: {}. Expected chr:start-end",
+            s
+        ));
     }
 
     let chr = normalize_region_chrom(parts[0], bam_targets);
@@ -870,14 +951,15 @@ fn parse_region_string(
 
     let (start, end) = match pos_parts.len() {
         1 => {
-            let pos: usize = pos_parts[0].parse()
-                .context("Invalid position in region")?;
+            let pos: usize = pos_parts[0].parse().context("Invalid position in region")?;
             (pos, pos)
         }
         2 => {
-            let start: usize = pos_parts[0].parse()
+            let start: usize = pos_parts[0]
+                .parse()
                 .context("Invalid start position in region")?;
-            let end: usize = pos_parts[1].parse()
+            let end: usize = pos_parts[1]
+                .parse()
                 .context("Invalid end position in region")?;
             (start, end)
         }
@@ -912,7 +994,11 @@ fn parse_bed_file(
         let line = line.trim();
 
         // Skip empty lines and comments
-        if line.is_empty() || line.starts_with('#') || line.starts_with("track") || line.starts_with("browser") {
+        if line.is_empty()
+            || line.starts_with('#')
+            || line.starts_with("track")
+            || line.starts_with("browser")
+        {
             continue;
         }
 
@@ -990,17 +1076,24 @@ fn parse_standard_regions(
 
         if fields.len() <= chr_idx || fields.len() <= start_idx || fields.len() <= end_idx {
             if args.debug {
-                event!(Level::WARN, "Skipping malformed BED line {}: {}", line_num + 1, line);
+                event!(
+                    Level::WARN,
+                    "Skipping malformed BED line {}: {}",
+                    line_num + 1,
+                    line
+                );
             }
             continue;
         }
 
         let chr = normalize_region_chrom(fields[chr_idx], bam_targets);
-        let start: usize = fields[start_idx].parse()
+        let start: usize = fields[start_idx]
+            .parse()
             .with_context(|| format!("Invalid start at line {}", line_num + 1))?;
-        let end: usize = fields[end_idx].parse()
+        let end: usize = fields[end_idx]
+            .parse()
             .with_context(|| format!("Invalid end at line {}", line_num + 1))?;
-        
+
         let gene = if fields.len() > gene_idx {
             fields[gene_idx].to_string()
         } else {
@@ -1062,14 +1155,7 @@ fn parse_amplicon_region_groups(
             chromosome_order.push(chr.clone());
         }
 
-        let region = Region::new_with_insert(
-            chr,
-            start,
-            end,
-            gene,
-            insert_start,
-            insert_end,
-        );
+        let region = Region::new_with_insert(chr, start, end, gene, insert_start, insert_end);
 
         let chrom_key = region.chr().to_string();
         regions_by_chrom
@@ -1241,13 +1327,7 @@ mod tests {
 
     #[test]
     fn test_parse_bed_file_auto_detects_amplicon_and_zero_based_default() {
-        let args = parse_args_for_test([
-            "vardict",
-            "-G",
-            "reference.fa",
-            "-b",
-            "input.bam",
-        ]);
+        let args = parse_args_for_test(["vardict", "-G", "reference.fa", "-b", "input.bam"]);
 
         let bed_path = PathBuf::from(format!(
             "tmp/test_amplicon_auto_{}_{}.bed",
@@ -1267,7 +1347,10 @@ mod tests {
         );
         assert_eq!(parsed.regions.len(), 1);
         assert_eq!(parsed.regions[0].start(), 101);
-        assert_eq!(parsed.amplicon_region_groups.as_ref().map(Vec::len), Some(1));
+        assert_eq!(
+            parsed.amplicon_region_groups.as_ref().map(Vec::len),
+            Some(1)
+        );
 
         let _ = std::fs::remove_file(&bed_path);
     }
@@ -1304,7 +1387,9 @@ mod tests {
         .unwrap();
 
         let parsed = parse_bed_file(&bed_path, &args, None).unwrap();
-        let groups = parsed.amplicon_region_groups.expect("expected amplicon groups");
+        let groups = parsed
+            .amplicon_region_groups
+            .expect("expected amplicon groups");
 
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].len(), 2);
@@ -1355,13 +1440,7 @@ mod tests {
 
     #[test]
     fn test_resolve_execution_mode_amplicon_without_region() {
-        let args = parse_args_for_test([
-            "vardict",
-            "-G",
-            "reference.fa",
-            "-b",
-            "input.bam",
-        ]);
+        let args = parse_args_for_test(["vardict", "-G", "reference.fa", "-b", "input.bam"]);
 
         let mode = resolve_execution_mode(&args, &Some("10:0.95".to_string()), false);
         assert_eq!(mode, ExecutionMode::Amplicon);
@@ -1551,11 +1630,8 @@ mod tests {
             ],
         ];
 
-        let batches = select_region_batches_for_execution(
-            ExecutionMode::Amplicon,
-            regions,
-            Some(groups),
-        );
+        let batches =
+            select_region_batches_for_execution(ExecutionMode::Amplicon, regions, Some(groups));
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].len(), 1);
         assert_eq!(batches[1].len(), 2);

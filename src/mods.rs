@@ -1,10 +1,10 @@
-pub mod variant_realigner;
-pub mod cigar_parser;
 pub mod cigar_modifier;
-pub mod to_vars_builder;
+pub mod cigar_parser;
 pub mod output_variant;
+pub mod parallel_pipeline;
 pub mod pipeline;
 pub mod simple_variant_caller;
-pub mod parallel_pipeline;
-pub mod vardict_pipeline;
 pub mod structural_variants_processor;
+pub mod to_vars_builder;
+pub mod vardict_pipeline;
+pub mod variant_realigner;

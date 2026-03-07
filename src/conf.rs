@@ -39,7 +39,6 @@ pub struct Configuration {
     /// Count N bases in total depth (Java: includeNInTotalDepth)
     pub include_n_in_total_depth: bool,
     // pub seed_2: i32,
-
     /// The phred score for a base to be considered a good call
     pub goodq: f64,
 

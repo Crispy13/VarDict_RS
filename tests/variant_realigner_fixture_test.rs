@@ -106,11 +106,9 @@ fn run_variant_realigner_fixture(fixture_rel: &str, bam_rel: &str, region: Regio
     );
     let _temp_guard = TempFileGuard::new(output_path.clone());
 
-    let shared_reference = load_shared_reference_chroms(
-        ref_path.to_str().expect("reference path"),
-        &["20"],
-    )
-    .expect("failed to load reference");
+    let shared_reference =
+        load_shared_reference_chroms(ref_path.to_str().expect("reference path"), &["20"])
+            .expect("failed to load reference");
 
     let mut scope = if let Some(existing) = INSTANCE.get() {
         existing.clone()
@@ -130,8 +128,8 @@ fn run_variant_realigner_fixture(fixture_rel: &str, bam_rel: &str, region: Regio
 
     let instance = Arc::new(scope);
 
-    let mut bam_reader = BamReader::open(bam_path.to_str().expect("bam path"))
-        .expect("failed to open BAM");
+    let mut bam_reader =
+        BamReader::open(bam_path.to_str().expect("bam path")).expect("failed to open BAM");
 
     let pipeline = VarDictPipeline::new("test_sample")
         .with_min_frequency(0.01)

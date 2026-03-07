@@ -18,8 +18,7 @@ pub(crate) use get_cap_group;
 pub(crate) static BEGIN_MINUS_NUMBER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^-(\d+)").unwrap());
 
-pub(crate) static BEGIN_DIGITS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\d+)").unwrap());
+pub(crate) static BEGIN_DIGITS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\d+)").unwrap());
 
 pub(crate) static BEGIN_MINUS_NUMBER_CARET: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^-\d+\^").unwrap());
@@ -36,14 +35,12 @@ pub(crate) static CARET_ATGNC: LazyLock<Regex> =
 pub(crate) static CARET_ATGC_END: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\^([ATGC]+)$").unwrap());
 
-pub(crate) static AMP_ATGC: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"&([ATGC]+)").unwrap());
+pub(crate) static AMP_ATGC: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"&([ATGC]+)").unwrap());
 
 pub(crate) static BEGIN_PLUS_ATGC: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\+([ATGC]+)").unwrap());
 
-pub(crate) static HASH_ATGC: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"#([ATGC]+)").unwrap());
+pub(crate) static HASH_ATGC: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"#([ATGC]+)").unwrap());
 
 pub(crate) static ATGSs_AMP_ATGSs_END: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(\+[ATGC]+)&[ATGC]+$").unwrap());
@@ -60,8 +57,7 @@ pub(crate) static INV_NUM: LazyLock<Regex> =
 pub(crate) static SOME_SV_NUMBERS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<(...)\d+>").unwrap());
 
-pub(crate) static ANY_SV: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<(...)>").unwrap());
+pub(crate) static ANY_SV: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<(...)>").unwrap());
 
 pub(crate) static BEGIN_ATGC_END: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[ATGC]+$").unwrap());

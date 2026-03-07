@@ -68,7 +68,8 @@ fn test_structural_variants_snapshot_fixture() {
     let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let fixture_path = manifest_dir.join("tests/fixtures/structural_variants_chr20_168600_168800.jsonl");
+    let fixture_path =
+        manifest_dir.join("tests/fixtures/structural_variants_chr20_168600_168800.jsonl");
     let bam_path = manifest_dir.join("test_data/test_168714.bam");
     let ref_path = manifest_dir.join("VarDictJava/tests/integration/reference/hs37d5.fa");
 
@@ -92,11 +93,9 @@ fn test_structural_variants_snapshot_fixture() {
     );
     let _temp_guard = TempFileGuard::new(output_path.clone());
 
-    let shared_reference = load_shared_reference_chroms(
-        ref_path.to_str().expect("reference path"),
-        &["20"],
-    )
-    .expect("failed to load reference");
+    let shared_reference =
+        load_shared_reference_chroms(ref_path.to_str().expect("reference path"), &["20"])
+            .expect("failed to load reference");
 
     let mut scope = if let Some(existing) = INSTANCE.get() {
         existing.clone()
@@ -115,8 +114,8 @@ fn test_structural_variants_snapshot_fixture() {
 
     let region = Region::new("20".to_string(), 168600, 168800, String::new());
 
-    let mut bam_reader = BamReader::open(bam_path.to_str().expect("bam path"))
-        .expect("failed to open BAM");
+    let mut bam_reader =
+        BamReader::open(bam_path.to_str().expect("bam path")).expect("failed to open BAM");
 
     let pipeline = VarDictPipeline::new("test_sample")
         .with_min_frequency(0.01)

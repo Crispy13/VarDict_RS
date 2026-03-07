@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::OnceLock};
 
 use crate::conf::Configuration;
+use crate::prelude::LibDefaultHasher;
 
 pub static INSTANCE: OnceLock<GlobalReadOnlyScope> = OnceLock::new();
 
@@ -14,9 +15,9 @@ pub fn instance() -> &'static GlobalReadOnlyScope {
 #[derive(Default, Clone)]
 pub struct GlobalReadOnlyScope {
     pub amplicon_based_calling: Option<String>,
-    pub chr_lens: HashMap<String, usize>,
+    pub chr_lens: HashMap<String, usize, LibDefaultHasher>,
     pub bam_paths: Vec<String>,
     pub conf: Configuration,
-    pub adaptor_forward: HashMap<String, usize>,
-    pub adaptor_reverse: HashMap<String, usize>,
+    pub adaptor_forward: HashMap<String, usize, LibDefaultHasher>,
+    pub adaptor_reverse: HashMap<String, usize, LibDefaultHasher>,
 }

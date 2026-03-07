@@ -449,12 +449,9 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                     > Configuration::LOW_QUAL as u8
             {
                 rn += 1;
-                homopolymer_checker.record_base(
-                    self.ref_data
-                        .ref_seq
-                        .get_or_err((refoff + rn + 1) as usize)
-                        .copied()?,
-                );
+                if let Some(base) = self.ref_data.ref_seq.get((refoff + rn + 1) as usize) {
+                    homopolymer_checker.record_base(*base);
+                }
             }
 
             if rn > 4 && !homopolymer_checker.is_homopolymer() {
@@ -561,7 +558,7 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
         let mut rn = 0;
         let mut rrn = 0;
         let mut rmch = 0;
-        
+
         while rrn < mch && rn < mch {
             let ref_idx = (refoff - rrn - 1) as usize;
             if self.contig_ref_seq().get(ref_idx).is_none() {
@@ -1180,12 +1177,12 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                 if rn > 0 && rn < mch {
                     soft += rn;
                     mch -= rn;
-                    
+
                     match (cigar_vd.get(0), cigar_vd.get(1)) {
                         (Some(Cigar::SoftClip(_)), Some(Cigar::Match(_))) => {
                             cigar_vd[0] = Cigar::SoftClip(soft as u32);
                             cigar_vd[1] = Cigar::Match(mch as u32);
-                        },
+                        }
                         _ => {}
                     }
 
@@ -1403,11 +1400,7 @@ fn find_d_i_m_id_i(cigar: &VecDeque<Cigar>) -> Option<(usize, [Cigar; 3], Option
     // If that first occurrence is preceded by D/H, do not search later occurrences.
     for j in 1..cigar.len() - 2 {
         match (&cigar[j], &cigar[j + 1], &cigar[j + 2]) {
-            (
-                &c2 @ Cigar::Ins(_),
-                &c3 @ Cigar::Match(_),
-                &c4 @ (Cigar::Ins(_) | Cigar::Del(_)),
-            ) => {
+            (&c2 @ Cigar::Ins(_), &c3 @ Cigar::Match(_), &c4 @ (Cigar::Ins(_) | Cigar::Del(_))) => {
                 let prev = cigar[j - 1];
                 if matches!(prev, Cigar::Del(_) | Cigar::HardClip(_)) {
                     return None;
@@ -1474,10 +1467,14 @@ fn find_i_i(cigar: &VecDeque<Cigar>) -> Option<(usize, [Cigar; 2])> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use crate::{
+        data::{reference::Reference, region::Region},
         mods::cigar_parser::CigarParser,
         scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE},
     };
+    use crackle_kit::data::bases::rev_comp::RevComplementor;
     use rust_htslib::bam::record::{Cigar, CigarString, CigarStringView};
 
     use super::*;
@@ -1486,14 +1483,14 @@ mod tests {
     fn parse_cigar_string(cigar_str: &str) -> CigarString {
         let mut cigars = Vec::new();
         let mut num = String::new();
-        
+
         for c in cigar_str.chars() {
             if c.is_ascii_digit() {
                 num.push(c);
             } else {
                 let len: u32 = num.parse().expect("Invalid CIGAR length");
                 num.clear();
-                
+
                 let cigar = match c {
                     'M' => Cigar::Match(len),
                     'I' => Cigar::Ins(len),
@@ -1509,23 +1506,26 @@ mod tests {
                 cigars.push(cigar);
             }
         }
-        
+
         CigarString(cigars)
     }
 
     /// Helper to convert CigarStringView back to a string
     fn cigar_to_string(cigar: &CigarStringView) -> String {
-        cigar.iter().map(|c| match c {
-            Cigar::Match(l) => format!("{}M", l),
-            Cigar::Ins(l) => format!("{}I", l),
-            Cigar::Del(l) => format!("{}D", l),
-            Cigar::RefSkip(l) => format!("{}N", l),
-            Cigar::SoftClip(l) => format!("{}S", l),
-            Cigar::HardClip(l) => format!("{}H", l),
-            Cigar::Pad(l) => format!("{}P", l),
-            Cigar::Equal(l) => format!("{}=", l),
-            Cigar::Diff(l) => format!("{}X", l),
-        }).collect()
+        cigar
+            .iter()
+            .map(|c| match c {
+                Cigar::Match(l) => format!("{}M", l),
+                Cigar::Ins(l) => format!("{}I", l),
+                Cigar::Del(l) => format!("{}D", l),
+                Cigar::RefSkip(l) => format!("{}N", l),
+                Cigar::SoftClip(l) => format!("{}S", l),
+                Cigar::HardClip(l) => format!("{}H", l),
+                Cigar::Pad(l) => format!("{}P", l),
+                Cigar::Equal(l) => format!("{}=", l),
+                Cigar::Diff(l) => format!("{}X", l),
+            })
+            .collect()
     }
 
     #[test]
@@ -1579,7 +1579,7 @@ mod tests {
         use crate::data::reference::Reference;
         use crate::data::region::Region;
         use crackle_kit::data::bases::rev_comp::RevComplementor;
-        use rust_htslib::bam::{Read, Record, Reader};
+        use rust_htslib::bam::{Read, Reader, Record};
 
         let conf = Configuration {
             chimeric_filter: true,
@@ -1631,8 +1631,39 @@ mod tests {
         let modified_cigar = CigarString(modified.cigar.into_iter().collect()).into_view(0);
 
         assert_eq!(modified.align_start_pos, record.pos());
-        assert_eq!(cigar_to_string(&modified_cigar), cigar_to_string(&cigar_view));
+        assert_eq!(
+            cigar_to_string(&modified_cigar),
+            cigar_to_string(&cigar_view)
+        );
         assert_eq!(modified.query_seq, query_seq_owned.as_slice());
         assert_eq!(modified.query_qual, query_qual_owned.as_slice());
+    }
+
+    #[test]
+    fn test_capture_mis_softly3_ms_boundary_does_not_error() {
+        let reference = Reference::new_with_start(vec![b'A'; 10], 1);
+        let region = Region::new("chr1".to_string(), 1, 10, "test".to_string());
+        let mut rev_complementor = RevComplementor::new();
+
+        let cigar = CigarString(vec![Cigar::Match(2), Cigar::SoftClip(3)]).into_view(0);
+        let query_sequence = vec![b'C', b'C', b'T', b'A', b'C'];
+        let query_quality = vec![30, 30, 30, 30, 30];
+
+        let mut modifier = CigarModifier::new(
+            0,
+            &cigar,
+            &query_sequence,
+            &query_quality,
+            &reference,
+            0,
+            query_sequence.len(),
+            &region,
+            &mut rev_complementor,
+        );
+
+        let mut cigar_vd = VecDeque::from(vec![Cigar::Match(2), Cigar::SoftClip(3)]);
+
+        let result = modifier.capture_mis_softly3_ms(6, &mut cigar_vd, 3, 2);
+        assert!(result.is_ok());
     }
 }

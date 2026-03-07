@@ -28,11 +28,14 @@ use crate::{
         region::Region,
     },
     mods::cigar_modifier::CigarModifier,
-    prelude::SmallVecBytes,
+    prelude::{LibDefaultHasher, SmallVecBytes},
     scopedata::global_read_only_scope::{GlobalReadOnlyScope, instance},
     utils::{BytesExt, SliceExt, SliceExt2, aligner::Aligner},
     variants::{
-        var_utils::{get_variants_from_map, get_variation_from_seq, is_has_and_equals, is_has_and_not_equals},
+        var_utils::{
+            get_variant_from_pos_map, get_variants_from_map, get_variation_from_seq,
+            is_has_and_equals, is_has_and_not_equals,
+        },
         variants::{InsOrDelLen, Mate, SoftClip, VarDesc, Variant},
     },
 };
@@ -48,8 +51,8 @@ pub struct CigarParser {
     region: Region,
     rev_complementor: RevComplementor,
     discordant_count: usize,
-    splice_count: HashMap<SplicingKey, Vec<usize>>,
-    splice_count_insert_index: HashMap<SplicingKey, usize>,
+    splice_count: HashMap<SplicingKey, Vec<usize>, LibDefaultHasher>,
+    splice_count_insert_index: HashMap<SplicingKey, usize, LibDefaultHasher>,
     next_splice_count_insert_index: usize,
 
     /// keep track the read position (offset), including softclipped
@@ -65,24 +68,27 @@ pub struct CigarParser {
     cigar: CigarStringView,
     cigar_len: u32,
 
-    non_insertion_vars: HashMap<i64, HashMap<VarDesc, Variant>>,
-    non_insertion_vars_insert_index: HashMap<i64, usize>,
+    non_insertion_vars:
+        HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher>,
+    non_insertion_vars_insert_index: HashMap<i64, usize, LibDefaultHasher>,
     next_non_insertion_vars_insert_index: usize,
-    insertion_vars: HashMap<i64, HashMap<VarDesc, Variant>>,
+    insertion_vars: HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher>,
 
     /// Track MNPs (multi-nucleotide polymorphisms) by position and description string
-    mnp: HashMap<i64, HashMap<String, usize>>,
+    mnp: HashMap<i64, HashMap<String, usize, LibDefaultHasher>, LibDefaultHasher>,
 
     /// Track insertion counts by position and description string (Java: positionToInsertionCount)
-    position_to_insertion_count: HashMap<i64, HashMap<String, usize>>,
+    position_to_insertion_count:
+        HashMap<i64, HashMap<String, usize, LibDefaultHasher>, LibDefaultHasher>,
 
     /// Track deletion counts by position and description string (Java: positionToDeletionCount)
-    position_to_deletions_count: HashMap<i64, HashMap<String, usize>>,
+    position_to_deletions_count:
+        HashMap<i64, HashMap<String, usize, LibDefaultHasher>, LibDefaultHasher>,
 
-    ref_coverage: HashMap<i64, usize>,
+    ref_coverage: HashMap<i64, usize, LibDefaultHasher>,
 
-    soft_clips5_end: HashMap<i64, SoftClip>,
-    soft_clips3_end: HashMap<i64, SoftClip>,
+    soft_clips5_end: HashMap<i64, SoftClip, LibDefaultHasher>,
+    soft_clips3_end: HashMap<i64, SoftClip, LibDefaultHasher>,
     svdelfend: i64,
     svdelrend: i64,
     svdupfend: i64,
@@ -102,6 +108,10 @@ pub struct CigarParser {
     current_qname: Option<String>,
     last_modified_pos: Option<i64>,
     last_modified_cigar: Option<String>,
+    debug_pos: Option<i64>,
+    trace_target_qname: Option<String>,
+    trace_ins_qname: Option<String>,
+    trace_merge_ins: bool,
 }
 
 impl Default for CigarParser {
@@ -154,17 +164,58 @@ impl Default for CigarParser {
             current_qname: None,
             last_modified_pos: None,
             last_modified_cigar: None,
+            debug_pos: Self::debug_pos_from_env(),
+            trace_target_qname: Self::trace_qname_from_env("VARDICT_TRACE_QNAME"),
+            trace_ins_qname: Self::trace_qname_from_env("VARDICT_TRACE_INS_QNAME"),
+            trace_merge_ins: Self::trace_flag_from_env("VARDICT_TRACE_MERGED_INS"),
         }
     }
 }
 
 impl CigarParser {
+    fn debug_pos_from_env() -> Option<i64> {
+        env::var("VARDICT_DEBUG_POS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+    }
+
+    fn trace_qname_from_env(name: &str) -> Option<String> {
+        env::var(name).ok()
+    }
+
+    fn trace_flag_from_env(name: &str) -> bool {
+        env::var(name)
+            .ok()
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    fn trace_record_qname(&self, needle: &Option<String>, qname: &[u8]) -> bool {
+        needle
+            .as_deref()
+            .map(|value| value == "*" || value.as_bytes() == qname)
+            .unwrap_or(false)
+    }
+
+    fn trace_current_qname(&self, needle: &Option<String>) -> bool {
+        needle
+            .as_deref()
+            .map(|value| {
+                value == "*"
+                    || self
+                        .current_qname
+                        .as_deref()
+                        .is_some_and(|name| name == value)
+            })
+            .unwrap_or(false)
+    }
+
+    fn needs_current_qname(&self) -> bool {
+        self.debug_pos.is_some() || self.trace_ins_qname.is_some() || self.trace_merge_ins
+    }
+
     /// Create a new CigarParser for processing a region
-    pub fn new(
-        region: Region,
-        reference: Reference,
-        instance: Arc<GlobalReadOnlyScope>,
-    ) -> Self {
+    pub fn new(region: Region, reference: Reference, instance: Arc<GlobalReadOnlyScope>) -> Self {
         Self {
             query_seq_buf: Some(Vec::with_capacity(512)),
             query_qual_buf: Some(Vec::with_capacity(512)),
@@ -174,24 +225,24 @@ impl CigarParser {
             max_read_len: 0,
             region,
             discordant_count: 0,
-            splice_count: HashMap::new(),
-            splice_count_insert_index: HashMap::new(),
+            splice_count: Default::default(),
+            splice_count_insert_index: Default::default(),
             next_splice_count_insert_index: 0,
             read_pos_including_softclip: 0,
             read_pos_excluding_softclip: 0,
             start: 0,
             offset: 0,
             cigar_len: 0,
-            non_insertion_vars: HashMap::new(),
-            non_insertion_vars_insert_index: HashMap::new(),
+            non_insertion_vars: Default::default(),
+            non_insertion_vars_insert_index: Default::default(),
             next_non_insertion_vars_insert_index: 0,
-            insertion_vars: HashMap::new(),
-            mnp: HashMap::new(),
-            position_to_insertion_count: HashMap::new(),
-            position_to_deletions_count: HashMap::new(),
-            ref_coverage: HashMap::new(),
-            soft_clips5_end: HashMap::new(),
-            soft_clips3_end: HashMap::new(),
+            insertion_vars: Default::default(),
+            mnp: Default::default(),
+            position_to_insertion_count: Default::default(),
+            position_to_deletions_count: Default::default(),
+            ref_coverage: Default::default(),
+            soft_clips5_end: Default::default(),
+            soft_clips3_end: Default::default(),
             svdelfend: 0,
             svdelrend: 0,
             svdupfend: 0,
@@ -213,6 +264,10 @@ impl CigarParser {
             current_qname: None,
             last_modified_pos: None,
             last_modified_cigar: None,
+            debug_pos: Self::debug_pos_from_env(),
+            trace_target_qname: Self::trace_qname_from_env("VARDICT_TRACE_QNAME"),
+            trace_ins_qname: Self::trace_qname_from_env("VARDICT_TRACE_INS_QNAME"),
+            trace_merge_ins: Self::trace_flag_from_env("VARDICT_TRACE_MERGED_INS"),
         }
     }
 
@@ -266,78 +321,96 @@ impl CigarParser {
     }
 
     /// Get the collected non-insertion variants
-    pub fn get_non_insertion_vars(&self) -> &HashMap<i64, HashMap<VarDesc, Variant>> {
+    pub fn get_non_insertion_vars(
+        &self,
+    ) -> &HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher> {
         &self.non_insertion_vars
     }
 
     /// Take ownership of the collected non-insertion variants
-    pub fn take_non_insertion_vars(&mut self) -> HashMap<i64, HashMap<VarDesc, Variant>> {
+    pub fn take_non_insertion_vars(
+        &mut self,
+    ) -> HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher> {
         std::mem::take(&mut self.non_insertion_vars)
     }
 
-    pub fn take_non_insertion_vars_insert_index(&mut self) -> HashMap<i64, usize> {
+    pub fn take_non_insertion_vars_insert_index(&mut self) -> HashMap<i64, usize, LibDefaultHasher> {
         std::mem::take(&mut self.non_insertion_vars_insert_index)
     }
 
     fn get_non_insertion_variant(&mut self, pos: i64, var_desc: &VarDesc) -> &mut Variant {
-        if !self.non_insertion_vars.contains_key(&pos) {
-            self.non_insertion_vars_insert_index
-                .insert(pos, self.next_non_insertion_vars_insert_index);
-            self.next_non_insertion_vars_insert_index += 1;
-        }
+        let pos_map = match self.non_insertion_vars.entry(pos) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                self.non_insertion_vars_insert_index
+                    .insert(pos, self.next_non_insertion_vars_insert_index);
+                self.next_non_insertion_vars_insert_index += 1;
+                entry.insert(HashMap::with_capacity_and_hasher(1, LibDefaultHasher::default()))
+            }
+        };
 
-        get_variants_from_map(&mut self.non_insertion_vars, pos, var_desc)
+        get_variant_from_pos_map(pos_map, var_desc)
     }
 
     /// Get the collected insertion variants
-    pub fn get_insertion_vars(&self) -> &HashMap<i64, HashMap<VarDesc, Variant>> {
+    pub fn get_insertion_vars(
+        &self,
+    ) -> &HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher> {
         &self.insertion_vars
     }
 
     /// Take ownership of the collected insertion variants
-    pub fn take_insertion_vars(&mut self) -> HashMap<i64, HashMap<VarDesc, Variant>> {
+    pub fn take_insertion_vars(
+        &mut self,
+    ) -> HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher> {
         std::mem::take(&mut self.insertion_vars)
     }
 
-    pub fn take_mnp(&mut self) -> HashMap<i64, HashMap<String, usize>> {
+    pub fn take_mnp(
+        &mut self,
+    ) -> HashMap<i64, HashMap<String, usize, LibDefaultHasher>, LibDefaultHasher> {
         std::mem::take(&mut self.mnp)
     }
 
-    pub fn take_position_to_insertion_count(&mut self) -> HashMap<i64, HashMap<String, usize>> {
+    pub fn take_position_to_insertion_count(
+        &mut self,
+    ) -> HashMap<i64, HashMap<String, usize, LibDefaultHasher>, LibDefaultHasher> {
         std::mem::take(&mut self.position_to_insertion_count)
     }
 
-    pub fn take_position_to_deletions_count(&mut self) -> HashMap<i64, HashMap<String, usize>> {
+    pub fn take_position_to_deletions_count(
+        &mut self,
+    ) -> HashMap<i64, HashMap<String, usize, LibDefaultHasher>, LibDefaultHasher> {
         std::mem::take(&mut self.position_to_deletions_count)
     }
 
     /// Get the reference coverage map
-    pub fn get_ref_coverage(&self) -> &HashMap<i64, usize> {
+    pub fn get_ref_coverage(&self) -> &HashMap<i64, usize, LibDefaultHasher> {
         &self.ref_coverage
     }
 
     /// Take ownership of the reference coverage map
-    pub fn take_ref_coverage(&mut self) -> HashMap<i64, usize> {
+    pub fn take_ref_coverage(&mut self) -> HashMap<i64, usize, LibDefaultHasher> {
         std::mem::take(&mut self.ref_coverage)
     }
 
     /// Get the 5' soft clips
-    pub fn get_soft_clips_5end(&self) -> &HashMap<i64, SoftClip> {
+    pub fn get_soft_clips_5end(&self) -> &HashMap<i64, SoftClip, LibDefaultHasher> {
         &self.soft_clips5_end
     }
 
     /// Take ownership of the 5' soft clips
-    pub fn take_soft_clips_5end(&mut self) -> HashMap<i64, SoftClip> {
+    pub fn take_soft_clips_5end(&mut self) -> HashMap<i64, SoftClip, LibDefaultHasher> {
         std::mem::take(&mut self.soft_clips5_end)
     }
 
     /// Get the 3' soft clips
-    pub fn get_soft_clips_3end(&self) -> &HashMap<i64, SoftClip> {
+    pub fn get_soft_clips_3end(&self) -> &HashMap<i64, SoftClip, LibDefaultHasher> {
         &self.soft_clips3_end
     }
 
     /// Take ownership of the 3' soft clips
-    pub fn take_soft_clips_3end(&mut self) -> HashMap<i64, SoftClip> {
+    pub fn take_soft_clips_3end(&mut self) -> HashMap<i64, SoftClip, LibDefaultHasher> {
         std::mem::take(&mut self.soft_clips3_end)
     }
 
@@ -386,11 +459,13 @@ impl CigarParser {
     }
 
     /// Take ownership of splice counts
-    pub fn take_splice_count(&mut self) -> HashMap<SplicingKey, Vec<usize>> {
+    pub fn take_splice_count(&mut self) -> HashMap<SplicingKey, Vec<usize>, LibDefaultHasher> {
         std::mem::take(&mut self.splice_count)
     }
 
-    pub fn take_splice_count_insert_index(&mut self) -> HashMap<SplicingKey, usize> {
+    pub fn take_splice_count_insert_index(
+        &mut self,
+    ) -> HashMap<SplicingKey, usize, LibDefaultHasher> {
         std::mem::take(&mut self.splice_count_insert_index)
     }
 
@@ -580,7 +655,8 @@ impl CigarParser {
         let mut soft5 = 0i64;
         if let Some(Cigar::SoftClip(len)) = cigar.iter().next() {
             let tt = *len as usize;
-            if tt > 0 && tt <= query_qual.len() && query_qual[tt - 1] as f64 > instance().conf.goodq {
+            if tt > 0 && tt <= query_qual.len() && query_qual[tt - 1] as f64 > instance().conf.goodq
+            {
                 soft5 = start;
             }
         }
@@ -628,7 +704,8 @@ impl CigarParser {
                 end - mate_start
             };
             if span.abs()
-                <= (instance().conf.inssize + instance().conf.insstdamt * instance().conf.insstd) as i64
+                <= (instance().conf.inssize + instance().conf.insstdamt * instance().conf.insstd)
+                    as i64
             {
                 return;
             }
@@ -681,12 +758,16 @@ impl CigarParser {
                 self.svdelrend = end;
             }
 
-            if !self.svfdel.is_empty() && ((start - self.svdelfend).abs() as f64) <= min_cluster_dist {
+            if !self.svfdel.is_empty()
+                && ((start - self.svdelfend).abs() as f64) <= min_cluster_dist
+            {
                 if let Some(last) = self.svfdel.last_mut() {
                     Self::add_discordant_count(last);
                 }
             }
-            if !self.svrdel.is_empty() && ((start - self.svdelrend).abs() as f64) <= min_cluster_dist {
+            if !self.svrdel.is_empty()
+                && ((start - self.svdelrend).abs() as f64) <= min_cluster_dist
+            {
                 if let Some(last) = self.svrdel.last_mut() {
                     Self::add_discordant_count(last);
                 }
@@ -773,12 +854,16 @@ impl CigarParser {
                 self.svduprend = end;
             }
 
-            if !self.svfdup.is_empty() && ((start - self.svdupfend).abs() as f64) <= min_cluster_dist {
+            if !self.svfdup.is_empty()
+                && ((start - self.svdupfend).abs() as f64) <= min_cluster_dist
+            {
                 if let Some(last) = self.svfdup.last_mut() {
                     Self::add_discordant_count(last);
                 }
             }
-            if !self.svrdup.is_empty() && ((start - self.svduprend).abs() as f64) <= min_cluster_dist {
+            if !self.svrdup.is_empty()
+                && ((start - self.svduprend).abs() as f64) <= min_cluster_dist
+            {
                 if let Some(last) = self.svrdup.last_mut() {
                     Self::add_discordant_count(last);
                 }
@@ -817,7 +902,9 @@ impl CigarParser {
             let max_read_len_i64 = self.max_read_len.max(1) as i64;
             if read_dir_num == 1 && mlen != 0 {
                 if mlen < -3 * max_read_len_i64 {
-                    if self.svfinv3.is_empty() || (start - self.svinvfend3) as f64 > min_cluster_dist {
+                    if self.svfinv3.is_empty()
+                        || (start - self.svinvfend3) as f64 > min_cluster_dist
+                    {
                         self.svfinv3.push(SoftClip::default());
                     }
                     if let Some(last) = self.svfinv3.last_mut() {
@@ -841,7 +928,9 @@ impl CigarParser {
                     }
                     self.svinvfend3 = end;
                 } else if mlen > 3 * max_read_len_i64 {
-                    if self.svfinv5.is_empty() || (start - self.svinvfend5) as f64 > min_cluster_dist {
+                    if self.svfinv5.is_empty()
+                        || (start - self.svinvfend5) as f64 > min_cluster_dist
+                    {
                         self.svfinv5.push(SoftClip::default());
                     }
                     if let Some(last) = self.svfinv5.last_mut() {
@@ -867,7 +956,9 @@ impl CigarParser {
                 }
             } else if mlen != 0 {
                 if mlen < -3 * max_read_len_i64 {
-                    if self.svrinv3.is_empty() || (start - self.svinvrend3) as f64 > min_cluster_dist {
+                    if self.svrinv3.is_empty()
+                        || (start - self.svinvrend3) as f64 > min_cluster_dist
+                    {
                         self.svrinv3.push(SoftClip::default());
                     }
                     if let Some(last) = self.svrinv3.last_mut() {
@@ -891,7 +982,9 @@ impl CigarParser {
                     }
                     self.svinvrend3 = end;
                 } else if mlen > 3 * max_read_len_i64 {
-                    if self.svrinv5.is_empty() || (start - self.svinvrend5) as f64 > min_cluster_dist {
+                    if self.svrinv5.is_empty()
+                        || (start - self.svinvrend5) as f64 > min_cluster_dist
+                    {
                         self.svrinv5.push(SoftClip::default());
                     }
                     if let Some(last) = self.svrinv5.last_mut() {
@@ -942,16 +1035,13 @@ impl CigarParser {
         }
     }
 
-
     fn parse_cigar(&mut self, record: &mut Record) -> Result<(), Error> {
         event!(Level::DEBUG, "Starting for record at pos {}", record.pos());
-        self.current_qname = Some(String::from_utf8_lossy(record.qname()).to_string());
-        let trace_target = env::var("VARDICT_TRACE_QNAME")
-            .ok()
-            .map(|needle| {
-                needle == "*" || record.qname() == needle.as_bytes()
-            })
-            .unwrap_or(record.qname() == b"SRR098401.96368837");
+        self.current_qname = self
+            .needs_current_qname()
+            .then(|| String::from_utf8_lossy(record.qname()).to_string());
+        let trace_target = self.trace_record_qname(&self.trace_target_qname, record.qname())
+            || record.qname() == b"SRR098401.96368837";
         if trace_target {
             event!(
                 Level::WARN,
@@ -961,7 +1051,7 @@ impl CigarParser {
                 record.cigar().to_string()
             );
         }
-        
+
         // Build query sequence and quality as owned vectors
         let mut query_seq_owned: Vec<u8> = record.seq().into_decoded_base_iter().collect();
         let mut query_qual_owned: Vec<u8> = record.qual().to_vec();
@@ -975,7 +1065,7 @@ impl CigarParser {
 
         record.cache_cigar_if_empty();
         let mut cigar = record.cigar();
-        
+
         event!(Level::DEBUG, "CIGAR: {:?}", cigar);
         if record.qname() == b"read_1" {
             event!(
@@ -998,7 +1088,10 @@ impl CigarParser {
             Some(oth) => Err(anyhow!("Got unexpected type for NM tag: {:?}", oth))?,
             None => {
                 if !cigar.is_empty() {
-                    event!(Level::DEBUG, "No NM tag for mismatches; continuing with NM=0");
+                    event!(
+                        Level::DEBUG,
+                        "No NM tag for mismatches; continuing with NM=0"
+                    );
                 }
 
                 let has_alignment = !cigar.is_empty() && record.pos() >= 0;
@@ -1038,7 +1131,10 @@ impl CigarParser {
             && self.parse_cigar_with_amp_case(record, &cigar, record.tid() == record.mtid())
         {
             if trace_target {
-                event!(Level::INFO, "[trace_target] return: amplicon gate filtered read");
+                event!(
+                    Level::INFO,
+                    "[trace_target] return: amplicon gate filtered read"
+                );
             }
             return Ok(());
         }
@@ -1056,10 +1152,11 @@ impl CigarParser {
                 self.last_modified_pos = Some(pos);
                 self.last_modified_cigar = Some(cigar.to_string());
             } else {
-                let mut local_cigar = CigarString(record.cigar().iter().copied().collect::<Vec<_>>())
-                    .into_view(local_pos);
-            // Modify the CIGAR for potential mis-alignment for indels at the end of reads to softclipping and let VarDict's
-            // algorithm to figure out indels
+                let mut local_cigar =
+                    CigarString(record.cigar().iter().copied().collect::<Vec<_>>())
+                        .into_view(local_pos);
+                // Modify the CIGAR for potential mis-alignment for indels at the end of reads to softclipping and let VarDict's
+                // algorithm to figure out indels
 
                 let mut cigar_modifier = CigarModifier::new(
                     local_pos,
@@ -1073,30 +1170,28 @@ impl CigarParser {
                     &mut self.rev_complementor,
                 );
 
-            let mc = cigar_modifier.modify_cigar()?;
+                let mc = cigar_modifier.modify_cigar()?;
 
-            // Convert to 1-based position (BAM is 0-based, Java VarDict uses 1-based)
+                // Convert to 1-based position (BAM is 0-based, Java VarDict uses 1-based)
                 pos = mc.align_start_pos + self.reference.region_start;
-                cigar = CigarString(mc.cigar.into_iter().collect::<Vec<_>>())
-                    .into_view(pos);
+                cigar = CigarString(mc.cigar.into_iter().collect::<Vec<_>>()).into_view(pos);
 
                 self.last_modified_pos = Some(pos);
                 self.last_modified_cigar = Some(cigar.to_string());
 
-            event!(Level::DEBUG, "Modified CIGAR: {:?}", cigar);
-            if record.qname() == b"read_1" {
-                event!(
-                    Level::DEBUG,
-                    "[debug read_1] cigar_after={:?} align_start={}",
-                    cigar,
-                    mc.align_start_pos
-                );
-            }
+                event!(Level::DEBUG, "Modified CIGAR: {:?}", cigar);
+                if record.qname() == b"read_1" {
+                    event!(
+                        Level::DEBUG,
+                        "[debug read_1] cigar_after={:?} align_start={}",
+                        cigar,
+                        mc.align_start_pos
+                    );
+                }
 
                 query_qual = mc.query_qual;
                 query_seq = mc.query_seq;
             }
-
         } else {
             // Convert to 1-based position (BAM is 0-based, Java VarDict uses 1-based)
             pos = record.pos() + 1;
@@ -1157,7 +1252,10 @@ impl CigarParser {
             const SUPPLEMENTARY_ALIGNMENT: u16 = 0x800;
             if (record.flags() & SUPPLEMENTARY_ALIGNMENT) != 0 {
                 if trace_target {
-                    event!(Level::INFO, "[trace_target] return: supplementary alignment");
+                    event!(
+                        Level::INFO,
+                        "[trace_target] return: supplementary alignment"
+                    );
                 }
                 return Ok(());
             }
@@ -1166,7 +1264,10 @@ impl CigarParser {
         // Skip sites that are not in region of interest in CRISPR mode
         if self.skip_sites_out_region_of_interest(cigar.0.as_slice()) {
             if trace_target {
-                event!(Level::INFO, "[trace_target] return: skip_sites_out_region_of_interest");
+                event!(
+                    Level::INFO,
+                    "[trace_target] return: skip_sites_out_region_of_interest"
+                );
             }
             return Ok(());
         }
@@ -1198,7 +1299,11 @@ impl CigarParser {
         }
 
         let alignment_start = self.start;
-        let mpos = if record.mpos() >= 0 { record.mpos() + 1 } else { 0 };
+        let mpos = if record.mpos() >= 0 {
+            record.mpos() + 1
+        } else {
+            0
+        };
 
         self.cigar = cigar;
         let cigar_view = self.cigar.clone();
@@ -1206,15 +1311,26 @@ impl CigarParser {
         'process_cigar: {
             let mut ci = 0;
             while ci < self.cigar.len() {
-                if self.skip_overlapping_reads(record, self.start, alignment_start, is_reverse, mpos)
-                {
+                if self.skip_overlapping_reads(
+                    record,
+                    self.start,
+                    alignment_start,
+                    is_reverse,
+                    mpos,
+                ) {
                     break 'process_cigar;
                 }
 
                 let c = *self.cigar.get(ci).unwrap();
-                self.cigar_len = c.len();
+                let c_dispatch = match c {
+                    Cigar::Ins(len) if ci == 0 || ci + 1 == self.cigar.len() => {
+                        Cigar::SoftClip(len)
+                    }
+                    _ => c,
+                };
+                self.cigar_len = c_dispatch.len();
 
-                match c {
+                match c_dispatch {
                     Cigar::RefSkip(_) => {
                         self.process_not_matched(self.cigar_len);
                         ci += 1;
@@ -1372,15 +1488,23 @@ impl CigarParser {
 
                                     // Require higher quality for MNV
                                     // BAM stores Phred quality directly (no +33 ASCII offset)
-                                    if (*query_qual.get_or_err(self.read_pos_including_softclip + ssn)? as f64)
+                                    if (*query_qual
+                                        .get_or_err(self.read_pos_including_softclip + ssn)?
+                                        as f64)
                                         < instance().conf.goodq + 5.0
                                     {
                                         break;
                                     }
-                                    
+
                                     for ssi in 1..=ssn {
-                                        ss.push(*query_seq.get_or_err(self.read_pos_including_softclip + ssi)?);
-                                        q += (*query_qual.get_or_err(self.read_pos_including_softclip + ssi)?) as f64;
+                                        ss.push(
+                                            *query_seq.get_or_err(
+                                                self.read_pos_including_softclip + ssi,
+                                            )?,
+                                        );
+                                        q += (*query_qual
+                                            .get_or_err(self.read_pos_including_softclip + ssi)?)
+                                            as f64;
                                         qbases += 1;
                                     }
                                     self.read_pos_including_softclip += ssn;
@@ -1395,226 +1519,227 @@ impl CigarParser {
                         }
                     }
 
-                            // If multi-base mismatch is found, append it to s
-                            if !ss.is_empty() {
-                                s.push(b'&');
-                                s.extend_from_slice(&ss);
-                            }
-                            
-                            let mut ddlen = 0;
+                    // If multi-base mismatch is found, append it to s
+                    if !ss.is_empty() {
+                        s.push(b'&');
+                        s.extend_from_slice(&ss);
+                    }
 
-                            // Check for adjacent deletions
-                            if self.is_closer_then_vext_and_good_base(
-                                query_seq,
-                                query_qual,
-                                ci,
-                                i,
-                                &ss,
-                                Cigar::Del(0),
-                            )? {
-                                // Extend through end of current segment
-                                while i + 1 < self.cigar_len as usize {
-                                    s.push(*query_seq.get_or_err(self.read_pos_including_softclip + 1)?);
-                                    q += (*query_qual.get_or_err(self.read_pos_including_softclip + 1)?) as f64;
-                                    qbases += 1;
+                    let mut ddlen = 0;
 
-                                    i += 1;
-                                    self.read_pos_including_softclip += 1;
-                                    self.read_pos_excluding_softclip += 1;
-                                    self.start += 1;
-                                }
-
-                                // Reformat s with deletion notation
-                                let next_del_len = self.cigar.get(ci + 1).map(|c| c.len()).unwrap_or(0);
-                                let mut new_s = SmallVecBytes::new();
-                                new_s.extend_from_slice(b"-");
-                                let del_str = next_del_len.to_string();
-                                new_s.extend_from_slice(del_str.as_bytes());
-                                new_s.push(b'&');
-                                
-                                // Remove '&' if present and rebuild
-                                if let Some(amp_pos) = s.iter().position(|&b| b == b'&') {
-                                    new_s.extend_from_slice(&s[0..amp_pos]);
-                                    new_s.extend_from_slice(&s[amp_pos + 1..]);
-                                } else {
-                                    new_s.extend_from_slice(&s);
-                                }
-                                s = new_s;
-                                
-                                start_with_deletion = true;
-                                ddlen = next_del_len as usize;
-                                ci += 1;
-
-                                // Check for insertion two segments ahead
-                                if self.is_two_insertions_ahead(ci) {
-                                    let ins_len = self.cigar.get(ci + 1).map(|c| c.len()).unwrap_or(0) as usize;
-                                    s.push(b'^');
-                                    s.extend_from_slice(
-                                        query_seq.get_or_err(
-                                            (self.read_pos_including_softclip + 1)
-                                                ..(self.read_pos_including_softclip + 1 + ins_len),
-                                        )?,
-                                    );
-
-                                    for qi in 1..=ins_len {
-                                        let idx = self.read_pos_including_softclip + 1 + qi;
-                                        q += (*query_qual.get_or_err(idx)?) as f64;
-                                        qibases += 1;
-                                    }
-
-                                    self.read_pos_including_softclip += ins_len;
-                                    self.read_pos_excluding_softclip += ins_len;
-                                    ci += 1;
-                                }
-
-                                if self.is_next_after_num_matched(ci, 1)? {
-                                    let next_len = self
-                                        .cigar
-                                        .get(ci + 1)
-                                        .map(|c| c.len())
-                                        .unwrap_or(0) as usize;
-                                    if let Some((toffset, tnmoff, tseq, tqual)) =
-                                        self.find_offset(
-                                            (self.start + ddlen as i64 + 1) as usize,
-                                            self.read_pos_including_softclip + 1,
-                                            next_len,
-                                            query_seq,
-                                            query_qual,
-                                        )?
-                                    {
-                                        moffset = toffset;
-                                        nmoff += tnmoff;
-                                        s.push(b'&');
-                                        s.extend_from_slice(&tseq);
-                                        for &bq in &tqual {
-                                            // BAM stores Phred quality directly
-                                            q += bq as f64;
-                                            qibases += 1;
-                                        }
-                                    }
-                                }
-                            } else if self.is_closer_then_vext_and_good_base(
-                                query_seq,
-                                query_qual,
-                                ci,
-                                i,
-                                &ss,
-                                Cigar::Ins(0),
-                            )? {
-                                while i + 1 < self.cigar_len as usize {
-                                    s.push(*query_seq.get_or_err(self.read_pos_including_softclip + 1)?);
-                                    q += (*query_qual.get_or_err(self.read_pos_including_softclip + 1)?) as f64;
-                                    qbases += 1;
-
-                                    i += 1;
-                                    self.read_pos_including_softclip += 1;
-                                    self.read_pos_excluding_softclip += 1;
-                                    self.start += 1;
-                                }
-                                
-                                let next_len = self.cigar.get(ci + 1).map(|c| c.len()).unwrap_or(0) as usize;
-                                
-                                // Java: remove first '&', append insertion, then insert '&' at next_len and prefix '+'
-                                let mut merged = SmallVecBytes::new();
-                                if let Some(amp_pos) = s.iter().position(|&b| b == b'&') {
-                                    merged.extend_from_slice(&s[0..amp_pos]);
-                                    merged.extend_from_slice(&s[amp_pos + 1..]);
-                                } else {
-                                    merged.extend_from_slice(&s);
-                                }
-
-                                let mut insertion_seq = SmallVecBytes::new();
-                                insertion_seq.extend_from_slice(
-                                    query_seq.get_or_err(
-                                        (self.read_pos_including_softclip + 1)
-                                            ..(self.read_pos_including_softclip + 1 + next_len),
-                                    )?,
-                                );
-                                merged.extend_from_slice(&insertion_seq);
-
-                                let split = next_len.min(merged.len());
-                                let mut final_s = SmallVecBytes::new();
-                                final_s.push(b'+');
-                                final_s.extend_from_slice(&merged[..split]);
-                                final_s.push(b'&');
-                                if split < merged.len() {
-                                    final_s.extend_from_slice(&merged[split..]);
-                                }
-                                s = final_s;
-
-                                for qi in 1..=next_len {
-                                    let idx = self.read_pos_including_softclip + 1 + qi;
-                                    q += (*query_qual.get_or_err(idx)?) as f64;
-                                    qibases += 1;
-                                }
-                                
-                                self.read_pos_including_softclip += next_len;
-                                self.read_pos_excluding_softclip += next_len;
-                                ci += 1;
-                                qibases -= 1;
-                                qbases += 1;
-                            }
-
-                            if !trim {
-                                let pos = self.start - qbases as i64 + 1;
-                                if pos >= self.region.start as i64
-                                    && pos <= self.region.end as i64
-                                    && !s.iter().any(|&b| b == b'N')
-                                {
-                                    self.add_variation_for_matching_part(
-                                        mapping_quality,
-                                        nm,
-                                        is_reverse,
-                                        read_match_ins_len,
-                                        self.read_pos_excluding_softclip,  // Use current position (after MNV loop, before final +1)
-                                        nmoff,
-                                        &s,
-                                        start_with_deletion,
-                                        q,
-                                        qbases,
-                                        qibases,
-                                        ddlen,
-                                        pos,
-                                    );
-                                } else {
-                                }
-                            }
-
-                            // If variation starts with deletion
-                            if start_with_deletion {
-                                self.start += ddlen as i64;
-                            }
-
-                            // Shift reference position by 1 if CIGAR segment is not insertion
-                            if !matches!(c, Cigar::Ins(_)) {
-                                self.start += 1;
-                            }
-                            
-                            // Shift read position by 1 if CIGAR segment is not deletion
-                            if !matches!(c, Cigar::Del(_)) {
-                                self.read_pos_including_softclip += 1;
-                                self.read_pos_excluding_softclip += 1;
-                            }
-
-                            // Check for overlapping reads
-                            if self.skip_overlapping_reads(record, self.start, alignment_start, is_reverse, mpos) {
-                                break 'process_cigar;
-                            }
+                    // Check for adjacent deletions
+                    if self.is_closer_then_vext_and_good_base(
+                        query_seq,
+                        query_qual,
+                        ci,
+                        i,
+                        &ss,
+                        Cigar::Del(0),
+                    )? {
+                        // Extend through end of current segment
+                        while i + 1 < self.cigar_len as usize {
+                            s.push(*query_seq.get_or_err(self.read_pos_including_softclip + 1)?);
+                            q += (*query_qual.get_or_err(self.read_pos_including_softclip + 1)?)
+                                as f64;
+                            qbases += 1;
 
                             i += 1;
+                            self.read_pos_including_softclip += 1;
+                            self.read_pos_excluding_softclip += 1;
+                            self.start += 1;
                         }
 
-                        if moffset != 0 {
-                            self.offset = moffset;
-                            self.read_pos_including_softclip += moffset;
-                            self.start += moffset as i64;
-                            self.read_pos_excluding_softclip += moffset;
+                        // Reformat s with deletion notation
+                        let next_del_len = self.cigar.get(ci + 1).map(|c| c.len()).unwrap_or(0);
+                        let mut new_s = SmallVecBytes::new();
+                        new_s.extend_from_slice(b"-");
+                        let del_str = next_del_len.to_string();
+                        new_s.extend_from_slice(del_str.as_bytes());
+                        new_s.push(b'&');
+
+                        // Remove '&' if present and rebuild
+                        if let Some(amp_pos) = s.iter().position(|&b| b == b'&') {
+                            new_s.extend_from_slice(&s[0..amp_pos]);
+                            new_s.extend_from_slice(&s[amp_pos + 1..]);
+                        } else {
+                            new_s.extend_from_slice(&s);
                         }
+                        s = new_s;
+
+                        start_with_deletion = true;
+                        ddlen = next_del_len as usize;
+                        ci += 1;
+
+                        // Check for insertion two segments ahead
+                        if self.is_two_insertions_ahead(ci) {
+                            let ins_len =
+                                self.cigar.get(ci + 1).map(|c| c.len()).unwrap_or(0) as usize;
+                            s.push(b'^');
+                            s.extend_from_slice(query_seq.get_or_err(
+                                (self.read_pos_including_softclip + 1)
+                                    ..(self.read_pos_including_softclip + 1 + ins_len),
+                            )?);
+
+                            for qi in 1..=ins_len {
+                                let idx = self.read_pos_including_softclip + 1 + qi;
+                                q += (*query_qual.get_or_err(idx)?) as f64;
+                                qibases += 1;
+                            }
+
+                            self.read_pos_including_softclip += ins_len;
+                            self.read_pos_excluding_softclip += ins_len;
+                            ci += 1;
+                        }
+
+                        if self.is_next_after_num_matched(ci, 1)? {
+                            let next_len =
+                                self.cigar.get(ci + 1).map(|c| c.len()).unwrap_or(0) as usize;
+                            if let Some((toffset, tnmoff, tseq, tqual)) = self.find_offset(
+                                (self.start + ddlen as i64 + 1) as usize,
+                                self.read_pos_including_softclip + 1,
+                                next_len,
+                                query_seq,
+                                query_qual,
+                            )? {
+                                moffset = toffset;
+                                nmoff += tnmoff;
+                                s.push(b'&');
+                                s.extend_from_slice(&tseq);
+                                for &bq in &tqual {
+                                    // BAM stores Phred quality directly
+                                    q += bq as f64;
+                                    qibases += 1;
+                                }
+                            }
+                        }
+                    } else if self.is_closer_then_vext_and_good_base(
+                        query_seq,
+                        query_qual,
+                        ci,
+                        i,
+                        &ss,
+                        Cigar::Ins(0),
+                    )? {
+                        while i + 1 < self.cigar_len as usize {
+                            s.push(*query_seq.get_or_err(self.read_pos_including_softclip + 1)?);
+                            q += (*query_qual.get_or_err(self.read_pos_including_softclip + 1)?)
+                                as f64;
+                            qbases += 1;
+
+                            i += 1;
+                            self.read_pos_including_softclip += 1;
+                            self.read_pos_excluding_softclip += 1;
+                            self.start += 1;
+                        }
+
+                        let next_len =
+                            self.cigar.get(ci + 1).map(|c| c.len()).unwrap_or(0) as usize;
+
+                        // Java: remove first '&', append insertion, then insert '&' at next_len and prefix '+'
+                        let mut merged = SmallVecBytes::new();
+                        if let Some(amp_pos) = s.iter().position(|&b| b == b'&') {
+                            merged.extend_from_slice(&s[0..amp_pos]);
+                            merged.extend_from_slice(&s[amp_pos + 1..]);
+                        } else {
+                            merged.extend_from_slice(&s);
+                        }
+
+                        let mut insertion_seq = SmallVecBytes::new();
+                        insertion_seq.extend_from_slice(query_seq.get_or_err(
+                            (self.read_pos_including_softclip + 1)
+                                ..(self.read_pos_including_softclip + 1 + next_len),
+                        )?);
+                        merged.extend_from_slice(&insertion_seq);
+
+                        let split = next_len.min(merged.len());
+                        let mut final_s = SmallVecBytes::new();
+                        final_s.push(b'+');
+                        final_s.extend_from_slice(&merged[..split]);
+                        final_s.push(b'&');
+                        if split < merged.len() {
+                            final_s.extend_from_slice(&merged[split..]);
+                        }
+                        s = final_s;
+
+                        for qi in 1..=next_len {
+                            let idx = self.read_pos_including_softclip + 1 + qi;
+                            q += (*query_qual.get_or_err(idx)?) as f64;
+                            qibases += 1;
+                        }
+
+                        self.read_pos_including_softclip += next_len;
+                        self.read_pos_excluding_softclip += next_len;
+                        ci += 1;
+                        qibases -= 1;
+                        qbases += 1;
+                    }
+
+                    if !trim {
+                        let pos = self.start - qbases as i64 + 1;
+                        if pos >= self.region.start as i64
+                            && pos <= self.region.end as i64
+                            && !s.iter().any(|&b| b == b'N')
+                        {
+                            self.add_variation_for_matching_part(
+                                mapping_quality,
+                                nm,
+                                is_reverse,
+                                read_match_ins_len,
+                                self.read_pos_excluding_softclip, // Use current position (after MNV loop, before final +1)
+                                nmoff,
+                                &s,
+                                start_with_deletion,
+                                q,
+                                qbases,
+                                qibases,
+                                ddlen,
+                                pos,
+                            );
+                        } else {
+                        }
+                    }
+
+                    // If variation starts with deletion
+                    if start_with_deletion {
+                        self.start += ddlen as i64;
+                    }
+
+                    // Shift reference position by 1 if CIGAR segment is not insertion
+                    if !matches!(c, Cigar::Ins(_)) {
+                        self.start += 1;
+                    }
+
+                    // Shift read position by 1 if CIGAR segment is not deletion
+                    if !matches!(c, Cigar::Del(_)) {
+                        self.read_pos_including_softclip += 1;
+                        self.read_pos_excluding_softclip += 1;
+                    }
+
+                    // Check for overlapping reads
+                    if self.skip_overlapping_reads(
+                        record,
+                        self.start,
+                        alignment_start,
+                        is_reverse,
+                        mpos,
+                    ) {
+                        break 'process_cigar;
+                    }
+
+                    i += 1;
+                }
+
+                if moffset != 0 {
+                    self.offset = moffset;
+                    self.read_pos_including_softclip += moffset;
+                    self.start += moffset as i64;
+                    self.read_pos_excluding_softclip += moffset;
+                }
 
                 if self.start > self.region.end as i64 {
                     break;
                 }
-                
+
                 ci += 1;
             }
         }
@@ -1719,20 +1844,15 @@ impl CigarParser {
                 4). reference and read bases match
                 5). read quality is more than 10
             */
-            let chr_len = *instance()
-                .chr_lens
-                .get(contig.as_str())
-                .unwrap_or(&0) as i64;
+            let chr_len = *instance().chr_lens.get(contig.as_str()).unwrap_or(&0) as i64;
             while cigar_len >= 1
                 && self.start > 1
                 && self.start - 1 <= chr_len
                 && self.reference.has_and_equals(
                     self.start - 1,
-                    query_sequence
-                        .get_or_err(cigar_len as usize - 1)
-                        .copied()?,
+                    query_sequence.get_or_err(cigar_len as usize - 1).copied()?,
                 )
-                    && *query_quality.get_or_err(cigar_len as usize - 1)? > 10
+                && *query_quality.get_or_err(cigar_len as usize - 1)? > 10
             {
                 //create variant if it is not present
                 let ref_b = self
@@ -1743,11 +1863,21 @@ impl CigarParser {
                 let read_pos = cigar_len as usize;
                 let base_qual = query_quality.get_or_err(cigar_len as usize - 1).copied()? as f64;
                 {
-                    let var =
-                        self.get_non_insertion_variant(self.start - 1, &VarDesc::SNV { ref_base: ref_b });
+                    let var = self.get_non_insertion_variant(
+                        self.start - 1,
+                        &VarDesc::SNV { ref_base: ref_b },
+                    );
                     //add count
                     // BAM stores Phred quality directly
-                    add_cnt(var, is_reverse, read_pos, base_qual, mapq, num_mismatch, None);
+                    add_cnt(
+                        var,
+                        is_reverse,
+                        read_pos,
+                        base_qual,
+                        mapq,
+                        num_mismatch,
+                        None,
+                    );
                 }
                 //increase coverage
                 inc_cnt(&mut self.ref_coverage, self.start - 1, 1);
@@ -1882,15 +2012,24 @@ impl CigarParser {
                     .get(self.start)
                     .ok_or_else(|| anyhow!("Reference base missing at {}", self.start))?;
 
-                let read_pos = total_length_including_soft_clipped - self.read_pos_excluding_softclip;
+                let read_pos =
+                    total_length_including_soft_clipped - self.read_pos_excluding_softclip;
                 let base_qual = query_quality
                     .get_or_err(self.read_pos_including_softclip)
                     .copied()? as f64;
                 {
-                    let var =
-                        self.get_non_insertion_variant(self.start, &VarDesc::SNV { ref_base: ref_b });
+                    let var = self
+                        .get_non_insertion_variant(self.start, &VarDesc::SNV { ref_base: ref_b });
                     //add count - BAM stores Phred quality directly
-                    add_cnt(var, is_reverse, read_pos, base_qual, mapq, num_mismatch, None);
+                    add_cnt(
+                        var,
+                        is_reverse,
+                        read_pos,
+                        base_qual,
+                        mapq,
+                        num_mismatch,
+                        None,
+                    );
                 }
                 // Add coverage
                 inc_cnt(&mut self.ref_coverage, self.start, 1);
@@ -2117,11 +2256,9 @@ impl CigarParser {
             }
 
             // Append next segment to quality string
-            qual_seg.extend_from_slice(
-                query_qual.get_or_err(
-                    self.read_pos_including_softclip..self.read_pos_including_softclip + ins_len,
-                )?,
-            );
+            qual_seg.extend_from_slice(query_qual.get_or_err(
+                self.read_pos_including_softclip..self.read_pos_including_softclip + ins_len,
+            )?);
 
             // Shift read position by length of insertion
             read_offset += ins_len;
@@ -2138,9 +2275,7 @@ impl CigarParser {
                     if seq_ch == b'N' {
                         break;
                     }
-                    if ((*query_qual.get_or_err(tn + vi)?) as f64)
-                        < instance().conf.goodq
-                    {
+                    if ((*query_qual.get_or_err(tn + vi)?) as f64) < instance().conf.goodq {
                         break;
                     }
                     match self.reference.get((ts + vi) as i64) {
@@ -2215,18 +2350,14 @@ impl CigarParser {
             // If next CIGAR segment has good matching base
             if self.offset != 0 {
                 // Append first offset bases of next segment to ss and q
-                seq_to_append_if_next_matched.extend_from_slice(
-                    query_seq.get_or_err(
-                        self.read_pos_including_softclip
-                            ..self.read_pos_including_softclip + self.offset,
-                    )?,
-                );
-                qual_seg.extend_from_slice(
-                    query_qual.get_or_err(
-                        self.read_pos_including_softclip
-                            ..self.read_pos_including_softclip + self.offset,
-                    )?,
-                );
+                seq_to_append_if_next_matched.extend_from_slice(query_seq.get_or_err(
+                    self.read_pos_including_softclip
+                        ..self.read_pos_including_softclip + self.offset,
+                )?);
+                qual_seg.extend_from_slice(query_qual.get_or_err(
+                    self.read_pos_including_softclip
+                        ..self.read_pos_including_softclip + self.offset,
+                )?);
             }
         }
 
@@ -2352,7 +2483,11 @@ impl CigarParser {
     }
 
     /// Check if position should be trimmed at opt_T bases
-    fn is_trim_at_opt_t_bases(&self, is_reverse: bool, total_length_including_softclipped: usize) -> bool {
+    fn is_trim_at_opt_t_bases(
+        &self,
+        is_reverse: bool,
+        total_length_including_softclipped: usize,
+    ) -> bool {
         if instance().conf.trim_bases_after != 0 {
             let trim_bases = instance().conf.trim_bases_after as usize;
             if !is_reverse {
@@ -2402,9 +2537,13 @@ impl CigarParser {
         {
             let next_cigar = self.cigar.get(ci + 1);
             let has_correct_type = if is_del {
-                next_cigar.map(|c| matches!(c, Cigar::Del(_))).unwrap_or(false)
+                next_cigar
+                    .map(|c| matches!(c, Cigar::Del(_)))
+                    .unwrap_or(false)
             } else if is_ins {
-                next_cigar.map(|c| matches!(c, Cigar::Ins(_))).unwrap_or(false)
+                next_cigar
+                    .map(|c| matches!(c, Cigar::Ins(_)))
+                    .unwrap_or(false)
             } else {
                 false
             };
@@ -2418,7 +2557,8 @@ impl CigarParser {
                     );
 
                 // BAM stores Phred quality directly
-                let has_good_quality = (*query_qual.get_or_err(self.read_pos_including_softclip)? as f64)
+                let has_good_quality = (*query_qual.get_or_err(self.read_pos_including_softclip)?
+                    as f64)
                     >= instance().conf.goodq;
 
                 return Ok(has_mismatch && has_good_quality);
@@ -2493,13 +2633,16 @@ impl CigarParser {
     /// Check if there's a matched segment after num positions
     fn is_next_after_num_matched(&self, ci: usize, num: usize) -> Result<bool, Error> {
         Ok(self.cigar.len() > ci + num
-            && matches!(self.cigar.get(ci + num), Some(Cigar::Match(_))))
+            && matches!(
+                self.cigar.get(ci + num),
+                Some(Cigar::Match(_) | Cigar::Equal(_) | Cigar::Diff(_))
+            ))
     }
 
     /// Process insertion in CIGAR
-    /// 
+    ///
     /// Java equivalent: processInsertion() in CigarParser.java
-    /// 
+    ///
     /// Key logic:
     /// 1. Get the inserted bases from the read
     /// 2. If next CIGAR is Match, look for mismatches using vext algorithm
@@ -2517,16 +2660,7 @@ impl CigarParser {
         mut ci: usize,
         cigar: &CigarStringView,
     ) -> Result<usize, Error> {
-        let trace_ins = env::var("VARDICT_TRACE_INS_QNAME")
-            .ok()
-            .map(|needle| {
-                needle == "*"
-                    || self
-                        .current_qname
-                        .as_deref()
-                        .map_or(false, |name| name == needle)
-            })
-            .unwrap_or(false);
+        let trace_ins = self.trace_current_qname(&self.trace_ins_qname);
 
         let ins_len = self.cigar_len as usize;
 
@@ -2584,8 +2718,12 @@ impl CigarParser {
             // Append '^' + next-next segment (sequence for insertion, length for deletion)
             desc.push(b'^');
             if matches!(cigar.get(ci + 2), Some(Cigar::Ins(_))) {
-                desc.extend_from_slice(query_seq.get_or_err(begin + mlen..begin + mlen + indel_len)?);
-                qual_seg.extend_from_slice(query_qual.get_or_err(begin + mlen..begin + mlen + indel_len)?);
+                desc.extend_from_slice(
+                    query_seq.get_or_err(begin + mlen..begin + mlen + indel_len)?,
+                );
+                qual_seg.extend_from_slice(
+                    query_qual.get_or_err(begin + mlen..begin + mlen + indel_len)?,
+                );
             } else {
                 let len_str = indel_len.to_string();
                 desc.extend_from_slice(len_str.as_bytes());
@@ -2655,7 +2793,8 @@ impl CigarParser {
             if self.offset != 0 {
                 let start_idx = self.read_pos_including_softclip + ins_len;
                 ss.extend_from_slice(query_seq.get_or_err(start_idx..start_idx + self.offset)?);
-                qual_seg.extend_from_slice(query_qual.get_or_err(start_idx..start_idx + self.offset)?);
+                qual_seg
+                    .extend_from_slice(query_qual.get_or_err(start_idx..start_idx + self.offset)?);
                 for osi in 0..self.offset {
                     inc_cnt(&mut self.ref_coverage, self.start + osi as i64, 1);
                 }
@@ -2675,8 +2814,8 @@ impl CigarParser {
         {
             if is_begin_atgc_end(&desc) {
                 let (adj_pos, adj_seq) = adj_ins_pos(insertion_pos, &desc, &self.reference);
-                let idx = (self.read_pos_including_softclip as i64 - 1)
-                    - (self.start - 1 - adj_pos);
+                let idx =
+                    (self.read_pos_including_softclip as i64 - 1) - (self.start - 1 - adj_pos);
                 if idx > 0 {
                     insertion_pos = adj_pos;
                     desc = adj_seq;
@@ -2723,8 +2862,8 @@ impl CigarParser {
             );
 
             // Adjust the reference count for insertion reads
-            let index_in_query = (self.read_pos_including_softclip as i64 - 1)
-                - (self.start - 1 - insertion_pos);
+            let index_in_query =
+                (self.read_pos_including_softclip as i64 - 1) - (self.start - 1 - insertion_pos);
             if insertion_pos > pos && index_in_query >= 0 {
                 let idx = index_in_query as usize;
                 if idx < query_seq.len() {
@@ -2777,7 +2916,10 @@ impl CigarParser {
                     if !ref_var.pstd && ref_var.pp != 0 && tp != ref_var.pp {
                         ref_var.pstd = true;
                     }
-                    if !ref_var.qstd && ref_var.pq != 0.0 && (tmpq - ref_var.pq).abs() > f64::EPSILON {
+                    if !ref_var.qstd
+                        && ref_var.pq != 0.0
+                        && (tmpq - ref_var.pq).abs() > f64::EPSILON
+                    {
                         ref_var.qstd = true;
                     }
                     ref_var.mean_pos += tp as f64;
@@ -2819,7 +2961,7 @@ impl CigarParser {
         nm: i32,
         is_reverse: bool,
         read_len_including_match_ins: usize,
-        read_pos: usize,  // Current read position (0-based)
+        read_pos: usize, // Current read position (0-based)
         nmoff: usize,
         s: &[u8],
         start_with_deletion: bool,
@@ -2829,17 +2971,12 @@ impl CigarParser {
         ddlen: usize,
         pos: i64,
     ) {
-        let debug_pos = env::var("VARDICT_DEBUG_POS")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok());
-        let trace_merge_ins = env::var("VARDICT_TRACE_MERGED_INS")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let debug_pos = self.debug_pos;
+        let trace_merge_ins = self.trace_merge_ins;
 
         // Build VarDesc from s string
         // s format examples: "A", "A&TGC" (MNV), "+ATC" (insertion), "-2&AT" (deletion+match), etc.
-        
+
         if s.is_empty() || s.iter().all(|&b| b == b'N') {
             return;
         }
@@ -2850,17 +2987,19 @@ impl CigarParser {
         } else {
             q
         };
-        
+
         let nm_adjusted = nm - nmoff as i32;
         let mut did_add_variant = false;
-        let s_str = String::from_utf8_lossy(s);
+        let is_insertion = s.starts_with(b"+");
+        let has_ampersand = s.contains(&b'&');
 
         // Check if this is an insertion first
-        if s.starts_with(b"+") {
+        if is_insertion {
             // Insertion: +ATC format
             let ins_seq: SmallVec<[u8; 32]> = s[1..].iter().copied().collect();
 
             if trace_merge_ins {
+                let s_str = String::from_utf8_lossy(s);
                 event!(
                     Level::WARN,
                     "[trace_merged_ins] qname={} pos={} s={} read_pos={} start={} read_pos_incl={} read_pos_excl={}",
@@ -2876,11 +3015,8 @@ impl CigarParser {
 
             let var_desc = VarDesc::Ins { seq: ins_seq };
 
-            Self::increment_position_count(
-                &mut self.position_to_insertion_count,
-                pos,
-                &s_str,
-            );
+            let ins_key = String::from_utf8_lossy(s);
+            Self::increment_position_count(&mut self.position_to_insertion_count, pos, &ins_key);
 
             // Store insertions in insertion_vars (Java: addVariationForMatchingPart uses insertionVariants)
             // use read_pos for tp calculation
@@ -2897,7 +3033,9 @@ impl CigarParser {
             did_add_variant = true;
         } else if s.starts_with(b"-") {
             // Deletion from matching part: preserve raw description string
-            let var_desc = VarDesc::Raw { desc: s.to_vec().into() };
+            let var_desc = VarDesc::Raw {
+                desc: s.to_vec().into(),
+            };
 
             let var = self.get_non_insertion_variant(pos, &var_desc);
             add_cnt(
@@ -2910,9 +3048,11 @@ impl CigarParser {
                 Some(read_len_including_match_ins),
             );
             did_add_variant = true;
-        } else if s.iter().any(|&b| b == b'&') {
+        } else if has_ampersand {
             // Complex/raw variant (MNV with '&')
-            let var_desc = VarDesc::Raw { desc: s.to_vec().into() };
+            let var_desc = VarDesc::Raw {
+                desc: s.to_vec().into(),
+            };
 
             let var = self.get_non_insertion_variant(pos, &var_desc);
             add_cnt(
@@ -2928,16 +3068,20 @@ impl CigarParser {
         } else if s.len() == 1 {
             // Simple base: single base (could be match or SNV)
             let alt_base = s[0];
-            
+
             // Get reference base at this position using coordinate-translated access
             let ref_base = match self.reference.get(pos) {
                 Some(b) => b,
                 None => {
-                    event!(Level::DEBUG, "[add_variation_for_matching_part] SNV at pos {} not in reference", pos);
+                    event!(
+                        Level::DEBUG,
+                        "[add_variation_for_matching_part] SNV at pos {} not in reference",
+                        pos
+                    );
                     return;
                 }
             };
-            
+
             // Create VarDesc keyed by alt_base (the read base)
             // This stores both matches (alt == ref) and mismatches (alt != ref)
             let var_desc = VarDesc::SNV { ref_base: alt_base };
@@ -2957,7 +3101,7 @@ impl CigarParser {
                     is_reverse
                 );
             }
-            
+
             // Get or create variant and add count - use read_pos for tp calculation
             let var = self.get_non_insertion_variant(pos, &var_desc);
             add_cnt(
@@ -2975,7 +3119,7 @@ impl CigarParser {
         }
 
         if did_add_variant {
-            let shift = if s.starts_with(b"+") && s.iter().any(|&b| b == b'&') {
+            let shift = if is_insertion && has_ampersand {
                 1
             } else {
                 0
@@ -2987,11 +3131,8 @@ impl CigarParser {
             }
 
             if start_with_deletion {
-                Self::increment_position_count(
-                    &mut self.position_to_deletions_count,
-                    pos,
-                    &s_str,
-                );
+                let s_str = String::from_utf8_lossy(s);
+                Self::increment_position_count(&mut self.position_to_deletions_count, pos, &s_str);
                 for qi in 1..ddlen {
                     inc_cnt(&mut self.ref_coverage, self.start + qi as i64, 1);
                 }
@@ -3014,17 +3155,17 @@ impl CigarParser {
 
         if is_begin_atgc_amp_atgcs_end(s) {
             let desc = String::from_utf8_lossy(s).to_string();
-            let pos_map = self.mnp.entry(pos).or_insert_with(HashMap::new);
+            let pos_map = self.mnp.entry(pos).or_default();
             *pos_map.entry(desc).or_insert(0) += 1;
         }
     }
 
     fn increment_position_count(
-        map: &mut HashMap<i64, HashMap<String, usize>>,
+        map: &mut HashMap<i64, HashMap<String, usize, LibDefaultHasher>, LibDefaultHasher>,
         pos: i64,
         key: &str,
     ) {
-        let pos_map = map.entry(pos).or_insert_with(HashMap::new);
+        let pos_map = map.entry(pos).or_default();
         *pos_map.entry(key.to_string()).or_insert(0) += 1;
     }
 
@@ -3148,11 +3289,10 @@ impl CigarParser {
         false
     }
 
-
     fn contig_ref_seq(&self) -> &Vec<u8> {
         &self.reference.ref_seq
     }
-    
+
     /// Get a reference base at a genomic position
     /// Converts genomic position to slice index using region.start()
     fn ref_base_at(&self, genomic_pos: i64) -> Option<u8> {
@@ -3162,12 +3302,12 @@ impl CigarParser {
         let idx = (genomic_pos - self.region.start() as i64) as usize;
         self.reference.ref_seq.get(idx).copied()
     }
-    
+
     /// Check if a reference position has a base that equals the given base
     fn ref_has_and_equals(&self, genomic_pos: i64, base: u8) -> bool {
         self.ref_base_at(genomic_pos).map_or(false, |b| b == base)
     }
-    
+
     /// Check if a reference position has a base that does NOT equal the given base
     fn ref_has_and_not_equals(&self, genomic_pos: i64, base: u8) -> bool {
         self.ref_base_at(genomic_pos).map_or(false, |b| b != base)
@@ -3203,7 +3343,10 @@ impl CigarParser {
                     break;
                 }
 
-                let b = query_sequence.get_or_err(si as usize).copied()?.to_ascii_uppercase();
+                let b = query_sequence
+                    .get_or_err(si as usize)
+                    .copied()?
+                    .to_ascii_uppercase();
                 let idx = cigar_len - 1 - si; // distance from start of match.
                 let cnts = sclip
                     .nt
@@ -3262,7 +3405,7 @@ impl CigarParser {
             && self.start as usize >= self.region.start
             && self.start as usize <= self.region.end
         {
-//add record to $sclip5
+            //add record to $sclip5
             let sclip = self
                 .soft_clips3_end
                 .entry(self.start)
@@ -3342,7 +3485,7 @@ fn get_aligned_length(cigar: &CigarStringView) -> i64 {
     cigar
         .iter()
         .map(|c| match c {
-            Cigar::Match(l) | Cigar::Del(l) => *l as i64,
+            Cigar::Match(l) | Cigar::Equal(l) | Cigar::Diff(l) | Cigar::Del(l) => *l as i64,
             _ => 0,
         })
         .sum::<i64>()
@@ -3353,7 +3496,11 @@ fn get_aligned_length_mnd(cigar: &CigarStringView) -> i64 {
     cigar
         .iter()
         .map(|c| match c {
-            Cigar::Match(l) | Cigar::Del(l) | Cigar::RefSkip(l) => *l as i64,
+            Cigar::Match(l)
+            | Cigar::Equal(l)
+            | Cigar::Diff(l)
+            | Cigar::Del(l)
+            | Cigar::RefSkip(l) => *l as i64,
             _ => 0,
         })
         .sum::<i64>()
@@ -3363,7 +3510,7 @@ fn get_match_insertion_length(cigar: &CigarStringView) -> usize {
     cigar
         .iter()
         .map(|c| match c {
-            Cigar::Match(l) | Cigar::Ins(l) => *l as usize,
+            Cigar::Match(l) | Cigar::Equal(l) | Cigar::Diff(l) | Cigar::Ins(l) => *l as usize,
             _ => 0,
         })
         .sum::<usize>()
@@ -3374,7 +3521,11 @@ fn get_soft_clipped_length(cigar: &CigarStringView) -> usize {
     cigar
         .iter()
         .map(|c| match c {
-            Cigar::Match(l) | Cigar::Ins(l) | Cigar::SoftClip(l) => *l as usize,
+            Cigar::Match(l)
+            | Cigar::Equal(l)
+            | Cigar::Diff(l)
+            | Cigar::Ins(l)
+            | Cigar::SoftClip(l) => *l as usize,
             _ => 0,
         })
         .sum::<usize>()
@@ -3391,7 +3542,13 @@ fn are_reads_overlap(record: &Record, current_start: i64, pos: i64, mate_pos: i6
         let ref_len = record
             .cigar()
             .iter()
-            .map(|c| if c.consumes_reference_bases() { c.len() } else { 0 })
+            .map(|c| {
+                if c.consumes_reference_bases() {
+                    c.len()
+                } else {
+                    0
+                }
+            })
             .sum::<u32>() as i64;
         current_start >= mate_pos && current_start <= mate_pos + ref_len - 1
     } else {
@@ -3457,7 +3614,15 @@ fn is_read_chimeric_with_sa(
 /// read_pos: position in read (excluding soft clips)  
 /// bq: base quality
 /// read_len: optional total read length for calculating tp correctly
-fn add_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64, mapq: u8, nm: i32, read_len: Option<usize>) {
+fn add_cnt(
+    var: &mut Variant,
+    is_reverse: bool,
+    read_pos: usize,
+    bq: f64,
+    mapq: u8,
+    nm: i32,
+    read_len: Option<usize>,
+) {
     var.alt_depth += 1;
     var.inc_dir(is_reverse);
 
@@ -3510,7 +3675,15 @@ fn add_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64, mapq: 
 
 /// Increment variant counters without adjusting high/low quality counts.
 /// Used for edge insertion adjustment to match Java's ref-call metrics.
-fn add_cnt_no_qual(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64, mapq: u8, nm: i32, read_len: Option<usize>) {
+fn add_cnt_no_qual(
+    var: &mut Variant,
+    is_reverse: bool,
+    read_pos: usize,
+    bq: f64,
+    mapq: u8,
+    nm: i32,
+    read_len: Option<usize>,
+) {
     var.alt_depth += 1;
     var.inc_dir(is_reverse);
 
@@ -3547,7 +3720,15 @@ fn add_cnt_no_qual(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64
 /// read_pos: position in read (excluding soft clips)
 /// bq: base quality
 /// read_len: optional total read length for calculating tp correctly
-fn sub_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64, mapq: u8, nm: i32, read_len: Option<usize>) {
+fn sub_cnt(
+    var: &mut Variant,
+    is_reverse: bool,
+    read_pos: usize,
+    bq: f64,
+    mapq: u8,
+    nm: i32,
+    read_len: Option<usize>,
+) {
     if var.alt_depth > 0 {
         var.alt_depth = var.alt_depth.saturating_sub(1);
     }
@@ -3587,10 +3768,18 @@ fn sub_cnt(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64, mapq: 
 /// read_pos: position in read (excluding soft clips)  
 /// bq: base quality
 /// read_len: optional total read length for calculating tp correctly
-fn add_cnt_anchor(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64, mapq: u8, nm: i32, read_len: Option<usize>) {
+fn add_cnt_anchor(
+    var: &mut Variant,
+    is_reverse: bool,
+    read_pos: usize,
+    bq: f64,
+    mapq: u8,
+    nm: i32,
+    read_len: Option<usize>,
+) {
     var.alt_depth += 1;
     var.inc_dir(is_reverse);
-    
+
     // Calculate tp: minimum distance from either end of read (like Java)
     let tp = if let Some(rlen) = read_len {
         let from_start = read_pos;
@@ -3603,18 +3792,18 @@ fn add_cnt_anchor(var: &mut Variant, is_reverse: bool, read_pos: usize, bq: f64,
     } else {
         read_pos + 1
     };
-    
+
     // pstd: true if variant is covered by reads with different positions
     if !var.pstd && var.pp != 0 && tp != var.pp {
         var.pstd = true;
     }
-    
+
     // qstd: true if variant is covered by reads with different qualities
     let tmpq = bq;
     if !var.qstd && var.pq != 0.0 && (tmpq - var.pq).abs() > f64::EPSILON {
         var.qstd = true;
     }
-    
+
     var.mean_pos += tp as f64;
     var.mean_qual += tmpq;
     var.mean_mapq += mapq as f64;
@@ -3643,15 +3832,25 @@ fn format_var_desc(desc: &VarDesc) -> String {
     match desc {
         VarDesc::SNV { ref_base } => format!("SNV({})", *ref_base as char),
         VarDesc::Ins { seq } => format!("INS({})", String::from_utf8_lossy(seq.as_slice())),
-        VarDesc::Del { len, match_seq, ins_or_del_len, mismatch_seq } => {
+        VarDesc::Del {
+            len,
+            match_seq,
+            ins_or_del_len,
+            mismatch_seq,
+        } => {
             let match_s = String::from_utf8_lossy(match_seq.as_slice());
             let mismatch_s = String::from_utf8_lossy(mismatch_seq.as_slice());
             let iod = match ins_or_del_len {
                 InsOrDelLen::None => "None".to_string(),
-                InsOrDelLen::InsSeq(s) => format!("InsSeq({})", String::from_utf8_lossy(s.as_slice())),
+                InsOrDelLen::InsSeq(s) => {
+                    format!("InsSeq({})", String::from_utf8_lossy(s.as_slice()))
+                }
                 InsOrDelLen::DelLen(l) => format!("DelLen({})", l),
             };
-            format!("DEL(len={},match={},ins_or_del_len={},mismatch={})", len, match_s, iod, mismatch_s)
+            format!(
+                "DEL(len={},match={},ins_or_del_len={},mismatch={})",
+                len, match_s, iod, mismatch_s
+            )
         }
         VarDesc::Complex { ref_seq, alt_seq } => format!(
             "COMPLEX(ref={},alt={})",
@@ -3682,7 +3881,9 @@ fn format_variant(var: &Variant) -> String {
     )
 }
 
-fn format_variation_pos_map(map: &HashMap<i64, HashMap<VarDesc, Variant>>) -> String {
+fn format_variation_pos_map(
+    map: &HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher>,
+) -> String {
     let mut pos_keys: Vec<i64> = map.keys().copied().collect();
     pos_keys.sort_unstable();
     let mut out = String::from("{");
@@ -3708,8 +3909,7 @@ fn format_variation_pos_map(map: &HashMap<i64, HashMap<VarDesc, Variant>>) -> St
     out
 }
 
-
-fn format_splice_count(map: &HashMap<(i64, i64), Vec<usize>>) -> String {
+fn format_splice_count(map: &HashMap<(i64, i64), Vec<usize>, LibDefaultHasher>) -> String {
     let mut keys: Vec<(i64, i64)> = map.keys().copied().collect();
     keys.sort_unstable();
     let mut out = String::from("{");
@@ -3726,7 +3926,7 @@ fn format_splice_count(map: &HashMap<(i64, i64), Vec<usize>>) -> String {
 
 /// Increase count for given key
 #[inline]
-fn inc_cnt(coverage_map: &mut HashMap<i64, usize>, pos: i64, depth: usize) {
+fn inc_cnt(coverage_map: &mut HashMap<i64, usize, LibDefaultHasher>, pos: i64, depth: usize) {
     coverage_map
         .entry(pos)
         .and_modify(|v| v.add_assign(depth))
@@ -3792,14 +3992,20 @@ fn skip_indel_next_to_intron(cigar: &CigarStringView, ci: usize) -> Result<bool,
     if cigar.len() == 0 {
         return Ok(false);
     }
-    
+
     // if the current cigar is not the last item.
     // and the next cigar is ref skip
     // or
     // the current cigar is not the first one and the previous one is refskip
-    let has_prev_refskip = ci > 0 && cigar.get(ci - 1).map_or(false, |c| matches!(c, Cigar::RefSkip(_)));
-    let has_next_refskip = ci + 1 < cigar.len() && cigar.get(ci + 1).map_or(false, |c| matches!(c, Cigar::RefSkip(_)));
-    
+    let has_prev_refskip = ci > 0
+        && cigar
+            .get(ci - 1)
+            .map_or(false, |c| matches!(c, Cigar::RefSkip(_)));
+    let has_next_refskip = ci + 1 < cigar.len()
+        && cigar
+            .get(ci + 1)
+            .map_or(false, |c| matches!(c, Cigar::RefSkip(_)));
+
     Ok(has_prev_refskip || has_next_refskip)
 }
 
@@ -3814,7 +4020,7 @@ fn is_followed_by_match_and_indel(cigar: &CigarStringView, ci: usize) -> bool {
     let n_cigar = cigar.get(ci + 1).unwrap();
     let nn_cigar = cigar.get(ci + 2).unwrap();
 
-    matches!(n_cigar, &Cigar::Match(l) if l <= instance().conf.vext as u32)
+    matches!(n_cigar, &Cigar::Match(l) | &Cigar::Equal(l) | &Cigar::Diff(l) if l <= instance().conf.vext as u32)
         && matches!(nn_cigar, Cigar::Ins(_) | Cigar::Del(_))
         && !matches!(cigar.get(ci + 3), Some(Cigar::Ins(_) | Cigar::Del(_)))
 }
@@ -3889,29 +4095,31 @@ fn append_segments(
 
 #[inline]
 fn is_next_after_num_matched(cigar: &CigarStringView, ci: usize, number: usize) -> bool {
-    cigar
-        .get(ci + number)
-        .map_or(false, |c| matches!(c, Cigar::Match(_)))
+    cigar.get(ci + number).map_or(false, |c| {
+        matches!(c, Cigar::Match(_) | Cigar::Equal(_) | Cigar::Diff(_))
+    })
 }
 
 #[inline]
 fn is_next_ins(cigar: &CigarStringView, ci: usize) -> bool {
     if !instance().conf.perform_local_realignment {
-        return false
+        return false;
     }
 
-    cigar.get(ci+1).map_or(false, |c| {
-        matches!(c, Cigar::Ins(_))
-    })
+    cigar
+        .get(ci + 1)
+        .map_or(false, |c| matches!(c, Cigar::Ins(_)))
 }
 
 #[inline]
 fn is_next_matched(cigar: &CigarStringView, ci: usize) -> bool {
     if !instance().conf.perform_local_realignment {
-        return false
+        return false;
     }
 
-    cigar.get(ci + 1).map_or(false, |c| matches!(c, Cigar::Match(_)))
+    cigar.get(ci + 1).map_or(false, |c| {
+        matches!(c, Cigar::Match(_) | Cigar::Equal(_) | Cigar::Diff(_))
+    })
 }
 
 /// Check if a character is a valid DNA base (A, T, G, or C)
@@ -4072,6 +4280,8 @@ mod tests {
     fn test_get_aligned_length_mnd() {
         let cigar = make_cigar(vec![
             Cigar::Match(1),
+            Cigar::Equal(2),
+            Cigar::Diff(3),
             Cigar::SoftClip(2),
             Cigar::Ins(4),
             Cigar::Del(8),
@@ -4079,7 +4289,7 @@ mod tests {
             Cigar::HardClip(32),
         ]);
 
-        assert_eq!(get_aligned_length_mnd(&cigar), 25); // 1 + 8 + 16
+        assert_eq!(get_aligned_length_mnd(&cigar), 30); // 1 + 2 + 3 + 8 + 16
     }
 
     /// Test getSoftClippedLength - calculates sum of M + I + S lengths
@@ -4155,7 +4365,8 @@ mod tests {
         });
 
         let bam_path = "/home/eck/workspace/vardict_rs/test_data/test_168714.bam";
-        let fasta_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/reference/hs37d5.fa";
+        let fasta_path =
+            "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/reference/hs37d5.fa";
 
         let mut reader = Reader::from_path(bam_path).expect("Failed to open test BAM");
 
@@ -4196,8 +4407,7 @@ mod tests {
         println!("=== Rust CigarParser non_insertion_vars (mapped read) ===");
         println!(
             "Alignment start: {}, read length: {}",
-            alignment_start,
-            read_len
+            alignment_start, read_len
         );
         println!(
             "Non-insertion positions: {}",
@@ -4236,7 +4446,7 @@ mod tests {
 
         let mut conf = Configuration::default();
         conf.disable_sv = true;
-        let mut chr_lens = HashMap::new();
+        let mut chr_lens: HashMap<String, usize, LibDefaultHasher> = Default::default();
         chr_lens.insert("20".to_string(), 63_025_520);
 
         let _ = INSTANCE.set(GlobalReadOnlyScope {
@@ -4247,7 +4457,8 @@ mod tests {
 
         let bam_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/input/NA12878.chrom20.ILLUMINA.bwa.CEU.exome.20121211.bam";
         let bed_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/input/20120518.consensus.annotation.bed.chr20";
-        let fasta_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/reference/hs37d5.fa";
+        let fasta_path =
+            "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/reference/hs37d5.fa";
 
         let file = File::open(bed_path).expect("Failed to open BED file");
         let mut reader = BufReader::new(file);
@@ -4315,7 +4526,8 @@ mod tests {
         // Collect read names contributing to position 68352 (desc "T") for comparison with Java
         let target_pos = 68352i64;
         let target_desc = VarDesc::snv_key(b'T');
-        let mut per_read_parser = CigarParser::new(region.clone(), reference.clone(), instance.clone());
+        let mut per_read_parser =
+            CigarParser::new(region.clone(), reference.clone(), instance.clone());
         let mut contributing_reads: Vec<String> = Vec::new();
         let mut extra_debug: Vec<String> = Vec::new();
         let extra_targets: std::collections::HashSet<&str> = [
@@ -4373,8 +4585,7 @@ mod tests {
         std::fs::create_dir_all("/home/eck/workspace/vardict_rs/tmp_compare")
             .expect("Failed to create tmp_compare");
         let mut reads_writer = std::io::BufWriter::new(
-            std::fs::File::create(reads_out_path)
-                .expect("Failed to create rust read dump"),
+            std::fs::File::create(reads_out_path).expect("Failed to create rust read dump"),
         );
         for name in &contributing_reads {
             writeln!(reads_writer, "{}", name).expect("Failed to write read name");
@@ -4390,9 +4601,11 @@ mod tests {
         }
 
         let out_dir = "/home/eck/workspace/vardict_rs/tmp_compare";
-        let out_path = "/home/eck/workspace/vardict_rs/tmp_compare/rust.cigarparser.non_insertion.txt";
+        let out_path =
+            "/home/eck/workspace/vardict_rs/tmp_compare/rust.cigarparser.non_insertion.txt";
         std::fs::create_dir_all(out_dir).expect("Failed to create tmp_compare");
-        let out_file = std::fs::File::create(out_path).expect("Failed to create rust cigarparser dump");
+        let out_file =
+            std::fs::File::create(out_path).expect("Failed to create rust cigarparser dump");
         let mut writer = std::io::BufWriter::new(out_file);
 
         for (pos, vars) in non_insertion.iter() {
@@ -4502,7 +4715,15 @@ mod tests {
     }
 
     fn assert_variant(
-        non_insertion: &std::collections::HashMap<i64, std::collections::HashMap<crate::variants::variants::VarDesc, crate::variants::variants::Variant>>,
+        non_insertion: &std::collections::HashMap<
+            i64,
+            std::collections::HashMap<
+                crate::variants::variants::VarDesc,
+                crate::variants::variants::Variant,
+                crate::prelude::LibDefaultHasher,
+            >,
+            crate::prelude::LibDefaultHasher,
+        >,
         pos: i64,
         ref_base: u8,
         alt_depth: usize,
@@ -4528,14 +4749,42 @@ mod tests {
             .unwrap_or_else(|| panic!("Missing SNV {:?} at position {}", ref_base as char, pos));
 
         assert_eq!(var.alt_depth, alt_depth, "alt_depth mismatch at {}", pos);
-        assert_eq!(var.alt_depth_fwd, alt_depth_fwd, "alt_depth_fwd mismatch at {}", pos);
-        assert_eq!(var.alt_depth_rev, alt_depth_rev, "alt_depth_rev mismatch at {}", pos);
-        assert!((var.mean_pos - mean_pos).abs() < 0.001, "mean_pos mismatch at {}", pos);
-        assert!((var.mean_qual - mean_qual).abs() < 0.001, "mean_qual mismatch at {}", pos);
-        assert!((var.mean_mapq - mean_mapq).abs() < 0.001, "mean_mapq mismatch at {}", pos);
+        assert_eq!(
+            var.alt_depth_fwd, alt_depth_fwd,
+            "alt_depth_fwd mismatch at {}",
+            pos
+        );
+        assert_eq!(
+            var.alt_depth_rev, alt_depth_rev,
+            "alt_depth_rev mismatch at {}",
+            pos
+        );
+        assert!(
+            (var.mean_pos - mean_pos).abs() < 0.001,
+            "mean_pos mismatch at {}",
+            pos
+        );
+        assert!(
+            (var.mean_qual - mean_qual).abs() < 0.001,
+            "mean_qual mismatch at {}",
+            pos
+        );
+        assert!(
+            (var.mean_mapq - mean_mapq).abs() < 0.001,
+            "mean_mapq mismatch at {}",
+            pos
+        );
         assert!((var.nm - nm).abs() < 0.001, "nm mismatch at {}", pos);
-        assert_eq!(var.low_qual_read_cnt, low_qual_read_cnt, "low_qual_read_cnt mismatch at {}", pos);
-        assert_eq!(var.high_qual_read_cnt, high_qual_read_cnt, "high_qual_read_cnt mismatch at {}", pos);
+        assert_eq!(
+            var.low_qual_read_cnt, low_qual_read_cnt,
+            "low_qual_read_cnt mismatch at {}",
+            pos
+        );
+        assert_eq!(
+            var.high_qual_read_cnt, high_qual_read_cnt,
+            "high_qual_read_cnt mismatch at {}",
+            pos
+        );
         assert_eq!(var.pstd, pstd, "pstd mismatch at {}", pos);
         assert_eq!(var.qstd, qstd, "qstd mismatch at {}", pos);
         assert_eq!(var.pp, pp, "pp mismatch at {}", pos);

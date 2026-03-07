@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use rust_htslib::bam::{self, Read, IndexedReader, Record};
+use rust_htslib::bam::{self, IndexedReader, Read, Record};
 
 /// BAM file reader with indexed access for region queries
 pub struct BamReader {
@@ -20,26 +20,26 @@ fn normalize_bam_chrom<'a>(header: &bam::HeaderView, chrom: &'a str) -> Option<S
     if header.tid(chrom.as_bytes()).is_some() {
         return Some(chrom.to_string());
     }
-    
+
     // Try with "chr" prefix stripped
     if let Some(stripped) = chrom.strip_prefix("chr") {
         if header.tid(stripped.as_bytes()).is_some() {
             return Some(stripped.to_string());
         }
     }
-    
+
     // Try with "chr" prefix added
     let with_chr = format!("chr{}", chrom);
     if header.tid(with_chr.as_bytes()).is_some() {
         return Some(with_chr);
     }
-    
+
     None
 }
 
 impl BamReader {
     /// Open an indexed BAM file
-    /// 
+    ///
     /// The .bai index must exist (run `samtools index <bam>` to create)
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let reader = IndexedReader::from_path(path.as_ref())
@@ -49,34 +49,41 @@ impl BamReader {
     }
 
     /// Set the region to query
-    /// 
+    ///
     /// Handles chromosome name normalization (e.g., "chr20" -> "20" or vice versa)
-    /// 
+    ///
     /// Arguments:
     /// * `chrom` - Chromosome/contig name
     /// * `start` - Start position (1-based, inclusive)  
     /// * `end` - End position (1-based, inclusive)
     pub fn fetch(&mut self, chrom: &str, start: usize, end: usize) -> Result<()> {
         // Normalize chromosome name to match BAM header
-        let bam_chrom = normalize_bam_chrom(self.reader.header(), chrom)
-            .ok_or_else(|| anyhow!("Chromosome '{}' not found in BAM header (tried with/without 'chr' prefix)", chrom))?;
-        
-        let tid = self.reader.header()
+        let bam_chrom = normalize_bam_chrom(self.reader.header(), chrom).ok_or_else(|| {
+            anyhow!(
+                "Chromosome '{}' not found in BAM header (tried with/without 'chr' prefix)",
+                chrom
+            )
+        })?;
+
+        let tid = self
+            .reader
+            .header()
             .tid(bam_chrom.as_bytes())
             .ok_or_else(|| anyhow!("Chromosome '{}' not found in BAM header", bam_chrom))?;
-        
+
         // Convert 1-based to 0-based for BAM
         let begin = (start.saturating_sub(1)) as i64;
         let end = end as i64;
-        
-        self.reader.fetch((tid, begin, end))
+
+        self.reader
+            .fetch((tid, begin, end))
             .with_context(|| format!("Failed to fetch region {}:{}-{}", bam_chrom, start, end))?;
-        
+
         Ok(())
     }
 
     /// Read the next record from the current region
-    /// 
+    ///
     /// Returns None when no more records are available
     pub fn read(&mut self, record: &mut Record) -> Result<bool> {
         match self.reader.read(record) {
@@ -97,7 +104,8 @@ impl BamReader {
 
     /// Get chromosome/contig names from header
     pub fn target_names(&self) -> Vec<String> {
-        self.reader.header()
+        self.reader
+            .header()
             .target_names()
             .iter()
             .map(|n| String::from_utf8_lossy(n).to_string())
@@ -161,22 +169,22 @@ pub fn passes_filter(record: &Record, sam_filter: u32, min_mapq: u8) -> bool {
     if record.flags() & (sam_filter as u16) != 0 {
         return false;
     }
-    
+
     // Check mapping quality
     if record.mapq() < min_mapq {
         return false;
     }
-    
+
     // Skip unmapped reads
     if record.is_unmapped() {
         return false;
     }
-    
+
     // Skip secondary alignments if flagged
     if record.is_secondary() {
         return false;
     }
-    
+
     true
 }
 

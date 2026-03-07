@@ -35,9 +35,9 @@ pub enum VarType {
 /// - 2: No strand bias (balanced, good)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrandBiasValue {
-    CantAssess = 0,   // Low count, only one strand has reads
-    HasBias = 1,      // High count but imbalanced  
-    NoBias = 2,       // Balanced, no strand bias
+    CantAssess = 0, // Low count, only one strand has reads
+    HasBias = 1,    // High count but imbalanced
+    NoBias = 2,     // Balanced, no strand bias
 }
 
 impl StrandBiasValue {
@@ -71,12 +71,12 @@ impl StrandBiasFlag {
     pub fn new(ref_bias: StrandBiasValue, var_bias: StrandBiasValue) -> Self {
         StrandBiasFlag { ref_bias, var_bias }
     }
-    
+
     /// Format as Java-compatible string "refBias;varBias"
     pub fn to_string(&self) -> String {
         format!("{};{}", self.ref_bias.as_int(), self.var_bias.as_int())
     }
-    
+
     /// Check if this is the "2;1" pattern (ref good, var has bias)
     pub fn is_ref_good_var_biased(&self) -> bool {
         self.ref_bias == StrandBiasValue::NoBias && self.var_bias == StrandBiasValue::HasBias
@@ -122,20 +122,20 @@ pub struct Variant {
     pub rightseq: String,
 
     // === Special Features ===
-    pub msi: f64,      // Microsatellite instability score
-    pub msint: f64,    // Microsatellite interval
-    pub shift3: i32,   // 3' shift for deletions
-    pub nm: f64,       // Edit distance
+    pub msi: f64,    // Microsatellite instability score
+    pub msint: f64,  // Microsatellite interval
+    pub shift3: i32, // 3' shift for deletions
+    pub nm: f64,     // Edit distance
 
     // === Quality counts ===
-    pub high_qual_read_cnt: usize,  // Number of high-quality reads
-    pub low_qual_read_cnt: usize,   // Number of low-quality reads
-    pub hicov: usize,               // Position coverage by high-quality reads
-    
+    pub high_qual_read_cnt: usize, // Number of high-quality reads
+    pub low_qual_read_cnt: usize,  // Number of low-quality reads
+    pub hicov: usize,              // Position coverage by high-quality reads
+
     // === Reference counts (for non-reference variants at same position) ===
-    pub ref_forward_count: usize,   // Forward reference reads at this position
-    pub ref_reverse_count: usize,   // Reverse reference reads at this position
-    
+    pub ref_forward_count: usize, // Forward reference reads at this position
+    pub ref_reverse_count: usize, // Reverse reference reads at this position
+
     // === Genotype ===
     pub genotype: String,
 
@@ -315,9 +315,9 @@ impl ToVarsBuilder {
     /// Create a new ToVarsBuilder with default settings
     pub fn new() -> Self {
         ToVarsBuilder {
-            min_frequency: 0.02,          // 2% minimum
-            quality_threshold: 20,         // Q20 minimum
-            mapq_threshold: 20,            // MAPQ 20 minimum
+            min_frequency: 0.02,   // 2% minimum
+            quality_threshold: 20, // Q20 minimum
+            mapq_threshold: 20,    // MAPQ 20 minimum
         }
     }
 
@@ -400,7 +400,7 @@ impl ToVarsBuilder {
         if !qualities.is_empty() {
             let (mean_qual, _std_qual) = calculate_mean_and_std(&qualities);
             variant.mean_quality = mean_qual;
-            
+
             // Check if qualities are distinct
             let qual_ints: Vec<u8> = qualities.iter().map(|q| *q as u8).collect();
             variant.has_at_least_2_diff_qualities = has_at_least_2_distinct(&qual_ints);
@@ -427,9 +427,10 @@ impl ToVarsBuilder {
             .iter()
             .filter(|v| v.quality >= self.quality_threshold)
             .count();
-        
+
         if high_quality_count > 0 && total_coverage > 0 {
-            variant.high_quality_reads_frequency = high_quality_count as f64 / total_coverage as f64;
+            variant.high_quality_reads_frequency =
+                high_quality_count as f64 / total_coverage as f64;
         }
 
         // === Reference allele and variant allele ===
@@ -438,13 +439,18 @@ impl ToVarsBuilder {
 
         // === Genotype prediction (Simple Mode) ===
         // No anchor base available in this context
-        variant.genotype = determine_genotype(&variant.refallele, &variant.varallele, variant.frequency, None);
+        variant.genotype = determine_genotype(
+            &variant.refallele,
+            &variant.varallele,
+            variant.frequency,
+            None,
+        );
 
         variant
     }
 
     /// Group variations by position and variant, then calculate statistics
-    /// 
+    ///
     /// Accepts SimpleVarKey enum for performance-optimized variant representation
     pub fn build_variants(
         &self,
@@ -480,12 +486,8 @@ impl ToVarsBuilder {
                 // Determine variant type from SimpleVarKey
                 let var_type = var_key_to_var_type(&var_key);
 
-                let mut variant = self.calculate_variant_statistics(
-                    &var_data_list,
-                    position,
-                    coverage,
-                    var_type,
-                );
+                let mut variant =
+                    self.calculate_variant_statistics(&var_data_list, position, coverage, var_type);
 
                 // Set ref and alt alleles from SimpleVarKey
                 variant.refallele = var_key.ref_allele();
@@ -531,11 +533,7 @@ pub fn calculate_mean_and_std(values: &[f64]) -> (f64, f64) {
     }
 
     let mean = values.iter().sum::<f64>() / values.len() as f64;
-    let variance = values
-        .iter()
-        .map(|v| (v - mean).powi(2))
-        .sum::<f64>()
-        / values.len() as f64;
+    let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
 
     (mean, variance.sqrt())
 }
@@ -557,17 +555,17 @@ pub fn has_at_least_2_distinct_f64(values: &[f64]) -> bool {
     if values.len() < 2 {
         return false;
     }
-    
+
     // Check if all values are approximately the same (within epsilon)
     let first = values[0];
     let epsilon = 1e-9;
-    
+
     for v in &values[1..] {
         if (v - first).abs() > epsilon {
             return true; // Found a different value
         }
     }
-    
+
     false // All values are essentially the same
 }
 
@@ -577,30 +575,30 @@ pub fn has_at_least_2_distinct_f64(values: &[f64]) -> bool {
 /// - For total >12: returns 2 if balanced (both ≥5% AND both ≥minBiasReads), else 1
 pub fn check_strand_bias(forward: usize, reverse: usize) -> StrandBiasValue {
     let total = forward + reverse;
-    let bias_threshold = 0.05;    // Java: instance().conf.bias = 0.05
-    let min_bias_reads = 2usize;  // Java: instance().conf.minBiasReads = 2
-    
+    let bias_threshold = 0.05; // Java: instance().conf.bias = 0.05
+    let min_bias_reads = 2usize; // Java: instance().conf.minBiasReads = 2
+
     // using p=0.01, because prop.test(1,12) = 0.01
     if total <= 12 {
         // For low counts, just check if both strands have any reads
         if forward > 0 && reverse > 0 {
-            StrandBiasValue::NoBias  // 2: both strands represented
+            StrandBiasValue::NoBias // 2: both strands represented
         } else {
-            StrandBiasValue::CantAssess  // 0: only one strand
+            StrandBiasValue::CantAssess // 0: only one strand
         }
     } else {
         // For higher counts, check if balanced
         let fwd_ratio = forward as f64 / total as f64;
         let rev_ratio = reverse as f64 / total as f64;
-        
-        if fwd_ratio >= bias_threshold 
+
+        if fwd_ratio >= bias_threshold
             && rev_ratio >= bias_threshold
-            && forward >= min_bias_reads 
-            && reverse >= min_bias_reads 
+            && forward >= min_bias_reads
+            && reverse >= min_bias_reads
         {
-            StrandBiasValue::NoBias  // 2: balanced, no bias
+            StrandBiasValue::NoBias // 2: balanced, no bias
         } else {
-            StrandBiasValue::HasBias  // 1: strand bias present
+            StrandBiasValue::HasBias // 1: strand bias present
         }
     }
 }
@@ -611,14 +609,19 @@ pub fn check_strand_bias(forward: usize, reverse: usize) -> StrandBiasValue {
 /// For reference calls (ref==alt): "REF/REF"
 /// For heterozygous: "REF/ALT"  
 /// For homozygous alternate: "ALT/ALT"
-/// 
+///
 /// Java-compatible format:
 /// - Reference calls: "REF/REF"
 /// - Pure insertions: "REF/+N" where N is the inserted length
 /// - Deletions: "-N<seq>/-N<seq>" format
 /// - Same-length complex: "ALT+REF[1:]/ALT" (extended genotype1)
 /// - Complex with length diff: Java-compatible extended format with anchor
-pub fn determine_genotype(refallele: &str, varallele: &str, frequency: f64, anchor_base: Option<char>) -> String {
+pub fn determine_genotype(
+    refallele: &str,
+    varallele: &str,
+    frequency: f64,
+    anchor_base: Option<char>,
+) -> String {
     if refallele == varallele {
         // Reference call: G→G becomes "G/G"
         format!("{}/{}", refallele, refallele)
@@ -626,7 +629,7 @@ pub fn determine_genotype(refallele: &str, varallele: &str, frequency: f64, anch
         // Determine if this is an insertion, deletion, or substitution
         let ref_len = refallele.len();
         let var_len = varallele.len();
-        
+
         if var_len > ref_len && varallele.starts_with(refallele) {
             // Pure insertion: alt starts with ref and is longer
             // Format: "REF/+N" where N is the insertion length
@@ -670,7 +673,7 @@ pub fn determine_genotype(refallele: &str, varallele: &str, frequency: f64, anch
             let genotype2 = format!("+{}", var_len + 1);
             format!("{}/{}", genotype1, genotype2)
         } else {
-            // Single base substitution  
+            // Single base substitution
             format!("{}/{}", refallele, varallele)
         }
     }
@@ -685,20 +688,20 @@ pub fn create_description_string(var_type: &VarType) -> String {
         VarType::Complex {
             insertion,
             deletion,
-        } => format!("{}#{}", insertion, if *deletion > 0 {
-            format!("-{}", deletion)
-        } else {
-            String::new()
-        }),
+        } => format!(
+            "{}#{}",
+            insertion,
+            if *deletion > 0 {
+                format!("-{}", deletion)
+            } else {
+                String::new()
+            }
+        ),
     }
 }
 
 /// Calculate shift3 (3' shift allowance) for deletions
-pub fn calculate_shift3(
-    reference: &[u8],
-    position: usize,
-    deletion_length: usize,
-) -> i32 {
+pub fn calculate_shift3(reference: &[u8], position: usize, deletion_length: usize) -> i32 {
     if position + deletion_length >= reference.len() {
         return 0;
     }
@@ -778,7 +781,7 @@ fn var_key_to_var_type(var_key: &SimpleVarKey) -> VarType {
 
 /// Validate and normalize reference allele by replacing IUPAC ambiguity codes
 /// with their first possible base.
-/// 
+///
 /// IUPAC ambiguity codes:
 /// - M (A or C) -> A
 /// - R (A or G) -> A
@@ -790,7 +793,7 @@ fn var_key_to_var_type(var_key: &SimpleVarKey) -> VarType {
 /// - H (A or C or T) -> A
 /// - D (A or G or T) -> A
 /// - B (C or G or T) -> C
-/// 
+///
 /// From Java ToVarsBuilderTest.java
 pub fn validate_ref_allele(allele: &str) -> String {
     allele
@@ -800,7 +803,7 @@ pub fn validate_ref_allele(allele: &str) -> String {
             'M' | 'R' | 'W' | 'V' | 'H' | 'D' => 'A', // First base is A
             'S' | 'Y' | 'B' => 'C',                   // First base is C
             'K' => 'G',                               // First base is G
-            _ => c, // Keep unknown chars as-is
+            _ => c,                                   // Keep unknown chars as-is
         })
         .collect()
 }
@@ -858,45 +861,33 @@ mod tests {
     #[test]
     fn test_strand_bias_no_bias() {
         // 10 forward, 10 reverse - total 20 > 12, both are >= 5% and >= 2 = NoBias (2)
-        assert_eq!(
-            check_strand_bias(10, 10),
-            StrandBiasValue::NoBias
-        );
+        assert_eq!(check_strand_bias(10, 10), StrandBiasValue::NoBias);
     }
 
     #[test]
     fn test_strand_bias_low_count_both_strands() {
         // Total <= 12, but both strands have reads = NoBias (2)
-        assert_eq!(
-            check_strand_bias(5, 3),
-            StrandBiasValue::NoBias
-        );
+        assert_eq!(check_strand_bias(5, 3), StrandBiasValue::NoBias);
     }
 
     #[test]
     fn test_strand_bias_low_count_one_strand() {
         // Total <= 12, only one strand has reads = CantAssess (0)
-        assert_eq!(
-            check_strand_bias(10, 0),
-            StrandBiasValue::CantAssess
-        );
+        assert_eq!(check_strand_bias(10, 0), StrandBiasValue::CantAssess);
     }
 
     #[test]
     fn test_strand_bias_high_count_imbalanced() {
         // Total > 12, but 5/100 = 5% is exactly at threshold, and both have >= 2 reads
         // Forward: 100/105 = 95.2% >= 5%, Reverse: 5/105 = 4.76% < 5% = HasBias
-        assert_eq!(
-            check_strand_bias(100, 5),
-            StrandBiasValue::HasBias
-        );
+        assert_eq!(check_strand_bias(100, 5), StrandBiasValue::HasBias);
     }
 
     #[test]
     fn test_strand_bias_balanced_high_count() {
         // Total > 12, both strands >= 5% and >= 2 reads = NoBias
         assert_eq!(
-            check_strand_bias(15, 5),  // 15/20=75% and 5/20=25%, both >= 5%
+            check_strand_bias(15, 5), // 15/20=75% and 5/20=25%, both >= 5%
             StrandBiasValue::NoBias
         );
     }
@@ -922,10 +913,7 @@ mod tests {
 
     #[test]
     fn test_create_description_snv() {
-        assert_eq!(
-            create_description_string(&VarType::SNV('A')),
-            "A"
-        );
+        assert_eq!(create_description_string(&VarType::SNV('A')), "A");
     }
 
     #[test]
@@ -938,10 +926,7 @@ mod tests {
 
     #[test]
     fn test_create_description_deletion() {
-        assert_eq!(
-            create_description_string(&VarType::Deletion(5)),
-            "-5"
-        );
+        assert_eq!(create_description_string(&VarType::Deletion(5)), "-5");
     }
 
     #[test]
@@ -993,8 +978,7 @@ mod tests {
 
     #[test]
     fn test_to_vars_builder_with_min_frequency() {
-        let builder = ToVarsBuilder::new()
-            .with_min_frequency(0.05);
+        let builder = ToVarsBuilder::new().with_min_frequency(0.05);
         assert_eq!(builder.min_frequency, 0.05);
     }
 
@@ -1066,7 +1050,7 @@ mod tests {
     #[test]
     fn test_calculate_variant_statistics_simple() {
         let builder = ToVarsBuilder::new();
-        
+
         // Create test data: 2 forward strand, 2 reverse strand reads
         let variations = vec![
             VariationData {
@@ -1101,8 +1085,8 @@ mod tests {
 
         let variant = builder.calculate_variant_statistics(
             &variations,
-            1000,    // position
-            100,     // coverage
+            1000, // position
+            100,  // coverage
             VarType::SNV('A'),
         );
 
@@ -1134,7 +1118,7 @@ mod tests {
     #[test]
     fn test_calculate_variant_statistics_biased() {
         let builder = ToVarsBuilder::new();
-        
+
         // Create test data: 11 forward, 1 reverse (strongly biased, ratio = 11.0 > 10.0)
         let mut variations = Vec::new();
         for i in 0..11 {
@@ -1154,12 +1138,8 @@ mod tests {
             read_id: "read_r1".to_string(),
         });
 
-        let variant = builder.calculate_variant_statistics(
-            &variations,
-            1000,
-            100,
-            VarType::SNV('T'),
-        );
+        let variant =
+            builder.calculate_variant_statistics(&variations, 1000, 100, VarType::SNV('T'));
 
         // Verify counts
         assert_eq!(variant.vars_count_on_forward, 11);
@@ -1180,16 +1160,12 @@ mod tests {
     #[test]
     fn test_calculate_variant_statistics_empty() {
         let builder = ToVarsBuilder::new();
-        
+
         // Empty variations
         let variations: Vec<VariationData> = vec![];
 
-        let variant = builder.calculate_variant_statistics(
-            &variations,
-            1000,
-            100,
-            VarType::SNV('A'),
-        );
+        let variant =
+            builder.calculate_variant_statistics(&variations, 1000, 100, VarType::SNV('A'));
 
         // Verify zero counts
         assert_eq!(variant.vars_count_on_forward, 0);
@@ -1201,7 +1177,7 @@ mod tests {
     #[test]
     fn test_build_variants_grouping() {
         let builder = ToVarsBuilder::new();
-        
+
         // Create variations as vector of tuples (position, SimpleVarKey, variation_data)
         let all_variations = vec![
             // Position 1000: SNV A>T (2 reads)
@@ -1272,11 +1248,13 @@ mod tests {
         assert_eq!(vars_at_1010.variants.len(), 1);
 
         // Verify variant types are correct at position 1000
-        let var_types: Vec<_> = vars_at_1000.variants.iter()
-            .map(|v| &v.vartype)
-            .collect();
+        let var_types: Vec<_> = vars_at_1000.variants.iter().map(|v| &v.vartype).collect();
         assert!(var_types.contains(&&VarType::SNV('T')));
-        assert!(var_types.iter().any(|vt| matches!(vt, VarType::Insertion(_))));
+        assert!(
+            var_types
+                .iter()
+                .any(|vt| matches!(vt, VarType::Insertion(_)))
+        );
     }
 
     // ========================================================================
@@ -1295,16 +1273,16 @@ mod tests {
             ("G", "G"),
             ("T", "T"),
             ("N", "N"),
-            ("M", "A"),  // M (A or C) -> A
-            ("R", "A"),  // R (A or G) -> A
-            ("W", "A"),  // W (A or T) -> A
-            ("S", "C"),  // S (C or G) -> C
-            ("Y", "C"),  // Y (C or T) -> C
-            ("K", "G"),  // K (G or T) -> G
-            ("V", "A"),  // V (A or C or G) -> A
-            ("H", "A"),  // H (A or C or T) -> A
-            ("D", "A"),  // D (A or G or T) -> A
-            ("B", "C"),  // B (C or G or T) -> C
+            ("M", "A"), // M (A or C) -> A
+            ("R", "A"), // R (A or G) -> A
+            ("W", "A"), // W (A or T) -> A
+            ("S", "C"), // S (C or G) -> C
+            ("Y", "C"), // Y (C or T) -> C
+            ("K", "G"), // K (G or T) -> G
+            ("V", "A"), // V (A or C or G) -> A
+            ("H", "A"), // H (A or C or T) -> A
+            ("D", "A"), // D (A or G or T) -> A
+            ("B", "C"), // B (C or G or T) -> C
         ];
 
         for (input, expected) in test_cases {
@@ -1323,9 +1301,9 @@ mod tests {
         // From Java: List<String> alleles_complex = Arrays.asList("ANYCGT", "MRACT", "CCGKBG");
         // Expected:  List<String> expected_complex = Arrays.asList("ANCCGT", "AAACT", "CCGGCG");
         let test_cases = vec![
-            ("ANYCGT", "ANCCGT"),  // Y->C
-            ("MRACT", "AAACT"),    // M->A, R->A
-            ("CCGKBG", "CCGGCG"),  // K->G, B->C
+            ("ANYCGT", "ANCCGT"), // Y->C
+            ("MRACT", "AAACT"),   // M->A, R->A
+            ("CCGKBG", "CCGGCG"), // K->G, B->C
         ];
 
         for (input, expected) in test_cases {
@@ -1340,7 +1318,7 @@ mod tests {
 
     /// Port of Java createInsertion/createVariant test
     /// Tests the statistics calculation with specific input values
-    /// 
+    ///
     /// Java test input:
     ///   varsCount = 4, varsCountOnForward = 3, varsCountOnReverse = 5
     ///   meanPosition = 9, meanQuality = 10.5, meanMappingQuality = 31
@@ -1360,16 +1338,16 @@ mod tests {
         //   - positions sum to 9 (e.g., 1, 2, 3, 3)
         //   - qualities sum to 10.5 (e.g., 2.0, 2.5, 3.0, 3.0)
         //   - mapqs sum to 31 (e.g., 7, 8, 8, 8)
-        
+
         let builder = ToVarsBuilder::new();
-        
+
         // Create 4 variations: 3 forward, 1 reverse (we can't have 5 reverse with only 4 total)
         // Note: Java test has varsCount=4 but varsCountOnForward=3 + varsCountOnReverse=5 = 8
         // This is inconsistent in the Java test. We'll use 4 total = 3 forward + 1 reverse
         let variations = vec![
             VariationData {
                 position_in_read: 1,
-                quality: 20,  // Will contribute to mean
+                quality: 20, // Will contribute to mean
                 mapping_quality: 7,
                 is_reverse: false,
                 read_id: "read1".to_string(),
@@ -1399,31 +1377,43 @@ mod tests {
 
         let variant = builder.calculate_variant_statistics(
             &variations,
-            1234567,  // Same position as Java test
-            10,       // Coverage = 10 (so 4/10 = 0.4 frequency)
+            1234567, // Same position as Java test
+            10,      // Coverage = 10 (so 4/10 = 0.4 frequency)
             VarType::SNV('T'),
         );
 
         // Check frequency: 4/10 = 0.4
-        assert!((variant.frequency - 0.4).abs() < 0.001, 
-                "frequency: expected 0.4, got {}", variant.frequency);
-        
+        assert!(
+            (variant.frequency - 0.4).abs() < 0.001,
+            "frequency: expected 0.4, got {}",
+            variant.frequency
+        );
+
         // Check counts
         assert_eq!(variant.vars_count_on_forward, 3);
         assert_eq!(variant.vars_count_on_reverse, 1);
-        
+
         // Check mean position: (1+2+3+3)/4 = 2.25
-        assert!((variant.mean_position - 2.25).abs() < 0.01,
-                "mean_position: expected 2.25, got {}", variant.mean_position);
-        
+        assert!(
+            (variant.mean_position - 2.25).abs() < 0.01,
+            "mean_position: expected 2.25, got {}",
+            variant.mean_position
+        );
+
         // Check mean quality: (20+25+30+30)/4 = 26.25
-        assert!((variant.mean_quality - 26.25).abs() < 0.01,
-                "mean_quality: expected 26.25, got {}", variant.mean_quality);
-        
+        assert!(
+            (variant.mean_quality - 26.25).abs() < 0.01,
+            "mean_quality: expected 26.25, got {}",
+            variant.mean_quality
+        );
+
         // Check mean mapping quality: (7+8+8+8)/4 = 7.75
-        assert!((variant.mean_mapping_quality - 7.75).abs() < 0.01,
-                "mean_mapping_quality: expected 7.75, got {}", variant.mean_mapping_quality);
-        
+        assert!(
+            (variant.mean_mapping_quality - 7.75).abs() < 0.01,
+            "mean_mapping_quality: expected 7.75, got {}",
+            variant.mean_mapping_quality
+        );
+
         // Check strand bias: 3 forward, 1 reverse, total=4 which is <=12
         // Both strands have reads, so should be NoBias (2) per Java logic
         assert_eq!(variant.strand_bias_flag.var_bias, StrandBiasValue::NoBias);

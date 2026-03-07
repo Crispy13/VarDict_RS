@@ -1,7 +1,6 @@
-use std::{collections::HashMap, hash::RandomState};
-
+use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
 
-pub type LibDefaultHasher = RandomState;
+pub type LibDefaultHasher = FxBuildHasher;
 
 pub type SmallVecBytes = SmallVec<[u8; 32]>;

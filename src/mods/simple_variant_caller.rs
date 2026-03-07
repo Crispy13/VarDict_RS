@@ -16,17 +16,14 @@ use smallvec::SmallVec;
 use crate::mods::to_vars_builder::VariationData;
 
 /// Simple variant key for the simple variant caller
-/// 
+///
 /// This is a performance-optimized key type that distinguishes variants
 /// by their full description (ref + alt for SNVs, sequence for indels).
 /// Uses SmallVec for inline storage of short sequences.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum SimpleVarKey {
     /// Single nucleotide variant: ref_base -> alt_base
-    SNV { 
-        ref_base: u8,
-        alt_base: u8,
-    },
+    SNV { ref_base: u8, alt_base: u8 },
     /// Insertion of sequence after position
     Ins {
         /// Inserted sequence
@@ -51,7 +48,7 @@ pub enum SimpleVarKey {
 impl SimpleVarKey {
     /// Create SNV from bases
     pub fn snv(ref_base: u8, alt_base: u8) -> Self {
-        SimpleVarKey::SNV { 
+        SimpleVarKey::SNV {
             ref_base: ref_base.to_ascii_uppercase(),
             alt_base: alt_base.to_ascii_uppercase(),
         }
@@ -123,9 +120,11 @@ impl SimpleVarKey {
                 format!("-{}", len)
             }
             SimpleVarKey::Complex { ref_seq, alt_seq } => {
-                format!("{}>{}",
+                format!(
+                    "{}>{}",
                     String::from_utf8_lossy(ref_seq),
-                    String::from_utf8_lossy(alt_seq))
+                    String::from_utf8_lossy(alt_seq)
+                )
             }
         }
     }
@@ -207,7 +206,7 @@ impl SimpleVariantCaller {
 
         // Parse CIGAR and extract variations
         let cigar = record.cigar();
-        
+
         // Position in reference (0-based from BAM, convert to 1-based)
         let mut ref_pos = record.pos() + 1;
         // Position in read sequence (0-based)
@@ -407,7 +406,7 @@ mod tests {
         assert_eq!(caller.get_ref_base(100), Some(b'A'));
         assert_eq!(caller.get_ref_base(101), Some(b'C'));
         assert_eq!(caller.get_ref_base(107), Some(b'T'));
-        assert_eq!(caller.get_ref_base(99), None);  // Before start
+        assert_eq!(caller.get_ref_base(99), None); // Before start
         assert_eq!(caller.get_ref_base(108), None); // After end
     }
 }

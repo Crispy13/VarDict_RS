@@ -61,16 +61,14 @@ impl Variant {
 }
 
 /// Variant Description - used as key in variant maps and for tracking complex variants
-/// 
+///
 /// Uses SmallVec for inline storage of short sequences (most variants are small)
 /// This avoids heap allocation for the common case.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum VarDesc {
     /// Single nucleotide variant: ref_base (alt determined from read data)
     /// Used as key for looking up variants at a position
-    SNV { 
-        ref_base: u8,
-    },
+    SNV { ref_base: u8 },
     /// Insertion of sequence after position
     Ins {
         /// Inserted sequence
@@ -104,7 +102,7 @@ pub enum VarDesc {
 impl VarDesc {
     /// Create SNV from ref base (for use as HashMap key)
     pub fn snv_key(ref_base: u8) -> Self {
-        VarDesc::SNV { 
+        VarDesc::SNV {
             ref_base: ref_base.to_ascii_uppercase(),
         }
     }
@@ -172,7 +170,7 @@ impl VarDesc {
         match self {
             VarDesc::SNV { ref_base } => {
                 // Only ref_base is stored, alt is determined from read data
-                format!("{}",  char::from(*ref_base))
+                format!("{}", char::from(*ref_base))
             }
             VarDesc::Ins { seq } => {
                 format!("+{}", String::from_utf8_lossy(seq))
@@ -209,9 +207,11 @@ impl VarDesc {
                 out
             }
             VarDesc::Complex { ref_seq, alt_seq } => {
-                format!("{}>{}", 
+                format!(
+                    "{}>{}",
                     String::from_utf8_lossy(ref_seq),
-                    String::from_utf8_lossy(alt_seq))
+                    String::from_utf8_lossy(alt_seq)
+                )
             }
             VarDesc::Raw { desc } => String::from_utf8_lossy(desc).to_string(),
         }
@@ -235,7 +235,7 @@ impl std::fmt::Display for VarDesc {
 pub enum InsOrDelLen {
     #[default]
     None,
-    InsSeq(SmallVec<[u8;32]>),
+    InsSeq(SmallVec<[u8; 32]>),
     DelLen(usize),
 }
 
@@ -273,7 +273,6 @@ pub(crate) struct SoftClip {
     pub(crate) soft: IndexMap<i64, usize>,
     pub(crate) mates: Vec<Mate>,
 }
-
 
 #[derive(Default, Clone)]
 pub(crate) struct Mate {

@@ -5,12 +5,13 @@ use anyhow::{Context, Result, anyhow};
 use rust_htslib::faidx;
 
 use crate::conf::Configuration;
+use crate::prelude::LibDefaultHasher;
 
 /// Reference sequence data
 #[derive(Default, Clone)]
 pub struct Reference {
     pub ref_seq: Vec<u8>,
-    pub seed: HashMap<Vec<u8>, Vec<i64>>,
+    pub seed: HashMap<Vec<u8>, Vec<i64>, LibDefaultHasher>,
     /// Start position of this reference slice in genomic coordinates (1-based)
     pub region_start: i64,
 }
@@ -20,16 +21,16 @@ impl Reference {
     pub fn from_seq(seq: &[u8]) -> Self {
         Reference {
             ref_seq: seq.to_vec(),
-            seed: HashMap::new(),
+            seed: Default::default(),
             region_start: 0,
         }
     }
-    
+
     /// Create a new Reference from a sequence slice with region start position
     pub fn from_seq_with_start(seq: &[u8], region_start: i64) -> Self {
         Reference {
             ref_seq: seq.to_vec(),
-            seed: HashMap::new(),
+            seed: Default::default(),
             region_start,
         }
     }
@@ -38,16 +39,16 @@ impl Reference {
     pub fn new(ref_seq: Vec<u8>) -> Self {
         Reference {
             ref_seq,
-            seed: HashMap::new(),
+            seed: Default::default(),
             region_start: 0,
         }
     }
-    
+
     /// Create a new Reference with owned sequence and region start
     pub fn new_with_start(ref_seq: Vec<u8>, region_start: i64) -> Self {
         Reference {
             ref_seq,
-            seed: HashMap::new(),
+            seed: Default::default(),
             region_start,
         }
     }
@@ -92,7 +93,7 @@ impl Reference {
             }
         }
     }
-    
+
     /// Get the base at a genomic position (0-based or 1-based depending on region_start)
     /// Returns None if position is out of bounds
     pub fn get(&self, genomic_pos: i64) -> Option<u8> {
@@ -102,18 +103,18 @@ impl Reference {
         let idx = (genomic_pos - self.region_start) as usize;
         self.ref_seq.get(idx).copied()
     }
-    
+
     /// Get the base at a genomic position as i64 (for compatibility)
     /// Returns None if position is out of bounds
     pub fn get_i64(&self, genomic_pos: i64) -> Option<u8> {
         self.get(genomic_pos)
     }
-    
+
     /// Check if a genomic position contains a specific base
     pub fn has_and_equals(&self, genomic_pos: i64, base: u8) -> bool {
         self.get(genomic_pos).map_or(false, |b| b == base)
     }
-    
+
     /// Check if a genomic position does NOT contain a specific base
     pub fn has_and_not_equals(&self, genomic_pos: i64, base: u8) -> bool {
         self.get(genomic_pos).map_or(false, |b| b != base)
@@ -127,7 +128,7 @@ pub struct FastaReader {
 
 impl FastaReader {
     /// Open a FASTA file with its index
-    /// 
+    ///
     /// The .fai index must exist (run `samtools faidx <fasta>` to create)
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let reader = faidx::Reader::from_path(path.as_ref())
@@ -136,26 +137,32 @@ impl FastaReader {
     }
 
     /// Fetch a reference sequence for a region
-    /// 
+    ///
     /// Arguments:
     /// * `chrom` - Chromosome/contig name
     /// * `start` - Start position (1-based, inclusive)
     /// * `end` - End position (1-based, inclusive)
-    /// 
+    ///
     /// Returns the sequence as uppercase bytes
     pub fn fetch_seq(&self, chrom: &str, start: usize, end: usize) -> Result<Vec<u8>> {
         if start == 0 {
             return Err(anyhow!("Start position must be 1-based (got 0)"));
         }
         if end < start {
-            return Err(anyhow!("End position ({}) cannot be less than start ({})", end, start));
+            return Err(anyhow!(
+                "End position ({}) cannot be less than start ({})",
+                end,
+                start
+            ));
         }
 
         // Convert 1-based inclusive to 0-based half-open for faidx
         let begin_0based = start - 1;
         let end_0based = end - 1; // faidx uses 0-based inclusive end
 
-        let seq = self.reader.fetch_seq(chrom, begin_0based, end_0based)
+        let seq = self
+            .reader
+            .fetch_seq(chrom, begin_0based, end_0based)
             .with_context(|| format!("Failed to fetch {}:{}-{}", chrom, start, end))?;
 
         // Convert to uppercase
@@ -172,7 +179,7 @@ impl FastaReader {
         let ref_seq = self.fetch_seq(chrom, start, end)?;
         let mut reference = Reference {
             ref_seq,
-            seed: HashMap::new(),
+            seed: Default::default(),
             region_start: start as i64,
         };
         let chr_len = self.seq_len(chrom);

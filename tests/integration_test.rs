@@ -18,6 +18,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use crackle_kit::tracing::level_filters::LevelFilter;
+use vardict_rs::prelude::LibDefaultHasher;
 use vardict_rs::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE};
 
 #[derive(Debug, Clone)]
@@ -172,15 +173,14 @@ pub struct ExpectedVariant {
 
 /// Parse a test case file following Java VarDictInput.fromCSVLine format
 pub fn parse_test_case(path: &Path) -> Result<(TestCaseConfig, Vec<ExpectedVariant>), String> {
-    let content = fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read test case: {}", e))?;
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("Failed to read test case: {}", e))?;
 
     let mut lines = content.lines();
 
     // Parse configuration from first line
-    let config_line = lines.next()
-        .ok_or_else(|| "Empty test file".to_string())?;
-    
+    let config_line = lines.next().ok_or_else(|| "Empty test file".to_string())?;
+
     let config_parts: Vec<&str> = config_line.split(',').collect();
     if config_parts.len() < 6 {
         return Err(format!("Invalid config line: {}", config_line));
@@ -191,7 +191,7 @@ pub fn parse_test_case(path: &Path) -> Result<(TestCaseConfig, Vec<ExpectedVaria
     let reference = config_parts[1].to_string();
     let bam_file = config_parts[2].to_string();
     let chrom = config_parts[3].to_string();
-    
+
     // Parse region - handle formats like "55259400-55259600" or "55259400"
     let (start, end, start_amp, end_amp, options) = if config_parts.len() >= 6 {
         // Try to parse start-end range
@@ -200,25 +200,35 @@ pub fn parse_test_case(path: &Path) -> Result<(TestCaseConfig, Vec<ExpectedVaria
             let parts: Vec<&str> = pos_str.split('-').collect();
             (
                 parts[0].parse().unwrap_or(0),
-                parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0)
+                parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0),
             )
         } else {
             let s: i64 = pos_str.parse().unwrap_or(0);
             let e: i64 = config_parts[5].parse().unwrap_or(0);
             (s, e)
         };
-        
+
         // Check for amplicon positions (8-9 columns)
         let (start_amp, end_amp, options) = if config_parts.len() >= 8 {
             (
                 config_parts[6].parse().ok(),
                 config_parts[7].parse().ok(),
-                config_parts.get(8).map(|s| s.to_string()).unwrap_or_default()
+                config_parts
+                    .get(8)
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
             )
         } else {
-            (None, None, config_parts.get(6).map(|s| s.to_string()).unwrap_or_default())
+            (
+                None,
+                None,
+                config_parts
+                    .get(6)
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+            )
         };
-        
+
         (s, e, start_amp, end_amp, options)
     } else {
         return Err(format!("Not enough fields in config line: {}", config_line));
@@ -242,7 +252,7 @@ pub fn parse_test_case(path: &Path) -> Result<(TestCaseConfig, Vec<ExpectedVaria
         if line.trim().is_empty() {
             continue;
         }
-        
+
         let raw_line = line.to_string();
         let fields: Vec<&str> = line.split('\t').collect();
         if fields.len() < 7 {
@@ -271,8 +281,8 @@ pub fn parse_test_case(path: &Path) -> Result<(TestCaseConfig, Vec<ExpectedVaria
 }
 
 fn parse_test_case_raw_output_lines(path: &Path) -> Result<(TestCaseConfig, Vec<String>), String> {
-    let content = fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read test case: {}", e))?;
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("Failed to read test case: {}", e))?;
 
     let (config, _) = parse_test_case(path)?;
     let raw_lines = content
@@ -288,8 +298,7 @@ fn parse_test_case_raw_output_lines(path: &Path) -> Result<(TestCaseConfig, Vec<
 /// Parse a FASTA CSV file (from CSVReferenceManager)
 /// Format: chromosome,start,end,sequence
 pub fn parse_fasta_csv(path: &Path) -> Result<HashMap<String, Vec<(i64, i64, String)>>, String> {
-    let file = fs::File::open(path)
-        .map_err(|e| format!("Failed to open FASTA CSV: {}", e))?;
+    let file = fs::File::open(path).map_err(|e| format!("Failed to open FASTA CSV: {}", e))?;
     let reader = BufReader::new(file);
 
     let mut regions: HashMap<String, Vec<(i64, i64, String)>> = HashMap::new();
@@ -307,7 +316,8 @@ pub fn parse_fasta_csv(path: &Path) -> Result<HashMap<String, Vec<(i64, i64, Str
             let end: i64 = fields[2].parse().unwrap_or(0);
             let seq = fields[3].to_string();
 
-            regions.entry(chrom)
+            regions
+                .entry(chrom)
                 .or_insert_with(Vec::new)
                 .push((start, end, seq));
         }
@@ -352,7 +362,10 @@ fn test_parse_all_test_cases() {
     let test_cases_dir = testdata_dir.join("integrationtestcases");
 
     if !test_cases_dir.exists() {
-        eprintln!("Skipping: testdata directory not found at {:?}", test_cases_dir);
+        eprintln!(
+            "Skipping: testdata directory not found at {:?}",
+            test_cases_dir
+        );
         return;
     }
 
@@ -370,11 +383,19 @@ fn test_parse_all_test_cases() {
             Ok((config, variants)) => {
                 success_count += 1;
                 variant_count += variants.len();
-                
+
                 // Validate config has required fields
                 assert!(!config.mode.is_empty(), "Mode empty in {:?}", entry.path());
-                assert!(!config.reference.is_empty(), "Reference empty in {:?}", entry.path());
-                assert!(!config.bam_file.is_empty(), "BAM file empty in {:?}", entry.path());
+                assert!(
+                    !config.reference.is_empty(),
+                    "Reference empty in {:?}",
+                    entry.path()
+                );
+                assert!(
+                    !config.bam_file.is_empty(),
+                    "BAM file empty in {:?}",
+                    entry.path()
+                );
             }
             Err(e) => {
                 fail_count += 1;
@@ -412,11 +433,10 @@ fn test_parse_fasta_csv_files() {
     println!("Found {} FASTA CSV files", csv_files.len());
 
     for csv_file in &csv_files {
-        let regions = parse_fasta_csv(&csv_file.path())
-            .expect("Failed to parse FASTA CSV");
-        
+        let regions = parse_fasta_csv(&csv_file.path()).expect("Failed to parse FASTA CSV");
+
         assert!(!regions.is_empty(), "No regions in {:?}", csv_file.path());
-        
+
         // Verify region format
         for (chrom, seqs) in &regions {
             assert!(!chrom.is_empty(), "Empty chromosome name");
@@ -453,11 +473,11 @@ fn test_simple_mode_test_cases() {
     let mut all_variant_types = std::collections::HashSet::new();
 
     for entry in &simple_cases {
-        let (config, variants) = parse_test_case(&entry.path())
-            .expect("Failed to parse Simple mode test case");
-        
+        let (config, variants) =
+            parse_test_case(&entry.path()).expect("Failed to parse Simple mode test case");
+
         assert_eq!(config.mode, "Simple", "Mode should be Simple");
-        
+
         for v in &variants {
             all_variant_types.insert(v.variant_type.clone());
         }
@@ -465,7 +485,10 @@ fn test_simple_mode_test_cases() {
 
     println!("Validated {} Simple mode test cases", simple_cases.len());
     println!("Found variant types: {:?}", all_variant_types);
-    assert!(all_variant_types.contains("SNV"), "Should have SNV variants");
+    assert!(
+        all_variant_types.contains("SNV"),
+        "Should have SNV variants"
+    );
 }
 
 #[test]
@@ -484,9 +507,9 @@ fn test_somatic_mode_test_cases() {
         .collect();
 
     for entry in &somatic_cases {
-        let (config, _variants) = parse_test_case(&entry.path())
-            .expect("Failed to parse Somatic mode test case");
-        
+        let (config, _variants) =
+            parse_test_case(&entry.path()).expect("Failed to parse Somatic mode test case");
+
         assert_eq!(config.mode, "Somatic", "Mode should be Somatic");
     }
 
@@ -516,10 +539,13 @@ fn test_run_simple_variant_calling() {
         .find(|e| e.file_name().to_string_lossy().starts_with("Simple;"))
         .expect("No Simple mode test case found");
 
-    let (config, expected_variants) = parse_test_case(&test_case_file.path())
-        .expect("Failed to parse test case");
+    let (config, expected_variants) =
+        parse_test_case(&test_case_file.path()).expect("Failed to parse test case");
 
-    println!("Running integration test: {}", test_case_file.file_name().to_string_lossy());
+    println!(
+        "Running integration test: {}",
+        test_case_file.file_name().to_string_lossy()
+    );
     println!("  Mode: {}", config.mode);
     println!("  Region: {}:{}-{}", config.chrom, config.start, config.end);
     println!("  Expected variants: {}", expected_variants.len());
@@ -539,10 +565,10 @@ fn test_run_simple_variant_calling() {
 #[test]
 #[ignore]
 fn test_generate_output_for_verification() {
-    use vardict_rs::mods::pipeline::{Pipeline, PipelineConfig};
-    use vardict_rs::mods::to_vars_builder::VariationData;
-    use vardict_rs::mods::simple_variant_caller::SimpleVarKey;
     use std::collections::HashMap;
+    use vardict_rs::mods::pipeline::{Pipeline, PipelineConfig};
+    use vardict_rs::mods::simple_variant_caller::SimpleVarKey;
+    use vardict_rs::mods::to_vars_builder::VariationData;
 
     // Create a simple test with mock data
     let config = PipelineConfig::builder()
@@ -556,7 +582,7 @@ fn test_generate_output_for_verification() {
 
     // Create mock variation data (simulating a SNV at position 1000)
     let mut variations = Vec::new();
-    
+
     // Simulate 5 reads supporting a G>A variant at position 1000
     for i in 0..5 {
         let var_key = SimpleVarKey::snv(b'G', b'A');
@@ -750,13 +776,19 @@ fn apply_simple_options_to_conf_and_pipeline(
                 conf.disable_sv = true;
             }
             "-J" | "--crispr" => {
-                if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<i32>().ok()) {
+                if let Some(value) = tokens
+                    .get(index + 1)
+                    .and_then(|value| value.parse::<i32>().ok())
+                {
                     conf.crispr_cutting_site = value;
                     index += 1;
                 }
             }
             "-j" => {
-                if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<i32>().ok()) {
+                if let Some(value) = tokens
+                    .get(index + 1)
+                    .and_then(|value| value.parse::<i32>().ok())
+                {
                     conf.crispr_filtering_bp = value;
                     index += 1;
                 }
@@ -765,31 +797,46 @@ fn apply_simple_options_to_conf_and_pipeline(
                 conf.delete_duplicate_variants = true;
             }
             "-f" => {
-                if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<f64>().ok()) {
+                if let Some(value) = tokens
+                    .get(index + 1)
+                    .and_then(|value| value.parse::<f64>().ok())
+                {
                     min_frequency = value;
                     index += 1;
                 }
             }
             "-r" => {
-                if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<usize>().ok()) {
+                if let Some(value) = tokens
+                    .get(index + 1)
+                    .and_then(|value| value.parse::<usize>().ok())
+                {
                     conf.minr = value;
                     index += 1;
                 }
             }
             "-V" => {
-                if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<f64>().ok()) {
+                if let Some(value) = tokens
+                    .get(index + 1)
+                    .and_then(|value| value.parse::<f64>().ok())
+                {
                     conf.lofreq = value;
                     index += 1;
                 }
             }
             "-q" => {
-                if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<f64>().ok()) {
+                if let Some(value) = tokens
+                    .get(index + 1)
+                    .and_then(|value| value.parse::<f64>().ok())
+                {
                     conf.goodq = value;
                     index += 1;
                 }
             }
             "-Q" => {
-                if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<u8>().ok()) {
+                if let Some(value) = tokens
+                    .get(index + 1)
+                    .and_then(|value| value.parse::<u8>().ok())
+                {
                     conf.mapping_quality = Some(value);
                     index += 1;
                 }
@@ -804,7 +851,10 @@ fn apply_simple_options_to_conf_and_pipeline(
                 }
             }
             "-k" => {
-                if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<u8>().ok()) {
+                if let Some(value) = tokens
+                    .get(index + 1)
+                    .and_then(|value| value.parse::<u8>().ok())
+                {
                     conf.perform_local_realignment = value != 0;
                     index += 1;
                 }
@@ -813,19 +863,28 @@ fn apply_simple_options_to_conf_and_pipeline(
                 conf.include_n_in_total_depth = true;
             }
             "-x" => {
-                if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<i32>().ok()) {
+                if let Some(value) = tokens
+                    .get(index + 1)
+                    .and_then(|value| value.parse::<i32>().ok())
+                {
                     conf.number_nucleotide_to_extend = value;
                     index += 1;
                 }
             }
             "-X" => {
-                if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<i32>().ok()) {
+                if let Some(value) = tokens
+                    .get(index + 1)
+                    .and_then(|value| value.parse::<i32>().ok())
+                {
                     conf.vext = value;
                     index += 1;
                 }
             }
             "-Y" => {
-                if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<i32>().ok()) {
+                if let Some(value) = tokens
+                    .get(index + 1)
+                    .and_then(|value| value.parse::<i32>().ok())
+                {
                     conf.reference_extension = value;
                     index += 1;
                 }
@@ -914,7 +973,8 @@ fn test_apply_simple_options_to_conf_parses_crispr_short_flags() {
 #[test]
 fn test_apply_simple_options_to_conf_parses_crispr_compact_and_long_flags() {
     let mut conf = vardict_rs::conf::Configuration::default();
-    let _ = apply_simple_options_to_conf_and_pipeline("-J50454941 --crispr=50454942 -j25", &mut conf);
+    let _ =
+        apply_simple_options_to_conf_and_pipeline("-J50454941 --crispr=50454942 -j25", &mut conf);
 
     assert_eq!(conf.crispr_cutting_site, 50_454_942);
     assert_eq!(conf.crispr_filtering_bp, 25);
@@ -934,8 +994,7 @@ fn is_low_risk_simple_tier1_row(row: &ParityManifestRow) -> bool {
         && !has_tag("hard_clip")
         && matches!(
             normalized_options.as_str(),
-            ""
-                | "-f 0.0"
+            "" | "-f 0.0"
                 | "-f 0.001"
                 | "-f0.001"
                 | "-f 0.001 --fisher"
@@ -965,7 +1024,10 @@ fn select_tier1_simple_run_now_cases(
     selected.into_iter().take(limit).collect()
 }
 
-fn first_raw_mismatch(expected_lines: &[String], rust_output: &[String]) -> Option<RawMismatchDiagnostic> {
+fn first_raw_mismatch(
+    expected_lines: &[String],
+    rust_output: &[String],
+) -> Option<RawMismatchDiagnostic> {
     let shared = expected_lines.len().min(rust_output.len());
     for index in 0..shared {
         if expected_lines[index] != rust_output[index] {
@@ -1182,14 +1244,12 @@ fn run_vardict_pipeline_simple_raw_case_with_sv_default(
     install_test_scope(scope.clone());
     let instance = Arc::new(scope);
 
-    let csv_entries = ref_regions
-        .get(&resolved_ref_chrom)
-        .ok_or_else(|| {
-            format!(
-                "Reference CSV entries missing for chromosome {}",
-                resolved_ref_chrom
-            )
-        })?;
+    let csv_entries = ref_regions.get(&resolved_ref_chrom).ok_or_else(|| {
+        format!(
+            "Reference CSV entries missing for chromosome {}",
+            resolved_ref_chrom
+        )
+    })?;
     let synthetic_chr_len = instance
         .chr_lens
         .get(&resolved_ref_chrom)
@@ -1216,7 +1276,11 @@ fn run_vardict_pipeline_simple_raw_case_with_sv_default(
         }
     }
 
-    let mut chromosomes = std::collections::HashMap::new();
+    let mut chromosomes: std::collections::HashMap<
+        String,
+        ChromosomeData,
+        LibDefaultHasher,
+    > = Default::default();
     let mut chrom_names = vec![resolved_ref_chrom.clone()];
     let shared_data = ChromosomeData {
         sequence: synthetic_sequence.clone(),
@@ -1311,7 +1375,12 @@ fn run_vardict_pipeline_amplicon_raw_case(
 
     let amplicon_params = parse_amplicon_option_value(&config.options)
         .or_else(|| Some("10:0.95".to_string()))
-        .ok_or_else(|| format!("Amplicon options missing -a parameter for case {}", case_name))?;
+        .ok_or_else(|| {
+            format!(
+                "Amplicon options missing -a parameter for case {}",
+                case_name
+            )
+        })?;
     conf.amplicon_based_calling = Some(amplicon_params);
 
     let mut start = config.start as usize;
@@ -1461,14 +1530,12 @@ fn run_vardict_pipeline_amplicon_raw_case(
     install_test_scope(scope.clone());
     let instance = Arc::new(scope);
 
-    let csv_entries = ref_regions
-        .get(&resolved_ref_chrom)
-        .ok_or_else(|| {
-            format!(
-                "Reference CSV entries missing for chromosome {}",
-                resolved_ref_chrom
-            )
-        })?;
+    let csv_entries = ref_regions.get(&resolved_ref_chrom).ok_or_else(|| {
+        format!(
+            "Reference CSV entries missing for chromosome {}",
+            resolved_ref_chrom
+        )
+    })?;
     let synthetic_chr_len = instance
         .chr_lens
         .get(&resolved_ref_chrom)
@@ -1495,7 +1562,11 @@ fn run_vardict_pipeline_amplicon_raw_case(
         }
     }
 
-    let mut chromosomes = std::collections::HashMap::new();
+    let mut chromosomes: std::collections::HashMap<
+        String,
+        ChromosomeData,
+        LibDefaultHasher,
+    > = Default::default();
     let mut chrom_names = vec![resolved_ref_chrom.clone()];
     let shared_data = ChromosomeData {
         sequence: synthetic_sequence.clone(),
@@ -1642,7 +1713,10 @@ fn run_vardict_pipeline_somatic_raw_case(
     }
     let normal_bam_path = resources_dir.join(&normal_bam_name);
     if !normal_bam_path.exists() {
-        return Err(format!("Normal BAM not found: {}", normal_bam_path.display()));
+        return Err(format!(
+            "Normal BAM not found: {}",
+            normal_bam_path.display()
+        ));
     }
 
     let min_base_quality = conf.goodq;
@@ -1715,8 +1789,14 @@ fn run_vardict_pipeline_somatic_raw_case(
     scope.conf = conf;
 
     for (names, lens) in [
-        (tumor_bam_reader.target_names(), tumor_bam_reader.target_lens()),
-        (normal_bam_reader.target_names(), normal_bam_reader.target_lens()),
+        (
+            tumor_bam_reader.target_names(),
+            tumor_bam_reader.target_lens(),
+        ),
+        (
+            normal_bam_reader.target_names(),
+            normal_bam_reader.target_lens(),
+        ),
     ] {
         for (name, len) in names.iter().zip(lens.iter()) {
             let len = *len as usize;
@@ -1755,14 +1835,12 @@ fn run_vardict_pipeline_somatic_raw_case(
     install_test_scope(scope.clone());
     let instance = Arc::new(scope);
 
-    let csv_entries = ref_regions
-        .get(&resolved_ref_chrom)
-        .ok_or_else(|| {
-            format!(
-                "Reference CSV entries missing for chromosome {}",
-                resolved_ref_chrom
-            )
-        })?;
+    let csv_entries = ref_regions.get(&resolved_ref_chrom).ok_or_else(|| {
+        format!(
+            "Reference CSV entries missing for chromosome {}",
+            resolved_ref_chrom
+        )
+    })?;
     let synthetic_chr_len = instance
         .chr_lens
         .get(&resolved_ref_chrom)
@@ -1789,7 +1867,11 @@ fn run_vardict_pipeline_somatic_raw_case(
         }
     }
 
-    let mut chromosomes = std::collections::HashMap::new();
+    let mut chromosomes: std::collections::HashMap<
+        String,
+        ChromosomeData,
+        LibDefaultHasher,
+    > = Default::default();
     let mut chrom_names = vec![resolved_ref_chrom.clone()];
     let shared_data = ChromosomeData {
         sequence: synthetic_sequence.clone(),
@@ -1901,7 +1983,13 @@ fn run_vardict_pipeline_somatic_raw_case(
             .to_str()
             .ok_or_else(|| format!("Invalid BAM path UTF-8: {}", tumor_bam_path.display()))?,
     )
-    .map_err(|e| format!("Failed to open tumor BAM {}: {}", tumor_bam_path.display(), e))?;
+    .map_err(|e| {
+        format!(
+            "Failed to open tumor BAM {}: {}",
+            tumor_bam_path.display(),
+            e
+        )
+    })?;
     if let Some(prefix) = &snapshot_prefix {
         unsafe {
             env::set_var("VARDICT_TO_VARS_JSONL", format!("{}.tumor.jsonl", prefix));
@@ -1909,7 +1997,10 @@ fn run_vardict_pipeline_somatic_raw_case(
     }
     if let Some(prefix) = &cigar_snapshot_prefix {
         unsafe {
-            env::set_var("VARDICT_CIGAR_PARSER_JSONL", format!("{}.tumor.jsonl", prefix));
+            env::set_var(
+                "VARDICT_CIGAR_PARSER_JSONL",
+                format!("{}.tumor.jsonl", prefix),
+            );
         }
     }
     if let Some(prefix) = &structural_snapshot_prefix {
@@ -1948,7 +2039,13 @@ fn run_vardict_pipeline_somatic_raw_case(
             .to_str()
             .ok_or_else(|| format!("Invalid BAM path UTF-8: {}", normal_bam_path.display()))?,
     )
-    .map_err(|e| format!("Failed to open normal BAM {}: {}", normal_bam_path.display(), e))?;
+    .map_err(|e| {
+        format!(
+            "Failed to open normal BAM {}: {}",
+            normal_bam_path.display(),
+            e
+        )
+    })?;
     if let Some(prefix) = &snapshot_prefix {
         unsafe {
             env::set_var("VARDICT_TO_VARS_JSONL", format!("{}.normal.jsonl", prefix));
@@ -1956,7 +2053,10 @@ fn run_vardict_pipeline_somatic_raw_case(
     }
     if let Some(prefix) = &cigar_snapshot_prefix {
         unsafe {
-            env::set_var("VARDICT_CIGAR_PARSER_JSONL", format!("{}.normal.jsonl", prefix));
+            env::set_var(
+                "VARDICT_CIGAR_PARSER_JSONL",
+                format!("{}.normal.jsonl", prefix),
+            );
         }
     }
     if let Some(prefix) = &structural_snapshot_prefix {
@@ -1992,12 +2092,18 @@ fn run_vardict_pipeline_somatic_raw_case(
 
     if let Some(prefix) = &snapshot_prefix {
         unsafe {
-            env::set_var("VARDICT_TO_VARS_JSONL", format!("{}.combined.jsonl", prefix));
+            env::set_var(
+                "VARDICT_TO_VARS_JSONL",
+                format!("{}.combined.jsonl", prefix),
+            );
         }
     }
     if let Some(prefix) = &cigar_snapshot_prefix {
         unsafe {
-            env::set_var("VARDICT_CIGAR_PARSER_JSONL", format!("{}.combined.jsonl", prefix));
+            env::set_var(
+                "VARDICT_CIGAR_PARSER_JSONL",
+                format!("{}.combined.jsonl", prefix),
+            );
         }
     }
     if let Some(prefix) = &realigner_snapshot_prefix {
@@ -2035,26 +2141,20 @@ fn run_vardict_pipeline_somatic_raw_case(
         .max_read_length
         .max(normal_output.max_read_length);
 
-    let combine_lookup = move |
-        _chr_name: &str,
-        position: i64,
-        description_string: &str,
-        max_read_length: usize,
-    | {
-        let combined_variant = combined_aligned_variants
-            .get(&position)
-            .and_then(|vars| {
+    let combine_lookup =
+        move |_chr_name: &str, position: i64, description_string: &str, max_read_length: usize| {
+            let combined_variant = combined_aligned_variants.get(&position).and_then(|vars| {
                 vars.variants
                     .iter()
                     .find(|variant| variant.description_string == description_string)
                     .cloned()
             });
 
-        SomaticCombineLookupResult {
-            combined_variant,
-            max_read_length: combined_max_read_length.max(max_read_length),
-        }
-    };
+            SomaticCombineLookupResult {
+                combined_variant,
+                max_read_length: combined_max_read_length.max(max_read_length),
+            }
+        };
 
     let output_lines = pipeline.run_somatic_post_processor_with_combine_lookup(
         normal_output.aligned_vars,
@@ -2075,58 +2175,57 @@ fn run_vardict_pipeline_somatic_raw_case(
 
 /// Run a REAL integration test with actual BAM files and expected output
 /// This compares Rust output with Java VarDict expected output
-/// 
+///
 /// Run with: cargo test test_real_integration_hard_clip -- --ignored --nocapture
 #[test]
 #[ignore]
 fn test_real_integration_hard_clip() {
     use vardict_rs::data::bam_reader::BamReader;
+    use vardict_rs::data::bam_reader::passes_filter;
+    use vardict_rs::mods::output_variant::Region as OutputRegion;
     use vardict_rs::mods::pipeline::{Pipeline, PipelineConfig};
     use vardict_rs::mods::simple_variant_caller::SimpleVariantCaller;
-    use vardict_rs::mods::output_variant::Region as OutputRegion;
-    use vardict_rs::data::bam_reader::passes_filter;
-    
+
     let testdata_dir = get_testdata_dir();
-    
+
     // Use the hard_clip test case - it uses a small test reference
     let test_case_path = testdata_dir
         .join("integrationtestcases")
         .join("Simple;hard_clip_case.fa;hard_clip_next_to_del_test1.bam;test;6674-6824;-f 0.0 -p -r 1.txt");
-    
+
     if !test_case_path.exists() {
         eprintln!("Test case not found: {:?}", test_case_path);
         return;
     }
-    
+
     // Parse test case
-    let (config, expected_variants) = parse_test_case(&test_case_path)
-        .expect("Failed to parse test case");
-    
+    let (config, expected_variants) =
+        parse_test_case(&test_case_path).expect("Failed to parse test case");
+
     // Parse FASTA CSV
     let fasta_csv_path = testdata_dir.join("fastas").join("hard_clip_case.fa.csv");
-    let ref_regions = parse_fasta_csv(&fasta_csv_path)
-        .expect("Failed to parse FASTA CSV");
-    
+    let ref_regions = parse_fasta_csv(&fasta_csv_path).expect("Failed to parse FASTA CSV");
+
     // Get reference sequence for the region
     let ref_seq = query_reference_csv(&ref_regions, &config.chrom, config.start, config.end)
         .expect("Failed to get reference sequence");
-    
+
     println!("Test: hard_clip_next_to_del_test1");
     println!("  Region: {}:{}-{}", config.chrom, config.start, config.end);
     println!("  Reference length: {} bp", ref_seq.len());
     println!("  Expected variants: {}", expected_variants.len());
-    
+
     // Build paths to resources
     let bam_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("VarDictJava")
         .join("src/test/resources/com/astrazeneca/vardict/integrationtests")
         .join(&config.bam_file);
-    
+
     if !bam_path.exists() {
         eprintln!("BAM file not found: {:?}", bam_path);
         return;
     }
-    
+
     // Create pipeline config - parse options from test case
     let pipeline_config = PipelineConfig::builder()
         .sample_name("hard_clip_next_to_del_test1".to_string())
@@ -2134,77 +2233,79 @@ fn test_real_integration_hard_clip() {
         .min_variant_reads(1)
         .min_base_quality(22.5)
         .build();
-    
+
     // Create variant caller
     let mut caller = SimpleVariantCaller::new(
         pipeline_config.quality_threshold as u8,
         pipeline_config.mapq_threshold,
     );
     caller.set_reference(ref_seq.as_bytes().to_vec(), config.start);
-    
+
     // Open BAM and read records
-    let mut bam_reader = BamReader::open(bam_path.to_str().unwrap())
-        .expect("Failed to open BAM file");
-    
-    bam_reader.fetch(&config.chrom, config.start as usize, config.end as usize)
+    let mut bam_reader =
+        BamReader::open(bam_path.to_str().unwrap()).expect("Failed to open BAM file");
+
+    bam_reader
+        .fetch(&config.chrom, config.start as usize, config.end as usize)
         .expect("Failed to fetch region");
-    
+
     let sam_filter: u32 = 0x504;
     let mut records = Vec::new();
     let mut record = rust_htslib::bam::Record::new();
-    let record_header = std::sync::Arc::new(
-        rust_htslib::bam::HeaderView::from_header(bam_reader.header()),
-    );
-    
-    while bam_reader.read(&mut record).expect("Failed to read BAM record") {
+    let record_header = std::sync::Arc::new(rust_htslib::bam::HeaderView::from_header(
+        bam_reader.header(),
+    ));
+
+    while bam_reader
+        .read(&mut record)
+        .expect("Failed to read BAM record")
+    {
         if passes_filter(&record, sam_filter, pipeline_config.mapq_threshold) {
             let mut cloned = record.clone();
             cloned.set_header(record_header.clone());
             records.push(cloned);
         }
     }
-    
+
     println!("  Reads in region: {}", records.len());
-    
+
     // Process records
     let (variations, coverage) = caller.process_records(records.iter());
-    
+
     println!("  Variations found: {}", variations.len());
-    
+
     // Create pipeline and process
     let pipeline = Pipeline::new(pipeline_config);
-    
-    let output_region = OutputRegion::new(
-        &config.chrom,
-        config.start,
-        config.end,
-        "testbed",
-    );
-    
+
+    let output_region = OutputRegion::new(&config.chrom, config.start, config.end, "testbed");
+
     let output_lines = pipeline.process_variations(variations, &coverage, &output_region);
-    
+
     println!("\n=== Rust Output ===");
     for line in &output_lines {
         println!("{}", line);
     }
     println!("===================");
-    
+
     println!("\n=== Expected Output (first 5 variants) ===");
     for variant in expected_variants.iter().take(5) {
         println!("{}", variant.raw_line);
     }
     println!("===================\n");
-    
+
     // Compare line counts at minimum
     if expected_variants.len() > 0 {
-        println!("Expected {} variants, got {} output lines", 
-            expected_variants.len(), output_lines.len());
+        println!(
+            "Expected {} variants, got {} output lines",
+            expected_variants.len(),
+            output_lines.len()
+        );
     }
 }
 
 /// Run integration test against all Simple mode test cases
 /// This is the full integration test suite
-/// 
+///
 /// Run with: cargo test test_all_simple_integration -- --ignored --nocapture
 #[test]
 #[ignore]
@@ -2217,7 +2318,7 @@ fn test_all_simple_integration() {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("VarDictJava")
         .join("src/test/resources/com/astrazeneca/vardict/integrationtests");
-    
+
     if !test_cases_dir.exists() || !resources_dir.exists() || !manifest_path.exists() {
         eprintln!("Test resources not found");
         return;
@@ -2255,7 +2356,7 @@ fn test_all_simple_integration() {
         expected_selected,
         "Unexpected selected-case count for RUN_NOW Simple cases"
     );
-    
+
     let mut passed = 0;
     let mut failed = 0;
     let mut skipped = 0;
@@ -2288,7 +2389,7 @@ fn test_all_simple_integration() {
             failed += 1;
             continue;
         }
-        
+
         // Check if BAM exists
         let bam_path = resources_dir.join(&config.bam_file);
         if !bam_path.exists() {
@@ -2300,9 +2401,11 @@ fn test_all_simple_integration() {
             skipped += 1;
             continue;
         }
-        
+
         // Check if FASTA CSV exists
-        let fasta_csv = testdata_dir.join("fastas").join(format!("{}.csv", config.reference));
+        let fasta_csv = testdata_dir
+            .join("fastas")
+            .join(format!("{}.csv", config.reference));
         if !fasta_csv.exists() {
             eprintln!(
                 "SKIP {}: FASTA CSV not found at {}",
@@ -2391,7 +2494,10 @@ fn test_all_simple_integration() {
     }
 
     println!("\n=== Integration Test Summary ===");
-    println!("Manifest-selected RUN_NOW Simple cases: {}", selected_cases.len());
+    println!(
+        "Manifest-selected RUN_NOW Simple cases: {}",
+        selected_cases.len()
+    );
     println!("Passed: {}", passed);
     println!("Failed: {}", failed);
     println!("Skipped: {}", skipped);
@@ -2693,8 +2799,14 @@ fn test_manifest_tier1_simple_raw_rust_vs_java_first_mismatch() {
                     diag.reason,
                     diag.line_index + 1
                 );
-                eprintln!("  JAVA: {}", diag.java_line.unwrap_or_else(|| "<none>".to_string()));
-                eprintln!("  RUST: {}", diag.rust_line.unwrap_or_else(|| "<none>".to_string()));
+                eprintln!(
+                    "  JAVA: {}",
+                    diag.java_line.unwrap_or_else(|| "<none>".to_string())
+                );
+                eprintln!(
+                    "  RUST: {}",
+                    diag.rust_line.unwrap_or_else(|| "<none>".to_string())
+                );
             }
         }
     }
@@ -2929,8 +3041,14 @@ fn test_manifest_simple_sv_core_raw_rust_vs_java_first_mismatch() {
                     diag.reason,
                     diag.line_index + 1
                 );
-                eprintln!("  JAVA: {}", diag.java_line.unwrap_or_else(|| "<none>".to_string()));
-                eprintln!("  RUST: {}", diag.rust_line.unwrap_or_else(|| "<none>".to_string()));
+                eprintln!(
+                    "  JAVA: {}",
+                    diag.java_line.unwrap_or_else(|| "<none>".to_string())
+                );
+                eprintln!(
+                    "  RUST: {}",
+                    diag.rust_line.unwrap_or_else(|| "<none>".to_string())
+                );
             }
         }
     }
@@ -3126,8 +3244,14 @@ fn test_manifest_simple_splicing_raw_rust_vs_java_first_mismatch() {
                     diag.reason,
                     diag.line_index + 1
                 );
-                eprintln!("  JAVA: {}", diag.java_line.unwrap_or_else(|| "<none>".to_string()));
-                eprintln!("  RUST: {}", diag.rust_line.unwrap_or_else(|| "<none>".to_string()));
+                eprintln!(
+                    "  JAVA: {}",
+                    diag.java_line.unwrap_or_else(|| "<none>".to_string())
+                );
+                eprintln!(
+                    "  RUST: {}",
+                    diag.rust_line.unwrap_or_else(|| "<none>".to_string())
+                );
             }
         }
     }
@@ -3322,8 +3446,14 @@ fn test_manifest_simple_unique_mode_raw_rust_vs_java_first_mismatch() {
                     diag.reason,
                     diag.line_index + 1
                 );
-                eprintln!("  JAVA: {}", diag.java_line.unwrap_or_else(|| "<none>".to_string()));
-                eprintln!("  RUST: {}", diag.rust_line.unwrap_or_else(|| "<none>".to_string()));
+                eprintln!(
+                    "  JAVA: {}",
+                    diag.java_line.unwrap_or_else(|| "<none>".to_string())
+                );
+                eprintln!(
+                    "  RUST: {}",
+                    diag.rust_line.unwrap_or_else(|| "<none>".to_string())
+                );
             }
         }
     }
@@ -3518,8 +3648,14 @@ fn test_manifest_simple_realigner_complex_raw_rust_vs_java_first_mismatch() {
                     diag.reason,
                     diag.line_index + 1
                 );
-                eprintln!("  JAVA: {}", diag.java_line.unwrap_or_else(|| "<none>".to_string()));
-                eprintln!("  RUST: {}", diag.rust_line.unwrap_or_else(|| "<none>".to_string()));
+                eprintln!(
+                    "  JAVA: {}",
+                    diag.java_line.unwrap_or_else(|| "<none>".to_string())
+                );
+                eprintln!(
+                    "  RUST: {}",
+                    diag.rust_line.unwrap_or_else(|| "<none>".to_string())
+                );
             }
         }
     }
@@ -3708,8 +3844,14 @@ fn test_manifest_amplicon_raw_rust_vs_java_first_mismatch() {
                     diag.reason,
                     diag.line_index + 1
                 );
-                eprintln!("  JAVA: {}", diag.java_line.unwrap_or_else(|| "<none>".to_string()));
-                eprintln!("  RUST: {}", diag.rust_line.unwrap_or_else(|| "<none>".to_string()));
+                eprintln!(
+                    "  JAVA: {}",
+                    diag.java_line.unwrap_or_else(|| "<none>".to_string())
+                );
+                eprintln!(
+                    "  RUST: {}",
+                    diag.rust_line.unwrap_or_else(|| "<none>".to_string())
+                );
             }
         }
     }
@@ -3931,8 +4073,14 @@ fn test_manifest_somatic_raw_rust_vs_java_first_mismatch() {
                     diag.reason,
                     diag.line_index + 1
                 );
-                eprintln!("  JAVA: {}", diag.java_line.unwrap_or_else(|| "<none>".to_string()));
-                eprintln!("  RUST: {}", diag.rust_line.unwrap_or_else(|| "<none>".to_string()));
+                eprintln!(
+                    "  JAVA: {}",
+                    diag.java_line.unwrap_or_else(|| "<none>".to_string())
+                );
+                eprintln!(
+                    "  RUST: {}",
+                    diag.rust_line.unwrap_or_else(|| "<none>".to_string())
+                );
             }
         }
     }
@@ -3981,30 +4129,30 @@ fn test_multithreaded_variant_calling_concept() {
     use std::thread;
 
     // This test validates the concept of shared reference across threads
-    
+
     // Simulate a shared reference sequence (3GB would be loaded once)
     let shared_reference: Arc<Vec<u8>> = Arc::new(b"ACGTACGTACGT".to_vec());
-    
+
     let mut handles = Vec::new();
-    
+
     // Spawn 4 threads simulating processing different regions
     for thread_id in 0..4 {
         let ref_clone = Arc::clone(&shared_reference);
-        
+
         let handle = thread::spawn(move || {
             // Each thread can read from the shared reference
             let _ref_base = ref_clone.get(thread_id).copied();
             thread_id
         });
-        
+
         handles.push(handle);
     }
-    
+
     // Collect results
     for handle in handles {
         let _result = handle.join().expect("Thread panicked");
     }
-    
+
     // The reference should still have refcount of 1 (only main thread)
     assert_eq!(Arc::strong_count(&shared_reference), 1);
 }
@@ -4014,70 +4162,69 @@ fn test_multithreaded_variant_calling_concept() {
 #[test]
 #[ignore]
 fn test_vardict_pipeline_hard_clip() {
+    use std::sync::Arc;
+    use vardict_rs::conf::Configuration;
     use vardict_rs::data::bam_reader::BamReader;
     use vardict_rs::data::reference::Reference;
     use vardict_rs::data::region::Region;
     use vardict_rs::mods::vardict_pipeline::VarDictPipeline;
-    use vardict_rs::conf::Configuration;
-    use std::sync::Arc;
-    
+
     let testdata_dir = get_testdata_dir();
-    
+
     // Use the hard_clip test case
     let test_case_path = testdata_dir
         .join("integrationtestcases")
         .join("Simple;hard_clip_case.fa;hard_clip_next_to_del_test1.bam;test;6674-6824;-f 0.0 -p -r 1.txt");
-    
+
     if !test_case_path.exists() {
         eprintln!("Test case not found: {:?}", test_case_path);
         return;
     }
-    
+
     // Parse test case
-    let (config, expected_variants) = parse_test_case(&test_case_path)
-        .expect("Failed to parse test case");
-    
+    let (config, expected_variants) =
+        parse_test_case(&test_case_path).expect("Failed to parse test case");
+
     // Parse FASTA CSV
     let fasta_csv_path = testdata_dir.join("fastas").join("hard_clip_case.fa.csv");
-    let ref_regions = parse_fasta_csv(&fasta_csv_path)
-        .expect("Failed to parse FASTA CSV");
-    
+    let ref_regions = parse_fasta_csv(&fasta_csv_path).expect("Failed to parse FASTA CSV");
+
     // Get reference sequence for the region
     let ref_seq = query_reference_csv(&ref_regions, &config.chrom, config.start, config.end)
         .expect("Failed to get reference sequence");
-    
+
     println!("\n=== VarDictPipeline Test ===");
     println!("Test: hard_clip_next_to_del_test1");
     println!("  Region: {}:{}-{}", config.chrom, config.start, config.end);
     println!("  Reference length: {} bp", ref_seq.len());
     println!("  Expected variants: {}", expected_variants.len());
-    
+
     // Build paths to resources
     let bam_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("VarDictJava")
         .join("src/test/resources/com/astrazeneca/vardict/integrationtests")
         .join(&config.bam_file);
-    
+
     if !bam_path.exists() {
         eprintln!("BAM file not found: {:?}", bam_path);
         return;
     }
-    
+
     // Create GlobalReadOnlyScope with configuration and initialize global INSTANCE
     let mut conf = Configuration::default();
     conf.goodq = 22.5;
     conf.vext = 2;
     conf.mismatch = 8;
     conf.disable_sv = true;
-    conf.perform_local_realignment = true;  // Enable local realignment for Del+Match combining
+    conf.perform_local_realignment = true; // Enable local realignment for Del+Match combining
     let mut scope = GlobalReadOnlyScope::default();
     scope.conf = conf;
-    
+
     // Initialize the global INSTANCE (may fail if already set by another test, which is OK)
     install_test_scope(scope.clone());
-    
+
     let instance = Arc::new(scope);
-    
+
     // Create region (Java IntegrationTest uses -z, so start is zero-based)
     let mut start = config.start as usize;
     let mut end = config.end as usize;
@@ -4091,43 +4238,49 @@ fn test_vardict_pipeline_hard_clip() {
         std::mem::swap(&mut start, &mut end);
     }
     let region = Region::new(config.chrom.clone(), start, end, "testbed".to_string());
-    
+
     // Create reference with region start offset
     let reference = Reference::from_seq_with_start(ref_seq.as_bytes(), config.start);
-    
+
     // Open BAM and read records
-    let mut bam_reader = BamReader::open(bam_path.to_str().unwrap())
-        .expect("Failed to open BAM file");
-    
-    bam_reader.fetch(&config.chrom, config.start as usize, config.end as usize)
+    let mut bam_reader =
+        BamReader::open(bam_path.to_str().unwrap()).expect("Failed to open BAM file");
+
+    bam_reader
+        .fetch(&config.chrom, config.start as usize, config.end as usize)
         .expect("Failed to fetch region");
-    
+
     let sam_filter: u32 = 0x504;
     let mut records = Vec::new();
     let mut record = rust_htslib::bam::Record::new();
-    let record_header = std::sync::Arc::new(
-        rust_htslib::bam::HeaderView::from_header(bam_reader.header()),
-    );
-    
-    while bam_reader.read(&mut record).expect("Failed to read BAM record") {
+    let record_header = std::sync::Arc::new(rust_htslib::bam::HeaderView::from_header(
+        bam_reader.header(),
+    ));
+
+    while bam_reader
+        .read(&mut record)
+        .expect("Failed to read BAM record")
+    {
         if vardict_rs::data::bam_reader::passes_filter(&record, sam_filter, 0) {
             let mut cloned = record.clone();
             cloned.set_header(record_header.clone());
             records.push(cloned);
         }
     }
-    
+
     println!("  Reads in region: {}", records.len());
-    
+
     // Create VarDictPipeline with pileup mode enabled (test case has -p flag)
     let pipeline = VarDictPipeline::new("hard_clip_next_to_del_test1")
         .with_min_frequency(0.0)
         .with_min_base_quality(22.5)
         .with_pileup(true);
-    
-    println!("  Pipeline config: min_freq={}, min_base_qual={}, pileup=true",
-        0.0, 25);
-    
+
+    println!(
+        "  Pipeline config: min_freq={}, min_base_qual={}, pileup=true",
+        0.0, 25
+    );
+
     // Examine the first read's CIGAR
     for record in &records {
         let cigar = record.cigar();
@@ -4135,31 +4288,43 @@ fn test_vardict_pipeline_hard_clip() {
         println!("  Read pos: {}", record.pos());
         println!("  Read seq len: {}", record.seq_len());
     }
-    
+
     // Process through pipeline
-    let output = pipeline.process_region(
-        records.into_iter(),
-        &region,
-        &reference,
-        instance,
-    ).expect("Pipeline failed");
-    
-    println!("\n=== Rust VarDictPipeline Output ({} lines) ===", output.len());
+    let output = pipeline
+        .process_region(records.into_iter(), &region, &reference, instance)
+        .expect("Pipeline failed");
+
+    println!(
+        "\n=== Rust VarDictPipeline Output ({} lines) ===",
+        output.len()
+    );
     for (i, line) in output.iter().take(10).enumerate() {
-        println!("{}. {}", i+1, &line[..line.len().min(100)]);
+        println!("{}. {}", i + 1, &line[..line.len().min(100)]);
     }
     if output.len() > 10 {
         println!("... ({} more lines)", output.len() - 10);
     }
-    
-    println!("\n=== Expected Output ({} variants) ===", expected_variants.len());
+
+    println!(
+        "\n=== Expected Output ({} variants) ===",
+        expected_variants.len()
+    );
     for (i, var) in expected_variants.iter().take(5).enumerate() {
-        println!("{}. pos={} ref={} alt={} type={}",
-            i+1, var.start, var.ref_allele, var.alt_allele, var.variant_type);
+        println!(
+            "{}. pos={} ref={} alt={} type={}",
+            i + 1,
+            var.start,
+            var.ref_allele,
+            var.alt_allele,
+            var.variant_type
+        );
     }
-    
+
     println!("\n=== Comparison ===");
-    println!("Expected: {} variants (including Complex at 6771-6787)", expected_variants.len());
+    println!(
+        "Expected: {} variants (including Complex at 6771-6787)",
+        expected_variants.len()
+    );
     println!("Got: {} output lines", output.len());
 }
 
@@ -4168,84 +4333,89 @@ fn test_vardict_pipeline_hard_clip() {
 #[test]
 #[ignore]
 fn test_rust_vs_java_output_comparison() {
+    use std::fs;
+    use std::sync::Arc;
+    use vardict_rs::conf::Configuration;
     use vardict_rs::data::bam_reader::BamReader;
     use vardict_rs::data::reference::Reference;
     use vardict_rs::data::region::Region;
     use vardict_rs::mods::vardict_pipeline::VarDictPipeline;
-    use vardict_rs::conf::Configuration;
-    use std::sync::Arc;
-    use std::fs;
 
     let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
-    
+
     let testdata_dir = get_testdata_dir();
-    
+
     // Use the hard_clip test case
     let test_case_path = testdata_dir
         .join("integrationtestcases")
         .join("Simple;hard_clip_case.fa;hard_clip_next_to_del_test1.bam;test;6674-6824;-f 0.0 -p -r 1.txt");
-    
+
     if !test_case_path.exists() {
         eprintln!("Test case not found: {:?}", test_case_path);
         return;
     }
-    
+
     // Read Java expected output from the test case file
     let file_content = fs::read_to_string(&test_case_path).expect("Failed to read test case");
     let lines: Vec<&str> = file_content.lines().collect();
-    
+
     // First line is config, rest are expected variant lines
     // Filter out empty lines and malformed lines (less than 7 columns)
-    let java_expected_lines: Vec<&str> = lines.iter()
+    let java_expected_lines: Vec<&str> = lines
+        .iter()
         .skip(1)
         .copied()
         .filter(|line| {
             let cols = line.split('\t').count();
-            cols >= 7  // Valid variant lines have at least 7 columns
+            cols >= 7 // Valid variant lines have at least 7 columns
         })
         .collect();
-    
+
     println!("\n=== Java Expected Output ===");
     for (i, line) in java_expected_lines.iter().enumerate() {
         let fields: Vec<&str> = line.split('\t').collect();
-        println!("Java {}: pos={}-{} ref={} alt={} (cols={})", 
-            i+1, 
-            fields.get(3).unwrap_or(&"?"), 
+        println!(
+            "Java {}: pos={}-{} ref={} alt={} (cols={})",
+            i + 1,
+            fields.get(3).unwrap_or(&"?"),
             fields.get(4).unwrap_or(&"?"),
             fields.get(5).unwrap_or(&"?"),
             fields.get(6).unwrap_or(&"?"),
             fields.len()
         );
     }
-    
+
     // Parse test case config
-    let (config, _expected_variants) = parse_test_case(&test_case_path)
-        .expect("Failed to parse test case");
-    
+    let (config, _expected_variants) =
+        parse_test_case(&test_case_path).expect("Failed to parse test case");
+
     // Parse FASTA CSV
     let fasta_csv_path = testdata_dir.join("fastas").join("hard_clip_case.fa.csv");
-    let ref_regions = parse_fasta_csv(&fasta_csv_path)
-        .expect("Failed to parse FASTA CSV");
-    
+    let ref_regions = parse_fasta_csv(&fasta_csv_path).expect("Failed to parse FASTA CSV");
+
     // Get reference sequence for the region with flanking for leftseq/rightseq
     // VarDict Java loads extra sequence around the region for flanking context
     let flank_size = 20i64;
-    let extended_start = if config.start > flank_size { config.start - flank_size } else { 1 };
+    let extended_start = if config.start > flank_size {
+        config.start - flank_size
+    } else {
+        1
+    };
     let extended_end = config.end + flank_size;
     let ref_seq = query_reference_csv(&ref_regions, &config.chrom, extended_start, extended_end)
         .expect("Failed to get reference sequence");
-    
+
     // Build paths to resources
     let bam_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("VarDictJava")
         .join("src/test/resources/com/astrazeneca/vardict/integrationtests")
         .join(&config.bam_file);
-    
+
     if !bam_path.exists() {
         eprintln!("BAM file not found: {:?}", bam_path);
         return;
     }
-    
+
     // Create GlobalReadOnlyScope with configuration
     let mut conf = Configuration::default();
     conf.goodq = 22.5;
@@ -4255,10 +4425,10 @@ fn test_rust_vs_java_output_comparison() {
     conf.perform_local_realignment = true;
     let mut scope = GlobalReadOnlyScope::default();
     scope.conf = conf;
-    
+
     install_test_scope(scope.clone());
     let instance = Arc::new(scope);
-    
+
     // Create region (Java IntegrationTest uses -z, so start is zero-based)
     let mut start = config.start as usize;
     let mut end = config.end as usize;
@@ -4272,127 +4442,170 @@ fn test_rust_vs_java_output_comparison() {
         std::mem::swap(&mut start, &mut end);
     }
     let region = Region::new(config.chrom.clone(), start, end, "testbed".to_string());
-    
+
     // Create reference with extended region start offset
     let reference = Reference::from_seq_with_start(ref_seq.as_bytes(), extended_start);
-    
+
     // Open BAM and read records
-    let mut bam_reader = BamReader::open(bam_path.to_str().unwrap())
-        .expect("Failed to open BAM file");
-    
-    bam_reader.fetch(&config.chrom, config.start as usize, config.end as usize)
+    let mut bam_reader =
+        BamReader::open(bam_path.to_str().unwrap()).expect("Failed to open BAM file");
+
+    bam_reader
+        .fetch(&config.chrom, config.start as usize, config.end as usize)
         .expect("Failed to fetch region");
-    
+
     let sam_filter: u32 = 0x504;
     let mut records = Vec::new();
     let mut record = rust_htslib::bam::Record::new();
-    let record_header = std::sync::Arc::new(
-        rust_htslib::bam::HeaderView::from_header(bam_reader.header()),
-    );
-    
-    while bam_reader.read(&mut record).expect("Failed to read BAM record") {
+    let record_header = std::sync::Arc::new(rust_htslib::bam::HeaderView::from_header(
+        bam_reader.header(),
+    ));
+
+    while bam_reader
+        .read(&mut record)
+        .expect("Failed to read BAM record")
+    {
         if vardict_rs::data::bam_reader::passes_filter(&record, sam_filter, 0) {
             let mut cloned = record.clone();
             cloned.set_header(record_header.clone());
             records.push(cloned);
         }
     }
-    
+
     // Create VarDictPipeline
     let pipeline = VarDictPipeline::new("hard_clip_next_to_del_test1")
         .with_min_frequency(0.0)
         .with_min_base_quality(22.5)
         .with_pileup(true);
-    
+
     // Process through pipeline
-    let rust_output = pipeline.process_region(
-        records.into_iter(),
-        &region,
-        &reference,
-        instance,
-    ).expect("Pipeline failed");
-    
+    let rust_output = pipeline
+        .process_region(records.into_iter(), &region, &reference, instance)
+        .expect("Pipeline failed");
+
     println!("\n=== Rust Output ===");
     for (i, line) in rust_output.iter().enumerate() {
         let fields: Vec<&str> = line.split('\t').collect();
-        println!("Rust {}: pos={}-{} ref={} alt={} (cols={})", 
-            i+1, 
-            fields.get(3).unwrap_or(&"?"), 
+        println!(
+            "Rust {}: pos={}-{} ref={} alt={} (cols={})",
+            i + 1,
+            fields.get(3).unwrap_or(&"?"),
             fields.get(4).unwrap_or(&"?"),
             fields.get(5).unwrap_or(&"?"),
             fields.get(6).unwrap_or(&"?"),
             fields.len()
         );
     }
-    
+
     // Compare counts
     println!("\n=== Line Count Comparison ===");
     println!("Java expected: {} lines", java_expected_lines.len());
     println!("Rust output:   {} lines", rust_output.len());
-    
+
     assert_eq!(
-        rust_output.len(), 
-        java_expected_lines.len(), 
-        "Line count mismatch: Rust={} Java={}", 
-        rust_output.len(), 
+        rust_output.len(),
+        java_expected_lines.len(),
+        "Line count mismatch: Rust={} Java={}",
+        rust_output.len(),
         java_expected_lines.len()
     );
-    
+
     // Compare key fields (position, ref, alt) for each variant
     // Sort both by position for comparison
-    let mut java_sorted: Vec<(i64, &str)> = java_expected_lines.iter()
+    let mut java_sorted: Vec<(i64, &str)> = java_expected_lines
+        .iter()
         .filter_map(|line| {
             let fields: Vec<&str> = line.split('\t').collect();
-            fields.get(3).and_then(|s| s.parse::<i64>().ok()).map(|pos| (pos, *line))
+            fields
+                .get(3)
+                .and_then(|s| s.parse::<i64>().ok())
+                .map(|pos| (pos, *line))
         })
         .collect();
     java_sorted.sort_by_key(|(pos, _)| *pos);
-    
-    let mut rust_sorted: Vec<(i64, String)> = rust_output.iter()
+
+    let mut rust_sorted: Vec<(i64, String)> = rust_output
+        .iter()
         .filter_map(|line| {
             let fields: Vec<&str> = line.split('\t').collect();
-            fields.get(3).and_then(|s| s.parse::<i64>().ok()).map(|pos| (pos, line.clone()))
+            fields
+                .get(3)
+                .and_then(|s| s.parse::<i64>().ok())
+                .map(|pos| (pos, line.clone()))
         })
         .collect();
     rust_sorted.sort_by_key(|(pos, _)| *pos);
-    
+
     // Column names for VarDict Simple Mode (36 columns)
     let column_names = [
-        "sample", "gene", "chr", "start", "end", "ref", "alt",
-        "depth", "var_depth", "ref_fwd", "ref_rev", "var_fwd", "var_rev",
-        "genotype", "freq", "bias", "pmean", "pstd", "qual", "qstd",
-        "mapq", "qratio", "hifreq", "extrafreq", "shift3", "msi", "msint",
-        "nm", "hicnt", "hicov", "leftseq", "rightseq", "region", "vartype",
-        "duprate", "sv"
+        "sample",
+        "gene",
+        "chr",
+        "start",
+        "end",
+        "ref",
+        "alt",
+        "depth",
+        "var_depth",
+        "ref_fwd",
+        "ref_rev",
+        "var_fwd",
+        "var_rev",
+        "genotype",
+        "freq",
+        "bias",
+        "pmean",
+        "pstd",
+        "qual",
+        "qstd",
+        "mapq",
+        "qratio",
+        "hifreq",
+        "extrafreq",
+        "shift3",
+        "msi",
+        "msint",
+        "nm",
+        "hicnt",
+        "hicov",
+        "leftseq",
+        "rightseq",
+        "region",
+        "vartype",
+        "duprate",
+        "sv",
     ];
-    
+
     println!("\n=== Full Column-by-Column Comparison ===");
     let mut all_match = true;
     let mut total_diffs = 0;
-    
-    for (i, ((java_pos, java_line), (_rust_pos, rust_line))) in 
-        java_sorted.iter().zip(rust_sorted.iter()).enumerate() 
+
+    for (i, ((java_pos, java_line), (_rust_pos, rust_line))) in
+        java_sorted.iter().zip(rust_sorted.iter()).enumerate()
     {
         let java_fields: Vec<&str> = java_line.split('\t').collect();
         let rust_fields: Vec<&str> = rust_line.split('\t').collect();
-        
-        println!("\n--- Variant {} (pos={}) ---", i+1, java_pos);
-        
+
+        println!("\n--- Variant {} (pos={}) ---", i + 1, java_pos);
+
         let mut variant_diffs = Vec::new();
-        
+
         for j in 0..java_fields.len().max(rust_fields.len()) {
             let java_val = java_fields.get(j).unwrap_or(&"<missing>");
             let rust_val = rust_fields.get(j).unwrap_or(&"<missing>");
             let col_name = column_names.get(j).unwrap_or(&"unknown");
-            
+
             if java_val != rust_val {
                 variant_diffs.push(format!(
-                    "  [{:2}] {:12}: Java='{}' vs Rust='{}'", 
-                    j+1, col_name, java_val, rust_val
+                    "  [{:2}] {:12}: Java='{}' vs Rust='{}'",
+                    j + 1,
+                    col_name,
+                    java_val,
+                    rust_val
                 ));
             }
         }
-        
+
         if variant_diffs.is_empty() {
             println!("  All 36 columns match! ✓");
         } else {
@@ -4404,13 +4617,16 @@ fn test_rust_vs_java_output_comparison() {
             }
         }
     }
-    
+
     println!("\n=== Summary ===");
     if all_match {
         println!("All {} variants match all 36 columns! ✓", java_sorted.len());
     } else {
-        println!("Found {} total column differences across variants. ✗", total_diffs);
+        println!(
+            "Found {} total column differences across variants. ✗",
+            total_diffs
+        );
     }
-    
+
     assert!(all_match, "All columns should match Java output exactly");
 }

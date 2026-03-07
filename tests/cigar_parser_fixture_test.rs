@@ -101,11 +101,9 @@ fn test_cigar_parser_snapshot_fixture() {
     }
     assert!(ref_path.exists(), "Missing reference: {:?}", ref_path);
 
-    let shared_reference = load_shared_reference_chroms(
-        ref_path.to_str().expect("reference path"),
-        &["20"],
-    )
-    .expect("failed to load reference");
+    let shared_reference =
+        load_shared_reference_chroms(ref_path.to_str().expect("reference path"), &["20"])
+            .expect("failed to load reference");
 
     let mut scope = if let Some(existing) = INSTANCE.get() {
         existing.clone()
@@ -144,8 +142,8 @@ fn test_cigar_parser_snapshot_fixture() {
         let region = Region::new(chrom.to_string(), start, end, String::new());
 
         let bam_path = manifest_dir.join(bam_rel);
-        let mut bam_reader = BamReader::open(bam_path.to_str().expect("bam path"))
-            .expect("failed to open BAM");
+        let mut bam_reader =
+            BamReader::open(bam_path.to_str().expect("bam path")).expect("failed to open BAM");
 
         let pipeline = VarDictPipeline::new("test_sample")
             .with_min_frequency(0.01)
@@ -154,7 +152,12 @@ fn test_cigar_parser_snapshot_fixture() {
             .with_pileup(false);
 
         let _ = pipeline
-            .process_region_from_bam(&region, &shared_reference, &mut bam_reader, instance.clone())
+            .process_region_from_bam(
+                &region,
+                &shared_reference,
+                &mut bam_reader,
+                instance.clone(),
+            )
             .expect("pipeline failed");
 
         let fixture_path = manifest_dir.join(fixture);
@@ -163,8 +166,7 @@ fn test_cigar_parser_snapshot_fixture() {
 
         let region_label = format!("{}:{}-{}", chrom, start, end);
         assert_eq!(
-            actual,
-            expected,
+            actual, expected,
             "CigarParser snapshot mismatch for {}",
             region_label
         );

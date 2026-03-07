@@ -9,33 +9,36 @@
 //! CigarParser → VariantRealigner → StructuralVariantsProcessor → ToVarsBuilder
 //! ```
 
-use std::collections::HashMap;
-use indexmap::IndexMap;
 use crackle_kit::{
     data::bases::rev_comp::RevComplementor,
-    tracing::{event, Level},
+    tracing::{Level, event},
 };
+use indexmap::IndexMap;
+use std::collections::HashMap;
 
 use crate::conf::Configuration;
 use crate::data::reference::Reference;
 use crate::data::shared_reference::SharedReferenceHandle;
 use crate::mods::variant_realigner::VariantRealigner;
+use crate::prelude::LibDefaultHasher;
 use crate::scopedata::global_read_only_scope::instance;
-use crate::variants::variants::{VarDesc, Variant, SoftClip};
+use crate::variants::variants::{SoftClip, VarDesc, Variant};
 
 /// Input data for StructuralVariantsProcessor (from VariantRealigner)
 #[derive(Default)]
 pub struct RealignedVariationData {
     /// Non-insertion variants by position
-    pub non_insertion_variants: HashMap<i64, HashMap<VarDesc, Variant>>,
+    pub non_insertion_variants:
+        HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher>,
     /// Insertion variants by position
-    pub insertion_variants: HashMap<i64, HashMap<VarDesc, Variant>>,
+    pub insertion_variants:
+        HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher>,
     /// 5' end soft clips by position
-    pub soft_clips_5end: HashMap<i64, SoftClip>,
+    pub soft_clips_5end: HashMap<i64, SoftClip, LibDefaultHasher>,
     /// 3' end soft clips by position  
-    pub soft_clips_3end: HashMap<i64, SoftClip>,
+    pub soft_clips_3end: HashMap<i64, SoftClip, LibDefaultHasher>,
     /// Reference coverage by position
-    pub ref_coverage: HashMap<i64, usize>,
+    pub ref_coverage: HashMap<i64, usize, LibDefaultHasher>,
     /// Maximum read length seen
     pub max_read_length: usize,
     /// Duplication rate
@@ -66,7 +69,7 @@ pub struct StructuralVariantsProcessor {
     /// Reference sequence
     reference_seq: Vec<u8>,
     /// Reference seed map
-    reference_seed: HashMap<Vec<u8>, Vec<i64>>,
+    reference_seed: HashMap<Vec<u8>, Vec<i64>, LibDefaultHasher>,
     /// Reference start position (1-based)
     ref_start: i64,
     /// Chromosome name for on-demand reference extension
@@ -81,7 +84,7 @@ impl StructuralVariantsProcessor {
     /// Create a new StructuralVariantsProcessor
     pub fn new(
         reference_seq: Vec<u8>,
-        reference_seed: HashMap<Vec<u8>, Vec<i64>>,
+        reference_seed: HashMap<Vec<u8>, Vec<i64>, LibDefaultHasher>,
         ref_start: i64,
     ) -> Self {
         StructuralVariantsProcessor {
@@ -97,7 +100,7 @@ impl StructuralVariantsProcessor {
     /// Create a StructuralVariantsProcessor with optional on-demand reference extension context.
     pub fn new_with_context(
         reference_seq: Vec<u8>,
-        reference_seed: HashMap<Vec<u8>, Vec<i64>>,
+        reference_seed: HashMap<Vec<u8>, Vec<i64>, LibDefaultHasher>,
         ref_start: i64,
         chromosome: Option<String>,
         bam_paths: Vec<String>,
@@ -114,7 +117,7 @@ impl StructuralVariantsProcessor {
     }
 
     /// Process realigned variation data
-    /// 
+    ///
     /// This is equivalent to Java StructuralVariantsProcessor.process()
     pub fn process(&mut self, mut data: RealignedVariationData) -> ProcessedVariationData {
         // If SV is enabled, find structural variants
@@ -137,7 +140,7 @@ impl StructuralVariantsProcessor {
     }
 
     /// Find all structural variants (DEL, INV, DUP)
-    /// 
+    ///
     /// Called when SV detection is enabled
     fn find_all_svs(&mut self, data: &mut RealignedVariationData) {
         self.find_del(data);
@@ -201,12 +204,7 @@ impl StructuralVariantsProcessor {
 
                 let m = self.find_match(&seq, softp, 1, Configuration::SEED_1 as usize, 3);
                 if m.base_position == 0 {
-                    event!(
-                        Level::DEBUG,
-                        phase = "find_del_forward_nomatch",
-                        idx,
-                        softp,
-                    );
+                    event!(Level::DEBUG, phase = "find_del_forward_nomatch", idx, softp,);
                     continue;
                 }
 
@@ -276,8 +274,11 @@ impl StructuralVariantsProcessor {
 
                 if let Some(scv) = data.soft_clips_3end.get(&softp) {
                     let scv_var = scv.var.clone();
-                    let variation =
-                        Self::get_or_create_variation(&mut data.non_insertion_variants, p5, &del_key);
+                    let variation = Self::get_or_create_variation(
+                        &mut data.non_insertion_variants,
+                        p5,
+                        &del_key,
+                    );
                     adj_cnt_from_variant(variation, &scv_var);
 
                     if let Some(ref_base) = self.get_ref_base(p5) {
@@ -321,12 +322,12 @@ impl StructuralVariantsProcessor {
                 );
                 Self::mark_sv(p5, bp, &mut data.svrdel, data.max_read_length as i64);
             } else {
-                let mut candidate_positions: Vec<i64> = data.soft_clips_3end.keys().copied().collect();
+                let mut candidate_positions: Vec<i64> =
+                    data.soft_clips_3end.keys().copied().collect();
                 candidate_positions.sort_unstable();
 
                 for candidate in candidate_positions {
-                    if !(candidate >= end - 3
-                        && candidate - end < 3 * data.max_read_length as i64)
+                    if !(candidate >= end - 3 && candidate - end < 3 * data.max_read_length as i64)
                     {
                         continue;
                     }
@@ -344,7 +345,8 @@ impl StructuralVariantsProcessor {
                         continue;
                     }
 
-                    let mut m = self.find_match(&seq, candidate, 1, Configuration::SEED_1 as usize, 3);
+                    let mut m =
+                        self.find_match(&seq, candidate, 1, Configuration::SEED_1 as usize, 3);
                     if m.base_position == 0 {
                         m = self.find_match(&seq, candidate, 1, Configuration::SEED_2 as usize, 0);
                     }
@@ -384,8 +386,11 @@ impl StructuralVariantsProcessor {
                     }
 
                     let del_key = format!("-{}", dellen);
-                    let vref =
-                        Self::get_or_create_variation(&mut data.non_insertion_variants, candidate, &del_key);
+                    let vref = Self::get_or_create_variation(
+                        &mut data.non_insertion_variants,
+                        candidate,
+                        &del_key,
+                    );
                     vref.alt_depth = 0;
 
                     let split_count = data
@@ -458,7 +463,18 @@ impl StructuralVariantsProcessor {
         }
 
         for idx in 0..data.svrdel.len() {
-            let (used, vars_count, mend, start, mstart, mean_qual, mean_pos, mean_mapq, nm, soft_map) = {
+            let (
+                used,
+                vars_count,
+                mend,
+                start,
+                mstart,
+                mean_qual,
+                mean_pos,
+                mean_mapq,
+                nm,
+                soft_map,
+            ) = {
                 let del = &data.svrdel[idx];
                 (
                     del.used(),
@@ -505,18 +521,12 @@ impl StructuralVariantsProcessor {
                     continue;
                 }
 
-                let mut m =
-                    self.find_match(&seq, softp, -1, Configuration::SEED_1 as usize, 3);
+                let mut m = self.find_match(&seq, softp, -1, Configuration::SEED_1 as usize, 3);
                 if m.base_position == 0 {
                     m = self.find_match(&seq, softp, -1, Configuration::SEED_2 as usize, 0);
                 }
                 if m.base_position == 0 {
-                    event!(
-                        Level::DEBUG,
-                        phase = "find_del_reverse_nomatch",
-                        idx,
-                        softp,
-                    );
+                    event!(Level::DEBUG, phase = "find_del_reverse_nomatch", idx, softp,);
                     continue;
                 }
 
@@ -565,8 +575,11 @@ impl StructuralVariantsProcessor {
                 );
 
                 if let Some(scv) = data.soft_clips_5end.get(&softp) {
-                    let variation =
-                        Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &del_key);
+                    let variation = Self::get_or_create_variation(
+                        &mut data.non_insertion_variants,
+                        bp,
+                        &del_key,
+                    );
                     adj_cnt_from_variant(variation, &scv.var);
                 }
 
@@ -610,7 +623,8 @@ impl StructuralVariantsProcessor {
                 );
                 Self::mark_sv(bp, p3, &mut data.svfdel, data.max_read_length as i64);
             } else {
-                let mut candidate_positions: Vec<i64> = data.soft_clips_5end.keys().copied().collect();
+                let mut candidate_positions: Vec<i64> =
+                    data.soft_clips_5end.keys().copied().collect();
                 candidate_positions.sort_unstable();
 
                 for candidate in candidate_positions {
@@ -676,8 +690,11 @@ impl StructuralVariantsProcessor {
                     }
 
                     let del_key = format!("-{}", dellen);
-                    let vref =
-                        Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &del_key);
+                    let vref = Self::get_or_create_variation(
+                        &mut data.non_insertion_variants,
+                        bp,
+                        &del_key,
+                    );
                     vref.alt_depth = 0;
 
                     let split_count = data
@@ -753,9 +770,19 @@ impl StructuralVariantsProcessor {
 
     fn find_inv(&mut self, data: &mut RealignedVariationData) {
         self.find_inv_sub(data, InversionClusterKind::Forward5, 1, InversionSide::End5);
-        self.find_inv_sub(data, InversionClusterKind::Reverse5, -1, InversionSide::End5);
+        self.find_inv_sub(
+            data,
+            InversionClusterKind::Reverse5,
+            -1,
+            InversionSide::End5,
+        );
         self.find_inv_sub(data, InversionClusterKind::Forward3, 1, InversionSide::End3);
-        self.find_inv_sub(data, InversionClusterKind::Reverse3, -1, InversionSide::End3);
+        self.find_inv_sub(
+            data,
+            InversionClusterKind::Reverse3,
+            -1,
+            InversionSide::End3,
+        );
     }
 
     fn find_inv_sub(
@@ -827,7 +854,8 @@ impl StructuralVariantsProcessor {
                     scv_var = Some(scv.var.clone());
                 }
 
-                let mut m = self.find_match_rev(&seq, softp, dir, Configuration::SEED_1 as usize, 3);
+                let mut m =
+                    self.find_match_rev(&seq, softp, dir, Configuration::SEED_1 as usize, 3);
                 if m.base_position == 0 {
                     m = self.find_match_rev(&seq, softp, dir, Configuration::SEED_2 as usize, 0);
                 }
@@ -869,7 +897,8 @@ impl StructuralVariantsProcessor {
                         scv_var = Some(scv.var.clone());
                     }
 
-                    let mut m = self.find_match_rev(&seq, cp, dir, Configuration::SEED_1 as usize, 3);
+                    let mut m =
+                        self.find_match_rev(&seq, cp, dir, Configuration::SEED_1 as usize, 3);
                     if m.base_position == 0 {
                         m = self.find_match_rev(&seq, cp, dir, Configuration::SEED_2 as usize, 0);
                     }
@@ -989,8 +1018,7 @@ impl StructuralVariantsProcessor {
                 1,
             );
 
-            let vref =
-                Self::get_or_create_variation(&mut data.non_insertion_variants, softp, &gt);
+            let vref = Self::get_or_create_variation(&mut data.non_insertion_variants, softp, &gt);
             vref.pstd = true;
             vref.qstd = true;
 
@@ -1026,8 +1054,12 @@ impl StructuralVariantsProcessor {
                 scv.mark_used();
             }
 
-            let mut dels5: HashMap<i64, HashMap<String, usize>> = HashMap::new();
-            let mut del_map = HashMap::new();
+            let mut dels5: HashMap<
+                i64,
+                HashMap<String, usize, LibDefaultHasher>,
+                LibDefaultHasher,
+            > = Default::default();
+            let mut del_map: HashMap<String, usize, LibDefaultHasher> = Default::default();
             del_map.insert(gt.clone(), inv.vars_count);
             dels5.insert(softp, del_map);
 
@@ -1088,13 +1120,7 @@ impl StructuralVariantsProcessor {
 
             let m = self.find_match(&seq, p5, -1, Configuration::SEED_1 as usize, 3);
             let mut bp = m.base_position;
-            event!(
-                Level::DEBUG,
-                phase = "findsv_5_candidate",
-                p5,
-                cnt5,
-                bp,
-            );
+            event!(Level::DEBUG, phase = "findsv_5_candidate", p5, cnt5, bp,);
             if bp != 0 {
                 if bp < p5 {
                     let pairs_data = Self::check_pairs(
@@ -1105,12 +1131,7 @@ impl StructuralVariantsProcessor {
                         data.max_read_length as i64,
                     );
                     if pairs_data.pairs == 0 {
-                        event!(
-                            Level::DEBUG,
-                            phase = "findsv_5_pairs_zero",
-                            p5,
-                            bp,
-                        );
+                        event!(Level::DEBUG, phase = "findsv_5_pairs_zero", p5, bp,);
                         continue;
                     }
 
@@ -1239,12 +1260,16 @@ impl StructuralVariantsProcessor {
                     );
                 }
 
-                let _ = Self::get_or_create_variation(&mut data.non_insertion_variants, p5_inv, &vn);
+                let _ =
+                    Self::get_or_create_variation(&mut data.non_insertion_variants, p5_inv, &vn);
                 Self::add_sv_counts(&mut data.non_insertion_variants, p5_inv, 0, cnt5, 0);
 
                 if let Some(sc5_var) = sc5_var {
-                    let variation =
-                        Self::get_or_create_variation(&mut data.non_insertion_variants, p5_inv, &vn);
+                    let variation = Self::get_or_create_variation(
+                        &mut data.non_insertion_variants,
+                        p5_inv,
+                        &vn,
+                    );
                     adj_cnt_from_variant(variation, &sc5_var);
                 }
 
@@ -1300,13 +1325,7 @@ impl StructuralVariantsProcessor {
 
             let m = self.find_match(&seq, p3, 1, Configuration::SEED_1 as usize, 3);
             let mut bp = m.base_position;
-            event!(
-                Level::DEBUG,
-                phase = "findsv_3_candidate",
-                p3,
-                cnt3,
-                bp,
-            );
+            event!(Level::DEBUG, phase = "findsv_3_candidate", p3, cnt3, bp,);
             if bp != 0 {
                 if bp > p3 {
                     let pairs_data = Self::check_pairs(
@@ -1317,12 +1336,7 @@ impl StructuralVariantsProcessor {
                         data.max_read_length as i64,
                     );
                     if pairs_data.pairs == 0 {
-                        event!(
-                            Level::DEBUG,
-                            phase = "findsv_3_pairs_zero",
-                            p3,
-                            bp,
-                        );
+                        event!(Level::DEBUG, phase = "findsv_3_pairs_zero", p3, bp,);
                         continue;
                     }
 
@@ -1399,8 +1413,7 @@ impl StructuralVariantsProcessor {
                     // candidate duplication
                 }
             } else {
-                let mut m_rev =
-                    self.find_match_rev(&seq, p3, 1, Configuration::SEED_1 as usize, 3);
+                let mut m_rev = self.find_match_rev(&seq, p3, 1, Configuration::SEED_1 as usize, 3);
                 bp = m_rev.base_position;
                 let mut extra = m_rev.matched_sequence;
                 if bp == 0 {
@@ -1574,7 +1587,8 @@ impl StructuralVariantsProcessor {
             }
 
             let del_key = format!("-{}", mlen);
-            let vref = Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &del_key);
+            let vref =
+                Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &del_key);
             vref.alt_depth = 0;
 
             let splits = data
@@ -1598,7 +1612,8 @@ impl StructuralVariantsProcessor {
             tv.mean_pos = 2.0 * mean_pos;
             tv.mean_mapq = 2.0 * mean_mapq;
             tv.nm = 2.0 * nm;
-            let variation = Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &del_key);
+            let variation =
+                Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &del_key);
             adj_cnt_from_variant(variation, &tv);
 
             if !data.ref_coverage.contains_key(&bp) {
@@ -1645,7 +1660,8 @@ impl StructuralVariantsProcessor {
             let bp = mend + (data.max_read_length as i64 / (vars_count + 1) as i64) / 2;
 
             let del_key = format!("-{}", mlen);
-            let vref = Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &del_key);
+            let vref =
+                Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &del_key);
             vref.alt_depth = 0;
 
             let splits = data
@@ -1675,7 +1691,8 @@ impl StructuralVariantsProcessor {
             tv.mean_pos = 2.0 * mean_pos;
             tv.mean_mapq = 2.0 * mean_mapq;
             tv.nm = 2.0 * nm;
-            let variation = Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &del_key);
+            let variation =
+                Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &del_key);
             adj_cnt_from_variant(variation, &tv);
 
             if !data.ref_coverage.contains_key(&bp) {
@@ -1971,20 +1988,7 @@ impl StructuralVariantsProcessor {
         let minr = instance().conf.minr;
 
         for idx in 0..data.svfdup.len() {
-            let (
-                used,
-                ms,
-                _me,
-                cnt,
-                mut end,
-                _start,
-                pmean,
-                qmean,
-                q_mean,
-                nm,
-                softp,
-                soft_map,
-            ) = {
+            let (used, ms, _me, cnt, mut end, _start, pmean, qmean, q_mean, nm, softp, soft_map) = {
                 let dup = &data.svfdup[idx];
                 (
                     dup.used(),
@@ -2087,10 +2091,7 @@ impl StructuralVariantsProcessor {
             let mut ins = self.join_ref(bp, bp + Configuration::SVFLANK as i64 - 1);
             let dup_len = mlen - 2 * Configuration::SVFLANK as i64;
             ins.extend_from_slice(format!("<dup{}>", dup_len).as_bytes());
-            ins.extend_from_slice(&self.join_ref(
-                pe - Configuration::SVFLANK as i64 + 1,
-                pe,
-            ));
+            ins.extend_from_slice(&self.join_ref(pe - Configuration::SVFLANK as i64 + 1, pe));
 
             let splits = if softp != 0 {
                 data.soft_clips_3end
@@ -2139,26 +2140,15 @@ impl StructuralVariantsProcessor {
                 }
             }
 
-            let (clusters, _) = Self::mark_dup_sv(bp, pe, &mut data.svrdup, data.max_read_length as i64);
+            let (clusters, _) =
+                Self::mark_dup_sv(bp, pe, &mut data.svrdup, data.max_read_length as i64);
             if clusters != 0 {
                 Self::add_sv_counts(&mut data.non_insertion_variants, bp, 0, 0, clusters);
             }
         }
 
         for idx in 0..data.svrdup.len() {
-            let (
-                used,
-                _ms,
-                me,
-                cnt,
-                _end,
-                start,
-                pmean,
-                qmean,
-                q_mean,
-                nm,
-                soft_map,
-            ) = {
+            let (used, _ms, me, cnt, _end, start, pmean, qmean, q_mean, nm, soft_map) = {
                 let dup = &data.svrdup[idx];
                 (
                     dup.used(),
@@ -2235,8 +2225,7 @@ impl StructuralVariantsProcessor {
                     tpe = pe + 1;
                     while self.get_ref_base(tpe).is_some()
                         && self.get_ref_base(bp + (tpe - pe - 1)).is_some()
-                        && self.get_ref_base(tpe)
-                            == self.get_ref_base(bp + (tpe - pe - 1))
+                        && self.get_ref_base(tpe) == self.get_ref_base(bp + (tpe - pe - 1))
                     {
                         tpe += 1;
                     }
@@ -2256,10 +2245,7 @@ impl StructuralVariantsProcessor {
             let mut ins = self.join_ref(bp, bp + Configuration::SVFLANK as i64 - 1);
             let dup_len = mlen - 2 * Configuration::SVFLANK as i64;
             ins.extend_from_slice(format!("<dup{}>", dup_len).as_bytes());
-            ins.extend_from_slice(&self.join_ref(
-                pe - Configuration::SVFLANK as i64 + 1,
-                pe,
-            ));
+            ins.extend_from_slice(&self.join_ref(pe - Configuration::SVFLANK as i64 + 1, pe));
 
             let mut splits = data
                 .soft_clips_5end
@@ -2310,7 +2296,8 @@ impl StructuralVariantsProcessor {
                 }
             }
 
-            let (clusters, _) = Self::mark_dup_sv(bp, pe, &mut data.svfdup, data.max_read_length as i64);
+            let (clusters, _) =
+                Self::mark_dup_sv(bp, pe, &mut data.svfdup, data.max_read_length as i64);
             if clusters != 0 {
                 Self::add_sv_counts(&mut data.non_insertion_variants, bp, 0, 0, clusters);
             }
@@ -2483,7 +2470,11 @@ impl StructuralVariantsProcessor {
         MatchResult::default()
     }
 
-    fn inc_ref_coverage(ref_coverage: &mut HashMap<i64, usize>, pos: i64, cnt: usize) {
+    fn inc_ref_coverage(
+        ref_coverage: &mut HashMap<i64, usize, LibDefaultHasher>,
+        pos: i64,
+        cnt: usize,
+    ) {
         let entry = ref_coverage.entry(pos).or_insert(0);
         *entry += cnt;
     }
@@ -2557,7 +2548,11 @@ impl StructuralVariantsProcessor {
     }
 
     fn get_or_create_variation<'a>(
-        map: &'a mut HashMap<i64, HashMap<VarDesc, Variant>>,
+        map: &'a mut HashMap<
+            i64,
+            HashMap<VarDesc, Variant, LibDefaultHasher>,
+            LibDefaultHasher,
+        >,
         pos: i64,
         key_str: &str,
     ) -> &'a mut Variant {
@@ -2573,7 +2568,7 @@ impl StructuralVariantsProcessor {
     }
 
     fn get_variation_mut_by_key_string<'a>(
-        pos_map: &'a mut HashMap<VarDesc, Variant>,
+        pos_map: &'a mut HashMap<VarDesc, Variant, LibDefaultHasher>,
         key_str: &str,
     ) -> Option<&'a mut Variant> {
         let key = pos_map
@@ -2584,7 +2579,7 @@ impl StructuralVariantsProcessor {
     }
 
     fn add_sv_counts(
-        map: &mut HashMap<i64, HashMap<VarDesc, Variant>>,
+        map: &mut HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher>,
         pos: i64,
         pairs: usize,
         splits: usize,
@@ -2873,14 +2868,14 @@ impl StructuralVariantsProcessor {
     }
 
     /// Adjust SNV counts from short soft-clipped reads
-    /// 
+    ///
     /// This always runs, even when SV detection is disabled.
     /// It looks at short soft clips (≤5 bp) and if the first base matches
     /// a known SNV at the adjacent position, adds the soft clip counts to that SNV.
     fn adj_snv(&self, data: &mut RealignedVariationData) {
         // Process 5' end soft clips
         self.adj_snv_5end(data);
-        
+
         // Process 3' end soft clips
         self.adj_snv_3end(data);
     }
@@ -2903,7 +2898,7 @@ impl StructuralVariantsProcessor {
 
             // Find consensus sequence from soft clip
             let seq = self.find_conseq(sclip);
-            
+
             // Only process short soft clips (≤5 bp)
             if seq.len() > 5 {
                 continue;
@@ -2928,10 +2923,9 @@ impl StructuralVariantsProcessor {
 
             // Check if there's a matching SNV at the previous position
             let prev_pos = position - 1;
-            
+
             // Create the variant description key for the first base
             let var_key = VarDesc::snv_key(bp);
-
 
             // Check if this base exists as a variant at the previous position
             if let Some(var_map) = data.non_insertion_variants.get_mut(&prev_pos) {
@@ -2992,7 +2986,7 @@ impl StructuralVariantsProcessor {
 
             // Find consensus sequence from soft clip
             let seq = self.find_conseq(sclip);
-            
+
             // Only process short soft clips (≤5 bp)
             if seq.len() > 5 {
                 continue;
@@ -3060,7 +3054,7 @@ impl StructuralVariantsProcessor {
     }
 
     /// Find consensus sequence from soft clip data
-    /// 
+    ///
     /// Simplified version of Java findconseq()
     fn find_conseq(&self, sclip: &mut SoftClip) -> Vec<u8> {
         crate::variants::var_utils::find_conseq(sclip, 0)
@@ -3182,7 +3176,7 @@ struct PairsData {
 }
 
 /// Adjust variant counts by adding values from soft clip
-/// 
+///
 /// Equivalent to Java VariationUtils.adjCnt()
 fn adj_cnt(
     variant: &mut Variant,
@@ -3247,7 +3241,7 @@ mod tests {
     fn test_processor_creation() {
         let processor = StructuralVariantsProcessor::new(
             b"ACGTACGT".to_vec(),
-            HashMap::new(),
+            Default::default(),
             100,
         );
         assert_eq!(processor.ref_start, 100);
@@ -3257,26 +3251,26 @@ mod tests {
     fn test_get_ref_base() {
         let processor = StructuralVariantsProcessor::new(
             b"ACGTACGT".to_vec(),
-            HashMap::new(),
+            Default::default(),
             100,
         );
-        
+
         assert_eq!(processor.get_ref_base(100), Some(b'A'));
         assert_eq!(processor.get_ref_base(101), Some(b'C'));
         assert_eq!(processor.get_ref_base(107), Some(b'T'));
         assert_eq!(processor.get_ref_base(108), None); // Out of bounds
-        assert_eq!(processor.get_ref_base(99), None);  // Before start
+        assert_eq!(processor.get_ref_base(99), None); // Before start
     }
 
     #[test]
     fn test_adj_cnt() {
         let mut variant = Variant::default();
-        
+
         adj_cnt(
             &mut variant,
-            10,  // vars_count
-            8,   // high_qual_cnt
-            2,   // low_qual_cnt
+            10,   // vars_count
+            8,    // high_qual_cnt
+            2,    // low_qual_cnt
             50.0, // mean_pos
             30.0, // mean_qual
             60.0, // mean_mapq
@@ -3299,17 +3293,13 @@ mod tests {
     fn test_empty_data_processing() {
         // This test only verifies the adj_snv logic with empty data
         // The process() method requires GlobalReadOnlyScope initialization
-        let processor = StructuralVariantsProcessor::new(
-            b"ACGT".to_vec(),
-            HashMap::new(),
-            1,
-        );
-        
+        let processor = StructuralVariantsProcessor::new(b"ACGT".to_vec(), Default::default(), 1);
+
         let mut data = RealignedVariationData::default();
-        
+
         // Directly test adj_snv with empty data
         processor.adj_snv(&mut data);
-        
+
         // Should return empty data without errors
         assert!(data.non_insertion_variants.is_empty());
         assert!(data.insertion_variants.is_empty());

@@ -4,47 +4,45 @@ use crackle_kit::nuc_base_map::NucBaseMap;
 
 use crate::{
     conf::Configuration,
+    prelude::LibDefaultHasher,
     scopedata::global_read_only_scope::instance,
-    utils::SliceExt,
     variants::variants::{SoftClip, VarDesc, Variant},
 };
 
 pub(crate) fn get_variants_from_map<'a>(
-    var_map: &'a mut HashMap<i64, HashMap<VarDesc, Variant>>,
+    var_map: &'a mut HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher>,
     start: i64,
     var_desc: &VarDesc,
 ) -> &'a mut Variant {
     let pos_map = var_map
         .entry(start)
-        .or_insert_with(|| HashMap::with_capacity(1));
+        .or_insert_with(|| HashMap::with_capacity_and_hasher(1, LibDefaultHasher::default()));
 
-    if pos_map.contains_key(var_desc) {
-        pos_map.get_mut(var_desc).unwrap()
+    get_variant_from_pos_map(pos_map, var_desc)
+}
+
+pub(crate) fn get_variant_from_pos_map<'a>(
+    pos_map: &'a mut HashMap<VarDesc, Variant, LibDefaultHasher>,
+    var_desc: &VarDesc,
+) -> &'a mut Variant {
+    let variant_ptr = if let Some(variant) = pos_map.get_mut(var_desc) {
+        variant as *mut Variant
     } else {
-        pos_map.entry(var_desc.clone()).or_default()
-    }
+        pos_map.entry(var_desc.clone()).or_default() as *mut Variant
+    };
 
-    // // Get a raw pointer to avoid the borrow checker blocking the 'None' branch
-    // let var_ptr: *const Variant = match pos_map.get(desc_string) {
-    //     // Fast Path: Found it. 1 Hash. 0 Allocations.
-    //     Some(var) => var,
-
-    //     // Slow Path: Not found.
-    //     // We use 'entry' here to insert AND get the reference in one go.
-    //     // 2 Hashes total (1 check above + 1 insert here).
-    //     None => pos_map.entry(desc_string.to_string()).or_default(),
-    // };
-
-    // // SAFETY:
-    // // 1. We know 'var_ptr' points to valid memory inside 'pos_map'.
-    // // 2. We do not mutate 'pos_map' again after obtaining this pointer.
-    // // 3. The returned reference lifetime 'a is tied to the map, preventing
-    // //    the caller from invalidating the pointer while holding the reference.
-    // unsafe { &*var_ptr }
+    // SAFETY: `variant_ptr` always points to an entry stored inside `pos_map`.
+    // We do not mutate `pos_map` again after taking the pointer, and the returned
+    // reference lifetime is still tied to the mutable borrow of `pos_map`.
+    unsafe { &mut *variant_ptr }
 }
 
 /// Get `Variant` from `SoftClip.seq` field
-pub(crate) fn get_variation_from_seq(softclip: &mut SoftClip, idx: usize, base: u8) -> &mut Variant {
+pub(crate) fn get_variation_from_seq(
+    softclip: &mut SoftClip,
+    idx: usize,
+    base: u8,
+) -> &mut Variant {
     softclip
         .seq
         .entry(idx)
@@ -76,7 +74,9 @@ pub(crate) fn find_conseq(softclip: &mut SoftClip, dir: i32) -> Vec<u8> {
         // Java iterates TreeMap<Character, Integer> entries in natural key order.
         // For nucleotide keys this is: A, C, G, N, T.
         for &base in [b'A', b'C', b'G', b'N', b'T'].iter() {
-            let Some(&count) = base_counts.get(base) else { continue; };
+            let Some(&count) = base_counts.get(base) else {
+                continue;
+            };
             total_count += count;
 
             let mut choose = count > max_count;
@@ -224,11 +224,19 @@ pub(crate) fn is_has_and_equals_two_index(
 }
 
 fn has_poly_a7(seq: &[u8]) -> bool {
-    seq.len() >= 8 && seq.get(1..8).map(|s| s.iter().all(|&b| b == b'A')).unwrap_or(false)
+    seq.len() >= 8
+        && seq
+            .get(1..8)
+            .map(|s| s.iter().all(|&b| b == b'A'))
+            .unwrap_or(false)
 }
 
 fn has_poly_t7(seq: &[u8]) -> bool {
-    seq.len() >= 8 && seq.get(1..8).map(|s| s.iter().all(|&b| b == b'T')).unwrap_or(false)
+    seq.len() >= 8
+        && seq
+            .get(1..8)
+            .map(|s| s.iter().all(|&b| b == b'T'))
+            .unwrap_or(false)
 }
 
 fn is_low_complex_seq(seq: &[u8]) -> bool {
@@ -243,15 +251,31 @@ fn is_low_complex_seq(seq: &[u8]) -> bool {
     let c = count_base(seq, b'C');
 
     let mut ntcnt = 0;
-    if a > 0 { ntcnt += 1; }
-    if t > 0 { ntcnt += 1; }
-    if g > 0 { ntcnt += 1; }
-    if c > 0 { ntcnt += 1; }
+    if a > 0 {
+        ntcnt += 1;
+    }
+    if t > 0 {
+        ntcnt += 1;
+    }
+    if g > 0 {
+        ntcnt += 1;
+    }
+    if c > 0 {
+        ntcnt += 1;
+    }
 
-    if a as f64 / len as f64 > 0.75 { return true; }
-    if t as f64 / len as f64 > 0.75 { return true; }
-    if g as f64 / len as f64 > 0.75 { return true; }
-    if c as f64 / len as f64 > 0.75 { return true; }
+    if a as f64 / len as f64 > 0.75 {
+        return true;
+    }
+    if t as f64 / len as f64 > 0.75 {
+        return true;
+    }
+    if g as f64 / len as f64 > 0.75 {
+        return true;
+    }
+    if c as f64 / len as f64 > 0.75 {
+        return true;
+    }
 
     ntcnt < 3
 }
@@ -260,30 +284,82 @@ fn count_base(seq: &[u8], base: u8) -> usize {
     seq.iter().filter(|&&b| b == base).count()
 }
 
-pub(crate) struct HomoPolymerChecker(u8);
+pub(crate) struct HomoPolymerChecker {
+    first_base: Option<u8>,
+    has_multiple_bases: bool,
+}
 
 impl HomoPolymerChecker {
     pub(crate) fn new() -> Self {
-        Self(0)
+        Self {
+            first_base: None,
+            has_multiple_bases: false,
+        }
     }
 
     pub(crate) fn record_base(&mut self, b: u8) {
-        let bit = match b.to_ascii_lowercase() {
-            b'a' => 0b1,
-            b'c' => 0b10,
-            b'g' => 0b100,
-            b't' => 0b1000,
-            b'n' => 0b10000,
-            _ => panic!("Invalid base: {}", b as char),
-        };
+        let normalized_base = b.to_ascii_uppercase();
 
-        self.0 |= bit
+        match self.first_base {
+            Some(first_base) if first_base != normalized_base => {
+                self.has_multiple_bases = true;
+            }
+            Some(_) => {}
+            None => {
+                self.first_base = Some(normalized_base);
+            }
+        }
     }
 
     pub(crate) fn is_homopolymer(&self) -> bool {
-        if self.0 == 0 {
-            panic!("No base is recorded.")
-        }
-        self.0.count_ones() == 1
+        !self.has_multiple_bases
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HomoPolymerChecker;
+
+    #[test]
+    fn homopolymer_checker_normalizes_case() {
+        let mut checker = HomoPolymerChecker::new();
+        checker.record_base(b'a');
+        checker.record_base(b'A');
+
+        assert!(checker.is_homopolymer());
+    }
+
+    #[test]
+    fn homopolymer_checker_detects_mixed_standard_bases() {
+        let mut checker = HomoPolymerChecker::new();
+        checker.record_base(b'A');
+        checker.record_base(b'C');
+
+        assert!(!checker.is_homopolymer());
+    }
+
+    #[test]
+    fn homopolymer_checker_accepts_ambiguous_iupac_bases() {
+        let mut checker = HomoPolymerChecker::new();
+        checker.record_base(b'Y');
+        checker.record_base(b'Y');
+
+        assert!(checker.is_homopolymer());
+    }
+
+    #[test]
+    fn homopolymer_checker_marks_ambiguous_and_standard_mix_as_non_homopolymer() {
+        let mut checker = HomoPolymerChecker::new();
+        checker.record_base(b'Y');
+        checker.record_base(b'C');
+
+        assert!(!checker.is_homopolymer());
+    }
+
+    #[test]
+    fn homopolymer_checker_without_bases_is_non_expanding() {
+        let checker = HomoPolymerChecker::new();
+
+        assert!(checker.is_homopolymer());
     }
 }
