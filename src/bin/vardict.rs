@@ -13,9 +13,11 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
+use regex::Regex;
 
 use crackle_kit::tracing::level_filters::LevelFilter;
 use crackle_kit::tracing::{Level, event};
@@ -26,6 +28,11 @@ use vardict_rs::mods::pipeline::PipelineConfig;
 use vardict_rs::mods::vardict_pipeline::{SomaticCombineLookupResult, VarDictPipeline};
 
 const DEFAULT_AMPLICON_PARAMETERS: &str = "10:0.95";
+
+static SAMPLE_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"([^/\._]+)\.sorted[^/]*\.bam$").expect("valid regex"));
+static SAMPLE_PATTERN2: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"([^/]+)[_\.][^/]*bam$").expect("valid regex"));
 
 /// VarDict-rs: Variant caller for NGS data (Simple Mode)
 #[derive(Parser, Debug)]
@@ -416,8 +423,12 @@ fn run_variant_calling(
     scope.bam_paths = bam_paths_string.clone();
     let _ = INSTANCE.set(scope);
 
-    let region_batches =
-        select_region_batches_for_execution(execution_mode, regions, amplicon_region_groups);
+    let region_batches = select_region_batches_for_execution(
+        execution_mode,
+        regions,
+        amplicon_region_groups,
+        num_threads,
+    );
 
     if args.debug {
         event!(
@@ -456,36 +467,31 @@ fn run_variant_calling(
     match execution_mode {
         ExecutionMode::Simple => {
             let pipeline = ParallelPipeline::new(reference, config, num_threads);
-            let mut results = Vec::new();
-            for batch in region_batches {
-                let mut batch_results =
-                    pipeline.process_regions_vardict(primary_bam_path.clone(), batch);
-                results.append(&mut batch_results);
-            }
-
-            let elapsed_processing = start_processing.elapsed();
-
-            let start_output = Instant::now();
             let mut stdout = io::stdout().lock();
-            for result in results {
-                if let Some(error) = result.error {
-                    if args.debug {
-                        event!(
-                            Level::WARN,
-                            "Error processing {}:{}-{}: {}",
-                            result.region.chr(),
-                            result.region.start(),
-                            result.region.end(),
-                            error
-                        );
-                    }
-                } else {
-                    for line in result.output_lines {
-                        writeln!(stdout, "{}", line)?;
+            for batch in region_batches {
+                let batch_results =
+                    pipeline.process_regions_vardict(primary_bam_path.clone(), batch);
+                for result in batch_results {
+                    if let Some(error) = result.error {
+                        if args.debug {
+                            event!(
+                                Level::WARN,
+                                "Error processing {}:{}-{}: {}",
+                                result.region.chr(),
+                                result.region.start(),
+                                result.region.end(),
+                                error
+                            );
+                        }
+                    } else {
+                        for line in result.output_lines {
+                            writeln!(stdout, "{}", line)?;
+                        }
                     }
                 }
             }
-            let elapsed_output = start_output.elapsed();
+
+            let elapsed_processing = start_processing.elapsed();
 
             let elapsed_total = start_total.elapsed();
 
@@ -498,7 +504,7 @@ fn run_variant_calling(
                 event!(
                     Level::INFO,
                     "[TIMING] Output writing: {:.3}s",
-                    elapsed_output.as_secs_f64()
+                    0.0f64
                 );
                 event!(
                     Level::INFO,
@@ -788,9 +794,11 @@ fn select_region_batches_for_execution(
     execution_mode: ExecutionMode,
     regions: Vec<Region>,
     amplicon_region_groups: Option<Vec<Vec<Region>>>,
+    _num_threads: usize,
 ) -> Vec<Vec<Region>> {
     match execution_mode {
-        ExecutionMode::Simple | ExecutionMode::Somatic | ExecutionMode::Splicing => vec![regions],
+        ExecutionMode::Simple => vec![regions],
+        ExecutionMode::Somatic | ExecutionMode::Splicing => vec![regions],
         ExecutionMode::Amplicon => {
             if let Some(groups) = amplicon_region_groups {
                 if groups.is_empty() {
@@ -874,9 +882,23 @@ fn validate_bam_with_index(path: &Path) -> Result<()> {
 }
 
 fn infer_sample_name_from_bam(path: &Path) -> String {
+    let bam_path = path.to_string_lossy();
+
+    if let Some(captures) = SAMPLE_PATTERN.captures(&bam_path) {
+        if let Some(sample) = captures.get(1) {
+            return sample.as_str().to_string();
+        }
+    }
+
+    if let Some(captures) = SAMPLE_PATTERN2.captures(&bam_path) {
+        if let Some(sample) = captures.get(1) {
+            return sample.as_str().to_string();
+        }
+    }
+
     path.file_stem()
         .and_then(|stem| stem.to_str())
-        .map(|stem| stem.split('_').next().unwrap_or(stem).to_string())
+        .map(|stem| stem.to_string())
         .unwrap_or_else(|| "SAMPLE".to_string())
 }
 
@@ -1259,6 +1281,29 @@ mod tests {
     }
 
     #[test]
+    fn test_infer_sample_name_from_bam_matches_java_secondary_pattern() {
+        let sample = infer_sample_name_from_bam(Path::new(
+            "/tmp/NA12878.mapped.ILLUMINA.bwa.CEU.low_coverage.20121211.bam",
+        ));
+
+        assert_eq!(sample, "NA12878.mapped.ILLUMINA.bwa.CEU.low_coverage.20121211");
+    }
+
+    #[test]
+    fn test_infer_sample_name_from_bam_matches_java_sorted_pattern() {
+        let sample = infer_sample_name_from_bam(Path::new("/tmp/L861Q.sorted.bam"));
+
+        assert_eq!(sample, "L861Q");
+    }
+
+    #[test]
+    fn test_infer_sample_name_from_bam_falls_back_to_stem() {
+        let sample = infer_sample_name_from_bam(Path::new("/tmp/no_delimiter_bamname.bamx"));
+
+        assert_eq!(sample, "no_delimiter_bamname");
+    }
+
+    #[test]
     fn test_parse_region_string_invalid() {
         assert!(parse_region_string("invalid", false, None).is_err());
         assert!(parse_region_string("chr1", false, None).is_err());
@@ -1408,14 +1453,14 @@ mod tests {
             "-G",
             "reference.fa",
             "-b",
-            "test_data/test_168714.bam",
+            "testdata/test_168714.bam",
             "-R",
             "chr20:168700-168710",
             "-a",
             "10:0.95",
         ]);
 
-        let loaded = get_regions(&args, Path::new("test_data/test_168714.bam")).unwrap();
+        let loaded = get_regions(&args, Path::new("testdata/test_168714.bam")).unwrap();
         assert_eq!(loaded.amplicon_based_calling, None);
         assert_eq!(loaded.regions.len(), 1);
     }
@@ -1610,9 +1655,50 @@ mod tests {
             Region::new("chr1".to_string(), 30, 40, "G2".to_string()),
         ];
 
-        let batches = select_region_batches_for_execution(ExecutionMode::Simple, regions, None);
+        let batches =
+            select_region_batches_for_execution(ExecutionMode::Simple, regions, None, 1);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].len(), 2);
+    }
+
+    #[test]
+    fn test_select_region_batches_for_execution_simple_mode_chunks_large_inputs() {
+        let regions = (0..65)
+            .map(|index| {
+                Region::new(
+                    "chr1".to_string(),
+                    1 + index * 10,
+                    10 + index * 10,
+                    "G".to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let batches =
+            select_region_batches_for_execution(ExecutionMode::Simple, regions, None, 1);
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 65);
+    }
+
+    #[test]
+    fn test_select_region_batches_for_execution_simple_mode_scales_with_threads() {
+        let regions = (0..10)
+            .map(|index| {
+                Region::new(
+                    "chr1".to_string(),
+                    1 + index * 10,
+                    10 + index * 10,
+                    "G".to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let batches =
+            select_region_batches_for_execution(ExecutionMode::Simple, regions, None, 4);
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 10);
     }
 
     #[test]
@@ -1630,8 +1716,12 @@ mod tests {
             ],
         ];
 
-        let batches =
-            select_region_batches_for_execution(ExecutionMode::Amplicon, regions, Some(groups));
+        let batches = select_region_batches_for_execution(
+            ExecutionMode::Amplicon,
+            regions,
+            Some(groups),
+            1,
+        );
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].len(), 1);
         assert_eq!(batches[1].len(), 2);

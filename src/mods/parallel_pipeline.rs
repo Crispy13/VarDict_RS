@@ -21,11 +21,15 @@
 //!       Collect results ──► Output
 //! ```
 
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use anyhow::Result;
-use rayon::prelude::*;
+use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use rust_htslib::bam::{HeaderView, Record, ext::BamRecordExtensions};
 
 use crate::data::bam_reader::BamReader;
@@ -38,6 +42,75 @@ use crate::scopedata::global_read_only_scope::instance;
 
 const SMALL_BATCH_PREFETCH_MULTIPLIER: usize = 4;
 const MAX_PREFETCH_GROUP_SPAN_BP: usize = 2_500_000;
+const SIMPLE_MODE_PREFETCH_REGION_GROUPS_ENABLED: bool = false;
+static RSS_LOG_HEADERS_WRITTEN: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy)]
+struct ProcessMemorySnapshot {
+    vmrss_kb: usize,
+    vmswap_kb: usize,
+}
+
+fn current_process_memory_snapshot() -> Option<ProcessMemorySnapshot> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    let mut vmrss_kb = None;
+    let mut vmswap_kb = None;
+
+    for line in status.lines() {
+        if let Some(value) = line.strip_prefix("VmRSS:") {
+            vmrss_kb = value.split_whitespace().next()?.parse::<usize>().ok();
+        } else if let Some(value) = line.strip_prefix("VmSwap:") {
+            vmswap_kb = value.split_whitespace().next()?.parse::<usize>().ok();
+        }
+
+        if vmrss_kb.is_some() && vmswap_kb.is_some() {
+            break;
+        }
+    }
+
+    Some(ProcessMemorySnapshot {
+        vmrss_kb: vmrss_kb?,
+        vmswap_kb: vmswap_kb.unwrap_or(0),
+    })
+}
+
+fn append_region_memory_log(
+    path: &Path,
+    elapsed_ms: u128,
+    region: &Region,
+    snapshot: ProcessMemorySnapshot,
+    stage: &str,
+) {
+    let initialized_paths = RSS_LOG_HEADERS_WRITTEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let should_write_header = {
+        let mut guard = initialized_paths.lock().expect("rss header mutex");
+        guard.insert(path.to_path_buf())
+    };
+
+    let mut file = match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+
+    if should_write_header {
+        let _ = writeln!(
+            file,
+            "elapsed_ms\tregion_chr\tregion_start\tregion_end\tvmrss_kb\tvmswap_kb\tstage"
+        );
+    }
+
+    let _ = writeln!(
+        file,
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        elapsed_ms,
+        region.chr(),
+        region.start(),
+        region.end(),
+        snapshot.vmrss_kb,
+        snapshot.vmswap_kb,
+        stage,
+    );
+}
 
 /// Result from processing a single region
 #[derive(Debug)]
@@ -58,6 +131,8 @@ pub struct ParallelPipeline {
     config: PipelineConfig,
     /// Number of worker threads
     num_threads: usize,
+    /// Dedicated worker pool sized to the configured thread limit
+    thread_pool: Option<Arc<ThreadPool>>,
 }
 
 impl ParallelPipeline {
@@ -67,10 +142,23 @@ impl ParallelPipeline {
         config: PipelineConfig,
         num_threads: usize,
     ) -> Self {
+        let num_threads = num_threads.max(1);
+        let thread_pool = if num_threads > 1 {
+            Some(Arc::new(
+                ThreadPoolBuilder::new()
+                    .num_threads(num_threads)
+                    .build()
+                    .expect("valid rayon thread pool"),
+            ))
+        } else {
+            None
+        };
+
         ParallelPipeline {
             reference,
             config,
-            num_threads: num_threads.max(1),
+            num_threads,
+            thread_pool,
         }
     }
 
@@ -126,18 +214,36 @@ impl ParallelPipeline {
             .map(|(chunk_index, chunk)| (chunk_index * chunk_size, chunk.to_vec()))
             .collect();
 
-        let mut chunk_results: Vec<(usize, Vec<RegionResult>)> = region_chunks
-            .into_par_iter()
-            .map(|(chunk_start_index, chunk)| {
-                let reference = Arc::clone(&self.reference);
-                let config = self.config.clone();
-                let bam_path = bam_path.clone();
-                (
-                    chunk_start_index,
-                    process_region_chunk(chunk, reference, config, bam_path),
-                )
-            })
-            .collect();
+        let mut chunk_results: Vec<(usize, Vec<RegionResult>)> =
+            if let Some(thread_pool) = &self.thread_pool {
+                thread_pool.install(|| {
+                    region_chunks
+                        .into_par_iter()
+                        .map(|(chunk_start_index, chunk)| {
+                            let reference = Arc::clone(&self.reference);
+                            let config = self.config.clone();
+                            let bam_path = bam_path.clone();
+                            (
+                                chunk_start_index,
+                                process_region_chunk(chunk, reference, config, bam_path),
+                            )
+                        })
+                        .collect()
+                })
+            } else {
+                region_chunks
+                    .into_iter()
+                    .map(|(chunk_start_index, chunk)| {
+                        let reference = Arc::clone(&self.reference);
+                        let config = self.config.clone();
+                        let bam_path = bam_path.clone();
+                        (
+                            chunk_start_index,
+                            process_region_chunk(chunk, reference, config, bam_path),
+                        )
+                    })
+                    .collect()
+            };
 
         // Preserve original BED input order when flattening chunk results
         chunk_results.sort_by_key(|(chunk_start_index, _)| *chunk_start_index);
@@ -171,47 +277,25 @@ impl ParallelPipeline {
             return Vec::new();
         }
 
-        if should_use_prefetched_region_groups(regions.len(), self.num_threads) {
+        if SIMPLE_MODE_PREFETCH_REGION_GROUPS_ENABLED
+            && should_use_prefetched_region_groups(regions.len(), self.num_threads)
+        {
             return process_prefetched_region_groups_vardict(
                 regions,
                 Arc::clone(&self.reference),
                 self.config.clone(),
                 bam_path,
+                self.thread_pool.as_deref(),
             );
         }
 
-        // Calculate regions per thread
-        let regions_per_thread = (regions.len() + self.num_threads - 1) / self.num_threads;
-
-        let chunk_size = regions_per_thread.max(1);
-
-        // Partition regions into chunks for each thread and keep original chunk start index
-        let region_chunks: Vec<(usize, Vec<Region>)> = regions
-            .chunks(chunk_size)
-            .enumerate()
-            .map(|(chunk_index, chunk)| (chunk_index * chunk_size, chunk.to_vec()))
-            .collect();
-
-        let mut chunk_results: Vec<(usize, Vec<RegionResult>)> = region_chunks
-            .into_par_iter()
-            .map(|(chunk_start_index, chunk)| {
-                let reference = Arc::clone(&self.reference);
-                let config = self.config.clone();
-                let bam_path = bam_path.clone();
-                (
-                    chunk_start_index,
-                    process_region_chunk_vardict(chunk, reference, config, bam_path),
-                )
-            })
-            .collect();
-
-        // Preserve original BED input order when flattening chunk results
-        chunk_results.sort_by_key(|(chunk_start_index, _)| *chunk_start_index);
-
-        chunk_results
-            .into_iter()
-            .flat_map(|(_, results)| results)
-            .collect()
+        process_regions_vardict_one_region_per_task(
+            regions,
+            Arc::clone(&self.reference),
+            self.config.clone(),
+            bam_path,
+            self.thread_pool.as_deref(),
+        )
     }
 
     /// Process regions using VarDict pipeline and return all output lines
@@ -238,6 +322,127 @@ impl ParallelPipeline {
 
 fn should_use_prefetched_region_groups(region_count: usize, num_threads: usize) -> bool {
     region_count > 1 && region_count <= num_threads.saturating_mul(SMALL_BATCH_PREFETCH_MULTIPLIER)
+}
+
+#[cfg(test)]
+fn build_single_region_chunks(regions: Vec<Region>) -> Vec<(usize, Vec<Region>)> {
+    regions
+        .into_iter()
+        .enumerate()
+        .map(|(index, region)| (index, vec![region]))
+        .collect()
+}
+
+fn process_regions_vardict_one_region_per_task<P: AsRef<Path> + Send + Sync + Clone + 'static>(
+    regions: Vec<Region>,
+    reference: SharedReferenceHandle,
+    config: PipelineConfig,
+    bam_path: P,
+    thread_pool: Option<&ThreadPool>,
+) -> Vec<RegionResult> {
+    let bam_path_owned = bam_path.as_ref().to_path_buf();
+
+    let build_context = || {
+        let bam_reader = BamReader::open(&bam_path_owned).map_err(|error| error.to_string());
+        let pipeline = VarDictPipeline::new(&config.sample_name)
+            .with_min_frequency(config.min_frequency)
+            .with_min_base_quality(config.quality_threshold)
+            .with_min_mapping_quality(config.mapq_threshold)
+            .with_pileup(config.pileup);
+        let global_scope = Arc::new(instance().clone());
+        (bam_reader, pipeline, global_scope)
+    };
+
+    let indexed_results = if let Some(thread_pool) = thread_pool {
+        thread_pool.install(|| {
+            regions
+                .into_par_iter()
+                .enumerate()
+                .map_init(
+                    build_context,
+                    |(bam_reader_result, pipeline, global_scope), (index, region)| {
+                        let result = match bam_reader_result {
+                            Ok(bam_reader) => match pipeline.process_region_from_bam(
+                                &region,
+                                &reference,
+                                bam_reader,
+                                Arc::clone(global_scope),
+                            ) {
+                                Ok(output_lines) => RegionResult {
+                                    region,
+                                    output_lines,
+                                    error: None,
+                                },
+                                Err(error) => RegionResult {
+                                    region,
+                                    output_lines: Vec::new(),
+                                    error: Some(format!("Processing error: {}", error)),
+                                },
+                            },
+                            Err(error) => RegionResult {
+                                region,
+                                output_lines: Vec::new(),
+                                error: Some(format!("Failed to open BAM: {}", error)),
+                            },
+                        };
+
+                        (index, result)
+                    },
+                )
+                .collect::<Vec<_>>()
+        })
+    } else {
+        let mut bam_reader = match BamReader::open(&bam_path_owned) {
+            Ok(reader) => reader,
+            Err(error) => {
+                return regions
+                    .into_iter()
+                    .map(|region| RegionResult {
+                        region,
+                        output_lines: Vec::new(),
+                        error: Some(format!("Failed to open BAM: {}", error)),
+                    })
+                    .collect();
+            }
+        };
+        let pipeline = VarDictPipeline::new(&config.sample_name)
+            .with_min_frequency(config.min_frequency)
+            .with_min_base_quality(config.quality_threshold)
+            .with_min_mapping_quality(config.mapq_threshold)
+            .with_pileup(config.pileup);
+        let global_scope = Arc::new(instance().clone());
+
+        regions
+            .into_iter()
+            .enumerate()
+            .map(|(index, region)| {
+                let result = match pipeline.process_region_from_bam(
+                    &region,
+                    &reference,
+                    &mut bam_reader,
+                    Arc::clone(&global_scope),
+                ) {
+                    Ok(output_lines) => RegionResult {
+                        region,
+                        output_lines,
+                        error: None,
+                    },
+                    Err(error) => RegionResult {
+                        region,
+                        output_lines: Vec::new(),
+                        error: Some(format!("Processing error: {}", error)),
+                    },
+                };
+
+                (index, result)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    indexed_results
+        .into_iter()
+        .map(|(_, result)| result)
+        .collect()
 }
 
 fn build_prefetch_region_groups(regions: Vec<Region>) -> Vec<Vec<(usize, Region)>> {
@@ -330,11 +535,15 @@ fn process_prefetched_region_groups_vardict<P: AsRef<Path>>(
     reference: SharedReferenceHandle,
     config: PipelineConfig,
     bam_path: P,
+    thread_pool: Option<&ThreadPool>,
 ) -> Vec<RegionResult> {
     use crackle_kit::tracing::{Level, event};
 
-    let start_thread = std::time::Instant::now();
+    let start_thread = Instant::now();
     let mut indexed_results = Vec::new();
+    let rss_log_path = std::env::var_os("VARDICT_RSS_MEMORY_LOG")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
     let bam_path_str = match bam_path.as_ref().to_str() {
         Some(path) => path,
         None => {
@@ -411,37 +620,90 @@ fn process_prefetched_region_groups_vardict<P: AsRef<Path>>(
         let group_reference = Arc::clone(&reference);
         let group_scope = Arc::clone(&global_scope);
 
-        let mut group_results: Vec<(usize, RegionResult)> = group
-            .into_par_iter()
-            .zip(record_buckets.into_par_iter())
-            .map(|((index, region), records)| {
-                let pipeline = VarDictPipeline::new(&group_config.sample_name)
-                    .with_min_frequency(group_config.min_frequency)
-                    .with_min_base_quality(group_config.quality_threshold)
-                    .with_min_mapping_quality(group_config.mapq_threshold);
+        let mut group_results: Vec<(usize, RegionResult)> = if let Some(thread_pool) = thread_pool
+        {
+            thread_pool.install(|| {
+                group
+                    .into_par_iter()
+                    .zip(record_buckets.into_par_iter())
+                    .map(|((index, region), records)| {
+                        let pipeline = VarDictPipeline::new(&group_config.sample_name)
+                            .with_min_frequency(group_config.min_frequency)
+                            .with_min_base_quality(group_config.quality_threshold)
+                            .with_min_mapping_quality(group_config.mapq_threshold);
 
-                let result = match pipeline.process_region_from_cached_records(
-                    &region,
-                    &group_reference,
-                    records,
-                    &target_names,
-                    Arc::clone(&group_scope),
-                ) {
-                    Ok(output_lines) => RegionResult {
-                        region,
-                        output_lines,
-                        error: None,
-                    },
-                    Err(error) => RegionResult {
-                        region,
-                        output_lines: Vec::new(),
-                        error: Some(format!("Processing error: {}", error)),
-                    },
-                };
+                        let result = match pipeline.process_region_from_cached_records(
+                            &region,
+                            &group_reference,
+                            records,
+                            &target_names,
+                            Arc::clone(&group_scope),
+                        ) {
+                            Ok(output_lines) => RegionResult {
+                                region,
+                                output_lines,
+                                error: None,
+                            },
+                            Err(error) => RegionResult {
+                                region,
+                                output_lines: Vec::new(),
+                                error: Some(format!("Processing error: {}", error)),
+                            },
+                        };
 
-                (index, result)
+                        (index, result)
+                    })
+                    .collect()
             })
-            .collect();
+        } else {
+            group
+                .into_iter()
+                .zip(record_buckets.into_iter())
+                .map(|((index, region), records)| {
+                    let pipeline = VarDictPipeline::new(&group_config.sample_name)
+                        .with_min_frequency(group_config.min_frequency)
+                        .with_min_base_quality(group_config.quality_threshold)
+                        .with_min_mapping_quality(group_config.mapq_threshold);
+
+                    let result = match pipeline.process_region_from_cached_records(
+                        &region,
+                        &group_reference,
+                        records,
+                        &target_names,
+                        Arc::clone(&group_scope),
+                    ) {
+                        Ok(output_lines) => RegionResult {
+                            region,
+                            output_lines,
+                            error: None,
+                        },
+                        Err(error) => RegionResult {
+                            region,
+                            output_lines: Vec::new(),
+                            error: Some(format!("Processing error: {}", error)),
+                        },
+                    };
+
+                    (index, result)
+                })
+                .collect()
+        };
+
+        group_results.sort_by_key(|(index, _)| *index);
+
+        if let Some(path) = rss_log_path.as_deref() {
+            for (_, result) in &group_results {
+                if let Some(snapshot) = current_process_memory_snapshot() {
+                    append_region_memory_log(
+                        path,
+                        start_thread.elapsed().as_millis(),
+                        &result.region,
+                        snapshot,
+                        "region_complete",
+                    );
+                }
+            }
+        }
 
         indexed_results.append(&mut group_results);
     }
@@ -462,6 +724,7 @@ fn process_prefetched_region_groups_vardict<P: AsRef<Path>>(
 }
 
 /// Worker function to process a chunk of regions using VarDict pipeline
+#[allow(dead_code)]
 fn process_region_chunk_vardict<P: AsRef<Path>>(
     regions: Vec<Region>,
     reference: SharedReferenceHandle,
@@ -470,8 +733,11 @@ fn process_region_chunk_vardict<P: AsRef<Path>>(
 ) -> Vec<RegionResult> {
     use crackle_kit::tracing::{Level, event};
 
-    let start_thread = std::time::Instant::now();
+    let start_thread = Instant::now();
     let mut results = Vec::new();
+    let rss_log_path = std::env::var_os("VARDICT_RSS_MEMORY_LOG")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
     let bam_path_str = match bam_path.as_ref().to_str() {
         Some(path) => path,
         None => {
@@ -529,6 +795,19 @@ fn process_region_chunk_vardict<P: AsRef<Path>>(
         };
 
         results.push(result);
+
+        if let (Some(path), Some(snapshot)) = (
+            rss_log_path.as_deref(),
+            current_process_memory_snapshot(),
+        ) {
+            append_region_memory_log(
+                path,
+                start_thread.elapsed().as_millis(),
+                &region,
+                snapshot,
+                "region_complete",
+            );
+        }
     }
 
     let elapsed_thread = start_thread.elapsed();
@@ -668,6 +947,35 @@ mod tests {
         let pipeline = ParallelPipeline::new(reference, config, 4);
 
         assert_eq!(pipeline.num_threads, 4);
+        assert!(pipeline.thread_pool.is_some());
+    }
+
+    #[test]
+    fn test_parallel_pipeline_single_thread_stays_sequential() {
+        let mut chromosomes: HashMap<
+            String,
+            crate::data::shared_reference::ChromosomeData,
+            crate::prelude::LibDefaultHasher,
+        > = Default::default();
+        chromosomes.insert(
+            "chr1".to_string(),
+            crate::data::shared_reference::ChromosomeData {
+                sequence: b"ACGTACGT".repeat(100),
+                length: 800,
+            },
+        );
+
+        let reference = Arc::new(SharedReference {
+            chromosomes,
+            chromosome_names: vec!["chr1".to_string()],
+            total_size: 800,
+        });
+
+        let config = PipelineConfig::default();
+        let pipeline = ParallelPipeline::new(reference, config, 1);
+
+        assert_eq!(pipeline.num_threads, 1);
+        assert!(pipeline.thread_pool.is_none());
     }
 
     #[test]
@@ -706,5 +1014,46 @@ mod tests {
         assert_eq!(groups[2].len(), 1);
         assert_eq!(groups[0][0].1.chr(), "chr1");
         assert_eq!(groups[2][0].1.chr(), "chr2");
+    }
+
+    #[test]
+    fn test_build_single_region_chunks_preserves_order_and_granularity() {
+        let regions = vec![
+            Region::new("chr1".to_string(), 10, 20, "G1".to_string()),
+            Region::new("chr2".to_string(), 30, 40, "G2".to_string()),
+            Region::new("chr3".to_string(), 50, 60, "G3".to_string()),
+        ];
+
+        let chunks = build_single_region_chunks(regions);
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].0, 0);
+        assert_eq!(chunks[1].0, 1);
+        assert_eq!(chunks[2].0, 2);
+        assert_eq!(chunks[0].1.len(), 1);
+        assert_eq!(chunks[1].1.len(), 1);
+        assert_eq!(chunks[2].1.len(), 1);
+        assert_eq!(chunks[0].1[0].chr(), "chr1");
+        assert_eq!(chunks[1].1[0].chr(), "chr2");
+        assert_eq!(chunks[2].1[0].chr(), "chr3");
+    }
+
+    #[test]
+    fn test_indexed_parallel_collect_preserves_input_order() {
+        let collected = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("thread pool")
+            .install(|| {
+                (0usize..32)
+                    .into_par_iter()
+                    .map(|index| {
+                        std::thread::sleep(std::time::Duration::from_millis((32 - index) as u64));
+                        index
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+        assert_eq!(collected, (0usize..32).collect::<Vec<_>>());
     }
 }

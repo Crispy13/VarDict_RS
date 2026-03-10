@@ -74,7 +74,7 @@ fn test_cigar_parser_snapshot_fixture() {
             168600,
             168800,
             "tests/fixtures/cigar_parser_chr20_168600_168800.jsonl",
-            "test_data/test_168714.bam",
+            "testdata/test_168714.bam",
         ),
         (
             "20",

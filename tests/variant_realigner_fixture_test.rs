@@ -67,7 +67,7 @@ impl Drop for TempFileGuard {
 fn test_variant_realigner_snapshot_fixtures() {
     run_variant_realigner_fixture(
         "tests/fixtures/variant_realigner_chr20_168600_168800.jsonl",
-        "test_data/test_168714.bam",
+        "testdata/test_168714.bam",
         Region::new("20".to_string(), 168600, 168800, String::new()),
     );
 

@@ -1,5 +1,6 @@
 use rust_htslib::bam::{Record, record::Cigar};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::{
     conf::Configuration,
@@ -8,7 +9,7 @@ use crate::{
         AMP_ATGC, ATGSs_AMP_ATGSs_END, BEGIN_PLUS_ATGC, CARET_ATGC_END, CARET_ATGNC, DUP_NUM_ATGC,
         HASH_ATGC, UP_NUMBER_END,
     },
-    data::reference::Reference,
+    data::reference::{Reference, ReferenceSeedMap},
     data::region::Region,
     mods::structural_variants_processor::RealignedVariationData,
     mods::vardict_pipeline::VarDictPipeline,
@@ -71,8 +72,8 @@ struct SvCluster {
 }
 
 pub struct VariantRealigner {
-    reference_seq: Vec<u8>,
-    reference_seed: HashMap<Vec<u8>, Vec<i64>, LibDefaultHasher>,
+    reference_seq: Arc<Vec<u8>>,
+    reference_seed: Arc<ReferenceSeedMap>,
     ref_start: i64,
     chromosome: Option<String>,
     bam_paths: Vec<String>,
@@ -81,15 +82,21 @@ pub struct VariantRealigner {
 impl VariantRealigner {
     pub fn new(
         reference_seq: Vec<u8>,
-        reference_seed: HashMap<Vec<u8>, Vec<i64>, LibDefaultHasher>,
+        reference_seed: ReferenceSeedMap,
         ref_start: i64,
     ) -> Self {
-        Self::new_with_context(reference_seq, reference_seed, ref_start, None, Vec::new())
+        Self::new_with_context(
+            Arc::new(reference_seq),
+            Arc::new(reference_seed),
+            ref_start,
+            None,
+            Vec::new(),
+        )
     }
 
     pub fn new_with_context(
-        reference_seq: Vec<u8>,
-        reference_seed: HashMap<Vec<u8>, Vec<i64>, LibDefaultHasher>,
+        reference_seq: Arc<Vec<u8>>,
+        reference_seed: Arc<ReferenceSeedMap>,
         ref_start: i64,
         chromosome: Option<String>,
         bam_paths: Vec<String>,
@@ -246,6 +253,55 @@ impl VariantRealigner {
         Self::filter_sv(&mut data.svrdel, data.max_read_length);
         Self::filter_sv(&mut data.svfdup, data.max_read_length);
         Self::filter_sv(&mut data.svrdup, data.max_read_length);
+        for sv_list in data.svffus.values_mut() {
+            Self::filter_sv(sv_list, data.max_read_length);
+        }
+        for sv_list in data.svrfus.values_mut() {
+            Self::filter_sv(sv_list, data.max_read_length);
+        }
+
+        data.softp2sv_first_used.clear();
+        Self::collect_softp2sv_first_used(&mut data.softp2sv_first_used, &data.svfinv3);
+        Self::collect_softp2sv_first_used(&mut data.softp2sv_first_used, &data.svrinv3);
+        Self::collect_softp2sv_first_used(&mut data.softp2sv_first_used, &data.svfinv5);
+        Self::collect_softp2sv_first_used(&mut data.softp2sv_first_used, &data.svrinv5);
+        Self::collect_softp2sv_first_used(&mut data.softp2sv_first_used, &data.svfdel);
+        Self::collect_softp2sv_first_used(&mut data.softp2sv_first_used, &data.svrdel);
+        Self::collect_softp2sv_first_used(&mut data.softp2sv_first_used, &data.svfdup);
+        Self::collect_softp2sv_first_used(&mut data.softp2sv_first_used, &data.svrdup);
+        for sv_list in data.svffus.values() {
+            Self::collect_softp2sv_first_used(&mut data.softp2sv_first_used, sv_list);
+        }
+        for sv_list in data.svrfus.values() {
+            Self::collect_softp2sv_first_used(&mut data.softp2sv_first_used, sv_list);
+        }
+    }
+
+    fn collect_softp2sv_first_used(
+        dest: &mut HashMap<i64, bool, LibDefaultHasher>,
+        sv_list: &[SoftClip],
+    ) {
+        let mut best_depth: HashMap<i64, usize, LibDefaultHasher> = Default::default();
+
+        for sv in sv_list {
+            let softp = sv.softp as i64;
+            if softp == 0 {
+                continue;
+            }
+
+            let depth = sv.var.alt_depth;
+            match best_depth.get(&softp).copied() {
+                None => {
+                    best_depth.insert(softp, depth);
+                    dest.insert(softp, sv.used());
+                }
+                Some(current_depth) if depth > current_depth => {
+                    best_depth.insert(softp, depth);
+                    dest.insert(softp, sv.used());
+                }
+                _ => {}
+            }
+        }
     }
 
     fn filter_sv(sv_list: &mut [SoftClip], max_read_length: usize) {
@@ -474,8 +530,17 @@ impl VariantRealigner {
             for j in (i + 1)..keys.len() {
                 let (short_key, short_seq) = (&keys[j].0, &keys[j].1);
                 let short_depth = pos_map.get(short_key).map(|v| v.alt_depth).unwrap_or(0);
+                let short_supported = position_to_insertion_count.is_some_and(|counts| {
+                    counts.contains_key(&format!("+{}", String::from_utf8_lossy(short_seq)))
+                });
+                let long_supported = position_to_insertion_count.is_some_and(|counts| {
+                    counts.contains_key(&format!("+{}", String::from_utf8_lossy(long_seq)))
+                });
 
                 if short_depth != 1 {
+                    continue;
+                }
+                if short_supported && long_supported {
                     continue;
                 }
                 if long_seq.len() != short_seq.len() + 1 {
@@ -487,17 +552,6 @@ impl VariantRealigner {
                 if long_seq[1..] != short_seq[..] {
                     continue;
                 }
-                if let Some(insertion_counts) = position_to_insertion_count {
-                    let long_desc = long_key.to_key_string();
-                    let short_desc = short_key.to_key_string();
-                    let long_supported = insertion_counts.get(&long_desc).copied().unwrap_or(0) > 0;
-                    let short_supported =
-                        insertion_counts.get(&short_desc).copied().unwrap_or(0) > 0;
-                    if short_supported && long_supported {
-                        continue;
-                    }
-                }
-
                 merges.push((short_key.clone(), long_key.clone()));
                 break;
             }
@@ -850,7 +904,8 @@ impl VariantRealigner {
             String::new(),
         );
 
-        let mut reference = Reference::new_with_start(self.reference_seq.clone(), self.ref_start);
+        let mut reference =
+            Reference::new_with_start(self.reference_seq.as_ref().clone(), self.ref_start);
         let ref_end = reference.region_start + reference.ref_seq.len() as i64 - 1;
         let chr_len = crate::scopedata::global_read_only_scope::instance()
             .chr_lens
@@ -1904,6 +1959,10 @@ impl VariantRealigner {
             .collect();
         tmp5.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
+        // Java initializes svcov once before each lgdel loop and reuses the
+        // last computed value when a later candidate resolves via findbp.
+        let mut svcov = 0usize;
+
         for (position, cnt) in tmp5 {
             if cnt < conf.minr {
                 break;
@@ -1930,7 +1989,6 @@ impl VariantRealigner {
 
             let mut bp = self.find_bp(&seq, position - 5, -1);
             let mut matched_extra: Vec<u8> = Vec::new();
-            let mut svcov = 0usize;
 
             if bp == 0 {
                 if Self::is_low_complex_seq(&String::from_utf8_lossy(&seq)) {
@@ -2237,6 +2295,8 @@ impl VariantRealigner {
             .collect();
         tmp3.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
+        let mut svcov = 0usize;
+
         for (position, cnt) in tmp3 {
             if cnt < conf.minr {
                 break;
@@ -2263,7 +2323,6 @@ impl VariantRealigner {
 
             let mut breakpoint = self.find_bp(&seq, position + 5, 1);
             let mut matched_extra: Vec<u8> = Vec::new();
-            let mut svcov = 0usize;
 
             if breakpoint == 0 {
                 if Self::is_low_complex_seq(&String::from_utf8_lossy(&seq)) {
@@ -4886,6 +4945,128 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_suffix_shift_insertion_keys_keeps_independently_supported_short_suffix_key() {
+        let mut pos_map: HashMap<VarDesc, Variant, LibDefaultHasher> = HashMap::default();
+        pos_map.insert(
+            VarDesc::Ins {
+                seq: b"AA".to_vec().into(),
+            },
+            Variant {
+                alt_depth: 6,
+                alt_depth_fwd: 2,
+                alt_depth_rev: 4,
+                high_qual_read_cnt: 6,
+                mean_pos: 132.0,
+                mean_qual: 203.0,
+                mean_mapq: 236.0,
+                nm: 1.0,
+                ..Default::default()
+            },
+        );
+        pos_map.insert(
+            VarDesc::Ins {
+                seq: b"A".to_vec().into(),
+            },
+            Variant {
+                alt_depth: 1,
+                alt_depth_fwd: 1,
+                high_qual_read_cnt: 1,
+                mean_pos: 45.0,
+                mean_qual: 42.0,
+                mean_mapq: 29.0,
+                ..Default::default()
+            },
+        );
+
+        let mut insertion_counts: HashMap<String, usize, LibDefaultHasher> = HashMap::default();
+        insertion_counts.insert("+AA".to_string(), 6);
+        insertion_counts.insert("+A".to_string(), 1);
+
+        VariantRealigner::merge_suffix_shift_insertion_keys(&mut pos_map, Some(&insertion_counts));
+
+        let short = pos_map
+            .get(&VarDesc::Ins {
+                seq: b"A".to_vec().into(),
+            })
+            .expect("short insertion key should remain when independently supported");
+        assert_eq!(short.alt_depth, 1);
+        assert_eq!(short.alt_depth_fwd, 1);
+        assert_eq!(short.high_qual_read_cnt, 1);
+
+        let long = pos_map
+            .get(&VarDesc::Ins {
+                seq: b"AA".to_vec().into(),
+            })
+            .expect("long insertion key missing");
+        assert_eq!(long.alt_depth, 6);
+        assert_eq!(long.alt_depth_fwd, 2);
+        assert_eq!(long.alt_depth_rev, 4);
+        assert_eq!(long.high_qual_read_cnt, 6);
+        assert_eq!(long.extra_cnt, 0);
+        assert_eq!(long.mean_pos, 132.0);
+        assert_eq!(long.mean_qual, 203.0);
+        assert_eq!(long.mean_mapq, 236.0);
+    }
+
+    #[test]
+    fn test_merge_suffix_shift_insertion_keys_merges_unsupported_short_suffix_key() {
+        let mut pos_map: HashMap<VarDesc, Variant, LibDefaultHasher> = HashMap::default();
+        pos_map.insert(
+            VarDesc::Ins {
+                seq: b"AA".to_vec().into(),
+            },
+            Variant {
+                alt_depth: 6,
+                alt_depth_fwd: 2,
+                alt_depth_rev: 4,
+                high_qual_read_cnt: 6,
+                mean_pos: 132.0,
+                mean_qual: 203.0,
+                mean_mapq: 236.0,
+                nm: 1.0,
+                ..Default::default()
+            },
+        );
+        pos_map.insert(
+            VarDesc::Ins {
+            seq: b"A".to_vec().into(),
+            },
+            Variant {
+                alt_depth: 1,
+                alt_depth_fwd: 1,
+                high_qual_read_cnt: 1,
+                mean_pos: 45.0,
+                mean_qual: 42.0,
+                mean_mapq: 29.0,
+                ..Default::default()
+            },
+        );
+
+        let mut insertion_counts: HashMap<String, usize, LibDefaultHasher> = HashMap::default();
+        insertion_counts.insert("+AA".to_string(), 6);
+
+        VariantRealigner::merge_suffix_shift_insertion_keys(&mut pos_map, Some(&insertion_counts));
+
+        assert!(!pos_map.contains_key(&VarDesc::Ins {
+            seq: b"A".to_vec().into(),
+        }));
+
+        let merged = pos_map
+            .get(&VarDesc::Ins {
+                seq: b"AA".to_vec().into(),
+            })
+            .expect("merged insertion key missing");
+        assert_eq!(merged.alt_depth, 7);
+        assert_eq!(merged.alt_depth_fwd, 3);
+        assert_eq!(merged.alt_depth_rev, 4);
+        assert_eq!(merged.high_qual_read_cnt, 7);
+        assert_eq!(merged.extra_cnt, 0);
+        assert_eq!(merged.mean_pos, 177.0);
+        assert_eq!(merged.mean_qual, 245.0);
+        assert_eq!(merged.mean_mapq, 265.0);
+    }
+
+    #[test]
     fn test_variant_realigner_mapped_read_no_indels() {
         let conf = crate::conf::Configuration {
             perform_local_realignment: false,
@@ -4898,7 +5079,7 @@ mod tests {
             ..Default::default()
         });
 
-        let bam_path = "/home/eck/workspace/vardict_rs/test_data/test_168714.bam";
+        let bam_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/test_168714.bam");
         let fasta_path =
             "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/reference/hs37d5.fa";
 
@@ -4953,6 +5134,9 @@ mod tests {
             svrinv5: parser.take_svrinv5(),
             svfinv3: parser.take_svfinv3(),
             svrinv3: parser.take_svrinv3(),
+            svffus: parser.take_svffus(),
+            svrfus: parser.take_svrfus(),
+            softp2sv_first_used: Default::default(),
         };
 
         if instance().conf.perform_local_realignment {
@@ -4970,4 +5154,5 @@ mod tests {
         assert!(sv_input.soft_clips_5end.is_empty());
         assert!(sv_input.soft_clips_3end.is_empty());
     }
+
 }

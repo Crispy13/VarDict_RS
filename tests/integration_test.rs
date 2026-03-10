@@ -333,6 +333,39 @@ fn get_testdata_dir() -> PathBuf {
         .join("testdata")
 }
 
+fn get_repo_testdata_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata")
+}
+
+fn resolve_testcase_bam_path(resources_dir: &Path, bam_name: &str) -> Result<PathBuf, String> {
+    let requested = PathBuf::from(bam_name);
+    let mut candidates = Vec::new();
+
+    if requested.is_absolute() {
+        candidates.push(requested.clone());
+    } else {
+        candidates.push(resources_dir.join(&requested));
+        candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&requested));
+        candidates.push(get_repo_testdata_dir().join(&requested));
+    }
+
+    for candidate in &candidates {
+        if candidate.exists() {
+            return Ok(candidate.clone());
+        }
+    }
+
+    Err(format!(
+        "BAM not found for {} (checked: {})",
+        bam_name,
+        candidates
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
 fn resolve_manifest_case_file_path(test_cases_dir: &Path, case_file: &str) -> PathBuf {
     let canonical = test_cases_dir.join(case_file);
     if canonical.exists() {
@@ -447,6 +480,36 @@ fn test_parse_fasta_csv_files() {
             }
         }
     }
+}
+
+#[test]
+fn test_resolve_testcase_bam_path_prefers_java_resources() {
+    let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("VarDictJava")
+        .join("src/test/resources/com/astrazeneca/vardict/integrationtests");
+
+    let resolved = resolve_testcase_bam_path(&resources_dir, "L861Q.bam")
+        .expect("expected Java resource BAM to resolve");
+
+    assert_eq!(resolved, resources_dir.join("L861Q.bam"));
+}
+
+#[test]
+fn test_resolve_testcase_bam_path_falls_back_to_repo_testdata() {
+    let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("VarDictJava")
+        .join("src/test/resources/com/astrazeneca/vardict/integrationtests");
+
+    let resolved = resolve_testcase_bam_path(
+        &resources_dir,
+        "NA12878.mapped.ILLUMINA.bwa.CEU.low_coverage.20121211.bam",
+    )
+    .expect("expected repo testdata BAM to resolve");
+
+    assert_eq!(
+        resolved,
+        get_repo_testdata_dir().join("NA12878.mapped.ILLUMINA.bwa.CEU.low_coverage.20121211.bam")
+    );
 }
 
 // ============================================================================
@@ -841,6 +904,24 @@ fn apply_simple_options_to_conf_and_pipeline(
                     index += 1;
                 }
             }
+            "-P" => {
+                if let Some(value) = tokens
+                    .get(index + 1)
+                    .and_then(|value| value.parse::<f64>().ok())
+                {
+                    conf.read_pos_filter = value;
+                    index += 1;
+                }
+            }
+            "-M" => {
+                if let Some(value) = tokens
+                    .get(index + 1)
+                    .and_then(|value| value.parse::<i32>().ok())
+                {
+                    conf.min_match = value;
+                    index += 1;
+                }
+            }
             "-F" => {
                 if let Some(value) = tokens
                     .get(index + 1)
@@ -861,6 +942,9 @@ fn apply_simple_options_to_conf_and_pipeline(
             }
             "-K" => {
                 conf.include_n_in_total_depth = true;
+            }
+            "--chimeric" => {
+                conf.chimeric_filter = true;
             }
             "-x" => {
                 if let Some(value) = tokens
@@ -901,6 +985,14 @@ fn apply_simple_options_to_conf_and_pipeline(
                 } else if let Some(value) = token.strip_prefix("-Q") {
                     if let Ok(parsed) = value.parse::<u8>() {
                         conf.mapping_quality = Some(parsed);
+                    }
+                } else if let Some(value) = token.strip_prefix("-P") {
+                    if let Ok(parsed) = value.parse::<f64>() {
+                        conf.read_pos_filter = parsed;
+                    }
+                } else if let Some(value) = token.strip_prefix("-M") {
+                    if let Ok(parsed) = value.parse::<i32>() {
+                        conf.min_match = parsed;
                     }
                 } else if let Some(value) = token.strip_prefix("-F") {
                     if let Some(parsed) = parse_u32_option_value(value) {
@@ -978,6 +1070,46 @@ fn test_apply_simple_options_to_conf_parses_crispr_compact_and_long_flags() {
 
     assert_eq!(conf.crispr_cutting_site, 50_454_942);
     assert_eq!(conf.crispr_filtering_bp, 25);
+}
+
+#[test]
+fn test_apply_simple_options_to_conf_parses_min_match_spaced_flag() {
+    let mut conf = vardict_rs::conf::Configuration::default();
+    let _ = apply_simple_options_to_conf_and_pipeline("-q 25 -M 20 -f 0.001", &mut conf);
+
+    assert_eq!(conf.min_match, 20);
+}
+
+#[test]
+fn test_apply_simple_options_to_conf_parses_min_match_compact_flag() {
+    let mut conf = vardict_rs::conf::Configuration::default();
+    let _ = apply_simple_options_to_conf_and_pipeline("-M20 -q25 -f0.001", &mut conf);
+
+    assert_eq!(conf.min_match, 20);
+}
+
+#[test]
+fn test_apply_simple_options_to_conf_parses_read_position_filter_spaced_flag() {
+    let mut conf = vardict_rs::conf::Configuration::default();
+    let _ = apply_simple_options_to_conf_and_pipeline("-f 0.0 -P 0", &mut conf);
+
+    assert_eq!(conf.read_pos_filter, 0.0);
+}
+
+#[test]
+fn test_apply_simple_options_to_conf_parses_read_position_filter_compact_flag() {
+    let mut conf = vardict_rs::conf::Configuration::default();
+    let _ = apply_simple_options_to_conf_and_pipeline("-P0 -f0.0", &mut conf);
+
+    assert_eq!(conf.read_pos_filter, 0.0);
+}
+
+#[test]
+fn test_apply_simple_options_to_conf_parses_chimeric_flag() {
+    let mut conf = vardict_rs::conf::Configuration::default();
+    let _ = apply_simple_options_to_conf_and_pipeline("--chimeric -p", &mut conf);
+
+    assert!(conf.chimeric_filter);
 }
 
 fn is_low_risk_simple_tier1_row(row: &ParityManifestRow) -> bool {
@@ -1151,10 +1283,7 @@ fn run_vardict_pipeline_simple_raw_case_with_sv_default(
     })?;
     let ref_seq = ref_seq.expect("resolved reference sequence should exist");
 
-    let bam_path = resources_dir.join(&config.bam_file);
-    if !bam_path.exists() {
-        return Err(format!("BAM not found: {}", bam_path.display()));
-    }
+    let bam_path = resolve_testcase_bam_path(resources_dir, &config.bam_file)?;
 
     let min_base_quality = conf.goodq;
 
@@ -1435,10 +1564,7 @@ fn run_vardict_pipeline_amplicon_raw_case(
     })?;
     let ref_seq = ref_seq.expect("resolved reference sequence should exist");
 
-    let bam_path = resources_dir.join(&config.bam_file);
-    if !bam_path.exists() {
-        return Err(format!("BAM not found: {}", bam_path.display()));
-    }
+    let bam_path = resolve_testcase_bam_path(resources_dir, &config.bam_file)?;
 
     let min_base_quality = conf.goodq;
 
@@ -1707,17 +1833,8 @@ fn run_vardict_pipeline_somatic_raw_case(
     let ref_seq = ref_seq.expect("resolved reference sequence should exist");
 
     let (tumor_bam_name, normal_bam_name) = parse_somatic_bam_pair(&config.bam_file)?;
-    let tumor_bam_path = resources_dir.join(&tumor_bam_name);
-    if !tumor_bam_path.exists() {
-        return Err(format!("Tumor BAM not found: {}", tumor_bam_path.display()));
-    }
-    let normal_bam_path = resources_dir.join(&normal_bam_name);
-    if !normal_bam_path.exists() {
-        return Err(format!(
-            "Normal BAM not found: {}",
-            normal_bam_path.display()
-        ));
-    }
+    let tumor_bam_path = resolve_testcase_bam_path(resources_dir, &tumor_bam_name)?;
+    let normal_bam_path = resolve_testcase_bam_path(resources_dir, &normal_bam_name)?;
 
     let min_base_quality = conf.goodq;
 
@@ -2391,13 +2508,16 @@ fn test_all_simple_integration() {
         }
 
         // Check if BAM exists
-        let bam_path = resources_dir.join(&config.bam_file);
+        let bam_path = match resolve_testcase_bam_path(&resources_dir, &config.bam_file) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("SKIP {}: {}", row.case_file, error);
+                skipped += 1;
+                continue;
+            }
+        };
         if !bam_path.exists() {
-            eprintln!(
-                "SKIP {}: BAM not found at {}",
-                row.case_file,
-                bam_path.display()
-            );
+            eprintln!("SKIP {}: BAM not found at {}", row.case_file, bam_path.display());
             skipped += 1;
             continue;
         }
@@ -2842,6 +2962,61 @@ fn test_manifest_tier1_simple_raw_rust_vs_java_first_mismatch() {
             accounting.mismatched, 0,
             "Strict RUN_NOW mode requires zero tier1 raw mismatches"
         );
+    }
+}
+
+#[test]
+#[ignore]
+fn test_target_bam_na12878_low_coverage_chr11_raw_parity() {
+    if env::var("VARDICT_DEBUG_POS").is_ok() {
+        let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
+    }
+
+    let testdata_dir = get_testdata_dir();
+    let test_cases_dir = testdata_dir.join("integrationtestcases");
+    let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("VarDictJava")
+        .join("src/test/resources/com/astrazeneca/vardict/integrationtests");
+
+    let case_file = "parity_case_inputs/Simple;hs37d5.fa;NA12878.mapped.ILLUMINA.bwa.CEU.low_coverage.20121211.bam;11;402283-410793;-f0.001-target-bam.txt";
+    let test_case_path = resolve_manifest_case_file_path(&test_cases_dir, case_file);
+    assert!(test_case_path.exists(), "Missing testcase file: {}", test_case_path.display());
+
+    let (config, expected_variants) =
+        parse_test_case(&test_case_path).expect("Failed to parse target BAM testcase");
+    assert_eq!(config.mode, "Simple");
+    assert_eq!(config.reference, "hs37d5.fa");
+    assert_eq!(config.bam_file, "NA12878.mapped.ILLUMINA.bwa.CEU.low_coverage.20121211.bam");
+    assert_eq!(config.chrom, "11");
+
+    let expected_sample_name = expected_sample_name_for_case(&config, &expected_variants);
+    let rust_output = run_vardict_pipeline_simple_raw_case(
+        &testdata_dir,
+        &resources_dir,
+        &config,
+        case_file,
+        &expected_sample_name,
+    )
+    .expect("Target BAM runner failed");
+
+    let expected_lines = expected_variants
+        .iter()
+        .map(|variant| variant.raw_line.clone())
+        .collect::<Vec<_>>();
+
+    match first_raw_mismatch(&expected_lines, &rust_output) {
+        None => {
+            assert_eq!(rust_output.len(), 11, "Unexpected target BAM output line count");
+        }
+        Some(diag) => {
+            panic!(
+                "Target BAM raw parity mismatch: {} at line {}\nJAVA: {}\nRUST: {}",
+                diag.reason,
+                diag.line_index + 1,
+                diag.java_line.unwrap_or_else(|| "<none>".to_string()),
+                diag.rust_line.unwrap_or_else(|| "<none>".to_string())
+            );
+        }
     }
 }
 

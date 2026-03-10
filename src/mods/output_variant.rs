@@ -136,7 +136,7 @@ pub struct SimpleOutputVariant {
 impl SimpleOutputVariant {
     /// Create a SimpleOutputVariant from a Variant and Region
     pub fn from_variant(variant: &Variant, region: &Region, sample: &str, sv: &str) -> Self {
-        let var_type_str = format_var_type(&variant.vartype);
+        let var_type_str = format_output_var_type(variant);
 
         // Detect reference call (ref == alt)
         let is_ref_call = variant.refallele == variant.varallele;
@@ -309,7 +309,6 @@ impl SimpleOutputVariant {
     /// Format as 36-column tab-delimited string (Simple Mode without Fisher)
     pub fn to_string_36_columns(&self) -> String {
         let parts: Vec<String> = vec![
-            // 1-7: Identity
             self.sample.clone(),
             self.gene.clone(),
             self.chr.clone(),
@@ -317,37 +316,29 @@ impl SimpleOutputVariant {
             self.end_position.to_string(),
             self.ref_allele.clone(),
             self.var_allele.clone(),
-            // 8-13: Coverage
             self.total_coverage.to_string(),
             self.variant_coverage.to_string(),
             self.reference_forward_count.to_string(),
             self.reference_reverse_count.to_string(),
             self.variant_forward_count.to_string(),
             self.variant_reverse_count.to_string(),
-            // 14-16: Genotype, frequency, bias
             self.genotype.clone(),
             format_f64(self.frequency, 4),
             self.bias.clone(),
-            // 17-18: Position metrics
             format_f64(self.pmean, 1),
             self.pstd.to_string(),
-            // 19-20: Quality metrics
             format_f64(self.qual, 1),
             self.qstd.to_string(),
-            // 21-24: More quality metrics
             format_f64(self.mapq, 1),
             format_f64(self.qratio, 3),
             format_f64(self.hifreq, 4),
             format_f64(self.extrafreq, 4),
-            // 25-28: Special metrics
             self.shift3.to_string(),
             format_f64(self.msi, 3),
             format_f64(self.msint, 0),
             format_f64(self.nm, 1),
-            // 29-30: High-quality counts
             self.hicnt.to_string(),
             self.hicov.to_string(),
-            // 31-36: Context and type
             self.left_sequence.clone(),
             self.right_sequence.clone(),
             self.region.clone(),
@@ -1207,9 +1198,9 @@ impl SomaticOutputVariant {
             self.region.clone(),
             self.var_label.clone(),
             self.var_type.clone(),
-            format_rounded_value_to_print("0.0", self.var1_duprate),
+            format_rounded_value_to_print("0.00", self.var1_duprate),
             self.var1_sv.clone(),
-            format_rounded_value_to_print("0.0", self.var2_duprate),
+            format_rounded_value_to_print("0.00", self.var2_duprate),
             self.var2_sv.clone(),
             format_rounded_value_to_print("0.00000", pvalue),
             oddratio,
@@ -1735,6 +1726,18 @@ fn format_var_type(var_type: &VarType) -> String {
     }
 }
 
+fn format_output_var_type(variant: &Variant) -> String {
+    if variant.refallele == variant.varallele {
+        return String::new();
+    }
+
+    if variant.varallele.starts_with('<') && variant.varallele.ends_with('>') && variant.varallele.len() >= 5 {
+        return var_type_string(&variant.refallele, &variant.varallele);
+    }
+
+    format_var_type(&variant.vartype)
+}
+
 /// Get column headers for 36-column format
 pub fn get_column_headers() -> Vec<&'static str> {
     vec![
@@ -1914,6 +1917,8 @@ pub fn get_somatic_header_line() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mods::to_vars_builder::VarType;
+    use crate::scopedata::global_read_only_scope::GlobalReadOnlyScope;
 
     #[test]
     fn test_region_to_string() {
@@ -1975,6 +1980,100 @@ mod tests {
             }),
             "Complex"
         );
+    }
+
+    #[test]
+    fn test_simple_output_variant_from_variant_uses_symbolic_alleles_for_var_type() {
+        let region = Region::new("1", 1_500_001, 2_000_000, "testbed");
+        let variant = Variant {
+            description_string: "<dup52673>".to_string(),
+            refallele: "C".to_string(),
+            varallele: "<DUP>".to_string(),
+            vartype: VarType::Complex {
+                insertion: String::new(),
+                deletion: 0,
+            },
+            start_position: 1_628_406,
+            end_position: 1_681_078,
+            vars_count_on_forward: 0,
+            vars_count_on_reverse: 3,
+            position_coverage: 3,
+            total_pos_coverage: 8,
+            frequency: 0.375,
+            high_quality_reads_frequency: 0.4286,
+            extra_frequency: 0.375,
+            mean_position: 34.3,
+            mean_quality: 37.0,
+            mean_mapping_quality: 15.0,
+            strand_bias_flag: StrandBiasFlag::default(),
+            is_at_least_at_2_positions: true,
+            has_at_least_2_diff_qualities: false,
+            leftseq: "CTCTGAGTGTGTGGTGCCTG".to_string(),
+            rightseq: "TGTGTGTGTGTGAATCTACG".to_string(),
+            msi: 0.0,
+            msint: 0.0,
+            shift3: 0,
+            nm: 2.0,
+            high_qual_read_cnt: 3,
+            low_qual_read_cnt: 0,
+            hicov: 7,
+            ref_forward_count: 5,
+            ref_reverse_count: 3,
+            genotype: "C/+52673".to_string(),
+            duprate: 0.0,
+            crispr: 0,
+        };
+
+        let output = SimpleOutputVariant::from_variant(&variant, &region, "sample", "3-0-0");
+
+        assert_eq!(output.var_type, "DUP");
+    }
+
+    #[test]
+    fn test_simple_output_variant_from_variant_preserves_complex_vartype() {
+        let region = Region::new("1", 11_000_001, 11_500_000, "testbed");
+        let variant = Variant {
+            description_string: "-2TC".to_string(),
+            refallele: "CTT".to_string(),
+            varallele: "C".to_string(),
+            vartype: VarType::Complex {
+                insertion: String::new(),
+                deletion: 2,
+            },
+            start_position: 11_464_646,
+            end_position: 11_464_648,
+            vars_count_on_forward: 11,
+            vars_count_on_reverse: 6,
+            position_coverage: 17,
+            total_pos_coverage: 20,
+            frequency: 0.85,
+            high_quality_reads_frequency: 0.8095,
+            extra_frequency: 0.0,
+            mean_position: 19.9,
+            mean_quality: 31.6,
+            mean_mapping_quality: 31.3,
+            strand_bias_flag: StrandBiasFlag::default(),
+            is_at_least_at_2_positions: true,
+            has_at_least_2_diff_qualities: true,
+            leftseq: "GAAAATATAGATCTGTAAAT".to_string(),
+            rightseq: "TTTATAAAAATACATTTAAA".to_string(),
+            msi: 4.0,
+            msint: 1.0,
+            shift3: 0,
+            nm: 1.2,
+            high_qual_read_cnt: 17,
+            low_qual_read_cnt: 4,
+            hicov: 21,
+            ref_forward_count: 3,
+            ref_reverse_count: 0,
+            genotype: "TTT/-2TC".to_string(),
+            duprate: 0.0769,
+            crispr: 0,
+        };
+
+        let output = SimpleOutputVariant::from_variant(&variant, &region, "sample", "0");
+
+        assert_eq!(output.var_type, "Complex");
     }
 
     #[test]
@@ -2159,6 +2258,7 @@ mod tests {
 
     #[test]
     fn test_amplicon_output_variant_to_string_38_columns() {
+        let _ = INSTANCE.get_or_init(GlobalReadOnlyScope::default);
         let region = Region::new("chr1", 1000, 2000, "GENE1");
         let variant = Variant {
             description_string: "A>T".to_string(),
@@ -2230,6 +2330,7 @@ mod tests {
 
     #[test]
     fn test_amplicon_output_variant_to_string_40_columns_fisher_parity() {
+        let _ = INSTANCE.get_or_init(GlobalReadOnlyScope::default);
         let region = Region::new("chr1", 1000, 2000, "GENE1");
         let variant = Variant {
             description_string: "A>T".to_string(),
@@ -2395,6 +2496,80 @@ mod tests {
         assert_eq!(fields[50], "SNV");
         assert_eq!(fields[52], "sv1");
         assert_eq!(fields[54], "0");
+    }
+
+    #[test]
+    fn test_somatic_output_variant_to_string_61_columns_fisher_parity() {
+        let region = Region::new("chr1", 900, 1100, "GENE1");
+
+        let begin_variant = Variant {
+            description_string: "A>T".to_string(),
+            refallele: "A".to_string(),
+            varallele: "T".to_string(),
+            vartype: VarType::SNV('T'),
+            start_position: 1000,
+            end_position: 1000,
+            vars_count_on_forward: 3,
+            vars_count_on_reverse: 2,
+            position_coverage: 5,
+            total_pos_coverage: 20,
+            frequency: 0.25,
+            high_quality_reads_frequency: 0.20,
+            extra_frequency: 0.0,
+            mean_position: 30.0,
+            mean_quality: 35.0,
+            mean_mapping_quality: 60.0,
+            strand_bias_flag: StrandBiasFlag::default(),
+            is_at_least_at_2_positions: true,
+            has_at_least_2_diff_qualities: true,
+            leftseq: "ACGT".to_string(),
+            rightseq: "TGCA".to_string(),
+            msi: 2.0,
+            msint: 1.0,
+            shift3: 1,
+            nm: 1.0,
+            high_qual_read_cnt: 5,
+            low_qual_read_cnt: 1,
+            hicov: 20,
+            ref_forward_count: 10,
+            ref_reverse_count: 5,
+            genotype: "0/1".to_string(),
+            duprate: 0.1,
+            crispr: 0,
+        };
+
+        let end_variant = begin_variant.clone();
+        let mut normal_variant = begin_variant.clone();
+        normal_variant.frequency = 0.10;
+        normal_variant.position_coverage = 2;
+        normal_variant.vars_count_on_forward = 1;
+        normal_variant.vars_count_on_reverse = 1;
+        normal_variant.duprate = 0.0;
+
+        let output = SomaticOutputVariant::from_variants(
+            Some(&begin_variant),
+            Some(&end_variant),
+            Some(&begin_variant),
+            Some(&normal_variant),
+            &region,
+            "sv1",
+            "",
+            "StrongSomatic",
+            "Tumor|Normal",
+        );
+
+        let line = output.to_string_61_columns();
+        let fields: Vec<&str> = line.split('\t').collect();
+        assert_eq!(fields.len(), 61);
+        assert_eq!(fields[0], "Tumor|Normal");
+        assert_eq!(fields[6], "T");
+        assert_eq!(fields[14], "0.25");
+        assert!(fields[25].parse::<f64>().is_ok());
+        assert!(fields[26] == "Inf" || fields[26].parse::<f64>().is_ok());
+        assert_eq!(fields[55], "0.1");
+        assert_eq!(fields[56], "sv1");
+        assert!(fields[59].parse::<f64>().is_ok());
+        assert!(fields[60] == "Inf" || fields[60].parse::<f64>().is_ok());
     }
 
     #[test]

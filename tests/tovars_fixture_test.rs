@@ -69,7 +69,7 @@ fn test_tovars_builder_snapshot_fixture() {
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let fixture_path = manifest_dir.join("tests/fixtures/tovars_builder_chr20_168600_168800.jsonl");
-    let bam_path = manifest_dir.join("test_data/test_168714.bam");
+    let bam_path = manifest_dir.join("testdata/test_168714.bam");
     let ref_path = manifest_dir.join("VarDictJava/tests/integration/reference/hs37d5.fa");
 
     assert!(fixture_path.exists(), "Missing fixture: {:?}", fixture_path);

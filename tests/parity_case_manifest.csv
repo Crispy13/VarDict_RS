@@ -66,6 +66,7 @@ Simple;hg38.fa;norealign-stringindex-oob.bam;chr22;20566544;20566545;-f 0.001-k0
 Simple;hg38.fa;test-malformed-cigar-and-string-eor.bam;chr4;25001600-25001607;-f0.001.txt,Simple,RUN_NOW,,hg38.fa,test-malformed-cigar-and-string-eor.bam,chr4,-f 0.001,simple|expected_empty
 Simple;hs37d5.fa;NA21144.chrom11.Duplicates.bam;11;402283-410793;-F 0;.txt,Simple,RUN_NOW,,hs37d5.fa,NA21144.chrom11.Duplicates.bam,chr11, -F 0,simple|sv_related
 Simple;hs37d5.fa;NA21144.chrom11.Duplicates.bam;11;402283-410793;.txt,Simple,RUN_NOW,,hs37d5.fa,NA21144.chrom11.Duplicates.bam,chr11,,simple|sv_related
+parity_case_inputs/Simple;hs37d5.fa;NA12878.mapped.ILLUMINA.bwa.CEU.low_coverage.20121211.bam;11;402283-410793;-f0.001-target-bam.txt,Simple,RUN_NOW,,hs37d5.fa,NA12878.mapped.ILLUMINA.bwa.CEU.low_coverage.20121211.bam,11,-f 0.001,simple|target_bam|java_backed|wgs_low_coverage
 Simple;hs38DH.fa;Count-Depth-With-Ns.bam;chr1;391310-391333;-K -p -r 1 -q 2 -f 0.0;.txt,Simple,RUN_NOW,,hs38DH.fa,Count-Depth-With-Ns.bam,chr1,-K -p -r 1 -q 2 -f 0.0 -k 0,simple|pileup
 Simple;hs38DH.fa;Count-Depth-With-Ns.bam;chr1;391310-391333;-p -r 1 -q 2 -f 0.0;.txt,Simple,RUN_NOW,,hs38DH.fa,Count-Depth-With-Ns.bam,chr1,-p -r 1 -q 2 -f 0.0 -k 0,simple|pileup
 Simple;hs38DH.fa;NA12878.chrom20.DELSV.bam;chr20;62596000-62598000;-f 0.001.txt,Simple,RUN_NOW,,hs38DH.fa,NA12878.chrom20.DELSV.bam,chr20,-f 0.001,simple|sv_related

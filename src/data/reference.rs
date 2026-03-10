@@ -6,12 +6,13 @@ use rust_htslib::faidx;
 
 use crate::conf::Configuration;
 use crate::prelude::LibDefaultHasher;
+pub type ReferenceSeedMap = HashMap<Vec<u8>, Vec<i64>, LibDefaultHasher>;
 
 /// Reference sequence data
 #[derive(Default, Clone)]
 pub struct Reference {
     pub ref_seq: Vec<u8>,
-    pub seed: HashMap<Vec<u8>, Vec<i64>, LibDefaultHasher>,
+    pub seed: ReferenceSeedMap,
     /// Start position of this reference slice in genomic coordinates (1-based)
     pub region_start: i64,
 }
@@ -197,5 +198,21 @@ mod tests {
         let r = Reference::default();
         assert!(r.ref_seq.is_empty());
         assert!(r.seed.is_empty());
+    }
+
+    #[test]
+    fn test_build_seed_map_supports_slice_lookup_and_tracks_positions() {
+        let mut reference = Reference::new_with_start(b"ACGTACGTACGTACGTACGT".to_vec(), 10);
+        reference.build_seed_map(29, Some(29));
+
+        let seed_17 = b"ACGTACGTACGTACGTA";
+        let seed_12 = b"ACGTACGTACGT";
+
+        let positions_17 = reference.seed.get(seed_17.as_slice()).expect("17-mer seed");
+        let positions_12 = reference.seed.get(seed_12.as_slice()).expect("12-mer seed");
+
+        assert!(positions_17.contains(&10));
+        assert!(positions_12.contains(&10));
+        assert!(positions_12.len() >= positions_17.len());
     }
 }

@@ -12,9 +12,10 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::env;
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Error, Result};
 use crackle_kit::tracing::{Level, event};
@@ -51,6 +52,74 @@ type CountByPos = HashMap<i64, CountMap, LibDefaultHasher>;
 type RefCovMap = HashMap<i64, usize, LibDefaultHasher>;
 type VarsByPos = HashMap<i64, Vars, LibDefaultHasher>;
 
+#[derive(Clone, Copy)]
+struct ProcessMemorySnapshot {
+    vmrss_kb: usize,
+    vmswap_kb: usize,
+}
+
+fn current_process_memory_snapshot() -> Option<ProcessMemorySnapshot> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    let mut vmrss_kb = None;
+    let mut vmswap_kb = None;
+
+    for line in status.lines() {
+        if let Some(value) = line.strip_prefix("VmRSS:") {
+            vmrss_kb = value.split_whitespace().next()?.parse::<usize>().ok();
+        } else if let Some(value) = line.strip_prefix("VmSwap:") {
+            vmswap_kb = value.split_whitespace().next()?.parse::<usize>().ok();
+        }
+
+        if vmrss_kb.is_some() && vmswap_kb.is_some() {
+            break;
+        }
+    }
+
+    Some(ProcessMemorySnapshot {
+        vmrss_kb: vmrss_kb?,
+        vmswap_kb: vmswap_kb.unwrap_or(0),
+    })
+}
+
+fn append_rss_stage_log_if_enabled(region: &Region, elapsed_ms: u128, stage: &str) {
+    let Some(path) = env::var_os("VARDICT_RSS_MEMORY_LOG") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+
+    let Some(snapshot) = current_process_memory_snapshot() else {
+        return;
+    };
+
+    let path = std::path::PathBuf::from(path);
+    let should_write_header = fs::metadata(&path).map(|meta| meta.len() == 0).unwrap_or(true);
+    let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+
+    if should_write_header {
+        let _ = writeln!(
+            file,
+            "elapsed_ms\tregion_chr\tregion_start\tregion_end\tvmrss_kb\tvmswap_kb\tstage"
+        );
+    }
+
+    let _ = writeln!(
+        file,
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        elapsed_ms,
+        region.chr(),
+        region.start(),
+        region.end(),
+        snapshot.vmrss_kb,
+        snapshot.vmswap_kb,
+        stage,
+    );
+}
+
 /// Data produced by CigarParser - mirrors Java VariationData
 #[derive(Default)]
 pub struct CigarParserOutput {
@@ -82,6 +151,10 @@ pub struct CigarParserOutput {
     pub svfinv3: Vec<SoftClip>,
     /// Reverse inversion 3' discordant clusters (Java svrinv3)
     pub svrinv3: Vec<SoftClip>,
+    /// Forward inter-chromosomal fusion clusters used by Java SOFTP2SV gating.
+    pub svffus: HashMap<i32, Vec<SoftClip>, LibDefaultHasher>,
+    /// Reverse inter-chromosomal fusion clusters used by Java SOFTP2SV gating.
+    pub svrfus: HashMap<i32, Vec<SoftClip>, LibDefaultHasher>,
     /// Reference coverage by position
     pub ref_coverage: HashMap<i64, usize, LibDefaultHasher>,
     /// MNP map (position -> description -> count)
@@ -357,8 +430,8 @@ fn write_variant_map<W: Write>(
             let mut keys: Vec<&VarDesc> = vars.keys().collect();
             keys.sort_by_cached_key(|desc| desc.to_key_string());
             for key in keys {
-                let key_str = key.to_key_string();
                 let var = vars.get(key).expect("variant missing for key");
+                let key_str = key.to_key_string();
                 let data = format!("{{\"variant\":{}}}", variant_json(var));
                 write_json_line(writer, line_type, pos, &key_str, &data)?;
             }
@@ -1086,6 +1159,7 @@ impl VarDictPipeline {
         instance: Arc<GlobalReadOnlyScope>,
         bam_paths: &[String],
     ) -> Result<RegionAlignedVarsOutput> {
+        let start_region = Instant::now();
         let extend = (instance.conf.number_nucleotide_to_extend + instance.conf.reference_extension)
             .max(0) as usize;
         let extended_start = if region.start() > extend {
@@ -1116,6 +1190,7 @@ impl VarDictPipeline {
         let mut reference = Reference::new_with_start(ref_seq, extended_start as i64);
         let chr_len = instance.chr_lens.get(region.chr()).copied();
         reference.build_seed_map(extended_end as i64, chr_len);
+        append_rss_stage_log_if_enabled(region, start_region.elapsed().as_millis(), "reference_ready");
 
         // Get SAM filter from instance configuration
         let sam_filter = instance.conf.sam_filter;
@@ -1129,6 +1204,7 @@ impl VarDictPipeline {
         )?;
 
         cigar_output.write_jsonl_snapshot_if_enabled(region)?;
+        append_rss_stage_log_if_enabled(region, start_region.elapsed().as_millis(), "cigar_complete");
 
         self.process_region_to_aligned_vars_from_cigar_output(
             cigar_output,
@@ -1136,6 +1212,7 @@ impl VarDictPipeline {
             &reference,
             bam_paths,
             Some(shared_reference),
+            start_region,
         )
     }
 
@@ -1148,6 +1225,7 @@ impl VarDictPipeline {
         instance: Arc<GlobalReadOnlyScope>,
         bam_paths: &[String],
     ) -> Result<RegionAlignedVarsOutput> {
+        let start_region = Instant::now();
         let extend = (instance.conf.number_nucleotide_to_extend + instance.conf.reference_extension)
             .max(0) as usize;
         let extended_start = if region.start() > extend {
@@ -1177,6 +1255,7 @@ impl VarDictPipeline {
         let mut reference = Reference::new_with_start(ref_seq, extended_start as i64);
         let chr_len = instance.chr_lens.get(region.chr()).copied();
         reference.build_seed_map(extended_end as i64, chr_len);
+        append_rss_stage_log_if_enabled(region, start_region.elapsed().as_millis(), "reference_ready");
 
         let sam_filter = instance.conf.sam_filter;
         let cigar_output = self.run_cigar_parser_from_cached_records(
@@ -1189,6 +1268,7 @@ impl VarDictPipeline {
         )?;
 
         cigar_output.write_jsonl_snapshot_if_enabled(region)?;
+        append_rss_stage_log_if_enabled(region, start_region.elapsed().as_millis(), "cigar_complete");
 
         self.process_region_to_aligned_vars_from_cigar_output(
             cigar_output,
@@ -1196,6 +1276,7 @@ impl VarDictPipeline {
             &reference,
             bam_paths,
             Some(shared_reference),
+            start_region,
         )
     }
 
@@ -1206,6 +1287,7 @@ impl VarDictPipeline {
         bam_paths: &[String],
         instance: Arc<GlobalReadOnlyScope>,
     ) -> Result<RegionAlignedVarsOutput> {
+        let start_region = Instant::now();
         let extend = (instance.conf.number_nucleotide_to_extend + instance.conf.reference_extension)
             .max(0) as usize;
         let extended_start = if region.start() > extend {
@@ -1235,6 +1317,7 @@ impl VarDictPipeline {
         let mut reference = Reference::new_with_start(ref_seq, extended_start as i64);
         let chr_len = instance.chr_lens.get(region.chr()).copied();
         reference.build_seed_map(extended_end as i64, chr_len);
+        append_rss_stage_log_if_enabled(region, start_region.elapsed().as_millis(), "reference_ready");
 
         let sam_filter = instance.conf.sam_filter;
         let cigar_output = self.run_cigar_parser_from_bam_paths(
@@ -1245,12 +1328,15 @@ impl VarDictPipeline {
             sam_filter,
         )?;
 
+        append_rss_stage_log_if_enabled(region, start_region.elapsed().as_millis(), "cigar_complete");
+
         self.process_region_to_aligned_vars_from_cigar_output(
             cigar_output,
             region,
             &reference,
             bam_paths,
             Some(shared_reference),
+            start_region,
         )
     }
 
@@ -1451,15 +1537,22 @@ impl VarDictPipeline {
     {
         let bam_paths = instance.bam_paths.clone();
 
-        let mut working_reference = reference.clone();
-        let region_end_for_seed =
-            working_reference.region_start + working_reference.ref_seq.len() as i64 - 1;
-        let chr_len = instance.chr_lens.get(region.chr()).copied();
-        working_reference.build_seed_map(region_end_for_seed, chr_len);
+        let rebuilt_reference;
+        let working_reference = if reference.seed.is_empty() {
+            let mut reference_with_seed = reference.clone();
+            let region_end_for_seed =
+                reference_with_seed.region_start + reference_with_seed.ref_seq.len() as i64 - 1;
+            let chr_len = instance.chr_lens.get(region.chr()).copied();
+            reference_with_seed.build_seed_map(region_end_for_seed, chr_len);
+            rebuilt_reference = reference_with_seed;
+            &rebuilt_reference
+        } else {
+            reference
+        };
 
         // Step 1: Parse CIGAR strings (CigarParser)
         let start_cigar = std::time::Instant::now();
-        let cigar_output = self.run_cigar_parser(records, region, &working_reference, instance)?;
+        let cigar_output = self.run_cigar_parser(records, region, working_reference, instance)?;
         let elapsed_cigar = start_cigar.elapsed();
         // Step 2: Write JSONL snapshot if enabled
         cigar_output.write_jsonl_snapshot_if_enabled(region)?;
@@ -1472,7 +1565,7 @@ impl VarDictPipeline {
             cigar_output.ref_coverage.len()
         );
 
-        self.process_region_from_cigar_output(cigar_output, region, &working_reference, &bam_paths)
+        self.process_region_from_cigar_output(cigar_output, region, working_reference, &bam_paths)
     }
 
     fn process_region_from_cigar_output(
@@ -1488,6 +1581,7 @@ impl VarDictPipeline {
             reference,
             bam_paths,
             None,
+            Instant::now(),
         )?;
 
         let start_post = std::time::Instant::now();
@@ -1515,6 +1609,7 @@ impl VarDictPipeline {
         reference: &Reference,
         bam_paths: &[String],
         shared_reference: Option<&SharedReferenceHandle>,
+        start_region: Instant,
     ) -> Result<RegionAlignedVarsOutput> {
         let start_realign = std::time::Instant::now();
         let (realigned_output, structural_reference) = self
@@ -1524,6 +1619,7 @@ impl VarDictPipeline {
                 reference,
                 bam_paths,
                 shared_reference,
+                start_region,
             )?;
         let elapsed_realign = start_realign.elapsed();
 
@@ -1534,12 +1630,17 @@ impl VarDictPipeline {
             realigned_output.non_insertion_vars.len(),
             realigned_output.ref_coverage.len()
         );
+        append_rss_stage_log_if_enabled(region, start_region.elapsed().as_millis(), "realigner_sv_complete");
 
         let start_tovars = std::time::Instant::now();
         let splice = realigned_output.splice.clone();
         let max_read_length = realigned_output.max_read_len;
-        let aligned_vars =
-            self.run_to_vars_builder(realigned_output, &structural_reference, region)?;
+        let aligned_vars = self.run_to_vars_builder(
+            realigned_output,
+            &structural_reference,
+            region,
+            shared_reference,
+        )?;
         let elapsed_tovars = start_tovars.elapsed();
 
         event!(
@@ -1548,6 +1649,7 @@ impl VarDictPipeline {
             elapsed_tovars.as_secs_f64(),
             aligned_vars.aligned_variants.len()
         );
+        append_rss_stage_log_if_enabled(region, start_region.elapsed().as_millis(), "tovars_complete");
 
         Ok(RegionAlignedVarsOutput {
             aligned_vars,
@@ -2215,6 +2317,8 @@ impl VarDictPipeline {
             svrinv5: cigar_parser.take_svrinv5(),
             svfinv3: cigar_parser.take_svfinv3(),
             svrinv3: cigar_parser.take_svrinv3(),
+            svffus: cigar_parser.take_svffus(),
+            svrfus: cigar_parser.take_svrfus(),
             ref_coverage: cigar_parser.take_ref_coverage(),
             mnp: cigar_parser.take_mnp(),
             position_to_insertion_count: cigar_parser.take_position_to_insertion_count(),
@@ -2238,6 +2342,7 @@ impl VarDictPipeline {
         reference: &Reference,
         bam_paths: &[String],
         shared_reference: Option<&SharedReferenceHandle>,
+        start_region: Instant,
     ) -> Result<(RealignedOutput, Reference)> {
         // TODO: Integrate actual VariantRealigner for soft clip realignment
         // For now, we pass through to StructuralVariantsProcessor
@@ -2256,6 +2361,8 @@ impl VarDictPipeline {
             svrinv5,
             svfinv3,
             svrinv3,
+            svffus,
+            svrfus,
             ref_coverage,
             mnp,
             position_to_insertion_count,
@@ -2283,13 +2390,19 @@ impl VarDictPipeline {
             svrinv5,
             svfinv3,
             svrinv3,
+            svffus,
+            svrfus,
+            softp2sv_first_used: Default::default(),
         };
 
         // Perform minimal deletion realignment using soft clips when enabled
         // Re-enable realigner to match Java behavior
+        let shared_reference_seq = Arc::new(reference.ref_seq.clone());
+        let shared_reference_seed = Arc::new(reference.seed.clone());
+
         let realigner = VariantRealigner::new_with_context(
-            reference.ref_seq.clone(),
-            reference.seed.clone(),
+            Arc::clone(&shared_reference_seq),
+            Arc::clone(&shared_reference_seed),
             reference.region_start,
             Some(region.chr().to_string()),
             bam_paths.to_vec(),
@@ -2297,9 +2410,19 @@ impl VarDictPipeline {
 
         if !instance().conf.disable_sv {
             realigner.filter_all_sv_structures(&mut sv_input);
+            append_rss_stage_log_if_enabled(
+                region,
+                start_region.elapsed().as_millis(),
+                "realigner_sv_filter_complete",
+            );
         }
 
         realigner.adjust_mnp(&mut sv_input, &mnp);
+        append_rss_stage_log_if_enabled(
+            region,
+            start_region.elapsed().as_millis(),
+            "realigner_adjust_mnp_complete",
+        );
 
         if instance().conf.perform_local_realignment {
             realigner.process_deletions(&mut sv_input, &position_to_deletions_count);
@@ -2307,21 +2430,31 @@ impl VarDictPipeline {
             realigner.realign_large_deletions(&mut sv_input);
             realigner.realign_long_insertions_30(&mut sv_input);
             realigner.realign_long_insertions(&mut sv_input);
+            append_rss_stage_log_if_enabled(
+                region,
+                start_region.elapsed().as_millis(),
+                "realigner_local_complete",
+            );
         }
 
         write_realigned_jsonl_snapshot_if_enabled(&sv_input, region)?;
 
         // Run StructuralVariantsProcessor (adjSNV always runs, SV detection is unimplemented)
         let mut sv_processor = StructuralVariantsProcessor::new_with_context(
-            reference.ref_seq.clone(),
-            reference.seed.clone(),
+            shared_reference_seq,
+            shared_reference_seed,
             reference.region_start,
             Some(region.chr().to_string()),
             bam_paths.to_vec(),
             shared_reference.cloned(),
         );
-        let processed = sv_processor.process(sv_input);
-        let structural_reference = sv_processor.current_reference();
+        let processed = sv_processor.process_with_region(sv_input, region);
+        append_rss_stage_log_if_enabled(
+            region,
+            start_region.elapsed().as_millis(),
+            "sv_processor_complete",
+        );
+        let structural_reference = sv_processor.into_reference();
 
         write_structural_variants_jsonl_snapshot_if_enabled(&processed, region)?;
 
@@ -2346,6 +2479,7 @@ impl VarDictPipeline {
         input: RealignedOutput,
         reference: &Reference,
         region: &Region,
+        shared_reference: Option<&SharedReferenceHandle>,
     ) -> Result<AlignedVarsData> {
         let mut aligned_variants: VarsByPos = Default::default();
         let mut aligned_variants_order: Vec<i64> = Vec::new();
@@ -2425,7 +2559,7 @@ impl VarDictPipeline {
                 .any(|desc| matches!(desc, VarDesc::Raw { desc } if desc.as_slice() == b"SV"));
 
             if (position < region.start() as i64 || position > region.end() as i64)
-                && (!has_sv_at_position || instance().conf.delete_duplicate_variants)
+                && !has_sv_at_position
             {
                 if trace_this_pos {
                     event!(
@@ -2550,6 +2684,8 @@ impl VarDictPipeline {
                 &mut aligned_variants_order,
                 position,
                 reference,
+                region,
+                shared_reference,
                 &var_list,
             );
 
@@ -2598,6 +2734,7 @@ impl VarDictPipeline {
                     &mut non_insertion_vars,
                     reference,
                     region,
+                    shared_reference,
                     &mut debug_lines,
                     duprate,
                 );
@@ -2951,10 +3088,14 @@ impl VarDictPipeline {
         aligned_variants_order: &mut Vec<i64>,
         position: i64,
         reference: &Reference,
+        region: &Region,
+        shared_reference: Option<&SharedReferenceHandle>,
         variants: &[Variant],
     ) -> f64 {
         let mut maxfreq = 0.0;
-        let ref_base = reference.get(position).map(|b| (b as char).to_string());
+        let ref_base = self
+            .get_reference_base_with_fallback(reference, shared_reference, region.chr(), position)
+            .map(|b| (b as char).to_string());
         let entry = match aligned_variants.entry(position) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
@@ -2989,6 +3130,7 @@ impl VarDictPipeline {
         non_insertion_vars: &mut RawVarByPos,
         reference: &Reference,
         region: &Region,
+        shared_reference: Option<&SharedReferenceHandle>,
         _debug_lines: &mut Vec<String>,
         duprate: f64,
     ) {
@@ -3106,8 +3248,13 @@ impl VarDictPipeline {
                         end_position += shift3 as i64;
                     }
 
-                    refallele = reference
-                        .get(position)
+                    refallele = self
+                        .get_reference_base_with_fallback(
+                            reference,
+                            shared_reference,
+                            region.chr(),
+                            position,
+                        )
                         .map(|b| (b as char).to_string())
                         .unwrap_or_default();
                     varallele = format!(
@@ -3174,24 +3321,41 @@ impl VarDictPipeline {
                             start_position += shift3 as i64;
                         }
                         if varallele != "<DEL>" {
-                            if let Some(base) = reference.get(position - 1) {
+                            if let Some(base) = self.get_reference_base_with_fallback(
+                                reference,
+                                shared_reference,
+                                region.chr(),
+                                position - 1,
+                            ) {
                                 varallele = (base as char).to_string();
                             }
                         }
-                        if let Some(base) = reference.get(position - 1) {
+                        if let Some(base) = self.get_reference_base_with_fallback(
+                            reference,
+                            shared_reference,
+                            region.chr(),
+                            position - 1,
+                        ) {
                             refallele.push(base as char);
                         }
                         start_position -= 1;
                     }
 
                     if SOME_SV_NUMBERS.is_match(&description_string) {
-                        refallele = reference
-                            .get(position)
+                        refallele = self
+                            .get_reference_base_with_fallback(
+                                reference,
+                                shared_reference,
+                                region.chr(),
+                                position,
+                            )
                             .map(|b| (b as char).to_string())
                             .unwrap_or_default();
                     } else if deletion_length < instance().conf.sv_min_len {
-                        refallele.push_str(&self.get_reference_range(
+                        refallele.push_str(&self.get_reference_range_with_fallback(
                             reference,
+                            shared_reference,
+                            region.chr(),
                             position,
                             position + deletion_length as i64 - 1,
                         ));
@@ -3203,8 +3367,13 @@ impl VarDictPipeline {
                     msint = msint_val;
                     shift3 = shift_val;
 
-                    refallele = reference
-                        .get(position)
+                    refallele = self
+                        .get_reference_base_with_fallback(
+                            reference,
+                            shared_reference,
+                            region.chr(),
+                            position,
+                        )
                         .map(|b| (b as char).to_string())
                         .unwrap_or_default();
                     varallele = description_string.clone();
@@ -3250,8 +3419,13 @@ impl VarDictPipeline {
                         }
 
                         if varallele == "<DEL>" && !refallele.is_empty() {
-                            refallele = reference
-                                .get(start_position)
+                            refallele = self
+                                .get_reference_base_with_fallback(
+                                    reference,
+                                    shared_reference,
+                                    region.chr(),
+                                    start_position,
+                                )
                                 .map(|b| (b as char).to_string())
                                 .unwrap_or_default();
                             if let Some(&coverage) = ref_coverage.get(&(start_position - 1)) {
@@ -3378,8 +3552,10 @@ impl VarDictPipeline {
                     }
                 }
 
-                vref.leftseq = self.get_reference_range(
+                vref.leftseq = self.get_reference_range_with_fallback(
                     reference,
+                    shared_reference,
+                    region.chr(),
                     (start_position - 20).max(1),
                     start_position - 1,
                 );
@@ -3388,7 +3564,13 @@ impl VarDictPipeline {
                 let fallback_len = reference.region_start + reference.ref_seq.len() as i64 - 1;
                 let chr_len = if chr_len > 0 { chr_len } else { fallback_len };
                 let right_end = (end_position + 20).min(chr_len);
-                vref.rightseq = self.get_reference_range(reference, end_position + 1, right_end);
+                vref.rightseq = self.get_reference_range_with_fallback(
+                    reference,
+                    shared_reference,
+                    region.chr(),
+                    end_position + 1,
+                    right_end,
+                );
 
                 let mut genotype = format!("{}/{}", genotype1current, genotype2)
                     .replace('&', "")
@@ -4418,6 +4600,56 @@ impl VarDictPipeline {
             }
         }
         seq
+    }
+
+    fn get_reference_range_with_fallback(
+        &self,
+        reference: &Reference,
+        shared_reference: Option<&SharedReferenceHandle>,
+        chromosome: &str,
+        start: i64,
+        end: i64,
+    ) -> String {
+        if end < start {
+            return String::new();
+        }
+
+        let reference_end = reference.region_start + reference.ref_seq.len() as i64 - 1;
+        if start >= reference.region_start && end <= reference_end {
+            return self.get_reference_range(reference, start, end);
+        }
+
+        if let Some(shared_reference) = shared_reference {
+            if start > 0 {
+                if let Some(sequence) =
+                    shared_reference.get_subseq(chromosome, start as usize, end as usize)
+                {
+                    return String::from_utf8_lossy(sequence).into_owned();
+                }
+            }
+        }
+
+        self.get_reference_range(reference, start, end)
+    }
+
+    fn get_reference_base_with_fallback(
+        &self,
+        reference: &Reference,
+        shared_reference: Option<&SharedReferenceHandle>,
+        chromosome: &str,
+        position: i64,
+    ) -> Option<u8> {
+        if let Some(base) = reference.get(position) {
+            return Some(base);
+        }
+
+        if position <= 0 {
+            return None;
+        }
+
+        shared_reference
+            .and_then(|shared| shared.get_subseq(chromosome, position as usize, position as usize))
+            .and_then(|sequence| sequence.first().copied())
     }
 
     /// Java-compatible findMSI implementation
@@ -6066,7 +6298,7 @@ mod tests {
         let region = Region::new("chr1".to_string(), 100, 110, "GENE".to_string());
 
         let aligned = pipeline
-            .run_to_vars_builder(input, &reference, &region)
+            .run_to_vars_builder(input, &reference, &region, None)
             .expect("to-vars builder should retain Java-style anchored insertions");
 
         assert_eq!(aligned.aligned_variants_order, vec![position]);
@@ -6109,7 +6341,7 @@ mod tests {
         };
 
         let unanchored_aligned = pipeline
-            .run_to_vars_builder(unanchored_input, &reference, &region)
+            .run_to_vars_builder(unanchored_input, &reference, &region, None)
             .expect("to-vars builder should ignore unanchored insertion-only loci");
 
         assert!(unanchored_aligned.aligned_variants_order.is_empty());
@@ -6197,7 +6429,7 @@ mod tests {
     fn test_record_preprocessor_unmapped_with_alignment_passes() {
         use crate::data::bam_reader::BamReader;
 
-        let bam_path = "/home/eck/workspace/vardict_rs/test_data/test_168714.bam";
+        let bam_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/test_168714.bam");
         let mut bam_reader = BamReader::open(bam_path).expect("Failed to open test BAM");
 
         bam_reader
