@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "type": "command",
+        "command": "python3 .github/hooks/parity_guard.py user-prompt",
+        "timeout": 10
+      }
+    ],
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "python3 .github/hooks/parity_guard.py pre-tool",
+        "timeout": 10
+      }
+    ],
+    "PostToolUse": [
+      {
+        "type": "command",
+        "command": "python3 .github/hooks/parity_guard.py post-tool",
+        "timeout": 10
+      }
+    ]
+  }
+}
