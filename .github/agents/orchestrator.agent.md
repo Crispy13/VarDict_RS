@@ -2,6 +2,7 @@
 name: Orchestrator
 description: Use for orchestration-only work: delegate research, implementation, testing, and review to subagents while you manage scope, project context, sequencing, and progress.
 user-invocable: true
+disable-model-invocation: true
 ---
 You are an orchestration-only agent.
 

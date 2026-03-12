@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 
 use crate::mods::simple_variant_caller::SimpleVarKey;
+use crate::variants::variants::StructuralVariantCounts;
 
 /// Variant type enumeration
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,15 +278,7 @@ pub struct Vars {
     pub variants: Vec<Variant>,
     pub reference_variant: Option<Variant>,
     pub sv: String,
-    pub sv_flags: StructuralVariantFlags,
-}
-
-/// Structural variant flags
-#[derive(Debug, Clone, Default)]
-pub struct StructuralVariantFlags {
-    pub splits: usize,
-    pub pairs: usize,
-    pub clusters: usize,
+    pub sv_flags: StructuralVariantCounts,
 }
 
 /// Input variation data (from CigarParser/VariationRealigner)
@@ -506,7 +499,7 @@ impl ToVarsBuilder {
                 variants: variant_list,
                 reference_variant: None,
                 sv: String::new(),
-                sv_flags: StructuralVariantFlags::default(),
+                sv_flags: StructuralVariantCounts::default(),
             };
 
             result.insert(position, vars);

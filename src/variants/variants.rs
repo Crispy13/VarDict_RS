@@ -60,6 +60,13 @@ impl Variant {
     }
 }
 
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StructuralVariantCounts {
+    pub splits: usize,
+    pub pairs: usize,
+    pub clusters: usize,
+}
+
 /// Variant Description - used as key in variant maps and for tracking complex variants
 ///
 /// Uses SmallVec for inline storage of short sequences (most variants are small)

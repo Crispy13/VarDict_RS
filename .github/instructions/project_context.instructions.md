@@ -21,18 +21,25 @@ You must utilize the following files and directories to maintain project alignme
 - **Agent Rule:** Read this first to understand the active mission. Propose updates only when the mission direction or scope changes.
 - **Agent Rule:** If mission-specific files conflict with generic notes, follow the mission-specific files and surface the conflict.
 
-## 2. Current Working Plan (`copilot-office/<mission-name>/copilot-current-plan.md`)
-- **Purpose:** Tracks immediate next steps, current tasks, and recent progress for the active mission.
-- **Agent Rule:** Read this to know what to work on next. Update this file continuously as tasks are completed or new actionable steps are identified.
-- **Agent Rule:** Keep this file operational and current. Move durable design notes into the mission desk rather than turning the current plan into an archive.
+## 2. Active Plan (`copilot-office/<mission-name>/copilot-active-plan.md`)
+- **Purpose:** Tracks the currently active goal for the mission, including the working backlog, blockers, unresolved decisions, and enough recent context to resume safely.
+- **Agent Rule:** Read this to understand what goal is currently active and what still needs to be achieved.
+- **Agent Rule:** Update this file when the active goal changes materially or when meaningful progress changes the working state.
+- **Agent Rule:** Keep this file operational and current. Compress stale history and move durable design notes into the mission desk rather than turning the active plan into an archive.
 
-## 3. Codebase Overview (`copilot-office/codebase/CODEBASE.md`)
+## 3. Stage Plan (`copilot-office/<mission-name>/copilot-stage-plan.md`)
+- **Purpose:** Defines the next actionable stage to execute for the active goal.
+- **Agent Rule:** Read this file to know what to execute now.
+- **Agent Rule:** Regenerate or rewrite this file when a stage is completed, replaced, or re-scoped.
+- **Agent Rule:** Keep this file short, execution-oriented, and specific enough to drive immediate work.
+
+## 4. Codebase Overview (`copilot-office/codebase/CODEBASE.md`)
 - **Purpose:** Explains shared architectural decisions, main components, and project structure across the workspace.
 - **Agent Rule:** Use this file to understand shared architecture and conventions.
 - **Agent Rule:** Do not let this global file override mission-specific requirements in the active mission folder.
 - **Agent Rule:** Keep this file limited to workspace-wide architecture, common modules, shared infrastructure, and conventions reused by multiple missions.
 - **Agent Rule:** Do not store mission-specific backlog, acceptance criteria, temporary status, or mission-only decisions here. Those belong in the active mission folder.
 
-## 4. Project Desk (`copilot-office/<mission-name>/copilot-desk/`)
+## 5. Project Desk (`copilot-office/<mission-name>/copilot-desk/`)
 - **Purpose:** A directory for storing mission-specific decisions, reference materials, technical specs, and scratchpad notes.
 - **Agent Rule:** Save important design choices, data schemas, and reference snippets here as separate Markdown files to retain knowledge across sessions.

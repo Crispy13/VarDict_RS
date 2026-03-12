@@ -42,7 +42,7 @@ use crate::prelude::LibDefaultHasher;
 use crate::scopedata::global_read_only_scope::GlobalReadOnlyScope;
 use crate::scopedata::global_read_only_scope::instance;
 use crate::utils::round_half_even;
-use crate::variants::variants::{SoftClip, VarDesc, Variant as RawVariant};
+use crate::variants::variants::{SoftClip, StructuralVariantCounts, VarDesc, Variant as RawVariant};
 use rand::Rng;
 
 type RawVarMap = HashMap<VarDesc, RawVariant, LibDefaultHasher>;
@@ -126,6 +126,8 @@ pub struct CigarParserOutput {
     /// Non-insertion variants by position
     pub non_insertion_vars:
         HashMap<i64, HashMap<VarDesc, RawVariant, LibDefaultHasher>, LibDefaultHasher>,
+    /// Java VariationMap.sv equivalent counts by position.
+    pub sv_counts: HashMap<i64, StructuralVariantCounts, LibDefaultHasher>,
     /// Insertion order of non-insertion variant positions
     pub non_insertion_vars_insert_index: HashMap<i64, usize, LibDefaultHasher>,
     /// Insertion variants by position (key is position before insertion)
@@ -300,29 +302,32 @@ fn write_structural_variants_jsonl_snapshot(
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
 
+    write_structural_variants_jsonl_snapshot_to_writer(&mut writer, data, region)?;
+
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_structural_variants_jsonl_snapshot_to_writer<W: Write>(
+    writer: &mut W,
+    data: &RealignedVariationData,
+    region: &Region,
+) -> Result<()> {
+
     let meta = format!(
         "{{\"region\":\"{}\",\"maxReadLength\":{},\"duprate\":\"{}\"}}",
         json_escape(&region.to_region_string()),
         data.max_read_length,
         fmt_f64(data.duprate),
     );
-    write_json_line(&mut writer, "META", 0, "-", &meta)?;
+    write_json_line(writer, "META", 0, "-", &meta)?;
 
-    write_variant_map(&mut writer, "NONINS", &data.non_insertion_variants)?;
-    write_variant_map(&mut writer, "INS", &data.insertion_variants)?;
-    write_ref_cov(&mut writer, &data.ref_coverage)?;
-    write_soft_clips(&mut writer, "SCLIP5", &data.soft_clips_5end, false)?;
-    write_soft_clips(&mut writer, "SCLIP3", &data.soft_clips_3end, false)?;
-    write_sv_clusters(&mut writer, "SVFDEL", &data.svfdel)?;
-    write_sv_clusters(&mut writer, "SVRDEL", &data.svrdel)?;
-    write_sv_clusters(&mut writer, "SVFDUP", &data.svfdup)?;
-    write_sv_clusters(&mut writer, "SVRDUP", &data.svrdup)?;
-    write_sv_clusters(&mut writer, "SVFINV5", &data.svfinv5)?;
-    write_sv_clusters(&mut writer, "SVRINV5", &data.svrinv5)?;
-    write_sv_clusters(&mut writer, "SVFINV3", &data.svfinv3)?;
-    write_sv_clusters(&mut writer, "SVRINV3", &data.svrinv3)?;
+    write_variant_map(writer, "NONINS", &data.non_insertion_variants)?;
+    write_variant_map(writer, "INS", &data.insertion_variants)?;
+    write_ref_cov(writer, &data.ref_coverage)?;
+    write_soft_clips(writer, "SCLIP5", &data.soft_clips_5end, false)?;
+    write_soft_clips(writer, "SCLIP3", &data.soft_clips_3end, false)?;
 
-    writer.flush()?;
     Ok(())
 }
 
@@ -353,17 +358,30 @@ fn write_tovars_jsonl_snapshot(
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
 
+    write_tovars_jsonl_snapshot_to_writer(&mut writer, data, region, max_read_len, duprate)?;
+
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_tovars_jsonl_snapshot_to_writer<W: Write>(
+    writer: &mut W,
+    data: &AlignedVarsData,
+    region: &Region,
+    max_read_len: usize,
+    duprate: f64,
+) -> Result<()> {
+
     let meta = format!(
         "{{\"region\":\"{}\",\"maxReadLength\":{},\"duprate\":\"{}\"}}",
         json_escape(&region.to_region_string()),
         max_read_len,
         fmt_f64(duprate),
     );
-    write_json_line(&mut writer, "META", 0, "-", &meta)?;
+    write_json_line(writer, "META", 0, "-", &meta)?;
 
-    write_tovars_variants(&mut writer, &data.aligned_variants)?;
+    write_tovars_variants(writer, &data.aligned_variants)?;
 
-    writer.flush()?;
     Ok(())
 }
 
@@ -454,7 +472,7 @@ fn write_tovars_variants<W: Write>(writer: &mut W, map: &VarsByPos) -> Result<()
             write_json_line(writer, "VAR", pos, &variant.description_string, &data)?;
         }
         if let Some(ref_variant) = &vars.reference_variant {
-            let data = format!("{{\"variant\":{}}}", tovars_variant_json(ref_variant));
+            let data = format!("{{\"variant\":{}}}", tovars_reference_variant_json(ref_variant));
             write_json_line(writer, "REF", pos, &ref_variant.description_string, &data)?;
         }
     }
@@ -636,15 +654,45 @@ fn tovars_variant_json(v: &Variant) -> String {
     )
 }
 
-fn soft_clip_json(sc: &SoftClip, compute_consensus_if_unset: bool) -> String {
+fn tovars_reference_variant_json(v: &Variant) -> String {
+    let msint = v.msint.round() as i64;
+    format!(
+        "{{\"descriptionString\":\"{}\",\"positionCoverage\":{},\"varsCountOnForward\":{},\"varsCountOnReverse\":{},\"strandBiasFlag\":\"{}\",\"frequency\":\"{}\",\"meanPosition\":\"{}\",\"pstd\":{},\"meanQuality\":\"{}\",\"qstd\":{},\"meanMappingQuality\":\"{}\",\"highQualityReadsFrequency\":\"{}\",\"extraFrequency\":\"{}\",\"shift3\":{},\"msi\":\"{}\",\"msint\":{},\"numberOfMismatches\":\"{}\",\"hicnt\":{},\"hicov\":{},\"leftseq\":\"\",\"rightseq\":\"\",\"startPosition\":0,\"endPosition\":0,\"refReverseCoverage\":0,\"refForwardCoverage\":0,\"totalPosCoverage\":0,\"duprate\":\"{}\",\"genotype\":\"\",\"varallele\":\"\",\"refallele\":\"\",\"varType\":\"Complex\",\"crispr\":0}}",
+        json_escape(&v.description_string),
+        v.position_coverage,
+        v.vars_count_on_forward,
+        v.vars_count_on_reverse,
+        json_escape(&snapshot_reference_strand_bias(v.strand_bias_flag)),
+        fmt_f64_with("0.0000", v.frequency),
+        fmt_f64_with("0.0", v.mean_position),
+        v.is_at_least_at_2_positions,
+        fmt_f64_with("0.0", v.mean_quality),
+        v.has_at_least_2_diff_qualities,
+        fmt_f64_with("0.0", v.mean_mapping_quality),
+        fmt_f64_with("0.0000", v.high_quality_reads_frequency),
+        fmt_f64_with("0.0000", v.extra_frequency),
+        v.shift3,
+        fmt_f64_with("0.000", v.msi),
+        msint,
+        fmt_f64_with("0.0", v.nm),
+        v.high_qual_read_cnt,
+        v.hicov,
+        fmt_f64_with("0.000", v.duprate),
+    )
+}
+
+fn snapshot_reference_strand_bias(flag: StrandBiasFlag) -> String {
+    let bias = if flag.ref_bias == crate::mods::to_vars_builder::StrandBiasValue::CantAssess {
+        flag.var_bias
+    } else {
+        flag.ref_bias
+    };
+    bias.as_int().to_string()
+}
+
+fn soft_clip_json(sc: &SoftClip, _compute_consensus_if_unset: bool) -> String {
     let consensus_bytes = if sc.consensus_seq_is_set() {
         sc.consensus_seq().to_vec()
-    } else if compute_consensus_if_unset {
-        let mut soft_clip_for_snapshot = SoftClip::default();
-        soft_clip_for_snapshot.var = sc.var.clone();
-        soft_clip_for_snapshot.nt = sc.nt.clone();
-        soft_clip_for_snapshot.seq = sc.seq.clone();
-        crate::variants::var_utils::find_conseq(&mut soft_clip_for_snapshot, 0)
     } else {
         Vec::new()
     };
@@ -743,6 +791,8 @@ pub struct RealignedOutput {
     /// Non-insertion variants (may be modified by realigner)
     pub non_insertion_vars:
         HashMap<i64, HashMap<VarDesc, RawVariant, LibDefaultHasher>, LibDefaultHasher>,
+    /// Java VariationMap.sv equivalent counts by position.
+    pub sv_counts: HashMap<i64, StructuralVariantCounts, LibDefaultHasher>,
     /// Insertion order of non-insertion variant positions
     pub non_insertion_vars_insert_index: HashMap<i64, usize, LibDefaultHasher>,
     /// Insertion variants
@@ -2305,6 +2355,7 @@ impl VarDictPipeline {
 
         CigarParserOutput {
             non_insertion_vars: cigar_parser.take_non_insertion_vars(),
+            sv_counts: Default::default(),
             non_insertion_vars_insert_index: cigar_parser.take_non_insertion_vars_insert_index(),
             insertion_vars: cigar_parser.take_insertion_vars(),
             soft_clips_5end: cigar_parser.take_soft_clips_5end(),
@@ -2349,6 +2400,7 @@ impl VarDictPipeline {
 
         let CigarParserOutput {
             non_insertion_vars,
+            sv_counts,
             non_insertion_vars_insert_index,
             insertion_vars,
             soft_clips_5end,
@@ -2376,6 +2428,7 @@ impl VarDictPipeline {
         // Convert CigarParserOutput to RealignedVariationData for SV processor
         let mut sv_input = RealignedVariationData {
             non_insertion_variants: non_insertion_vars,
+            sv_counts,
             insertion_variants: insertion_vars,
             soft_clips_5end,
             soft_clips_3end,
@@ -2462,6 +2515,7 @@ impl VarDictPipeline {
         Ok((
             RealignedOutput {
                 non_insertion_vars: processed.non_insertion_variants,
+                sv_counts: processed.sv_counts,
                 non_insertion_vars_insert_index,
                 insertion_vars: processed.insertion_variants,
                 ref_coverage: processed.ref_coverage,
@@ -2489,6 +2543,7 @@ impl VarDictPipeline {
             aligned_variants_java_capacity - (aligned_variants_java_capacity >> 2);
         let RealignedOutput {
             non_insertion_vars,
+            sv_counts,
             non_insertion_vars_insert_index,
             insertion_vars,
             ref_coverage,
@@ -2626,6 +2681,7 @@ impl VarDictPipeline {
             let sv_string = self.create_variant_records(
                 position,
                 &vars_at_pos,
+                sv_counts.get(&position).copied(),
                 total_pos_coverage,
                 &mut var_list,
                 &mut debug_lines,
@@ -2700,6 +2756,7 @@ impl VarDictPipeline {
 
             if let Some(sv) = sv_string {
                 if let Some(vars_entry) = aligned_variants.get_mut(&position) {
+                    vars_entry.sv_flags = sv_counts.get(&position).copied().unwrap_or_default();
                     vars_entry.sv = sv;
                 }
             }
@@ -2840,6 +2897,7 @@ impl VarDictPipeline {
         &self,
         position: i64,
         vars_at_pos: &RawVarMap,
+        sv_counts: Option<StructuralVariantCounts>,
         total_pos_coverage: usize,
         var_list: &mut Vec<Variant>,
         _debug_lines: &mut Vec<String>,
@@ -2855,12 +2913,11 @@ impl VarDictPipeline {
 
         for desc in keys {
             if matches!(desc, VarDesc::Raw { desc } if desc.as_slice() == b"SV") {
-                if let Some(sv_var) = vars_at_pos.get(desc) {
-                    sv_string = Some(format!(
-                        "{}-{}-{}",
-                        sv_var.high_qual_read_cnt, sv_var.alt_depth, sv_var.low_qual_read_cnt,
-                    ));
-                }
+                let sv_counts = sv_counts.unwrap_or_default();
+                sv_string = Some(format!(
+                    "{}-{}-{}",
+                    sv_counts.splits, sv_counts.pairs, sv_counts.clusters,
+                ));
                 continue;
             }
 
@@ -3560,15 +3617,14 @@ impl VarDictPipeline {
                     start_position - 1,
                 );
 
-                let chr_len = instance().chr_lens.get(region.chr()).copied().unwrap_or(0) as i64;
-                let fallback_len = reference.region_start + reference.ref_seq.len() as i64 - 1;
-                let chr_len = if chr_len > 0 { chr_len } else { fallback_len };
+                let chr_len = self.get_chromosome_end(reference, shared_reference, region.chr());
+                let right_start = end_position + 1;
                 let right_end = (end_position + 20).min(chr_len);
                 vref.rightseq = self.get_reference_range_with_fallback(
                     reference,
                     shared_reference,
                     region.chr(),
-                    end_position + 1,
+                    right_start,
                     right_end,
                 );
 
@@ -4630,6 +4686,25 @@ impl VarDictPipeline {
         }
 
         self.get_reference_range(reference, start, end)
+    }
+
+    fn get_chromosome_end(
+        &self,
+        reference: &Reference,
+        shared_reference: Option<&SharedReferenceHandle>,
+        chromosome: &str,
+    ) -> i64 {
+        if let Some(chr_len) = instance().chr_lens.get(chromosome).copied() {
+            return chr_len as i64;
+        }
+
+        if let Some(shared_reference) = shared_reference {
+            if let Some(chromosome_data) = shared_reference.get_chromosome(chromosome) {
+                return chromosome_data.length as i64;
+            }
+        }
+
+        reference.region_start + reference.ref_seq.len() as i64 - 1
     }
 
     fn get_reference_base_with_fallback(
@@ -6093,6 +6168,166 @@ mod tests {
     }
 
     #[test]
+    fn test_tovars_reference_snapshot_uses_java_surface() {
+        use crate::mods::to_vars_builder::{StrandBiasFlag, StrandBiasValue};
+
+        let mut ref_variant = Variant::new();
+        ref_variant.description_string = "C".to_string();
+        ref_variant.position_coverage = 2;
+        ref_variant.vars_count_on_forward = 1;
+        ref_variant.vars_count_on_reverse = 1;
+        ref_variant.strand_bias_flag =
+            StrandBiasFlag::new(StrandBiasValue::CantAssess, StrandBiasValue::NoBias);
+        ref_variant.frequency = 0.0833;
+        ref_variant.mean_position = 5.5;
+        ref_variant.is_at_least_at_2_positions = true;
+        ref_variant.mean_quality = 2.0;
+        ref_variant.mean_mapping_quality = 0.0;
+        ref_variant.high_quality_reads_frequency = 0.0;
+        ref_variant.extra_frequency = 0.0;
+        ref_variant.msi = 0.0;
+        ref_variant.msint = 0.0;
+        ref_variant.nm = 2.0;
+        ref_variant.hicov = 22;
+        ref_variant.start_position = 18_500_001;
+        ref_variant.end_position = 18_500_001;
+        ref_variant.refallele = "C".to_string();
+        ref_variant.varallele = "C".to_string();
+        ref_variant.genotype = "0/0".to_string();
+        ref_variant.total_pos_coverage = 24;
+        ref_variant.ref_forward_count = 1;
+        ref_variant.ref_reverse_count = 1;
+
+        let vars = make_vars_at_position(18_500_001, Vec::new(), Some(ref_variant));
+        let mut writer = Vec::new();
+        write_tovars_variants(&mut writer, &vars).expect("reference snapshot should serialize");
+
+        let actual = String::from_utf8(writer).expect("utf8 snapshot");
+        assert!(actual.contains("\"type\":\"REF\""));
+        assert!(actual.contains("\"strandBiasFlag\":\"2\""));
+        assert!(!actual.contains("\"strandBiasFlag\":\"0;2\""));
+        assert!(actual.contains("\"startPosition\":0"));
+        assert!(actual.contains("\"endPosition\":0"));
+        assert!(actual.contains("\"refReverseCoverage\":0"));
+        assert!(actual.contains("\"refForwardCoverage\":0"));
+        assert!(actual.contains("\"totalPosCoverage\":0"));
+        assert!(actual.contains("\"genotype\":\"\""));
+        assert!(actual.contains("\"varallele\":\"\""));
+        assert!(actual.contains("\"refallele\":\"\""));
+        assert!(actual.contains("\"varType\":\"Complex\""));
+    }
+
+    #[test]
+    fn test_structural_snapshot_omits_sv_cluster_debug_records() {
+        let region = Region::new("chr1".to_string(), 100, 110, String::new());
+        let mut data = RealignedVariationData::default();
+        data.max_read_length = 101;
+        data.svfdel.push(SoftClip::default());
+        data.svrdup.push(SoftClip::default());
+
+        let mut writer = Vec::new();
+        write_structural_variants_jsonl_snapshot_to_writer(&mut writer, &data, &region)
+            .expect("structural snapshot should serialize");
+
+        let actual = String::from_utf8(writer).expect("utf8 snapshot");
+        assert!(actual.contains("\"type\":\"META\""));
+        assert!(!actual.contains("\"type\":\"SVFDEL\""));
+        assert!(!actual.contains("\"type\":\"SVRDEL\""));
+        assert!(!actual.contains("\"type\":\"SVFDUP\""));
+        assert!(!actual.contains("\"type\":\"SVRDUP\""));
+        assert!(!actual.contains("\"type\":\"SVFINV5\""));
+        assert!(!actual.contains("\"type\":\"SVRINV5\""));
+        assert!(!actual.contains("\"type\":\"SVFINV3\""));
+        assert!(!actual.contains("\"type\":\"SVRINV3\""));
+    }
+
+    #[test]
+    fn test_collect_reference_variants_uses_fallback_for_large_del_rightseq() {
+        use std::sync::Arc;
+
+        use crate::data::shared_reference::{ChromosomeData, SharedReference};
+        use crate::mods::to_vars_builder::{StrandBiasFlag, StrandBiasValue};
+
+        ensure_test_scope_initialized();
+
+        let pipeline = VarDictPipeline::new("sample");
+        let region = Region::new("chr1".to_string(), 100, 130, String::new());
+        let reference = Reference::from_seq_with_start(&vec![b'A'; 31], 100);
+
+        let expected_rightseq = "AACCTGGAACACTGTTTCTT";
+        let mut full_sequence = vec![b'A'; 2200];
+        let right_start = 2105usize;
+        full_sequence[right_start - 1..right_start - 1 + expected_rightseq.len()]
+            .copy_from_slice(expected_rightseq.as_bytes());
+
+        let mut chromosomes =
+            std::collections::HashMap::<String, ChromosomeData, crate::prelude::LibDefaultHasher>::default();
+        chromosomes.insert(
+            "chr1".to_string(),
+            ChromosomeData {
+                sequence: full_sequence,
+                length: 2200,
+            },
+        );
+        let shared_reference = Arc::new(SharedReference {
+            chromosomes,
+            chromosome_names: vec!["chr1".to_string()],
+            total_size: 2200,
+        });
+
+        let mut ref_coverage: RefCovMap = Default::default();
+        ref_coverage.insert(105, 8);
+        let mut non_insertion_vars: RawVarByPos = Default::default();
+        let mut debug_lines = Vec::new();
+
+        let mut ref_variant = Variant::new();
+        ref_variant.description_string = "A".to_string();
+        ref_variant.frequency = 1.0;
+        ref_variant.vars_count_on_forward = 1;
+        ref_variant.vars_count_on_reverse = 1;
+        ref_variant.strand_bias_flag =
+            StrandBiasFlag::new(StrandBiasValue::NoBias, StrandBiasValue::CantAssess);
+
+        let mut deletion_variant = Variant::new();
+        deletion_variant.description_string = "-2000".to_string();
+        deletion_variant.position_coverage = 8;
+        deletion_variant.vars_count_on_forward = 2;
+        deletion_variant.vars_count_on_reverse = 6;
+        deletion_variant.frequency = 1.0;
+        deletion_variant.high_quality_reads_frequency = 1.0;
+        deletion_variant.extra_frequency = 1.0;
+        deletion_variant.mean_position = 41.7;
+        deletion_variant.mean_quality = 35.9;
+        deletion_variant.mean_mapping_quality = 28.2;
+        deletion_variant.hicov = 8;
+
+        let mut vars = Vars {
+            variants: vec![deletion_variant],
+            reference_variant: Some(ref_variant),
+            ..Vars::default()
+        };
+
+        pipeline.collect_reference_variants(
+            105,
+            8,
+            &mut vars,
+            &ref_coverage,
+            &mut non_insertion_vars,
+            &reference,
+            &region,
+            Some(&shared_reference),
+            &mut debug_lines,
+            0.0,
+        );
+
+        let variant = &vars.variants[0];
+        assert_eq!(variant.varallele, "<DEL>");
+        assert_eq!(variant.start_position, 104);
+        assert_eq!(variant.end_position, 2104);
+        assert_eq!(variant.rightseq, expected_rightseq);
+    }
+
+    #[test]
     fn test_pipeline_creation() {
         let pipeline = VarDictPipeline::new("test_sample")
             .with_min_frequency(0.05)
@@ -6139,6 +6374,7 @@ mod tests {
         let _ = pipeline.create_variant_records(
             position,
             &vars_at_pos,
+            None,
             10,
             &mut var_list,
             &mut debug_lines,
@@ -6272,6 +6508,7 @@ mod tests {
                 map.insert(position, RawVarMap::default());
                 map
             },
+            sv_counts: Default::default(),
             non_insertion_vars_insert_index: {
                 let mut map: HashMap<i64, usize, LibDefaultHasher> = Default::default();
                 map.insert(position, 0usize);
@@ -6322,6 +6559,7 @@ mod tests {
 
         let unanchored_input = RealignedOutput {
             non_insertion_vars: Default::default(),
+            sv_counts: Default::default(),
             non_insertion_vars_insert_index: Default::default(),
             insertion_vars: {
                 let mut vars: RawVarMap = Default::default();

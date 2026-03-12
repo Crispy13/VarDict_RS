@@ -28,3 +28,6 @@
 - Use `tracing`-based logging, not `println!`, for new diagnostic output.
 - Prefer measuring before optimizing. Check repository memory notes before retrying known performance ideas that already regressed or proved unstable.
 - When debugging pipeline stages, prefer the existing JSONL fixture and snapshot workflow over ad hoc print-based debugging.
+
+## Note
+- Run `cargo build --profile debug-release` before running `target/debug-release/vardict`.

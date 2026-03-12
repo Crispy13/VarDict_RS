@@ -27,7 +27,7 @@ use crate::data::shared_reference::SharedReferenceHandle;
 use crate::mods::variant_realigner::VariantRealigner;
 use crate::prelude::LibDefaultHasher;
 use crate::scopedata::global_read_only_scope::instance;
-use crate::variants::variants::{SoftClip, VarDesc, Variant};
+use crate::variants::variants::{SoftClip, StructuralVariantCounts, VarDesc, Variant};
 
 /// Input data for StructuralVariantsProcessor (from VariantRealigner)
 #[derive(Default)]
@@ -35,6 +35,8 @@ pub struct RealignedVariationData {
     /// Non-insertion variants by position
     pub non_insertion_variants:
         HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher>,
+    /// Java VariationMap.sv equivalent counts by position.
+    pub sv_counts: HashMap<i64, StructuralVariantCounts, LibDefaultHasher>,
     /// Insertion variants by position
     pub insertion_variants:
         HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher>,
@@ -79,6 +81,12 @@ pub type ProcessedVariationData = RealignedVariationData;
 struct ProcessMemorySnapshot {
     vmrss_kb: usize,
     vmswap_kb: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReferenceWindow {
+    start: i64,
+    end: i64,
 }
 
 fn current_process_memory_snapshot() -> Option<ProcessMemorySnapshot> {
@@ -166,6 +174,10 @@ pub struct StructuralVariantsProcessor {
     bam_paths: Vec<String>,
     /// Shared reference handle for on-demand reference extension
     shared_reference: Option<SharedReferenceHandle>,
+    /// Historical remote windows loaded earlier in SV processing.
+    historical_reference_windows: Vec<ReferenceWindow>,
+    /// Remote windows whose BAM-derived coverage has already been merged into the live data.
+    loaded_reference_coverage_windows: Vec<ReferenceWindow>,
 }
 
 impl StructuralVariantsProcessor {
@@ -187,6 +199,8 @@ impl StructuralVariantsProcessor {
             chromosome: None,
             bam_paths: Vec::new(),
             shared_reference: None,
+            historical_reference_windows: Vec::new(),
+            loaded_reference_coverage_windows: Vec::new(),
         }
     }
 
@@ -209,6 +223,8 @@ impl StructuralVariantsProcessor {
             chromosome,
             bam_paths,
             shared_reference,
+            historical_reference_windows: Vec::new(),
+            loaded_reference_coverage_windows: Vec::new(),
         }
     }
 
@@ -270,6 +286,7 @@ impl StructuralVariantsProcessor {
         append_rss_stage_log_if_enabled(region, "sv_find_del_complete");
         self.find_inv(data, region);
         append_rss_stage_log_if_enabled(region, "sv_find_inv_complete");
+        self.restore_original_reference_window();
         self.find_svs_del_candidates(data, region);
         append_rss_stage_log_if_enabled(region, "sv_find_svs_del_candidates_complete");
         self.find_del_disc(data);
@@ -304,6 +321,7 @@ impl StructuralVariantsProcessor {
                 continue;
             }
 
+            let span_preloaded = self.is_span_loaded(mstart, mend);
             self.ensure_reference_span(mstart - 300, mend + 300);
 
             let softp = Self::select_primary_soft_pos(&soft_map).unwrap_or(0);
@@ -329,6 +347,10 @@ impl StructuralVariantsProcessor {
 
                 if seq.is_empty() || seq.len() < Configuration::SEED_2 as usize {
                     continue;
+                }
+
+                if !span_preloaded {
+                    self.load_uncovered_reference_coverage(data, mstart - 200, mend + 200);
                 }
 
                 let m = self.find_match(&seq, softp, 1, Configuration::SEED_1 as usize, 3);
@@ -384,6 +406,7 @@ impl StructuralVariantsProcessor {
                     .unwrap_or(0);
                 Self::add_sv_counts(
                     &mut data.non_insertion_variants,
+                    &mut data.sv_counts,
                     p5,
                     vars_count,
                     split_count,
@@ -529,6 +552,7 @@ impl StructuralVariantsProcessor {
                         .unwrap_or(0);
                     Self::add_sv_counts(
                         &mut data.non_insertion_variants,
+                        &mut data.sv_counts,
                         candidate,
                         vars_count,
                         split_count,
@@ -623,6 +647,7 @@ impl StructuralVariantsProcessor {
                 continue;
             }
 
+            let span_preloaded = self.is_span_loaded(mstart, mend);
             self.ensure_reference_span(mstart - 300, mend + 300);
 
             let softp = Self::select_primary_soft_pos(&soft_map).unwrap_or(0);
@@ -648,6 +673,10 @@ impl StructuralVariantsProcessor {
 
                 if seq.is_empty() || seq.len() < Configuration::SEED_2 as usize {
                     continue;
+                }
+
+                if !span_preloaded {
+                    self.load_uncovered_reference_coverage(data, mstart - 200, mend + 200);
                 }
 
                 let mut m = self.find_match(&seq, softp, -1, Configuration::SEED_1 as usize, 3);
@@ -697,6 +726,7 @@ impl StructuralVariantsProcessor {
                     .unwrap_or(0);
                 Self::add_sv_counts(
                     &mut data.non_insertion_variants,
+                    &mut data.sv_counts,
                     bp,
                     vars_count,
                     split_count,
@@ -833,6 +863,7 @@ impl StructuralVariantsProcessor {
                         .unwrap_or(0);
                     Self::add_sv_counts(
                         &mut data.non_insertion_variants,
+                        &mut data.sv_counts,
                         bp,
                         vars_count,
                         split_count,
@@ -947,22 +978,14 @@ impl StructuralVariantsProcessor {
                 continue;
             }
 
-            let inv_span_preloaded =
-                self.get_ref_base(inv.mstart).is_some() && self.get_ref_base(inv.mend).is_some();
+            let inv_span_preloaded = self.is_span_loaded(inv.mstart, inv.mend);
             append_rss_stage_log_if_enabled(region, "sv_find_inv_before_ensure_reference_span");
             self.ensure_reference_span(inv.mstart - 500, inv.mend + 500);
             append_rss_stage_log_if_enabled(region, "sv_find_inv_after_ensure_reference_span");
 
             if !inv_span_preloaded {
                 append_rss_stage_log_if_enabled(region, "sv_find_inv_before_load_partial_ref_coverage");
-                let realigner = VariantRealigner::new_with_context(
-                    Arc::clone(&self.reference_seq),
-                    Arc::clone(&self.reference_seed),
-                    self.ref_start,
-                    self.chromosome.clone(),
-                    self.bam_paths.clone(),
-                );
-                realigner.load_partial_ref_coverage(data, inv.mstart - 200, inv.mend + 200);
+                self.load_uncovered_reference_coverage(data, inv.mstart - 200, inv.mend + 200);
                 append_rss_stage_log_if_enabled(region, "sv_find_inv_after_load_partial_ref_coverage");
             }
 
@@ -985,7 +1008,7 @@ impl StructuralVariantsProcessor {
                     if scv_seq.is_empty() {
                         continue;
                     }
-                    let mut m = self.find_match_rev(
+                    let mut m = self.find_match_rev_with_historical(
                         scv_seq,
                         softp,
                         dir,
@@ -993,7 +1016,7 @@ impl StructuralVariantsProcessor {
                         3,
                     );
                     if m.base_position == 0 {
-                        m = self.find_match_rev(
+                        m = self.find_match_rev_with_historical(
                             scv_seq,
                             softp,
                             dir,
@@ -1019,7 +1042,7 @@ impl StructuralVariantsProcessor {
                     if scv_seq.is_empty() {
                         continue;
                     }
-                    let mut m = self.find_match_rev(
+                    let mut m = self.find_match_rev_with_historical(
                         scv_seq,
                         softp,
                         dir,
@@ -1027,7 +1050,7 @@ impl StructuralVariantsProcessor {
                         3,
                     );
                     if m.base_position == 0 {
-                        m = self.find_match_rev(
+                        m = self.find_match_rev_with_historical(
                             scv_seq,
                             softp,
                             dir,
@@ -1059,7 +1082,7 @@ impl StructuralVariantsProcessor {
                         if scv_seq.is_empty() {
                             continue;
                         }
-                        let mut m = self.find_match_rev(
+                        let mut m = self.find_match_rev_with_historical(
                             scv_seq,
                             cp,
                             dir,
@@ -1067,7 +1090,7 @@ impl StructuralVariantsProcessor {
                             3,
                         );
                         if m.base_position == 0 {
-                            m = self.find_match_rev(
+                            m = self.find_match_rev_with_historical(
                                 scv_seq,
                                 cp,
                                 dir,
@@ -1093,7 +1116,7 @@ impl StructuralVariantsProcessor {
                         if scv_seq.is_empty() {
                             continue;
                         }
-                        let mut m = self.find_match_rev(
+                        let mut m = self.find_match_rev_with_historical(
                             scv_seq,
                             cp,
                             dir,
@@ -1101,7 +1124,7 @@ impl StructuralVariantsProcessor {
                             3,
                         );
                         if m.base_position == 0 {
-                            m = self.find_match_rev(
+                            m = self.find_match_rev_with_historical(
                                 scv_seq,
                                 cp,
                                 dir,
@@ -1221,6 +1244,7 @@ impl StructuralVariantsProcessor {
             let gt = format!("-{}^{}", len, ins_final);
             Self::add_sv_counts(
                 &mut data.non_insertion_variants,
+                &mut data.sv_counts,
                 softp,
                 inv.vars_count,
                 scv_var.alt_depth,
@@ -1278,6 +1302,10 @@ impl StructuralVariantsProcessor {
                 self.ref_start,
                 self.chromosome.clone(),
                 self.bam_paths.clone(),
+            )
+            .with_reference_fallback(
+                Arc::clone(&self.original_reference_seq),
+                self.original_ref_start,
             );
             append_rss_stage_log_if_enabled(region, "sv_find_inv_before_process_deletions");
             realigner.process_deletions(data, &dels5);
@@ -1369,6 +1397,7 @@ impl StructuralVariantsProcessor {
 
                     Self::add_sv_counts(
                         &mut data.non_insertion_variants,
+                        &mut data.sv_counts,
                         bp_adj,
                         pairs_data.pairs,
                         cnt5,
@@ -1474,7 +1503,14 @@ impl StructuralVariantsProcessor {
 
                 let _ =
                     Self::get_or_create_variation(&mut data.non_insertion_variants, p5_inv, &vn);
-                Self::add_sv_counts(&mut data.non_insertion_variants, p5_inv, 0, cnt5, 0);
+                Self::add_sv_counts(
+                    &mut data.non_insertion_variants,
+                    &mut data.sv_counts,
+                    p5_inv,
+                    0,
+                    cnt5,
+                    0,
+                );
 
                 if let Some(sc5_var) = sc5_var {
                     let variation = Self::get_or_create_variation(
@@ -1582,6 +1618,7 @@ impl StructuralVariantsProcessor {
 
                     Self::add_sv_counts(
                         &mut data.non_insertion_variants,
+                        &mut data.sv_counts,
                         p3,
                         pairs_data.pairs,
                         cnt3,
@@ -1687,7 +1724,14 @@ impl StructuralVariantsProcessor {
                 }
 
                 let _ = Self::get_or_create_variation(&mut data.non_insertion_variants, p3, &vn);
-                Self::add_sv_counts(&mut data.non_insertion_variants, p3, 0, cnt3, 0);
+                Self::add_sv_counts(
+                    &mut data.non_insertion_variants,
+                    &mut data.sv_counts,
+                    p3,
+                    0,
+                    cnt3,
+                    0,
+                );
 
                 if let Some(sc3_var) = sc3_var {
                     let variation =
@@ -1816,7 +1860,14 @@ impl StructuralVariantsProcessor {
                     .get(&mstart)
                     .map(|s| s.var.alt_depth)
                     .unwrap_or(0);
-            Self::add_sv_counts(&mut data.non_insertion_variants, bp, vars_count, splits, 1);
+            Self::add_sv_counts(
+                &mut data.non_insertion_variants,
+                &mut data.sv_counts,
+                bp,
+                vars_count,
+                splits,
+                1,
+            );
 
             let mut tv = Variant::default();
             tv.alt_depth = 2 * vars_count;
@@ -1889,7 +1940,14 @@ impl StructuralVariantsProcessor {
                     .get(&start)
                     .map(|s| s.var.alt_depth)
                     .unwrap_or(0);
-            Self::add_sv_counts(&mut data.non_insertion_variants, bp, vars_count, splits, 1);
+            Self::add_sv_counts(
+                &mut data.non_insertion_variants,
+                &mut data.sv_counts,
+                bp,
+                vars_count,
+                splits,
+                1,
+            );
 
             if softp != 0 {
                 if let Some(sc) = data.soft_clips_5end.get_mut(&(softp as i64)) {
@@ -2044,7 +2102,14 @@ impl StructuralVariantsProcessor {
                         .get(&ms)
                         .map(|s| s.var.alt_depth)
                         .unwrap_or(0);
-                Self::add_sv_counts(&mut data.non_insertion_variants, bp, cnt, splits, 1);
+                Self::add_sv_counts(
+                    &mut data.non_insertion_variants,
+                    &mut data.sv_counts,
+                    bp,
+                    cnt,
+                    splits,
+                    1,
+                );
 
                 if !data.ref_coverage.contains_key(&bp) {
                     data.ref_coverage.insert(bp, 2 * cnt);
@@ -2177,7 +2242,14 @@ impl StructuralVariantsProcessor {
                         .get(&(me + 1))
                         .map(|s| s.var.alt_depth)
                         .unwrap_or(0);
-                Self::add_sv_counts(&mut data.non_insertion_variants, bp, cnt, splits, 1);
+                Self::add_sv_counts(
+                    &mut data.non_insertion_variants,
+                    &mut data.sv_counts,
+                    bp,
+                    cnt,
+                    splits,
+                    1,
+                );
 
                 if !data.ref_coverage.contains_key(&bp) {
                     data.ref_coverage.insert(bp, 2 * cnt);
@@ -2322,7 +2394,14 @@ impl StructuralVariantsProcessor {
             } else {
                 0
             };
-            Self::add_sv_counts(&mut data.non_insertion_variants, bp, cnt, splits, 1);
+            Self::add_sv_counts(
+                &mut data.non_insertion_variants,
+                &mut data.sv_counts,
+                bp,
+                cnt,
+                splits,
+                1,
+            );
 
             let tcnt = cntr + cntf;
             let mut tmp = Variant::default();
@@ -2336,7 +2415,7 @@ impl StructuralVariantsProcessor {
             tmp.nm = nmf + nmr;
 
             let iref_key = VarDesc::Ins {
-                seq: ins.iter().map(|b| b.to_ascii_uppercase()).collect(),
+                seq: ins.iter().copied().collect(),
             };
             let iref = data
                 .insertion_variants
@@ -2364,7 +2443,14 @@ impl StructuralVariantsProcessor {
             let (clusters, _) =
                 Self::mark_dup_sv(bp, pe, &mut data.svrdup, data.max_read_length as i64);
             if clusters != 0 {
-                Self::add_sv_counts(&mut data.non_insertion_variants, bp, 0, 0, clusters);
+                Self::add_sv_counts(
+                    &mut data.non_insertion_variants,
+                    &mut data.sv_counts,
+                    bp,
+                    0,
+                    0,
+                    clusters,
+                );
             }
         }
 
@@ -2478,7 +2564,14 @@ impl StructuralVariantsProcessor {
                 .get(&tpe)
                 .map(|s| s.var.alt_depth)
                 .unwrap_or(0);
-            Self::add_sv_counts(&mut data.non_insertion_variants, bp, cnt, splits, 1);
+            Self::add_sv_counts(
+                &mut data.non_insertion_variants,
+                &mut data.sv_counts,
+                bp,
+                cnt,
+                splits,
+                1,
+            );
 
             let tcnt = cntr + cntf;
             let mut tmp = Variant::default();
@@ -2492,7 +2585,7 @@ impl StructuralVariantsProcessor {
             tmp.nm = nmf + nmr;
 
             let iref_key = VarDesc::Ins {
-                seq: ins.iter().map(|b| b.to_ascii_uppercase()).collect(),
+                seq: ins.iter().copied().collect(),
             };
             let iref = data
                 .insertion_variants
@@ -2520,7 +2613,14 @@ impl StructuralVariantsProcessor {
             let (clusters, _) =
                 Self::mark_dup_sv(bp, pe, &mut data.svfdup, data.max_read_length as i64);
             if clusters != 0 {
-                Self::add_sv_counts(&mut data.non_insertion_variants, bp, 0, 0, clusters);
+                Self::add_sv_counts(
+                    &mut data.non_insertion_variants,
+                    &mut data.sv_counts,
+                    bp,
+                    0,
+                    0,
+                    clusters,
+                );
             }
         }
     }
@@ -2587,10 +2687,33 @@ impl StructuralVariantsProcessor {
     fn find_match_rev(
         &self,
         seq: &[u8],
+        position: i64,
+        dir: i64,
+        seed_len: usize,
+        mm: usize,
+    ) -> MatchResult {
+        self.find_match_rev_internal(seq, position, dir, seed_len, mm, true)
+    }
+
+    fn find_match_rev_with_historical(
+        &self,
+        seq: &[u8],
+        position: i64,
+        dir: i64,
+        seed_len: usize,
+        mm: usize,
+    ) -> MatchResult {
+        self.find_match_rev_internal(seq, position, dir, seed_len, mm, true)
+    }
+
+    fn find_match_rev_internal(
+        &self,
+        seq: &[u8],
         _position: i64,
         dir: i64,
         seed_len: usize,
         mm: usize,
+        include_historical_windows: bool,
     ) -> MatchResult {
         let mut seq_work = seq.to_vec();
         if dir == 1 {
@@ -2607,7 +2730,7 @@ impl StructuralVariantsProcessor {
 
         for i in (0..=seq_work.len() - seed_len).rev() {
             let seed = &seq_work[i..i + seed_len];
-            let seeds = self.combined_seed_positions(seed);
+            let seeds = self.seed_positions(seed, include_historical_windows);
             if seeds.len() != 1 {
                 continue;
             }
@@ -2796,6 +2919,7 @@ impl StructuralVariantsProcessor {
 
     fn add_sv_counts(
         map: &mut HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher>,
+        sv_counts: &mut HashMap<i64, StructuralVariantCounts, LibDefaultHasher>,
         pos: i64,
         pairs: usize,
         splits: usize,
@@ -2809,10 +2933,11 @@ impl StructuralVariantsProcessor {
             .unwrap_or_else(|| VarDesc::Raw {
                 desc: b"SV".to_vec().into(),
             });
-        let sv = pos_map.entry(key).or_default();
-        sv.alt_depth += pairs;
-        sv.high_qual_read_cnt += splits;
-        sv.low_qual_read_cnt += clusters;
+        pos_map.entry(key).or_default();
+        let sv = sv_counts.entry(pos).or_default();
+        sv.pairs += pairs;
+        sv.splits += splits;
+        sv.clusters += clusters;
     }
 
     fn mark_sv(start: i64, end: i64, clusters: &mut [SoftClip], rlen: i64) {
@@ -2927,7 +3052,10 @@ impl StructuralVariantsProcessor {
 
         for i in (0..=seq_work.len() - seed_len).rev() {
             let seed = &seq_work[i..i + seed_len];
-            let seeds = self.combined_seed_positions(seed);
+            // Java keeps previously loaded structural reference windows reachable
+            // through the same mutable reference object. Search historical windows
+            // here so long-range deletion matching can still resolve earlier spans.
+            let seeds = self.seed_positions(seed, true);
             if seeds.len() != 1 {
                 continue;
             }
@@ -3311,13 +3439,14 @@ impl StructuralVariantsProcessor {
             if self.original_ref_start == self.ref_start
                 && Arc::ptr_eq(&self.original_reference_seq, &self.reference_seq)
             {
-                None
+                self.shared_reference_base(pos)
             } else {
                 Self::get_ref_base_from_window(
                     &self.original_reference_seq,
                     self.original_ref_start,
                     pos,
                 )
+                .or_else(|| self.shared_reference_base(pos))
             }
         })
     }
@@ -3330,22 +3459,38 @@ impl StructuralVariantsProcessor {
         reference_seq.get(idx).copied()
     }
 
-    fn combined_seed_positions(&self, seed: &[u8]) -> Vec<i64> {
+    fn seed_positions(&self, seed: &[u8], include_historical_windows: bool) -> Vec<i64> {
         let mut positions = Vec::new();
+        let reference_window_shifted = !(self.original_ref_start == self.ref_start
+            && Arc::ptr_eq(&self.original_reference_seed, &self.reference_seed));
+        let has_remote_reference_context =
+            reference_window_shifted || !self.historical_reference_windows.is_empty();
 
         if let Some(current) = self.reference_seed.get(seed) {
             positions.extend(current.iter().copied());
         }
 
-        if !(self.original_ref_start == self.ref_start
-            && Arc::ptr_eq(&self.original_reference_seed, &self.reference_seed))
-        {
+        if reference_window_shifted {
             if let Some(original) = self.original_reference_seed.get(seed) {
                 for pos in original {
                     if !positions.contains(pos) {
                         positions.push(*pos);
                     }
                 }
+            }
+        }
+
+        if include_historical_windows {
+            self.extend_seed_positions_from_historical_windows(seed, &mut positions);
+
+            // If a seed looks unique inside the currently loaded windows, verify
+            // that uniqueness against the shared reference before accepting it.
+            // Java's mutable reference object can still discover remote matches
+            // that are not present in the currently seeded windows. Keep local
+            // in-window matching on the original seed map to avoid widening
+            // unique local seeds into unrelated chromosome-wide duplicates.
+            if has_remote_reference_context && positions.len() <= 1 {
+                self.extend_seed_positions_from_shared_reference(seed, &mut positions);
             }
         }
 
@@ -3370,13 +3515,6 @@ impl StructuralVariantsProcessor {
             return;
         }
 
-        let Some(chromosome) = self.chromosome.as_deref() else {
-            return;
-        };
-        let Some(shared_reference) = self.shared_reference.as_ref() else {
-            return;
-        };
-
         let requested_start = start.max(1);
         let requested_end = end.max(requested_start);
 
@@ -3394,8 +3532,17 @@ impl StructuralVariantsProcessor {
             return;
         }
 
-        // Match Java's reference refresh behavior: replace the working window with the
-        // requested span instead of monotonically growing a union of every prior SV span.
+        // Keep prior remote windows only as coordinates for later seed lookups while still
+        // replacing the active contiguous window to avoid the old memory blow-up.
+        self.remember_current_reference_window();
+
+        let Some(chromosome) = self.chromosome.as_deref() else {
+            return;
+        };
+        let Some(shared_reference) = self.shared_reference.as_ref() else {
+            return;
+        };
+
         let new_start = requested_start;
         let new_end = requested_end;
 
@@ -3419,6 +3566,265 @@ impl StructuralVariantsProcessor {
         self.reference_seq = Arc::clone(&self.original_reference_seq);
         self.reference_seed = Arc::clone(&self.original_reference_seed);
         self.ref_start = self.original_ref_start;
+    }
+
+    fn is_span_loaded(&self, start: i64, end: i64) -> bool {
+        if start > end {
+            return false;
+        }
+
+        let mut windows = self.historical_reference_windows.clone();
+
+        if !self.original_reference_seq.is_empty() {
+            windows.push(ReferenceWindow {
+                start: self.original_ref_start,
+                end: self.original_ref_start + self.original_reference_seq.len() as i64 - 1,
+            });
+        }
+
+        if !self.reference_seq.is_empty() {
+            windows.push(ReferenceWindow {
+                start: self.ref_start,
+                end: self.ref_start + self.reference_seq.len() as i64 - 1,
+            });
+        }
+
+        windows
+            .iter()
+            .any(|window| start >= window.start && end <= window.end)
+    }
+
+    fn is_reference_coverage_loaded(&self, start: i64, end: i64) -> bool {
+        if start > end {
+            return false;
+        }
+
+        if !self.original_reference_seq.is_empty() {
+            let original_window = ReferenceWindow {
+                start: self.original_ref_start,
+                end: self.original_ref_start + self.original_reference_seq.len() as i64 - 1,
+            };
+            if start >= original_window.start && end <= original_window.end {
+                return true;
+            }
+        }
+
+        self.loaded_reference_coverage_windows
+            .iter()
+            .any(|window| start >= window.start && end <= window.end)
+    }
+
+    fn uncovered_reference_coverage_spans(&self, start: i64, end: i64) -> Vec<ReferenceWindow> {
+        if start > end {
+            return Vec::new();
+        }
+
+        if self.is_reference_coverage_loaded(start, end) {
+            return Vec::new();
+        }
+
+        let mut covered_windows = self.loaded_reference_coverage_windows.clone();
+        if !self.original_reference_seq.is_empty() {
+            covered_windows.push(ReferenceWindow {
+                start: self.original_ref_start,
+                end: self.original_ref_start + self.original_reference_seq.len() as i64 - 1,
+            });
+        }
+
+        if covered_windows.is_empty() {
+            return vec![ReferenceWindow { start, end }];
+        }
+
+        covered_windows.sort_by_key(|window| window.start);
+
+        let mut merged_covered: Vec<ReferenceWindow> = Vec::with_capacity(covered_windows.len());
+        for window in covered_windows {
+            if let Some(last) = merged_covered.last_mut() {
+                if window.start <= last.end + 1 {
+                    last.end = last.end.max(window.end);
+                    continue;
+                }
+            }
+            merged_covered.push(window);
+        }
+
+        let mut cursor = start;
+        let mut uncovered = Vec::new();
+        for window in merged_covered {
+            if window.end < cursor {
+                continue;
+            }
+            if window.start > end {
+                break;
+            }
+            if window.start > cursor {
+                uncovered.push(ReferenceWindow {
+                    start: cursor,
+                    end: (window.start - 1).min(end),
+                });
+            }
+            cursor = cursor.max(window.end.saturating_add(1));
+            if cursor > end {
+                break;
+            }
+        }
+
+        if cursor <= end {
+            uncovered.push(ReferenceWindow { start: cursor, end });
+        }
+
+        uncovered
+    }
+
+    fn load_uncovered_reference_coverage(
+        &mut self,
+        data: &mut RealignedVariationData,
+        start: i64,
+        end: i64,
+    ) {
+        for window in self.uncovered_reference_coverage_spans(start, end) {
+            let realigner = VariantRealigner::new_with_context(
+                Arc::clone(&self.reference_seq),
+                Arc::clone(&self.reference_seed),
+                self.ref_start,
+                self.chromosome.clone(),
+                self.bam_paths.clone(),
+            );
+            realigner.load_partial_ref_coverage(data, window.start, window.end);
+            self.remember_reference_coverage_window(window.start, window.end);
+        }
+    }
+
+    fn shared_reference_base(&self, pos: i64) -> Option<u8> {
+        let chromosome = self.chromosome.as_deref()?;
+        let shared_reference = self.shared_reference.as_ref()?;
+        let pos = usize::try_from(pos).ok()?;
+        shared_reference.get_base(chromosome, pos)
+    }
+
+    fn remember_current_reference_window(&mut self) {
+        if self.reference_seq.is_empty() {
+            return;
+        }
+
+        if self.ref_start == self.original_ref_start
+            && Arc::ptr_eq(&self.reference_seq, &self.original_reference_seq)
+        {
+            return;
+        }
+
+        let end = self.ref_start + self.reference_seq.len() as i64 - 1;
+        self.remember_reference_window(self.ref_start, end);
+    }
+
+    fn remember_reference_window(&mut self, start: i64, end: i64) {
+        if start > end {
+            return;
+        }
+
+        let window = ReferenceWindow { start, end };
+        if self.historical_reference_windows.contains(&window) {
+            return;
+        }
+
+        self.historical_reference_windows.push(window);
+    }
+
+    fn remember_reference_coverage_window(&mut self, start: i64, end: i64) {
+        if start > end {
+            return;
+        }
+
+        self.loaded_reference_coverage_windows
+            .push(ReferenceWindow { start, end });
+        self.loaded_reference_coverage_windows
+            .sort_by_key(|window| window.start);
+
+        let mut merged_windows: Vec<ReferenceWindow> =
+            Vec::with_capacity(self.loaded_reference_coverage_windows.len());
+        for window in self.loaded_reference_coverage_windows.drain(..) {
+            if let Some(last) = merged_windows.last_mut() {
+                if window.start <= last.end + 1 {
+                    last.end = last.end.max(window.end);
+                    continue;
+                }
+            }
+            merged_windows.push(window);
+        }
+
+        self.loaded_reference_coverage_windows = merged_windows;
+    }
+
+    fn extend_seed_positions_from_historical_windows(
+        &self,
+        seed: &[u8],
+        positions: &mut Vec<i64>,
+    ) {
+        if seed.is_empty() {
+            return;
+        }
+
+        let Some(shared_reference) = self.shared_reference.as_ref() else {
+            return;
+        };
+        let Some(chromosome) = self.chromosome.as_deref() else {
+            return;
+        };
+
+        for window in &self.historical_reference_windows {
+            let Some(sequence) = shared_reference
+                .get_subseq(chromosome, window.start as usize, window.end as usize)
+            else {
+                continue;
+            };
+
+            if sequence.len() < seed.len() {
+                continue;
+            }
+
+            for offset in 0..=sequence.len() - seed.len() {
+                if &sequence[offset..offset + seed.len()] != seed {
+                    continue;
+                }
+
+                let pos = window.start + offset as i64;
+                if !positions.contains(&pos) {
+                    positions.push(pos);
+                }
+            }
+        }
+    }
+
+    fn extend_seed_positions_from_shared_reference(&self, seed: &[u8], positions: &mut Vec<i64>) {
+        if seed.is_empty() {
+            return;
+        }
+
+        let Some(shared_reference) = self.shared_reference.as_ref() else {
+            return;
+        };
+        let Some(chromosome) = self.chromosome.as_deref() else {
+            return;
+        };
+        let Some(chromosome_data) = shared_reference.get_chromosome(chromosome) else {
+            return;
+        };
+
+        let sequence = &chromosome_data.sequence;
+        if sequence.len() < seed.len() {
+            return;
+        }
+
+        for offset in 0..=sequence.len() - seed.len() {
+            if &sequence[offset..offset + seed.len()] != seed {
+                continue;
+            }
+
+            let pos = offset as i64 + 1;
+            if !positions.contains(&pos) {
+                positions.push(pos);
+            }
+        }
     }
 }
 
@@ -3528,6 +3934,7 @@ fn sub_cnt_from_variant(dest: &mut Variant, src: &Variant) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::shared_reference::{ChromosomeData, SharedReference};
 
     #[test]
     fn test_processor_creation() {
@@ -3588,6 +3995,278 @@ mod tests {
 
         assert_eq!(processor.ref_start, 100);
         assert_eq!(processor.reference_seq.as_ref(), b"ACGTACGT");
+    }
+
+    #[test]
+    fn test_seed_positions_search_historical_windows_via_shared_reference() {
+        let chrom = "testchr".to_string();
+        let full_sequence = b"AAAAAAAAAAAAAAAAAAAAACGTACGTACGAACGTACGATTTTTTTTTTTTTTTTTTTT";
+
+        let mut original_reference = Reference::new_with_start(full_sequence[..20].to_vec(), 1);
+        original_reference.build_seed_map(20, Some(full_sequence.len()));
+
+        let mut current_reference = Reference::new_with_start(full_sequence[40..].to_vec(), 41);
+        current_reference.build_seed_map(full_sequence.len() as i64, Some(full_sequence.len()));
+
+        let mut chromosomes: HashMap<String, ChromosomeData, LibDefaultHasher> = Default::default();
+        chromosomes.insert(
+            chrom.clone(),
+            ChromosomeData {
+                sequence: full_sequence.to_vec(),
+                length: full_sequence.len(),
+            },
+        );
+
+        let shared_reference = Arc::new(SharedReference {
+            chromosomes,
+            chromosome_names: vec![chrom.clone()],
+            total_size: full_sequence.len(),
+        });
+
+        let mut processor = StructuralVariantsProcessor::new_with_context(
+            Arc::new(original_reference.ref_seq.clone()),
+            Arc::new(original_reference.seed.clone()),
+            1,
+            Some(chrom),
+            Vec::new(),
+            Some(shared_reference),
+        );
+
+        processor.reference_seq = Arc::new(current_reference.ref_seq.clone());
+        processor.reference_seed = Arc::new(current_reference.seed.clone());
+        processor.ref_start = 41;
+        processor.historical_reference_windows.push(ReferenceWindow { start: 21, end: 40 });
+
+        let seed = b"ACGTACGTACGA";
+        let positions = processor.seed_positions(seed, true);
+
+        assert_eq!(positions, vec![21]);
+        assert_eq!(processor.get_ref_base(25), Some(b'A'));
+    }
+
+    #[test]
+    fn test_seed_positions_search_full_shared_reference_when_not_loaded() {
+        let chrom = "testchr".to_string();
+        let full_sequence = b"AAAAAAAAAAAAAAAAAAAAACGTACGTACGAACGTACGATTTTTTTTTTTTTTTTTTTT";
+
+        let mut original_reference = Reference::new_with_start(full_sequence[..20].to_vec(), 1);
+        original_reference.build_seed_map(20, Some(full_sequence.len()));
+
+        let mut current_reference = Reference::new_with_start(full_sequence[40..].to_vec(), 41);
+        current_reference.build_seed_map(full_sequence.len() as i64, Some(full_sequence.len()));
+
+        let mut chromosomes: HashMap<String, ChromosomeData, LibDefaultHasher> = Default::default();
+        chromosomes.insert(
+            chrom.clone(),
+            ChromosomeData {
+                sequence: full_sequence.to_vec(),
+                length: full_sequence.len(),
+            },
+        );
+
+        let shared_reference = Arc::new(SharedReference {
+            chromosomes,
+            chromosome_names: vec![chrom.clone()],
+            total_size: full_sequence.len(),
+        });
+
+        let mut processor = StructuralVariantsProcessor::new_with_context(
+            Arc::new(original_reference.ref_seq.clone()),
+            Arc::new(original_reference.seed.clone()),
+            1,
+            Some(chrom),
+            Vec::new(),
+            Some(shared_reference),
+        );
+
+        processor.reference_seq = Arc::new(current_reference.ref_seq.clone());
+        processor.reference_seed = Arc::new(current_reference.seed.clone());
+        processor.ref_start = 41;
+
+        let seed = b"ACGTACGTACGA";
+        let positions = processor.seed_positions(seed, true);
+
+        assert_eq!(positions, vec![21]);
+    }
+
+    #[test]
+    fn test_seed_positions_keep_local_window_uniqueness() {
+        let chrom = "testchr".to_string();
+        let full_sequence = b"TTTTTTTTTTACGTACGTACGACCCCCCCCCCCCCCCCCCCCACGTACGTACGAGGGGGGGGGG";
+
+        let mut original_reference = Reference::new_with_start(full_sequence[..35].to_vec(), 1);
+        original_reference.build_seed_map(35, Some(full_sequence.len()));
+
+        let mut chromosomes: HashMap<String, ChromosomeData, LibDefaultHasher> = Default::default();
+        chromosomes.insert(
+            chrom.clone(),
+            ChromosomeData {
+                sequence: full_sequence.to_vec(),
+                length: full_sequence.len(),
+            },
+        );
+
+        let shared_reference = Arc::new(SharedReference {
+            chromosomes,
+            chromosome_names: vec![chrom.clone()],
+            total_size: full_sequence.len(),
+        });
+
+        let processor = StructuralVariantsProcessor::new_with_context(
+            Arc::new(original_reference.ref_seq.clone()),
+            Arc::new(original_reference.seed.clone()),
+            1,
+            Some(chrom),
+            Vec::new(),
+            Some(shared_reference),
+        );
+
+        let seed = b"ACGTACGTACGA";
+        let positions = processor.seed_positions(seed, true);
+
+        assert_eq!(positions, vec![11]);
+    }
+
+    #[test]
+    fn test_seed_positions_search_full_shared_reference_after_restore_with_history() {
+        let chrom = "testchr".to_string();
+        let full_sequence = b"AAAAAAAAAAAAAAAAAAAAACGTACGTACGAACGTACGATTTTTTTTTTTTTTTTTTTT";
+
+        let mut restored_reference = Reference::new_with_start(full_sequence[40..].to_vec(), 41);
+        restored_reference.build_seed_map(full_sequence.len() as i64, Some(full_sequence.len()));
+
+        let mut chromosomes: HashMap<String, ChromosomeData, LibDefaultHasher> = Default::default();
+        chromosomes.insert(
+            chrom.clone(),
+            ChromosomeData {
+                sequence: full_sequence.to_vec(),
+                length: full_sequence.len(),
+            },
+        );
+
+        let shared_reference = Arc::new(SharedReference {
+            chromosomes,
+            chromosome_names: vec![chrom.clone()],
+            total_size: full_sequence.len(),
+        });
+
+        let mut processor = StructuralVariantsProcessor::new_with_context(
+            Arc::new(restored_reference.ref_seq.clone()),
+            Arc::new(restored_reference.seed.clone()),
+            41,
+            Some(chrom),
+            Vec::new(),
+            Some(shared_reference),
+        );
+        processor.historical_reference_windows.push(ReferenceWindow { start: 1, end: 20 });
+
+        let seed = b"ACGTACGTACGA";
+        let positions = processor.seed_positions(seed, true);
+
+        assert_eq!(positions, vec![21]);
+    }
+
+    #[test]
+    fn test_find_match_searches_historical_windows() {
+        let chrom = "testchr".to_string();
+        let full_sequence = b"AAAAAAAAAAAAAAAAAAAAACGTACGTACGAACGTACGATTTTTTTTTTTTTTTTTTTT";
+
+        let mut original_reference = Reference::new_with_start(full_sequence[..20].to_vec(), 1);
+        original_reference.build_seed_map(20, Some(full_sequence.len()));
+
+        let mut current_reference = Reference::new_with_start(full_sequence[40..].to_vec(), 41);
+        current_reference.build_seed_map(full_sequence.len() as i64, Some(full_sequence.len()));
+
+        let mut chromosomes: HashMap<String, ChromosomeData, LibDefaultHasher> = Default::default();
+        chromosomes.insert(
+            chrom.clone(),
+            ChromosomeData {
+                sequence: full_sequence.to_vec(),
+                length: full_sequence.len(),
+            },
+        );
+
+        let shared_reference = Arc::new(SharedReference {
+            chromosomes,
+            chromosome_names: vec![chrom.clone()],
+            total_size: full_sequence.len(),
+        });
+
+        let mut processor = StructuralVariantsProcessor::new_with_context(
+            Arc::new(original_reference.ref_seq.clone()),
+            Arc::new(original_reference.seed.clone()),
+            1,
+            Some(chrom),
+            Vec::new(),
+            Some(shared_reference),
+        );
+
+        processor.reference_seq = Arc::new(current_reference.ref_seq.clone());
+        processor.reference_seed = Arc::new(current_reference.seed.clone());
+        processor.ref_start = 41;
+        processor.historical_reference_windows.push(ReferenceWindow { start: 21, end: 40 });
+
+        let match_result = processor.find_match(b"ACGTACGTACGA", 50, 1, 12, 0);
+
+        assert_eq!(match_result.base_position, 21);
+        assert!(match_result.matched_sequence.is_empty());
+    }
+
+    #[test]
+    fn test_reference_coverage_tracking_is_separate_from_historical_reference_windows() {
+        let mut processor = StructuralVariantsProcessor::new(
+            b"ACGTACGT".to_vec(),
+            Default::default(),
+            100,
+        );
+
+        processor.historical_reference_windows.push(ReferenceWindow { start: 21, end: 40 });
+
+        assert!(processor.is_span_loaded(21, 40));
+        assert!(!processor.is_reference_coverage_loaded(21, 40));
+
+        processor.remember_reference_coverage_window(21, 40);
+
+        assert!(processor.is_reference_coverage_loaded(21, 40));
+    }
+
+    #[test]
+    fn test_reference_coverage_windows_merge_overlaps() {
+        let mut processor = StructuralVariantsProcessor::new(
+            b"ACGTACGT".to_vec(),
+            Default::default(),
+            100,
+        );
+
+        processor.remember_reference_coverage_window(21, 40);
+        processor.remember_reference_coverage_window(35, 55);
+
+        assert_eq!(
+            processor.loaded_reference_coverage_windows,
+            vec![ReferenceWindow { start: 21, end: 55 }]
+        );
+        assert!(processor.is_reference_coverage_loaded(30, 50));
+    }
+
+    #[test]
+    fn test_uncovered_reference_coverage_spans_skip_loaded_segments() {
+        let mut processor = StructuralVariantsProcessor::new(
+            b"ACGTACGT".to_vec(),
+            Default::default(),
+            100,
+        );
+
+        processor.remember_reference_coverage_window(21, 40);
+        processor.remember_reference_coverage_window(60, 80);
+
+        assert_eq!(
+            processor.uncovered_reference_coverage_spans(10, 90),
+            vec![
+                ReferenceWindow { start: 10, end: 20 },
+                ReferenceWindow { start: 41, end: 59 },
+                ReferenceWindow { start: 81, end: 90 },
+            ]
+        );
     }
 
     #[test]
