@@ -620,8 +620,7 @@ fn process_prefetched_region_groups_vardict<P: AsRef<Path>>(
         let group_reference = Arc::clone(&reference);
         let group_scope = Arc::clone(&global_scope);
 
-        let mut group_results: Vec<(usize, RegionResult)> = if let Some(thread_pool) = thread_pool
-        {
+        let mut group_results: Vec<(usize, RegionResult)> = if let Some(thread_pool) = thread_pool {
             thread_pool.install(|| {
                 group
                     .into_par_iter()
@@ -796,10 +795,9 @@ fn process_region_chunk_vardict<P: AsRef<Path>>(
 
         results.push(result);
 
-        if let (Some(path), Some(snapshot)) = (
-            rss_log_path.as_deref(),
-            current_process_memory_snapshot(),
-        ) {
+        if let (Some(path), Some(snapshot)) =
+            (rss_log_path.as_deref(), current_process_memory_snapshot())
+        {
             append_region_memory_log(
                 path,
                 start_thread.elapsed().as_millis(),

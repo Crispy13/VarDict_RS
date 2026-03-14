@@ -1,6 +1,6 @@
 use rust_htslib::bam::{Record, record::Cigar};
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use crate::{
@@ -113,11 +113,7 @@ pub struct VariantRealigner {
 }
 
 impl VariantRealigner {
-    pub fn new(
-        reference_seq: Vec<u8>,
-        reference_seed: ReferenceSeedMap,
-        ref_start: i64,
-    ) -> Self {
+    pub fn new(reference_seq: Vec<u8>, reference_seed: ReferenceSeedMap, ref_start: i64) -> Self {
         Self::new_with_context(
             Arc::new(reference_seq),
             Arc::new(reference_seed),
@@ -210,12 +206,7 @@ impl VariantRealigner {
                 for (desc, variant) in var_map {
                     let desc_str = desc.to_key_string();
                     if desc_str.starts_with('-') {
-                        del_keys.push((
-                            *pos,
-                            desc.clone(),
-                            desc_str,
-                            variant.alt_depth,
-                        ));
+                        del_keys.push((*pos, desc.clone(), desc_str, variant.alt_depth));
                     }
                 }
             }
@@ -286,7 +277,9 @@ impl VariantRealigner {
         var_map: &'a HashMap<VarDesc, Variant, LibDefaultHasher>,
         key_string: &str,
     ) -> Option<&'a VarDesc> {
-        var_map.keys().find(|desc| desc.to_key_string() == key_string)
+        var_map
+            .keys()
+            .find(|desc| desc.to_key_string() == key_string)
     }
 
     pub fn filter_all_sv_structures(&self, data: &mut RealignedVariationData) {
@@ -2260,11 +2253,8 @@ impl VariantRealigner {
                 .map(|v| v.alt_depth)
                 .unwrap_or(0);
 
-            let mut dels: HashMap<
-                i64,
-                HashMap<String, usize, LibDefaultHasher>,
-                LibDefaultHasher,
-            > = Default::default();
+            let mut dels: HashMap<i64, HashMap<String, usize, LibDefaultHasher>, LibDefaultHasher> =
+                Default::default();
             let mut inner: HashMap<String, usize, LibDefaultHasher> = Default::default();
             inner.insert(gt.clone(), tv_before_realign);
             dels.insert(bp, inner);
@@ -2481,11 +2471,8 @@ impl VariantRealigner {
                 .map(|v| v.alt_depth)
                 .unwrap_or(0);
 
-            let mut dels: HashMap<
-                i64,
-                HashMap<String, usize, LibDefaultHasher>,
-                LibDefaultHasher,
-            > = Default::default();
+            let mut dels: HashMap<i64, HashMap<String, usize, LibDefaultHasher>, LibDefaultHasher> =
+                Default::default();
             let mut inner: HashMap<String, usize, LibDefaultHasher> = Default::default();
             inner.insert(gt.clone(), tv_before_realign);
             dels.insert(anchor_pos, inner);
@@ -2676,11 +2663,8 @@ impl VariantRealigner {
                 }
             }
 
-            let mut tins: HashMap<
-                i64,
-                HashMap<String, usize, LibDefaultHasher>,
-                LibDefaultHasher,
-            > = Default::default();
+            let mut tins: HashMap<i64, HashMap<String, usize, LibDefaultHasher>, LibDefaultHasher> =
+                Default::default();
             let mut map: HashMap<String, usize, LibDefaultHasher> = Default::default();
             map.insert(
                 format!("+{}", String::from_utf8_lossy(&ins)),
@@ -2948,11 +2932,8 @@ impl VariantRealigner {
 
             let original_ins_count = iref.alt_depth;
 
-            let mut tins: HashMap<
-                i64,
-                HashMap<String, usize, LibDefaultHasher>,
-                LibDefaultHasher,
-            > = Default::default();
+            let mut tins: HashMap<i64, HashMap<String, usize, LibDefaultHasher>, LibDefaultHasher> =
+                Default::default();
             let mut map: HashMap<String, usize, LibDefaultHasher> = Default::default();
             map.insert(
                 format!("+{}", String::from_utf8_lossy(&ins)),
@@ -4958,16 +4939,10 @@ mod tests {
 
     #[test]
     fn test_merge_variant_maps_preserves_new_variant_fields() {
-        let mut dest: HashMap<
-            i64,
-            HashMap<VarDesc, Variant, LibDefaultHasher>,
-            LibDefaultHasher,
-        > = Default::default();
-        let mut src: HashMap<
-            i64,
-            HashMap<VarDesc, Variant, LibDefaultHasher>,
-            LibDefaultHasher,
-        > = Default::default();
+        let mut dest: HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher> =
+            Default::default();
+        let mut src: HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher> =
+            Default::default();
 
         let key = VarDesc::snv_key(b'A');
         let mut source_variant = Variant::default();
@@ -5063,20 +5038,22 @@ mod tests {
 
         VariantRealigner::move_sv_marker(&mut data, 100, 99);
 
-        assert!(data
-            .non_insertion_variants
-            .get(&99)
-            .and_then(|map| map.get(&key))
-            .is_some());
+        assert!(
+            data.non_insertion_variants
+                .get(&99)
+                .and_then(|map| map.get(&key))
+                .is_some()
+        );
         let moved = data.sv_counts.get(&99).expect("destination SV counts");
         assert_eq!(moved.pairs, 6);
         assert_eq!(moved.splits, 4);
         assert_eq!(moved.clusters, 2);
-        assert!(data
-            .non_insertion_variants
-            .get(&100)
-            .and_then(|map| map.get(&key))
-            .is_none());
+        assert!(
+            data.non_insertion_variants
+                .get(&100)
+                .and_then(|map| map.get(&key))
+                .is_none()
+        );
         assert!(!data.sv_counts.contains_key(&100));
     }
 
@@ -5165,7 +5142,7 @@ mod tests {
         );
         pos_map.insert(
             VarDesc::Ins {
-            seq: b"A".to_vec().into(),
+                seq: b"A".to_vec().into(),
             },
             Variant {
                 alt_depth: 1,
@@ -5291,5 +5268,4 @@ mod tests {
         assert!(sv_input.soft_clips_5end.is_empty());
         assert!(sv_input.soft_clips_3end.is_empty());
     }
-
 }

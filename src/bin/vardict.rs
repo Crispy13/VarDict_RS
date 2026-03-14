@@ -501,11 +501,7 @@ fn run_variant_calling(
                     "[TIMING] Processing all regions: {:.3}s",
                     elapsed_processing.as_secs_f64()
                 );
-                event!(
-                    Level::INFO,
-                    "[TIMING] Output writing: {:.3}s",
-                    0.0f64
-                );
+                event!(Level::INFO, "[TIMING] Output writing: {:.3}s", 0.0f64);
                 event!(
                     Level::INFO,
                     "[TIMING] TOTAL execution: {:.3}s",
@@ -1286,7 +1282,10 @@ mod tests {
             "/tmp/NA12878.mapped.ILLUMINA.bwa.CEU.low_coverage.20121211.bam",
         ));
 
-        assert_eq!(sample, "NA12878.mapped.ILLUMINA.bwa.CEU.low_coverage.20121211");
+        assert_eq!(
+            sample,
+            "NA12878.mapped.ILLUMINA.bwa.CEU.low_coverage.20121211"
+        );
     }
 
     #[test]
@@ -1655,8 +1654,7 @@ mod tests {
             Region::new("chr1".to_string(), 30, 40, "G2".to_string()),
         ];
 
-        let batches =
-            select_region_batches_for_execution(ExecutionMode::Simple, regions, None, 1);
+        let batches = select_region_batches_for_execution(ExecutionMode::Simple, regions, None, 1);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].len(), 2);
     }
@@ -1674,8 +1672,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let batches =
-            select_region_batches_for_execution(ExecutionMode::Simple, regions, None, 1);
+        let batches = select_region_batches_for_execution(ExecutionMode::Simple, regions, None, 1);
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].len(), 65);
@@ -1694,8 +1691,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let batches =
-            select_region_batches_for_execution(ExecutionMode::Simple, regions, None, 4);
+        let batches = select_region_batches_for_execution(ExecutionMode::Simple, regions, None, 4);
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].len(), 10);
@@ -1716,12 +1712,8 @@ mod tests {
             ],
         ];
 
-        let batches = select_region_batches_for_execution(
-            ExecutionMode::Amplicon,
-            regions,
-            Some(groups),
-            1,
-        );
+        let batches =
+            select_region_batches_for_execution(ExecutionMode::Amplicon, regions, Some(groups), 1);
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].len(), 1);
         assert_eq!(batches[1].len(), 2);

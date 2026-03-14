@@ -1731,7 +1731,10 @@ fn format_output_var_type(variant: &Variant) -> String {
         return String::new();
     }
 
-    if variant.varallele.starts_with('<') && variant.varallele.ends_with('>') && variant.varallele.len() >= 5 {
+    if variant.varallele.starts_with('<')
+        && variant.varallele.ends_with('>')
+        && variant.varallele.len() >= 5
+    {
         return var_type_string(&variant.refallele, &variant.varallele);
     }
 

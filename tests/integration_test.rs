@@ -1405,11 +1405,8 @@ fn run_vardict_pipeline_simple_raw_case_with_sv_default(
         }
     }
 
-    let mut chromosomes: std::collections::HashMap<
-        String,
-        ChromosomeData,
-        LibDefaultHasher,
-    > = Default::default();
+    let mut chromosomes: std::collections::HashMap<String, ChromosomeData, LibDefaultHasher> =
+        Default::default();
     let mut chrom_names = vec![resolved_ref_chrom.clone()];
     let shared_data = ChromosomeData {
         sequence: synthetic_sequence.clone(),
@@ -1688,11 +1685,8 @@ fn run_vardict_pipeline_amplicon_raw_case(
         }
     }
 
-    let mut chromosomes: std::collections::HashMap<
-        String,
-        ChromosomeData,
-        LibDefaultHasher,
-    > = Default::default();
+    let mut chromosomes: std::collections::HashMap<String, ChromosomeData, LibDefaultHasher> =
+        Default::default();
     let mut chrom_names = vec![resolved_ref_chrom.clone()];
     let shared_data = ChromosomeData {
         sequence: synthetic_sequence.clone(),
@@ -1984,11 +1978,8 @@ fn run_vardict_pipeline_somatic_raw_case(
         }
     }
 
-    let mut chromosomes: std::collections::HashMap<
-        String,
-        ChromosomeData,
-        LibDefaultHasher,
-    > = Default::default();
+    let mut chromosomes: std::collections::HashMap<String, ChromosomeData, LibDefaultHasher> =
+        Default::default();
     let mut chrom_names = vec![resolved_ref_chrom.clone()];
     let shared_data = ChromosomeData {
         sequence: synthetic_sequence.clone(),
@@ -2517,7 +2508,11 @@ fn test_all_simple_integration() {
             }
         };
         if !bam_path.exists() {
-            eprintln!("SKIP {}: BAM not found at {}", row.case_file, bam_path.display());
+            eprintln!(
+                "SKIP {}: BAM not found at {}",
+                row.case_file,
+                bam_path.display()
+            );
             skipped += 1;
             continue;
         }
@@ -2980,13 +2975,20 @@ fn test_target_bam_na12878_low_coverage_chr11_raw_parity() {
 
     let case_file = "parity_case_inputs/Simple;hs37d5.fa;NA12878.mapped.ILLUMINA.bwa.CEU.low_coverage.20121211.bam;11;402283-410793;-f0.001-target-bam.txt";
     let test_case_path = resolve_manifest_case_file_path(&test_cases_dir, case_file);
-    assert!(test_case_path.exists(), "Missing testcase file: {}", test_case_path.display());
+    assert!(
+        test_case_path.exists(),
+        "Missing testcase file: {}",
+        test_case_path.display()
+    );
 
     let (config, expected_variants) =
         parse_test_case(&test_case_path).expect("Failed to parse target BAM testcase");
     assert_eq!(config.mode, "Simple");
     assert_eq!(config.reference, "hs37d5.fa");
-    assert_eq!(config.bam_file, "NA12878.mapped.ILLUMINA.bwa.CEU.low_coverage.20121211.bam");
+    assert_eq!(
+        config.bam_file,
+        "NA12878.mapped.ILLUMINA.bwa.CEU.low_coverage.20121211.bam"
+    );
     assert_eq!(config.chrom, "11");
 
     let expected_sample_name = expected_sample_name_for_case(&config, &expected_variants);
@@ -3006,7 +3008,11 @@ fn test_target_bam_na12878_low_coverage_chr11_raw_parity() {
 
     match first_raw_mismatch(&expected_lines, &rust_output) {
         None => {
-            assert_eq!(rust_output.len(), 11, "Unexpected target BAM output line count");
+            assert_eq!(
+                rust_output.len(),
+                11,
+                "Unexpected target BAM output line count"
+            );
         }
         Some(diag) => {
             panic!(

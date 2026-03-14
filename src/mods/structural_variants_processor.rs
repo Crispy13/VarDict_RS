@@ -14,15 +14,15 @@ use crackle_kit::{
     tracing::{Level, event},
 };
 use indexmap::IndexMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
-use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::sync::Arc;
 
 use crate::conf::Configuration;
-use crate::data::region::Region;
 use crate::data::reference::{Reference, ReferenceSeedMap};
+use crate::data::region::Region;
 use crate::data::shared_reference::SharedReferenceHandle;
 use crate::mods::variant_realigner::VariantRealigner;
 use crate::prelude::LibDefaultHasher;
@@ -129,7 +129,9 @@ fn append_rss_stage_log_if_enabled(region: Option<&Region>, stage: &str) {
     };
 
     let path = std::path::PathBuf::from(path);
-    let should_write_header = fs::metadata(&path).map(|meta| meta.len() == 0).unwrap_or(true);
+    let should_write_header = fs::metadata(&path)
+        .map(|meta| meta.len() == 0)
+        .unwrap_or(true);
     let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
         Ok(file) => file,
         Err(_) => return,
@@ -176,17 +178,16 @@ pub struct StructuralVariantsProcessor {
     shared_reference: Option<SharedReferenceHandle>,
     /// Historical remote windows loaded earlier in SV processing.
     historical_reference_windows: Vec<ReferenceWindow>,
+    /// DEL variants whose trailing rightseq span was inside the active remote SV window.
+    historical_del_rightseq_variants:
+        HashMap<i64, HashSet<String, LibDefaultHasher>, LibDefaultHasher>,
     /// Remote windows whose BAM-derived coverage has already been merged into the live data.
     loaded_reference_coverage_windows: Vec<ReferenceWindow>,
 }
 
 impl StructuralVariantsProcessor {
     /// Create a new StructuralVariantsProcessor
-    pub fn new(
-        reference_seq: Vec<u8>,
-        reference_seed: ReferenceSeedMap,
-        ref_start: i64,
-    ) -> Self {
+    pub fn new(reference_seq: Vec<u8>, reference_seed: ReferenceSeedMap, ref_start: i64) -> Self {
         let reference_seq = Arc::new(reference_seq);
         let reference_seed = Arc::new(reference_seed);
         StructuralVariantsProcessor {
@@ -200,6 +201,7 @@ impl StructuralVariantsProcessor {
             bam_paths: Vec::new(),
             shared_reference: None,
             historical_reference_windows: Vec::new(),
+            historical_del_rightseq_variants: Default::default(),
             loaded_reference_coverage_windows: Vec::new(),
         }
     }
@@ -224,6 +226,7 @@ impl StructuralVariantsProcessor {
             bam_paths,
             shared_reference,
             historical_reference_windows: Vec::new(),
+            historical_del_rightseq_variants: Default::default(),
             loaded_reference_coverage_windows: Vec::new(),
         }
     }
@@ -278,6 +281,19 @@ impl StructuralVariantsProcessor {
         }
     }
 
+    pub fn historical_reference_windows(&self) -> Vec<(i64, i64)> {
+        self.historical_reference_windows
+            .iter()
+            .map(|window| (window.start, window.end))
+            .collect()
+    }
+
+    pub fn historical_del_rightseq_variants(
+        &self,
+    ) -> HashMap<i64, HashSet<String, LibDefaultHasher>, LibDefaultHasher> {
+        self.historical_del_rightseq_variants.clone()
+    }
+
     /// Find all structural variants (DEL, INV, DUP)
     ///
     /// Called when SV detection is enabled
@@ -286,7 +302,7 @@ impl StructuralVariantsProcessor {
         append_rss_stage_log_if_enabled(region, "sv_find_del_complete");
         self.find_inv(data, region);
         append_rss_stage_log_if_enabled(region, "sv_find_inv_complete");
-        self.restore_original_reference_window();
+        self.restore_original_reference_window_preserving_history();
         self.find_svs_del_candidates(data, region);
         append_rss_stage_log_if_enabled(region, "sv_find_svs_del_candidates_complete");
         self.find_del_disc(data);
@@ -395,6 +411,7 @@ impl StructuralVariantsProcessor {
                 }
 
                 let del_key = format!("-{}", dellen);
+                self.remember_historical_del_rightseq_if_loaded(p5, &del_key);
                 let vref =
                     Self::get_or_create_variation(&mut data.non_insertion_variants, p5, &del_key);
                 vref.alt_depth = 0;
@@ -497,10 +514,21 @@ impl StructuralVariantsProcessor {
                         continue;
                     }
 
-                    let mut m =
-                        self.find_match(&seq, candidate, 1, Configuration::SEED_1 as usize, 3);
+                    let mut m = self.find_match_without_shared_fallback(
+                        &seq,
+                        candidate,
+                        1,
+                        Configuration::SEED_1 as usize,
+                        3,
+                    );
                     if m.base_position == 0 {
-                        m = self.find_match(&seq, candidate, 1, Configuration::SEED_2 as usize, 0);
+                        m = self.find_match_without_shared_fallback(
+                            &seq,
+                            candidate,
+                            1,
+                            Configuration::SEED_2 as usize,
+                            0,
+                        );
                     }
                     if m.base_position == 0 {
                         event!(
@@ -538,6 +566,7 @@ impl StructuralVariantsProcessor {
                     }
 
                     let del_key = format!("-{}", dellen);
+                    self.remember_historical_del_rightseq_if_loaded(candidate, &del_key);
                     let vref = Self::get_or_create_variation(
                         &mut data.non_insertion_variants,
                         candidate,
@@ -715,6 +744,7 @@ impl StructuralVariantsProcessor {
                 }
 
                 let del_key = format!("-{}", dellen);
+                self.remember_historical_del_rightseq_if_loaded(bp, &del_key);
                 let vref =
                     Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &del_key);
                 vref.alt_depth = 0;
@@ -849,6 +879,7 @@ impl StructuralVariantsProcessor {
                     }
 
                     let del_key = format!("-{}", dellen);
+                    self.remember_historical_del_rightseq_if_loaded(bp, &del_key);
                     let vref = Self::get_or_create_variation(
                         &mut data.non_insertion_variants,
                         bp,
@@ -984,9 +1015,15 @@ impl StructuralVariantsProcessor {
             append_rss_stage_log_if_enabled(region, "sv_find_inv_after_ensure_reference_span");
 
             if !inv_span_preloaded {
-                append_rss_stage_log_if_enabled(region, "sv_find_inv_before_load_partial_ref_coverage");
+                append_rss_stage_log_if_enabled(
+                    region,
+                    "sv_find_inv_before_load_partial_ref_coverage",
+                );
                 self.load_uncovered_reference_coverage(data, inv.mstart - 200, inv.mend + 200);
-                append_rss_stage_log_if_enabled(region, "sv_find_inv_after_load_partial_ref_coverage");
+                append_rss_stage_log_if_enabled(
+                    region,
+                    "sv_find_inv_after_load_partial_ref_coverage",
+                );
             }
 
             let mut softp = inv.primary_softp.unwrap_or(0);
@@ -1314,18 +1351,19 @@ impl StructuralVariantsProcessor {
         }
     }
 
-    fn find_svs_del_candidates(&self, data: &mut RealignedVariationData, region: Option<&Region>) {
+    fn find_svs_del_candidates(&mut self, data: &mut RealignedVariationData, region: Option<&Region>) {
         let minr = instance().conf.minr;
-        let region_bounds = region.map(|current_region| {
-            (current_region.start() as i64, current_region.end() as i64)
-        });
+        let region_bounds = region
+            .map(|current_region| (current_region.start() as i64, current_region.end() as i64));
 
         let mut tmp5: Vec<SortPositionSoftClip> = data
             .soft_clips_5end
             .iter()
             .filter(|(_, sclip)| !sclip.used())
             .filter(|(position, _)| {
-                region_bounds.map_or(true, |(start, end)| **position >= start && **position <= end)
+                region_bounds.map_or(true, |(start, end)| {
+                    **position >= start && **position <= end
+                })
             })
             .map(|(position, sclip)| SortPositionSoftClip {
                 position: *position,
@@ -1363,7 +1401,13 @@ impl StructuralVariantsProcessor {
                 continue;
             }
 
-            let m = self.find_match(&seq, p5, -1, Configuration::SEED_1 as usize, 3);
+            let m = self.find_match_without_shared_fallback(
+                &seq,
+                p5,
+                -1,
+                Configuration::SEED_1 as usize,
+                3,
+            );
             let mut bp = m.base_position;
             event!(Level::DEBUG, phase = "findsv_5_candidate", p5, cnt5, bp,);
             if bp != 0 {
@@ -1388,6 +1432,7 @@ impl StructuralVariantsProcessor {
                     }
 
                     let del_key = format!("-{}", dellen);
+                    self.remember_historical_del_rightseq_if_loaded(bp_adj, &del_key);
                     let vref = Self::get_or_create_variation(
                         &mut data.non_insertion_variants,
                         bp_adj,
@@ -1536,7 +1581,9 @@ impl StructuralVariantsProcessor {
             .iter()
             .filter(|(_, sclip)| !sclip.used())
             .filter(|(position, _)| {
-                region_bounds.map_or(true, |(start, end)| **position >= start && **position <= end)
+                region_bounds.map_or(true, |(start, end)| {
+                    **position >= start && **position <= end
+                })
             })
             .map(|(position, sclip)| SortPositionSoftClip {
                 position: *position,
@@ -1574,7 +1621,13 @@ impl StructuralVariantsProcessor {
                 continue;
             }
 
-            let m = self.find_match(&seq, p3, 1, Configuration::SEED_1 as usize, 3);
+            let m = self.find_match_without_shared_fallback(
+                &seq,
+                p3,
+                1,
+                Configuration::SEED_1 as usize,
+                3,
+            );
             let mut bp = m.base_position;
             event!(Level::DEBUG, phase = "findsv_3_candidate", p3, cnt3, bp,);
             if bp != 0 {
@@ -1609,6 +1662,7 @@ impl StructuralVariantsProcessor {
                     }
 
                     let del_key = format!("-{}", dellen);
+                    self.remember_historical_del_rightseq_if_loaded(p3, &del_key);
                     let vref = Self::get_or_create_variation(
                         &mut data.non_insertion_variants,
                         p3,
@@ -2692,7 +2746,7 @@ impl StructuralVariantsProcessor {
         seed_len: usize,
         mm: usize,
     ) -> MatchResult {
-        self.find_match_rev_internal(seq, position, dir, seed_len, mm, true)
+        self.find_match_rev_internal(seq, position, dir, seed_len, mm, true, false)
     }
 
     fn find_match_rev_with_historical(
@@ -2703,7 +2757,7 @@ impl StructuralVariantsProcessor {
         seed_len: usize,
         mm: usize,
     ) -> MatchResult {
-        self.find_match_rev_internal(seq, position, dir, seed_len, mm, true)
+        self.find_match_rev_internal(seq, position, dir, seed_len, mm, true, true)
     }
 
     fn find_match_rev_internal(
@@ -2714,6 +2768,7 @@ impl StructuralVariantsProcessor {
         seed_len: usize,
         mm: usize,
         include_historical_windows: bool,
+        include_shared_reference_fallback: bool,
     ) -> MatchResult {
         let mut seq_work = seq.to_vec();
         if dir == 1 {
@@ -2730,79 +2785,83 @@ impl StructuralVariantsProcessor {
 
         for i in (0..=seq_work.len() - seed_len).rev() {
             let seed = &seq_work[i..i + seed_len];
-            let seeds = self.seed_positions(seed, include_historical_windows);
+            let seeds = if include_shared_reference_fallback {
+                self.seed_positions(seed, include_historical_windows)
+            } else {
+                self.seed_positions_with_scope(seed, include_historical_windows, false)
+            };
             if seeds.len() != 1 {
                 continue;
             }
 
             let first_seed = seeds[0];
-                let mut bp = if dir == 1 {
-                    first_seed + seq_work.len() as i64 - i as i64 - 1
-                } else {
-                    first_seed - i as i64
-                };
+            let mut bp = if dir == 1 {
+                first_seed + seq_work.len() as i64 - i as i64 - 1
+            } else {
+                first_seed - i as i64
+            };
 
-                if self.is_match_ref(&seq_work, bp, -dir, mm) {
-                    return MatchResult {
-                        base_position: bp,
-                        matched_sequence: Vec::new(),
-                    };
+            if self.is_match_ref(&seq_work, bp, -dir, mm) {
+                return MatchResult {
+                    base_position: bp,
+                    matched_sequence: Vec::new(),
+                };
+            }
+
+            let mut window_start = 0usize;
+            let mut window_end = seq_work.len();
+            let mut eqcnt = 0usize;
+            for j in 1..=15 {
+                bp -= dir;
+                if dir == -1 {
+                    window_start += 1;
+                } else {
+                    window_end = window_end.saturating_sub(1);
                 }
 
-                let mut window_start = 0usize;
-                let mut window_end = seq_work.len();
-                let mut eqcnt = 0usize;
-                for j in 1..=15 {
-                    bp -= dir;
-                    if dir == -1 {
-                        window_start += 1;
-                    } else {
-                        window_end = window_end.saturating_sub(1);
+                if window_start >= window_end {
+                    break;
+                }
+
+                let sseq = &seq_work[window_start..window_end];
+
+                let extra = if dir == -1 {
+                    let ch0 = sseq[0];
+                    if self.is_has_and_not_equals(bp, ch0) {
+                        continue;
                     }
-
-                    if window_start >= window_end {
-                        break;
+                    eqcnt += 1;
+                    let ch1 = sseq.get(1).copied().unwrap_or(b'N');
+                    if sseq.len() < 2 || self.is_has_and_not_equals(bp + 1, ch1) {
+                        continue;
                     }
+                    &seq_work[..j]
+                } else {
+                    let ch_last = sseq[sseq.len() - 1];
+                    if self.is_has_and_not_equals(bp, ch_last) {
+                        continue;
+                    }
+                    eqcnt += 1;
+                    if sseq.len() < 2 {
+                        continue;
+                    }
+                    let ch_prev = sseq[sseq.len() - 2];
+                    if self.is_has_and_not_equals(bp - 1, ch_prev) {
+                        continue;
+                    }
+                    &seq_work[seq_work.len() - j..]
+                };
 
-                    let sseq = &seq_work[window_start..window_end];
+                if eqcnt >= 3 && (eqcnt as f64 / j as f64) > 0.5 {
+                    break;
+                }
 
-                    let extra = if dir == -1 {
-                        let ch0 = sseq[0];
-                        if self.is_has_and_not_equals(bp, ch0) {
-                            continue;
-                        }
-                        eqcnt += 1;
-                        let ch1 = sseq.get(1).copied().unwrap_or(b'N');
-                        if sseq.len() < 2 || self.is_has_and_not_equals(bp + 1, ch1) {
-                            continue;
-                        }
-                        &seq_work[..j]
-                    } else {
-                        let ch_last = sseq[sseq.len() - 1];
-                        if self.is_has_and_not_equals(bp, ch_last) {
-                            continue;
-                        }
-                        eqcnt += 1;
-                        if sseq.len() < 2 {
-                            continue;
-                        }
-                        let ch_prev = sseq[sseq.len() - 2];
-                        if self.is_has_and_not_equals(bp - 1, ch_prev) {
-                            continue;
-                        }
-                        &seq_work[seq_work.len() - j..]
+                if self.is_match_ref(&sseq, bp, -dir, 1) {
+                    return MatchResult {
+                        base_position: bp,
+                        matched_sequence: extra.to_vec(),
                     };
-
-                    if eqcnt >= 3 && (eqcnt as f64 / j as f64) > 0.5 {
-                        break;
-                    }
-
-                    if self.is_match_ref(&sseq, bp, -dir, 1) {
-                        return MatchResult {
-                            base_position: bp,
-                            matched_sequence: extra.to_vec(),
-                        };
-                    }
+                }
             }
         }
 
@@ -2887,11 +2946,7 @@ impl StructuralVariantsProcessor {
     }
 
     fn get_or_create_variation<'a>(
-        map: &'a mut HashMap<
-            i64,
-            HashMap<VarDesc, Variant, LibDefaultHasher>,
-            LibDefaultHasher,
-        >,
+        map: &'a mut HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher>,
         pos: i64,
         key_str: &str,
     ) -> &'a mut Variant {
@@ -3034,10 +3089,34 @@ impl StructuralVariantsProcessor {
     fn find_match(
         &self,
         seq: &[u8],
+        position: i64,
+        dir: i64,
+        seed_len: usize,
+        mm: usize,
+    ) -> MatchResult {
+        self.find_match_internal(seq, position, dir, seed_len, mm, true, true)
+    }
+
+    fn find_match_without_shared_fallback(
+        &self,
+        seq: &[u8],
+        position: i64,
+        dir: i64,
+        seed_len: usize,
+        mm: usize,
+    ) -> MatchResult {
+        self.find_match_internal(seq, position, dir, seed_len, mm, false, false)
+    }
+
+    fn find_match_internal(
+        &self,
+        seq: &[u8],
         _position: i64,
         dir: i64,
         seed_len: usize,
         mm: usize,
+        include_historical_windows: bool,
+        include_shared_reference_fallback: bool,
     ) -> MatchResult {
         let mut seq_work = seq.to_vec();
         if dir == -1 {
@@ -3052,100 +3131,101 @@ impl StructuralVariantsProcessor {
 
         for i in (0..=seq_work.len() - seed_len).rev() {
             let seed = &seq_work[i..i + seed_len];
-            // Java keeps previously loaded structural reference windows reachable
-            // through the same mutable reference object. Search historical windows
-            // here so long-range deletion matching can still resolve earlier spans.
-            let seeds = self.seed_positions(seed, true);
+            let seeds = self.seed_positions_with_scope(
+                seed,
+                include_historical_windows,
+                include_shared_reference_fallback,
+            );
             if seeds.len() != 1 {
                 continue;
             }
 
             let first_seed = seeds[0];
-                let mut bp = if dir == 1 {
-                    first_seed - i as i64
-                } else {
-                    first_seed + seq_work.len() as i64 - i as i64 - 1
-                };
+            let mut bp = if dir == 1 {
+                first_seed - i as i64
+            } else {
+                first_seed + seq_work.len() as i64 - i as i64 - 1
+            };
 
-                if self.is_match_ref(&seq_work, bp, dir, mm) {
-                    persistent_extra.clear();
-                    let mut mm_idx: i64 = if dir == -1 { -1 } else { 0 };
-                    loop {
-                        let Some(ch) = Self::char_at(&seq_work, mm_idx) else {
-                            break;
-                        };
-                        if self.is_has_and_not_equals(bp, ch) {
-                            persistent_extra.push(ch);
-                            bp += dir;
-                            mm_idx += dir;
-                        } else {
-                            break;
-                        }
-                    }
-                    if !persistent_extra.is_empty() && dir == -1 {
-                        persistent_extra.reverse();
-                    }
-                    return MatchResult {
-                        base_position: bp,
-                        matched_sequence: persistent_extra,
+            if self.is_match_ref(&seq_work, bp, dir, mm) {
+                persistent_extra.clear();
+                let mut mm_idx: i64 = if dir == -1 { -1 } else { 0 };
+                loop {
+                    let Some(ch) = Self::char_at(&seq_work, mm_idx) else {
+                        break;
                     };
+                    if self.is_has_and_not_equals(bp, ch) {
+                        persistent_extra.push(ch);
+                        bp += dir;
+                        mm_idx += dir;
+                    } else {
+                        break;
+                    }
+                }
+                if !persistent_extra.is_empty() && dir == -1 {
+                    persistent_extra.reverse();
+                }
+                return MatchResult {
+                    base_position: bp,
+                    matched_sequence: persistent_extra,
+                };
+            }
+
+            let mut sseq = seq_work.clone();
+            let mut eqcnt = 0usize;
+            for ii in 1..=15 {
+                bp += dir;
+                sseq = if dir == 1 {
+                    Self::substr_bytes(&sseq, 1, None)
+                } else {
+                    Self::substr_bytes(&sseq, 0, Some(-1))
+                };
+                if sseq.is_empty() {
+                    break;
                 }
 
-                let mut sseq = seq_work.clone();
-                let mut eqcnt = 0usize;
-                for ii in 1..=15 {
-                    bp += dir;
-                    sseq = if dir == 1 {
-                        Self::substr_bytes(&sseq, 1, None)
-                    } else {
-                        Self::substr_bytes(&sseq, 0, Some(-1))
+                let extra = if dir == 1 {
+                    let Some(ch0) = sseq.first().copied() else {
+                        continue;
                     };
-                    if sseq.is_empty() {
-                        break;
+                    if self.is_has_and_not_equals(bp, ch0) {
+                        continue;
                     }
-
-                    let extra = if dir == 1 {
-                        let Some(ch0) = sseq.first().copied() else {
-                            continue;
-                        };
-                        if self.is_has_and_not_equals(bp, ch0) {
-                            continue;
-                        }
-                        eqcnt += 1;
-                        let ch1 = sseq.get(1).copied().unwrap_or(b'N');
-                        if sseq.len() < 2 || self.is_has_and_not_equals(bp + 1, ch1) {
-                            continue;
-                        }
-                        Self::substr_bytes(&seq_work, 0, Some(ii as i64))
-                    } else {
-                        let Some(ch_last) = Self::char_at(&sseq, -1) else {
-                            continue;
-                        };
-                        if self.is_has_and_not_equals(bp, ch_last) {
-                            continue;
-                        }
-                        eqcnt += 1;
-                        let Some(ch_prev) = Self::char_at(&sseq, -2) else {
-                            continue;
-                        };
-                        if self.is_has_and_not_equals(bp - 1, ch_prev) {
-                            continue;
-                        }
-                        Self::substr_bytes(&seq_work, -(ii as i64), None)
+                    eqcnt += 1;
+                    let ch1 = sseq.get(1).copied().unwrap_or(b'N');
+                    if sseq.len() < 2 || self.is_has_and_not_equals(bp + 1, ch1) {
+                        continue;
+                    }
+                    Self::substr_bytes(&seq_work, 0, Some(ii as i64))
+                } else {
+                    let Some(ch_last) = Self::char_at(&sseq, -1) else {
+                        continue;
                     };
-
-                    persistent_extra = extra.clone();
-
-                    if eqcnt >= 3 && (eqcnt as f64 / ii as f64) > 0.5 {
-                        break;
+                    if self.is_has_and_not_equals(bp, ch_last) {
+                        continue;
                     }
-
-                    if self.is_match_ref(&sseq, bp, dir, 1) {
-                        return MatchResult {
-                            base_position: bp,
-                            matched_sequence: extra,
-                        };
+                    eqcnt += 1;
+                    let Some(ch_prev) = Self::char_at(&sseq, -2) else {
+                        continue;
+                    };
+                    if self.is_has_and_not_equals(bp - 1, ch_prev) {
+                        continue;
                     }
+                    Self::substr_bytes(&seq_work, -(ii as i64), None)
+                };
+
+                persistent_extra = extra.clone();
+
+                if eqcnt >= 3 && (eqcnt as f64 / ii as f64) > 0.5 {
+                    break;
+                }
+
+                if self.is_match_ref(&sseq, bp, dir, 1) {
+                    return MatchResult {
+                        base_position: bp,
+                        matched_sequence: extra,
+                    };
+                }
             }
         }
 
@@ -3460,6 +3540,15 @@ impl StructuralVariantsProcessor {
     }
 
     fn seed_positions(&self, seed: &[u8], include_historical_windows: bool) -> Vec<i64> {
+        self.seed_positions_with_scope(seed, include_historical_windows, true)
+    }
+
+    fn seed_positions_with_scope(
+        &self,
+        seed: &[u8],
+        include_historical_windows: bool,
+        include_shared_reference_fallback: bool,
+    ) -> Vec<i64> {
         let mut positions = Vec::new();
         let reference_window_shifted = !(self.original_ref_start == self.ref_start
             && Arc::ptr_eq(&self.original_reference_seed, &self.reference_seed));
@@ -3483,13 +3572,15 @@ impl StructuralVariantsProcessor {
         if include_historical_windows {
             self.extend_seed_positions_from_historical_windows(seed, &mut positions);
 
-            // If a seed looks unique inside the currently loaded windows, verify
-            // that uniqueness against the shared reference before accepting it.
-            // Java's mutable reference object can still discover remote matches
-            // that are not present in the currently seeded windows. Keep local
-            // in-window matching on the original seed map to avoid widening
-            // unique local seeds into unrelated chromosome-wide duplicates.
-            if has_remote_reference_context && positions.len() <= 1 {
+            // The plain candidate-creation reverse matcher should stay aligned
+            // with Java's mutable REF hash: current plus previously loaded
+            // windows are visible, but not an unrestricted chromosome-wide
+            // seed scan. Reserve the shared-reference fallback for the wider
+            // historical matcher used by inversion rescue paths.
+            if include_shared_reference_fallback
+                && has_remote_reference_context
+                && positions.len() <= 1
+            {
                 self.extend_seed_positions_from_shared_reference(seed, &mut positions);
             }
         }
@@ -3566,6 +3657,11 @@ impl StructuralVariantsProcessor {
         self.reference_seq = Arc::clone(&self.original_reference_seq);
         self.reference_seed = Arc::clone(&self.original_reference_seed);
         self.ref_start = self.original_ref_start;
+    }
+
+    fn restore_original_reference_window_preserving_history(&mut self) {
+        self.remember_current_reference_window();
+        self.restore_original_reference_window();
     }
 
     fn is_span_loaded(&self, start: i64, end: i64) -> bool {
@@ -3730,6 +3826,41 @@ impl StructuralVariantsProcessor {
         self.historical_reference_windows.push(window);
     }
 
+    fn remember_historical_del_rightseq_if_loaded(&mut self, position: i64, del_key: &str) {
+        if self.reference_seq.is_empty() {
+            return;
+        }
+
+        if self.ref_start == self.original_ref_start
+            && Arc::ptr_eq(&self.reference_seq, &self.original_reference_seq)
+        {
+            return;
+        }
+
+        let Some(del_len) = del_key.strip_prefix('-').and_then(|suffix| {
+            let digits: String = suffix.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                None
+            } else {
+                digits.parse::<i64>().ok()
+            }
+        }) else {
+            return;
+        };
+
+        let right_start = position + del_len;
+        let right_end = right_start + 19;
+        let current_end = self.ref_start + self.reference_seq.len() as i64 - 1;
+        if right_start < self.ref_start || right_end > current_end {
+            return;
+        }
+
+        self.historical_del_rightseq_variants
+            .entry(position)
+            .or_default()
+            .insert(del_key.to_string());
+    }
+
     fn remember_reference_coverage_window(&mut self, start: i64, end: i64) {
         if start > end {
             return;
@@ -3755,11 +3886,7 @@ impl StructuralVariantsProcessor {
         self.loaded_reference_coverage_windows = merged_windows;
     }
 
-    fn extend_seed_positions_from_historical_windows(
-        &self,
-        seed: &[u8],
-        positions: &mut Vec<i64>,
-    ) {
+    fn extend_seed_positions_from_historical_windows(&self, seed: &[u8], positions: &mut Vec<i64>) {
         if seed.is_empty() {
             return;
         }
@@ -3772,8 +3899,8 @@ impl StructuralVariantsProcessor {
         };
 
         for window in &self.historical_reference_windows {
-            let Some(sequence) = shared_reference
-                .get_subseq(chromosome, window.start as usize, window.end as usize)
+            let Some(sequence) =
+                shared_reference.get_subseq(chromosome, window.start as usize, window.end as usize)
             else {
                 continue;
             };
@@ -3935,24 +4062,19 @@ fn sub_cnt_from_variant(dest: &mut Variant, src: &Variant) {
 mod tests {
     use super::*;
     use crate::data::shared_reference::{ChromosomeData, SharedReference};
+    use crate::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE};
 
     #[test]
     fn test_processor_creation() {
-        let processor = StructuralVariantsProcessor::new(
-            b"ACGTACGT".to_vec(),
-            Default::default(),
-            100,
-        );
+        let processor =
+            StructuralVariantsProcessor::new(b"ACGTACGT".to_vec(), Default::default(), 100);
         assert_eq!(processor.ref_start, 100);
     }
 
     #[test]
     fn test_get_ref_base() {
-        let processor = StructuralVariantsProcessor::new(
-            b"ACGTACGT".to_vec(),
-            Default::default(),
-            100,
-        );
+        let processor =
+            StructuralVariantsProcessor::new(b"ACGTACGT".to_vec(), Default::default(), 100);
 
         assert_eq!(processor.get_ref_base(100), Some(b'A'));
         assert_eq!(processor.get_ref_base(101), Some(b'C'));
@@ -3963,11 +4085,8 @@ mod tests {
 
     #[test]
     fn test_into_reference_preserves_original_region_reference() {
-        let mut processor = StructuralVariantsProcessor::new(
-            b"ACGTACGT".to_vec(),
-            Default::default(),
-            100,
-        );
+        let mut processor =
+            StructuralVariantsProcessor::new(b"ACGTACGT".to_vec(), Default::default(), 100);
 
         processor.reference_seq = Arc::new(b"GT".to_vec());
         processor.reference_seed = Arc::new(Default::default());
@@ -3980,12 +4099,47 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_reference_span_restores_original_window_for_in_region_requests() {
-        let mut processor = StructuralVariantsProcessor::new(
-            b"ACGTACGT".to_vec(),
-            Default::default(),
-            100,
+    fn test_restore_original_reference_window_preserving_history_keeps_remote_window_history() {
+        let mut processor =
+            StructuralVariantsProcessor::new(b"ACGTACGT".to_vec(), Default::default(), 100);
+
+        processor.reference_seq = Arc::new(b"TTGGAACC".to_vec());
+        processor.reference_seed = Arc::new(Default::default());
+        processor.ref_start = 500;
+
+        processor.restore_original_reference_window_preserving_history();
+
+        assert_eq!(
+            processor.historical_reference_windows,
+            vec![ReferenceWindow {
+                start: 500,
+                end: 507,
+            }]
         );
+        assert_eq!(processor.ref_start, 100);
+        assert_eq!(processor.reference_seq.as_ref(), b"ACGTACGT");
+    }
+
+    #[test]
+    fn test_restore_original_reference_window_drops_unrecorded_remote_window_history() {
+        let mut processor =
+            StructuralVariantsProcessor::new(b"ACGTACGT".to_vec(), Default::default(), 100);
+
+        processor.reference_seq = Arc::new(b"TTGGAACC".to_vec());
+        processor.reference_seed = Arc::new(Default::default());
+        processor.ref_start = 500;
+
+        processor.restore_original_reference_window();
+
+        assert!(processor.historical_reference_windows.is_empty());
+        assert_eq!(processor.ref_start, 100);
+        assert_eq!(processor.reference_seq.as_ref(), b"ACGTACGT");
+    }
+
+    #[test]
+    fn test_ensure_reference_span_restores_original_window_for_in_region_requests() {
+        let mut processor =
+            StructuralVariantsProcessor::new(b"ACGTACGT".to_vec(), Default::default(), 100);
 
         processor.reference_seq = Arc::new(b"GT".to_vec());
         processor.reference_seed = Arc::new(Default::default());
@@ -4035,7 +4189,9 @@ mod tests {
         processor.reference_seq = Arc::new(current_reference.ref_seq.clone());
         processor.reference_seed = Arc::new(current_reference.seed.clone());
         processor.ref_start = 41;
-        processor.historical_reference_windows.push(ReferenceWindow { start: 21, end: 40 });
+        processor
+            .historical_reference_windows
+            .push(ReferenceWindow { start: 21, end: 40 });
 
         let seed = b"ACGTACGTACGA";
         let positions = processor.seed_positions(seed, true);
@@ -4158,12 +4314,68 @@ mod tests {
             Vec::new(),
             Some(shared_reference),
         );
-        processor.historical_reference_windows.push(ReferenceWindow { start: 1, end: 20 });
+        processor
+            .historical_reference_windows
+            .push(ReferenceWindow { start: 1, end: 20 });
 
         let seed = b"ACGTACGTACGA";
         let positions = processor.seed_positions(seed, true);
 
         assert_eq!(positions, vec![21]);
+    }
+
+    #[test]
+    fn test_seed_positions_can_skip_shared_reference_fallback_for_plain_reverse_match() {
+        let chrom = "testchr".to_string();
+        let full_sequence = b"AAAAAAAAAAAAAAAAAAAAACGTACGTACGATTTTTTTTTTGGGGGGGGGGACGTACGTACGA";
+
+        let mut original_reference = Reference::new_with_start(full_sequence[..20].to_vec(), 1);
+        original_reference.build_seed_map(20, Some(full_sequence.len()));
+
+        let mut current_reference = Reference::new_with_start(full_sequence[40..].to_vec(), 41);
+        current_reference.build_seed_map(full_sequence.len() as i64, Some(full_sequence.len()));
+
+        let mut chromosomes: HashMap<String, ChromosomeData, LibDefaultHasher> = Default::default();
+        chromosomes.insert(
+            chrom.clone(),
+            ChromosomeData {
+                sequence: full_sequence.to_vec(),
+                length: full_sequence.len(),
+            },
+        );
+
+        let shared_reference = Arc::new(SharedReference {
+            chromosomes,
+            chromosome_names: vec![chrom.clone()],
+            total_size: full_sequence.len(),
+        });
+
+        let mut processor = StructuralVariantsProcessor::new_with_context(
+            Arc::new(original_reference.ref_seq.clone()),
+            Arc::new(original_reference.seed.clone()),
+            1,
+            Some(chrom),
+            Vec::new(),
+            Some(shared_reference),
+        );
+
+        processor.reference_seq = Arc::new(current_reference.ref_seq.clone());
+        processor.reference_seed = Arc::new(current_reference.seed.clone());
+        processor.ref_start = 41;
+        processor
+            .historical_reference_windows
+            .push(ReferenceWindow { start: 21, end: 40 });
+
+        let seed = b"ACGTACGTACGA";
+
+        assert_eq!(
+            processor.seed_positions_with_scope(seed, true, false),
+            vec![21]
+        );
+        assert_eq!(
+            processor.seed_positions_with_scope(seed, true, true),
+            vec![21, 53]
+        );
     }
 
     #[test]
@@ -4204,7 +4416,9 @@ mod tests {
         processor.reference_seq = Arc::new(current_reference.ref_seq.clone());
         processor.reference_seed = Arc::new(current_reference.seed.clone());
         processor.ref_start = 41;
-        processor.historical_reference_windows.push(ReferenceWindow { start: 21, end: 40 });
+        processor
+            .historical_reference_windows
+            .push(ReferenceWindow { start: 21, end: 40 });
 
         let match_result = processor.find_match(b"ACGTACGTACGA", 50, 1, 12, 0);
 
@@ -4213,14 +4427,191 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_coverage_tracking_is_separate_from_historical_reference_windows() {
-        let mut processor = StructuralVariantsProcessor::new(
-            b"ACGTACGT".to_vec(),
-            Default::default(),
-            100,
+    fn test_find_match_without_shared_fallback_skips_global_only_hits() {
+        let chrom = "testchr".to_string();
+        let full_sequence = b"AAAAAAAAAAAAAAAAAAAAACGTACGTACGATTTTTTTTTTTTTTTTTTTTTTTTTTTT";
+
+        let mut original_reference = Reference::new_with_start(full_sequence[..20].to_vec(), 1);
+        original_reference.build_seed_map(20, Some(full_sequence.len()));
+
+        let mut current_reference = Reference::new_with_start(full_sequence[40..].to_vec(), 41);
+        current_reference.build_seed_map(full_sequence.len() as i64, Some(full_sequence.len()));
+
+        let mut chromosomes: HashMap<String, ChromosomeData, LibDefaultHasher> = Default::default();
+        chromosomes.insert(
+            chrom.clone(),
+            ChromosomeData {
+                sequence: full_sequence.to_vec(),
+                length: full_sequence.len(),
+            },
         );
 
-        processor.historical_reference_windows.push(ReferenceWindow { start: 21, end: 40 });
+        let shared_reference = Arc::new(SharedReference {
+            chromosomes,
+            chromosome_names: vec![chrom.clone()],
+            total_size: full_sequence.len(),
+        });
+
+        let mut processor = StructuralVariantsProcessor::new_with_context(
+            Arc::new(original_reference.ref_seq.clone()),
+            Arc::new(original_reference.seed.clone()),
+            1,
+            Some(chrom),
+            Vec::new(),
+            Some(shared_reference),
+        );
+
+        processor.reference_seq = Arc::new(current_reference.ref_seq.clone());
+        processor.reference_seed = Arc::new(current_reference.seed.clone());
+        processor.ref_start = 41;
+
+        assert_eq!(
+            processor
+                .find_match(b"ACGTACGTACGA", 50, 1, 12, 0)
+                .base_position,
+            21
+        );
+        assert_eq!(
+            processor
+                .find_match_without_shared_fallback(b"ACGTACGTACGA", 50, 1, 12, 0)
+                .base_position,
+            0
+        );
+    }
+
+    #[test]
+    fn test_find_match_without_shared_fallback_skips_historical_window_hits() {
+        let chrom = "testchr".to_string();
+        let full_sequence = b"AAAAAAAAAAAAAAAAAAAAACGTACGTACGAACGTACGATTTTTTTTTTTTTTTTTTTT";
+
+        let mut original_reference = Reference::new_with_start(full_sequence[..20].to_vec(), 1);
+        original_reference.build_seed_map(20, Some(full_sequence.len()));
+
+        let mut current_reference = Reference::new_with_start(full_sequence[40..].to_vec(), 41);
+        current_reference.build_seed_map(full_sequence.len() as i64, Some(full_sequence.len()));
+
+        let mut chromosomes: HashMap<String, ChromosomeData, LibDefaultHasher> = Default::default();
+        chromosomes.insert(
+            chrom.clone(),
+            ChromosomeData {
+                sequence: full_sequence.to_vec(),
+                length: full_sequence.len(),
+            },
+        );
+
+        let shared_reference = Arc::new(SharedReference {
+            chromosomes,
+            chromosome_names: vec![chrom.clone()],
+            total_size: full_sequence.len(),
+        });
+
+        let mut processor = StructuralVariantsProcessor::new_with_context(
+            Arc::new(original_reference.ref_seq.clone()),
+            Arc::new(original_reference.seed.clone()),
+            1,
+            Some(chrom),
+            Vec::new(),
+            Some(shared_reference),
+        );
+
+        processor.reference_seq = Arc::new(current_reference.ref_seq.clone());
+        processor.reference_seed = Arc::new(current_reference.seed.clone());
+        processor.ref_start = 41;
+        processor
+            .historical_reference_windows
+            .push(ReferenceWindow { start: 21, end: 40 });
+
+        assert_eq!(
+            processor
+                .find_match(b"ACGTACGTACGA", 50, 1, 12, 0)
+                .base_position,
+            21
+        );
+        assert_eq!(
+            processor
+                .find_match_without_shared_fallback(b"ACGTACGTACGA", 50, 1, 12, 0)
+                .base_position,
+            0
+        );
+    }
+
+    #[test]
+    fn test_find_del_forward_nosoftp_uses_java_like_match_scope() {
+        let _ = INSTANCE.get_or_init(GlobalReadOnlyScope::default);
+
+        let chrom = "testchr".to_string();
+        let seq = b"ACGTACGTACGA";
+        let mut full_sequence = vec![b'A'; 1000];
+        full_sequence[349..349 + seq.len()].copy_from_slice(seq);
+        full_sequence[799..799 + seq.len()].copy_from_slice(seq);
+
+        let mut original_reference = Reference::new_with_start(full_sequence[..100].to_vec(), 1);
+        original_reference.build_seed_map(100, Some(full_sequence.len()));
+
+        let mut chromosomes: HashMap<String, ChromosomeData, LibDefaultHasher> = Default::default();
+        chromosomes.insert(
+            chrom.clone(),
+            ChromosomeData {
+                sequence: full_sequence,
+                length: 1000,
+            },
+        );
+
+        let shared_reference = Arc::new(SharedReference {
+            chromosomes,
+            chromosome_names: vec![chrom.clone()],
+            total_size: 1000,
+        });
+
+        let mut processor = StructuralVariantsProcessor::new_with_context(
+            Arc::new(original_reference.ref_seq.clone()),
+            Arc::new(original_reference.seed.clone()),
+            1,
+            Some(chrom),
+            Vec::new(),
+            Some(shared_reference),
+        );
+
+        let mut data = RealignedVariationData {
+            max_read_length: 100,
+            ..Default::default()
+        };
+
+        let mut del = SoftClip::default();
+        del.end = 300;
+        del.mstart = 340;
+        del.mend = 360;
+        del.var.alt_depth = 10;
+        data.svfdel.push(del);
+
+        let mut scv = SoftClip::default();
+        scv.var.alt_depth = 1;
+        scv.var.alt_depth_rev = 1;
+        scv.set_consensus_seq(seq.to_vec());
+        data.soft_clips_3end.insert(300, scv);
+
+        processor.find_del(&mut data);
+
+        let emitted = data
+            .non_insertion_variants
+            .get(&300)
+            .and_then(|pos_map| pos_map.iter().find(|(key, _)| key.to_string() == "-50"))
+            .map(|(_, variant)| variant.alt_depth);
+
+        assert_eq!(emitted, Some(11));
+        assert_eq!(data.sv_counts.get(&300).map(|sv| sv.pairs), Some(10));
+        assert_eq!(data.sv_counts.get(&300).map(|sv| sv.splits), Some(1));
+        assert!(data.svfdel[0].used());
+    }
+
+    #[test]
+    fn test_reference_coverage_tracking_is_separate_from_historical_reference_windows() {
+        let mut processor =
+            StructuralVariantsProcessor::new(b"ACGTACGT".to_vec(), Default::default(), 100);
+
+        processor
+            .historical_reference_windows
+            .push(ReferenceWindow { start: 21, end: 40 });
 
         assert!(processor.is_span_loaded(21, 40));
         assert!(!processor.is_reference_coverage_loaded(21, 40));
@@ -4232,11 +4623,8 @@ mod tests {
 
     #[test]
     fn test_reference_coverage_windows_merge_overlaps() {
-        let mut processor = StructuralVariantsProcessor::new(
-            b"ACGTACGT".to_vec(),
-            Default::default(),
-            100,
-        );
+        let mut processor =
+            StructuralVariantsProcessor::new(b"ACGTACGT".to_vec(), Default::default(), 100);
 
         processor.remember_reference_coverage_window(21, 40);
         processor.remember_reference_coverage_window(35, 55);
@@ -4250,11 +4638,8 @@ mod tests {
 
     #[test]
     fn test_uncovered_reference_coverage_spans_skip_loaded_segments() {
-        let mut processor = StructuralVariantsProcessor::new(
-            b"ACGTACGT".to_vec(),
-            Default::default(),
-            100,
-        );
+        let mut processor =
+            StructuralVariantsProcessor::new(b"ACGTACGT".to_vec(), Default::default(), 100);
 
         processor.remember_reference_coverage_window(21, 40);
         processor.remember_reference_coverage_window(60, 80);

@@ -172,7 +172,8 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
             flag |= self.normalize_back_indel_softclip(&mut cigar_vec);
             flag |= self.normalize_front_softclip_match_indel(&mut ref_start_pos, &mut cigar_vec);
             flag |= self.normalize_back_indel_match_softclip(&mut cigar_vec);
-            flag |= self.normalize_front_short_match_indel_match(&mut ref_start_pos, &mut cigar_vec)?;
+            flag |=
+                self.normalize_front_short_match_indel_match(&mut ref_start_pos, &mut cigar_vec)?;
             flag |= self.normalize_back_indel_short_match(&mut cigar_vec);
 
             if let Some(pattern_match) = find_primary_realign_pattern(&cigar_vec) {
@@ -186,11 +187,16 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                         )?;
                     }
                     PrimaryRealignPattern::ThreeDeletions(si_and_c_lens) => {
-                        flag =
-                            self.three_deletions(ref_start_pos, &mut cigar_vec, si_and_c_lens, flag)?;
+                        flag = self.three_deletions(
+                            ref_start_pos,
+                            &mut cigar_vec,
+                            si_and_c_lens,
+                            flag,
+                        )?;
                     }
                     PrimaryRealignPattern::ThreeIndels(si_and_cigars) => {
-                        flag = self.three_indels(ref_start_pos, &mut cigar_vec, si_and_cigars, flag)?;
+                        flag =
+                            self.three_indels(ref_start_pos, &mut cigar_vec, si_and_cigars, flag)?;
                     }
                 }
             }
@@ -337,8 +343,18 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
                 Some(c_id @ (Cigar::Ins(idl) | Cigar::Del(idl))),
                 Some(Cigar::Match(mut ml2)),
             ) if ml1 < 10 => {
-                let mut tslen = ml1 + if matches!(c_id, Cigar::Ins(_)) { idl } else { 0 };
-                *ref_start_pos += ml1 + if matches!(c_id, Cigar::Del(_)) { idl } else { 0 };
+                let mut tslen = ml1
+                    + if matches!(c_id, Cigar::Ins(_)) {
+                        idl
+                    } else {
+                        0
+                    };
+                *ref_start_pos += ml1
+                    + if matches!(c_id, Cigar::Del(_)) {
+                        idl
+                    } else {
+                        0
+                    };
 
                 let mut tn = 0;
                 while tn < ml2
@@ -423,7 +439,12 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
             (Some(Cigar::Match(ml)), Some(c_id @ (Cigar::Ins(idl) | Cigar::Del(idl))))
                 if ml < 10 =>
             {
-                let tslen = ml + if matches!(c_id, Cigar::Ins(_)) { idl } else { 0 };
+                let tslen = ml
+                    + if matches!(c_id, Cigar::Ins(_)) {
+                        idl
+                    } else {
+                        0
+                    };
 
                 cigar_vec.pop_back().unwrap();
                 *cigar_vec.back_mut().unwrap() = Cigar::SoftClip(tslen);
@@ -605,22 +626,12 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
             let seq_idx = (rdoff - rrn - 1) as usize;
 
             if rrn < rdoff
-                && is_has_and_not_equals_ref_and_seq_base(
-                    ref_seq,
-                    ref_idx,
-                    query_sequence,
-                    seq_idx,
-                )
+                && is_has_and_not_equals_ref_and_seq_base(ref_seq, ref_idx, query_sequence, seq_idx)
             {
                 rn = rrn + 1;
                 rmch = 0;
             } else if rrn < rdoff
-                && is_has_and_equals_ref_and_seq_base(
-                    ref_seq,
-                    ref_idx,
-                    query_sequence,
-                    seq_idx,
-                )
+                && is_has_and_equals_ref_and_seq_base(ref_seq, ref_idx, query_sequence, seq_idx)
             {
                 rmch += 1;
             }
@@ -1211,7 +1222,11 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
         while rrn < mch && rn < mch {
             let ref_idx = (*cigar_pos as i32 + rrn) as usize;
             let seq_idx = rrn as usize;
-            if self.contig_ref_seq().get((*cigar_pos as i32 + rrn) as usize).is_none() {
+            if self
+                .contig_ref_seq()
+                .get((*cigar_pos as i32 + rrn) as usize)
+                .is_none()
+            {
                 break;
             }
 
@@ -1344,14 +1359,13 @@ fn find_primary_realign_pattern(cigar: &VecDeque<Cigar>) -> Option<PrimaryRealig
                 &Cigar::Match(i7),
             ) => {
                 if first_three_deletions.is_none() {
-                    first_three_deletions = Some(PrimaryRealignPattern::ThreeDeletions(
-                        PrimaryPatternMatch {
+                    first_three_deletions =
+                        Some(PrimaryRealignPattern::ThreeDeletions(PrimaryPatternMatch {
                             start_idx: i,
                             prefix_ref_len,
                             prefix_read_len,
                             pattern: [i1, i2, i3, i4, i5, i6, i7],
-                        },
-                    ));
+                        }));
                 }
             }
             (
@@ -1364,14 +1378,13 @@ fn find_primary_realign_pattern(cigar: &VecDeque<Cigar>) -> Option<PrimaryRealig
                 &c7 @ Cigar::Match(_),
             ) => {
                 if first_three_indels.is_none() {
-                    first_three_indels = Some(PrimaryRealignPattern::ThreeIndels(
-                        PrimaryPatternMatch {
+                    first_three_indels =
+                        Some(PrimaryRealignPattern::ThreeIndels(PrimaryPatternMatch {
                             start_idx: i,
                             prefix_ref_len,
                             prefix_read_len,
                             pattern: [c1, c2, c3, c4, c5, c6, c7],
-                        },
-                    ));
+                        }));
                 }
             }
             _ => {}
@@ -1399,7 +1412,10 @@ fn accumulate_cigar_offsets(cigar: Cigar, ref_len: &mut u32, read_len: &mut u32)
     }
 }
 
-fn terminal_cigar_offsets(align_start_pos: u32, cigar_vd: &VecDeque<Cigar>) -> TerminalCigarOffsets {
+fn terminal_cigar_offsets(
+    align_start_pos: u32,
+    cigar_vd: &VecDeque<Cigar>,
+) -> TerminalCigarOffsets {
     let mut ref_offset = align_start_pos;
     let mut read_offset = 0u32;
 
@@ -1607,10 +1623,9 @@ mod tests {
 
         assert!(matches!(
             found,
-            Some(PrimaryRealignPattern::TwoDelsInsToComplex(PrimaryPatternMatch {
-                start_idx: 7,
-                ..
-            }))
+            Some(PrimaryRealignPattern::TwoDelsInsToComplex(
+                PrimaryPatternMatch { start_idx: 7, .. }
+            ))
         ));
     }
 
@@ -1637,12 +1652,14 @@ mod tests {
 
         assert!(matches!(
             found,
-            Some(PrimaryRealignPattern::TwoDelsInsToComplex(PrimaryPatternMatch {
-                start_idx: 2,
-                prefix_ref_len: 3,
-                prefix_read_len: 5,
-                ..
-            }))
+            Some(PrimaryRealignPattern::TwoDelsInsToComplex(
+                PrimaryPatternMatch {
+                    start_idx: 2,
+                    prefix_ref_len: 3,
+                    prefix_read_len: 5,
+                    ..
+                }
+            ))
         ));
     }
 

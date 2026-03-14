@@ -42,7 +42,9 @@ use crate::prelude::LibDefaultHasher;
 use crate::scopedata::global_read_only_scope::GlobalReadOnlyScope;
 use crate::scopedata::global_read_only_scope::instance;
 use crate::utils::round_half_even;
-use crate::variants::variants::{SoftClip, StructuralVariantCounts, VarDesc, Variant as RawVariant};
+use crate::variants::variants::{
+    SoftClip, StructuralVariantCounts, VarDesc, Variant as RawVariant,
+};
 use rand::Rng;
 
 type RawVarMap = HashMap<VarDesc, RawVariant, LibDefaultHasher>;
@@ -51,6 +53,7 @@ type CountMap = HashMap<String, usize, LibDefaultHasher>;
 type CountByPos = HashMap<i64, CountMap, LibDefaultHasher>;
 type RefCovMap = HashMap<i64, usize, LibDefaultHasher>;
 type VarsByPos = HashMap<i64, Vars, LibDefaultHasher>;
+type HistoricalDelRightseqMap = HashMap<i64, HashSet<String, LibDefaultHasher>, LibDefaultHasher>;
 
 #[derive(Clone, Copy)]
 struct ProcessMemorySnapshot {
@@ -94,7 +97,9 @@ fn append_rss_stage_log_if_enabled(region: &Region, elapsed_ms: u128, stage: &st
     };
 
     let path = std::path::PathBuf::from(path);
-    let should_write_header = fs::metadata(&path).map(|meta| meta.len() == 0).unwrap_or(true);
+    let should_write_header = fs::metadata(&path)
+        .map(|meta| meta.len() == 0)
+        .unwrap_or(true);
     let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
         Ok(file) => file,
         Err(_) => return,
@@ -313,7 +318,6 @@ fn write_structural_variants_jsonl_snapshot_to_writer<W: Write>(
     data: &RealignedVariationData,
     region: &Region,
 ) -> Result<()> {
-
     let meta = format!(
         "{{\"region\":\"{}\",\"maxReadLength\":{},\"duprate\":\"{}\"}}",
         json_escape(&region.to_region_string()),
@@ -371,7 +375,6 @@ fn write_tovars_jsonl_snapshot_to_writer<W: Write>(
     max_read_len: usize,
     duprate: f64,
 ) -> Result<()> {
-
     let meta = format!(
         "{{\"region\":\"{}\",\"maxReadLength\":{},\"duprate\":\"{}\"}}",
         json_escape(&region.to_region_string()),
@@ -435,11 +438,7 @@ fn write_json_line<W: Write>(
     Ok(())
 }
 
-fn write_variant_map<W: Write>(
-    writer: &mut W,
-    line_type: &str,
-    map: &RawVarByPos,
-) -> Result<()> {
+fn write_variant_map<W: Write>(writer: &mut W, line_type: &str, map: &RawVarByPos) -> Result<()> {
     let mut positions: Vec<i64> = map.keys().copied().collect();
     positions.sort_unstable();
 
@@ -472,7 +471,10 @@ fn write_tovars_variants<W: Write>(writer: &mut W, map: &VarsByPos) -> Result<()
             write_json_line(writer, "VAR", pos, &variant.description_string, &data)?;
         }
         if let Some(ref_variant) = &vars.reference_variant {
-            let data = format!("{{\"variant\":{}}}", tovars_reference_variant_json(ref_variant));
+            let data = format!(
+                "{{\"variant\":{}}}",
+                tovars_reference_variant_json(ref_variant)
+            );
             write_json_line(writer, "REF", pos, &ref_variant.description_string, &data)?;
         }
     }
@@ -491,11 +493,7 @@ fn write_ref_cov<W: Write>(writer: &mut W, map: &RefCovMap) -> Result<()> {
     Ok(())
 }
 
-fn write_count_map<W: Write>(
-    writer: &mut W,
-    line_type: &str,
-    map: &CountByPos,
-) -> Result<()> {
+fn write_count_map<W: Write>(writer: &mut W, line_type: &str, map: &CountByPos) -> Result<()> {
     let mut positions: Vec<i64> = map.keys().copied().collect();
     positions.sort_unstable();
     for pos in positions {
@@ -573,10 +571,7 @@ fn write_splice<W: Write>(writer: &mut W, splice: &HashSet<String>) -> Result<()
     Ok(())
 }
 
-fn write_splice_count<W: Write>(
-    writer: &mut W,
-    splice_count: &CountMap,
-) -> Result<()> {
+fn write_splice_count<W: Write>(writer: &mut W, splice_count: &CountMap) -> Result<()> {
     let mut keys: Vec<&String> = splice_count.keys().collect();
     keys.sort();
     for key in keys {
@@ -806,6 +801,10 @@ pub struct RealignedOutput {
     pub max_read_len: usize,
     /// Splice positions ("start-end")
     pub splice: HashSet<String>,
+    /// Remote reference windows loaded during structural processing.
+    pub historical_reference_windows: Vec<(i64, i64)>,
+    /// DEL variants whose trailing rightseq span was loaded in an SV remote window.
+    pub historical_del_rightseq_variants: HistoricalDelRightseqMap,
 }
 
 /// Final aligned variants data - mirrors Java AlignedVarsData
@@ -1240,7 +1239,11 @@ impl VarDictPipeline {
         let mut reference = Reference::new_with_start(ref_seq, extended_start as i64);
         let chr_len = instance.chr_lens.get(region.chr()).copied();
         reference.build_seed_map(extended_end as i64, chr_len);
-        append_rss_stage_log_if_enabled(region, start_region.elapsed().as_millis(), "reference_ready");
+        append_rss_stage_log_if_enabled(
+            region,
+            start_region.elapsed().as_millis(),
+            "reference_ready",
+        );
 
         // Get SAM filter from instance configuration
         let sam_filter = instance.conf.sam_filter;
@@ -1254,7 +1257,11 @@ impl VarDictPipeline {
         )?;
 
         cigar_output.write_jsonl_snapshot_if_enabled(region)?;
-        append_rss_stage_log_if_enabled(region, start_region.elapsed().as_millis(), "cigar_complete");
+        append_rss_stage_log_if_enabled(
+            region,
+            start_region.elapsed().as_millis(),
+            "cigar_complete",
+        );
 
         self.process_region_to_aligned_vars_from_cigar_output(
             cigar_output,
@@ -1305,7 +1312,11 @@ impl VarDictPipeline {
         let mut reference = Reference::new_with_start(ref_seq, extended_start as i64);
         let chr_len = instance.chr_lens.get(region.chr()).copied();
         reference.build_seed_map(extended_end as i64, chr_len);
-        append_rss_stage_log_if_enabled(region, start_region.elapsed().as_millis(), "reference_ready");
+        append_rss_stage_log_if_enabled(
+            region,
+            start_region.elapsed().as_millis(),
+            "reference_ready",
+        );
 
         let sam_filter = instance.conf.sam_filter;
         let cigar_output = self.run_cigar_parser_from_cached_records(
@@ -1318,7 +1329,11 @@ impl VarDictPipeline {
         )?;
 
         cigar_output.write_jsonl_snapshot_if_enabled(region)?;
-        append_rss_stage_log_if_enabled(region, start_region.elapsed().as_millis(), "cigar_complete");
+        append_rss_stage_log_if_enabled(
+            region,
+            start_region.elapsed().as_millis(),
+            "cigar_complete",
+        );
 
         self.process_region_to_aligned_vars_from_cigar_output(
             cigar_output,
@@ -1367,7 +1382,11 @@ impl VarDictPipeline {
         let mut reference = Reference::new_with_start(ref_seq, extended_start as i64);
         let chr_len = instance.chr_lens.get(region.chr()).copied();
         reference.build_seed_map(extended_end as i64, chr_len);
-        append_rss_stage_log_if_enabled(region, start_region.elapsed().as_millis(), "reference_ready");
+        append_rss_stage_log_if_enabled(
+            region,
+            start_region.elapsed().as_millis(),
+            "reference_ready",
+        );
 
         let sam_filter = instance.conf.sam_filter;
         let cigar_output = self.run_cigar_parser_from_bam_paths(
@@ -1378,7 +1397,11 @@ impl VarDictPipeline {
             sam_filter,
         )?;
 
-        append_rss_stage_log_if_enabled(region, start_region.elapsed().as_millis(), "cigar_complete");
+        append_rss_stage_log_if_enabled(
+            region,
+            start_region.elapsed().as_millis(),
+            "cigar_complete",
+        );
 
         self.process_region_to_aligned_vars_from_cigar_output(
             cigar_output,
@@ -1680,7 +1703,11 @@ impl VarDictPipeline {
             realigned_output.non_insertion_vars.len(),
             realigned_output.ref_coverage.len()
         );
-        append_rss_stage_log_if_enabled(region, start_region.elapsed().as_millis(), "realigner_sv_complete");
+        append_rss_stage_log_if_enabled(
+            region,
+            start_region.elapsed().as_millis(),
+            "realigner_sv_complete",
+        );
 
         let start_tovars = std::time::Instant::now();
         let splice = realigned_output.splice.clone();
@@ -1699,7 +1726,11 @@ impl VarDictPipeline {
             elapsed_tovars.as_secs_f64(),
             aligned_vars.aligned_variants.len()
         );
-        append_rss_stage_log_if_enabled(region, start_region.elapsed().as_millis(), "tovars_complete");
+        append_rss_stage_log_if_enabled(
+            region,
+            start_region.elapsed().as_millis(),
+            "tovars_complete",
+        );
 
         Ok(RegionAlignedVarsOutput {
             aligned_vars,
@@ -2507,6 +2538,8 @@ impl VarDictPipeline {
             start_region.elapsed().as_millis(),
             "sv_processor_complete",
         );
+        let historical_reference_windows = sv_processor.historical_reference_windows();
+        let historical_del_rightseq_variants = sv_processor.historical_del_rightseq_variants();
         let structural_reference = sv_processor.into_reference();
 
         write_structural_variants_jsonl_snapshot_if_enabled(&processed, region)?;
@@ -2522,6 +2555,8 @@ impl VarDictPipeline {
                 duprate: processed.duprate,
                 max_read_len: processed.max_read_length,
                 splice,
+                historical_reference_windows,
+                historical_del_rightseq_variants,
             },
             structural_reference,
         ))
@@ -2549,6 +2584,8 @@ impl VarDictPipeline {
             ref_coverage,
             duprate,
             max_read_len,
+            historical_reference_windows,
+            historical_del_rightseq_variants,
             ..
         } = input;
         let mut non_insertion_vars = non_insertion_vars;
@@ -2792,6 +2829,8 @@ impl VarDictPipeline {
                     reference,
                     region,
                     shared_reference,
+                    &historical_reference_windows,
+                    &historical_del_rightseq_variants,
                     &mut debug_lines,
                     duprate,
                 );
@@ -3188,6 +3227,8 @@ impl VarDictPipeline {
         reference: &Reference,
         region: &Region,
         shared_reference: Option<&SharedReferenceHandle>,
+        _historical_reference_windows: &[(i64, i64)],
+        historical_del_rightseq_variants: &HistoricalDelRightseqMap,
         _debug_lines: &mut Vec<String>,
         duprate: f64,
     ) {
@@ -3620,13 +3661,30 @@ impl VarDictPipeline {
                 let chr_len = self.get_chromosome_end(reference, shared_reference, region.chr());
                 let right_start = end_position + 1;
                 let right_end = (end_position + 20).min(chr_len);
-                vref.rightseq = self.get_reference_range_with_fallback(
-                    reference,
-                    shared_reference,
-                    region.chr(),
-                    right_start,
-                    right_end,
-                );
+                let del_rightseq_loaded = varallele != "<DEL>"
+                    || self.local_reference_span_loaded(
+                        reference,
+                        right_start,
+                        right_end,
+                    )
+                    || self.historical_del_rightseq_loaded(
+                        historical_del_rightseq_variants,
+                        position,
+                        &description_string,
+                    );
+                if !del_rightseq_loaded {
+                    // Java leaves rightseq empty for restored large DEL rows whose trailing
+                    // sequence was never loaded into the mutable stage reference.
+                    vref.rightseq.clear();
+                } else {
+                    vref.rightseq = self.get_reference_range_with_fallback(
+                        reference,
+                        shared_reference,
+                        region.chr(),
+                        right_start,
+                        right_end,
+                    );
+                }
 
                 let mut genotype = format!("{}/{}", genotype1current, genotype2)
                     .replace('&', "")
@@ -4686,6 +4744,26 @@ impl VarDictPipeline {
         }
 
         self.get_reference_range(reference, start, end)
+    }
+
+    fn local_reference_span_loaded(&self, reference: &Reference, start: i64, end: i64) -> bool {
+        if end < start {
+            return true;
+        }
+
+        let reference_end = reference.region_start + reference.ref_seq.len() as i64 - 1;
+        start >= reference.region_start && end <= reference_end
+    }
+
+    fn historical_del_rightseq_loaded(
+        &self,
+        historical_del_rightseq_variants: &HistoricalDelRightseqMap,
+        position: i64,
+        description_string: &str,
+    ) -> bool {
+        historical_del_rightseq_variants
+            .get(&position)
+            .is_some_and(|descriptions| descriptions.contains(description_string))
     }
 
     fn get_chromosome_end(
@@ -6242,7 +6320,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_reference_variants_uses_fallback_for_large_del_rightseq() {
+    fn test_collect_reference_variants_keeps_large_del_rightseq_empty_without_local_reference() {
         use std::sync::Arc;
 
         use crate::data::shared_reference::{ChromosomeData, SharedReference};
@@ -6254,14 +6332,17 @@ mod tests {
         let region = Region::new("chr1".to_string(), 100, 130, String::new());
         let reference = Reference::from_seq_with_start(&vec![b'A'; 31], 100);
 
-        let expected_rightseq = "AACCTGGAACACTGTTTCTT";
+        let remote_rightseq = "AACCTGGAACACTGTTTCTT";
         let mut full_sequence = vec![b'A'; 2200];
         let right_start = 2105usize;
-        full_sequence[right_start - 1..right_start - 1 + expected_rightseq.len()]
-            .copy_from_slice(expected_rightseq.as_bytes());
+        full_sequence[right_start - 1..right_start - 1 + remote_rightseq.len()]
+            .copy_from_slice(remote_rightseq.as_bytes());
 
-        let mut chromosomes =
-            std::collections::HashMap::<String, ChromosomeData, crate::prelude::LibDefaultHasher>::default();
+        let mut chromosomes = std::collections::HashMap::<
+            String,
+            ChromosomeData,
+            crate::prelude::LibDefaultHasher,
+        >::default();
         chromosomes.insert(
             "chr1".to_string(),
             ChromosomeData {
@@ -6316,6 +6397,8 @@ mod tests {
             &reference,
             &region,
             Some(&shared_reference),
+            &[],
+            &HistoricalDelRightseqMap::default(),
             &mut debug_lines,
             0.0,
         );
@@ -6324,7 +6407,103 @@ mod tests {
         assert_eq!(variant.varallele, "<DEL>");
         assert_eq!(variant.start_position, 104);
         assert_eq!(variant.end_position, 2104);
-        assert_eq!(variant.rightseq, expected_rightseq);
+        assert!(variant.rightseq.is_empty());
+    }
+
+    #[test]
+    fn test_collect_reference_variants_keeps_rightseq_for_large_del_in_historical_window() {
+        use crate::data::reference::Reference;
+        use crate::data::region::Region;
+        use crate::data::shared_reference::{ChromosomeData, SharedReference};
+        use crate::mods::to_vars_builder::{StrandBiasFlag, StrandBiasValue};
+        use std::sync::Arc;
+
+        let pipeline = VarDictPipeline::new("test");
+
+        let reference = Reference::new_with_start(b"ACGTACGT".to_vec(), 100);
+        let region = Region::new("chr1".to_string(), 100, 107, "GENE".to_string());
+
+        let full_sequence: Vec<u8> = (0..2200)
+            .map(|idx| match idx % 4 {
+                0 => b'A',
+                1 => b'C',
+                2 => b'G',
+                _ => b'T',
+            })
+            .collect();
+
+        let mut chromosomes: HashMap<String, ChromosomeData, LibDefaultHasher> =
+            Default::default();
+        chromosomes.insert(
+            "chr1".to_string(),
+            ChromosomeData {
+                sequence: full_sequence,
+                length: 2200,
+            },
+        );
+        let shared_reference = Arc::new(SharedReference {
+            chromosomes,
+            chromosome_names: vec!["chr1".to_string()],
+            total_size: 2200,
+        });
+
+        let mut ref_coverage: RefCovMap = Default::default();
+        ref_coverage.insert(105, 8);
+        let mut non_insertion_vars: RawVarByPos = Default::default();
+        let mut historical_del_rightseq_variants: HistoricalDelRightseqMap = Default::default();
+        historical_del_rightseq_variants
+            .entry(105)
+            .or_default()
+            .insert("-2000".to_string());
+        let mut debug_lines = Vec::new();
+
+        let mut ref_variant = Variant::new();
+        ref_variant.description_string = "A".to_string();
+        ref_variant.frequency = 1.0;
+        ref_variant.vars_count_on_forward = 1;
+        ref_variant.vars_count_on_reverse = 1;
+        ref_variant.strand_bias_flag =
+            StrandBiasFlag::new(StrandBiasValue::NoBias, StrandBiasValue::CantAssess);
+
+        let mut deletion_variant = Variant::new();
+        deletion_variant.description_string = "-2000".to_string();
+        deletion_variant.position_coverage = 8;
+        deletion_variant.vars_count_on_forward = 2;
+        deletion_variant.vars_count_on_reverse = 6;
+        deletion_variant.frequency = 1.0;
+        deletion_variant.high_quality_reads_frequency = 1.0;
+        deletion_variant.extra_frequency = 1.0;
+        deletion_variant.mean_position = 41.7;
+        deletion_variant.mean_quality = 35.9;
+        deletion_variant.mean_mapping_quality = 28.2;
+        deletion_variant.hicov = 8;
+
+        let mut vars = Vars {
+            variants: vec![deletion_variant],
+            reference_variant: Some(ref_variant),
+            ..Vars::default()
+        };
+
+        pipeline.collect_reference_variants(
+            105,
+            8,
+            &mut vars,
+            &ref_coverage,
+            &mut non_insertion_vars,
+            &reference,
+            &region,
+            Some(&shared_reference),
+            &[(2105, 2124)],
+            &historical_del_rightseq_variants,
+            &mut debug_lines,
+            0.0,
+        );
+
+        let variant = &vars.variants[0];
+        assert_eq!(variant.varallele, "<DEL>");
+        assert_eq!(variant.start_position, 104);
+        assert_eq!(variant.end_position, 2104);
+        assert_eq!(variant.rightseq, "ACGTACGTACGTACGTACGT");
     }
 
     #[test]
@@ -6529,6 +6708,8 @@ mod tests {
             duprate: 0.0,
             max_read_len: 101,
             splice: HashSet::new(),
+            historical_reference_windows: Vec::new(),
+            historical_del_rightseq_variants: HistoricalDelRightseqMap::default(),
         };
 
         let reference = Reference::from_seq_with_start(b"AAAAAAAAAAA", 100);
@@ -6576,6 +6757,8 @@ mod tests {
             duprate: 0.0,
             max_read_len: 101,
             splice: HashSet::new(),
+            historical_reference_windows: Vec::new(),
+            historical_del_rightseq_variants: HistoricalDelRightseqMap::default(),
         };
 
         let unanchored_aligned = pipeline
