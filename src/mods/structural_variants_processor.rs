@@ -181,6 +181,9 @@ pub struct StructuralVariantsProcessor {
     /// DEL variants whose trailing rightseq span was inside the active remote SV window.
     historical_del_rightseq_variants:
         HashMap<i64, HashSet<String, LibDefaultHasher>, LibDefaultHasher>,
+    /// Tracks reference regions explicitly loaded by SV methods, mirroring Java's
+    /// Reference.loadedRegions list.
+    loaded_regions: Vec<(i64, i64)>,
     /// Remote windows whose BAM-derived coverage has already been merged into the live data.
     loaded_reference_coverage_windows: Vec<ReferenceWindow>,
 }
@@ -202,6 +205,7 @@ impl StructuralVariantsProcessor {
             shared_reference: None,
             historical_reference_windows: Vec::new(),
             historical_del_rightseq_variants: Default::default(),
+            loaded_regions: Vec::new(),
             loaded_reference_coverage_windows: Vec::new(),
         }
     }
@@ -227,6 +231,7 @@ impl StructuralVariantsProcessor {
             shared_reference,
             historical_reference_windows: Vec::new(),
             historical_del_rightseq_variants: Default::default(),
+            loaded_regions: Vec::new(),
             loaded_reference_coverage_windows: Vec::new(),
         }
     }
@@ -298,6 +303,11 @@ impl StructuralVariantsProcessor {
     ///
     /// Called when SV detection is enabled
     fn find_all_svs(&mut self, data: &mut RealignedVariationData, region: Option<&Region>) {
+        let nnte = data.max_read_length as i64;
+        let orig_end = self.original_ref_start + self.original_reference_seq.len() as i64 - 1;
+        self.loaded_regions
+            .push((self.original_ref_start - 2 * nnte, orig_end + 2 * nnte));
+
         self.find_del(data);
         append_rss_stage_log_if_enabled(region, "sv_find_del_complete");
         self.find_inv(data, region);
@@ -310,6 +320,7 @@ impl StructuralVariantsProcessor {
         self.find_inv_disc(data, region);
         append_rss_stage_log_if_enabled(region, "sv_find_inv_disc_complete");
         self.find_dup_disc(data);
+        self.record_del_rightseq_from_loaded_regions(data);
         append_rss_stage_log_if_enabled(region, "sv_find_dup_disc_complete");
     }
 
@@ -337,8 +348,14 @@ impl StructuralVariantsProcessor {
                 continue;
             }
 
+            let region_was_loaded = self.is_region_loaded(mstart, mend);
             let span_preloaded = self.is_span_loaded(mstart, mend);
             self.ensure_reference_span(mstart - 300, mend + 300);
+            if !region_was_loaded {
+                let nnte = data.max_read_length as i64;
+                self.loaded_regions
+                    .push((mstart - nnte - 300, mend + nnte + 300));
+            }
 
             let softp = Self::select_primary_soft_pos(&soft_map).unwrap_or(0);
             event!(
@@ -411,7 +428,6 @@ impl StructuralVariantsProcessor {
                 }
 
                 let del_key = format!("-{}", dellen);
-                self.remember_historical_del_rightseq_if_loaded(p5, &del_key);
                 let vref =
                     Self::get_or_create_variation(&mut data.non_insertion_variants, p5, &del_key);
                 vref.alt_depth = 0;
@@ -514,7 +530,7 @@ impl StructuralVariantsProcessor {
                         continue;
                     }
 
-                    let mut m = self.find_match_without_shared_fallback(
+                    let mut m = self.find_match(
                         &seq,
                         candidate,
                         1,
@@ -522,7 +538,7 @@ impl StructuralVariantsProcessor {
                         3,
                     );
                     if m.base_position == 0 {
-                        m = self.find_match_without_shared_fallback(
+                        m = self.find_match(
                             &seq,
                             candidate,
                             1,
@@ -566,7 +582,6 @@ impl StructuralVariantsProcessor {
                     }
 
                     let del_key = format!("-{}", dellen);
-                    self.remember_historical_del_rightseq_if_loaded(candidate, &del_key);
                     let vref = Self::get_or_create_variation(
                         &mut data.non_insertion_variants,
                         candidate,
@@ -676,8 +691,13 @@ impl StructuralVariantsProcessor {
                 continue;
             }
 
+            let region_was_loaded = self.is_region_loaded(mstart, mend);
             let span_preloaded = self.is_span_loaded(mstart, mend);
             self.ensure_reference_span(mstart - 300, mend + 300);
+            if !region_was_loaded {
+                self.loaded_regions
+                    .push((mstart - 300, mend + 300));
+            }
 
             let softp = Self::select_primary_soft_pos(&soft_map).unwrap_or(0);
             event!(
@@ -744,7 +764,6 @@ impl StructuralVariantsProcessor {
                 }
 
                 let del_key = format!("-{}", dellen);
-                self.remember_historical_del_rightseq_if_loaded(bp, &del_key);
                 let vref =
                     Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &del_key);
                 vref.alt_depth = 0;
@@ -879,7 +898,6 @@ impl StructuralVariantsProcessor {
                     }
 
                     let del_key = format!("-{}", dellen);
-                    self.remember_historical_del_rightseq_if_loaded(bp, &del_key);
                     let vref = Self::get_or_create_variation(
                         &mut data.non_insertion_variants,
                         bp,
@@ -1009,10 +1027,15 @@ impl StructuralVariantsProcessor {
                 continue;
             }
 
+            let region_was_loaded = self.is_region_loaded(inv.mstart, inv.mend);
             let inv_span_preloaded = self.is_span_loaded(inv.mstart, inv.mend);
             append_rss_stage_log_if_enabled(region, "sv_find_inv_before_ensure_reference_span");
             self.ensure_reference_span(inv.mstart - 500, inv.mend + 500);
             append_rss_stage_log_if_enabled(region, "sv_find_inv_after_ensure_reference_span");
+            if !region_was_loaded {
+                self.loaded_regions
+                    .push((inv.mstart - 500, inv.mend + 500));
+            }
 
             if !inv_span_preloaded {
                 append_rss_stage_log_if_enabled(
@@ -1045,7 +1068,7 @@ impl StructuralVariantsProcessor {
                     if scv_seq.is_empty() {
                         continue;
                     }
-                    let mut m = self.find_match_rev_with_historical(
+                    let mut m = self.find_match_rev(
                         scv_seq,
                         softp,
                         dir,
@@ -1053,7 +1076,7 @@ impl StructuralVariantsProcessor {
                         3,
                     );
                     if m.base_position == 0 {
-                        m = self.find_match_rev_with_historical(
+                        m = self.find_match_rev(
                             scv_seq,
                             softp,
                             dir,
@@ -1079,7 +1102,7 @@ impl StructuralVariantsProcessor {
                     if scv_seq.is_empty() {
                         continue;
                     }
-                    let mut m = self.find_match_rev_with_historical(
+                    let mut m = self.find_match_rev(
                         scv_seq,
                         softp,
                         dir,
@@ -1087,7 +1110,7 @@ impl StructuralVariantsProcessor {
                         3,
                     );
                     if m.base_position == 0 {
-                        m = self.find_match_rev_with_historical(
+                        m = self.find_match_rev(
                             scv_seq,
                             softp,
                             dir,
@@ -1119,7 +1142,7 @@ impl StructuralVariantsProcessor {
                         if scv_seq.is_empty() {
                             continue;
                         }
-                        let mut m = self.find_match_rev_with_historical(
+                        let mut m = self.find_match_rev(
                             scv_seq,
                             cp,
                             dir,
@@ -1127,7 +1150,7 @@ impl StructuralVariantsProcessor {
                             3,
                         );
                         if m.base_position == 0 {
-                            m = self.find_match_rev_with_historical(
+                            m = self.find_match_rev(
                                 scv_seq,
                                 cp,
                                 dir,
@@ -1153,7 +1176,7 @@ impl StructuralVariantsProcessor {
                         if scv_seq.is_empty() {
                             continue;
                         }
-                        let mut m = self.find_match_rev_with_historical(
+                        let mut m = self.find_match_rev(
                             scv_seq,
                             cp,
                             dir,
@@ -1161,7 +1184,7 @@ impl StructuralVariantsProcessor {
                             3,
                         );
                         if m.base_position == 0 {
-                            m = self.find_match_rev_with_historical(
+                            m = self.find_match_rev(
                                 scv_seq,
                                 cp,
                                 dir,
@@ -1379,15 +1402,17 @@ impl StructuralVariantsProcessor {
                 break;
             }
 
-            if data
+            let used_val = data
                 .soft_clips_5end
                 .get(&p5)
                 .map(|s| s.used())
-                .unwrap_or(true)
-            {
+                .unwrap_or(true);
+            let softp2sv_val = Self::is_softp2sv_first_used(data, p5);
+
+            if used_val {
                 continue;
             }
-            if Self::is_softp2sv_first_used(data, p5) {
+            if softp2sv_val {
                 continue;
             }
 
@@ -1401,7 +1426,7 @@ impl StructuralVariantsProcessor {
                 continue;
             }
 
-            let m = self.find_match_without_shared_fallback(
+            let m = self.find_match(
                 &seq,
                 p5,
                 -1,
@@ -1432,7 +1457,6 @@ impl StructuralVariantsProcessor {
                     }
 
                     let del_key = format!("-{}", dellen);
-                    self.remember_historical_del_rightseq_if_loaded(bp_adj, &del_key);
                     let vref = Self::get_or_create_variation(
                         &mut data.non_insertion_variants,
                         bp_adj,
@@ -1599,15 +1623,17 @@ impl StructuralVariantsProcessor {
                 break;
             }
 
-            if data
+            let used_val = data
                 .soft_clips_3end
                 .get(&p3)
                 .map(|s| s.used())
-                .unwrap_or(true)
-            {
+                .unwrap_or(true);
+            let softp2sv_val = Self::is_softp2sv_first_used(data, p3);
+
+            if used_val {
                 continue;
             }
-            if Self::is_softp2sv_first_used(data, p3) {
+            if softp2sv_val {
                 continue;
             }
 
@@ -1621,7 +1647,7 @@ impl StructuralVariantsProcessor {
                 continue;
             }
 
-            let m = self.find_match_without_shared_fallback(
+            let m = self.find_match(
                 &seq,
                 p3,
                 1,
@@ -1662,7 +1688,6 @@ impl StructuralVariantsProcessor {
                     }
 
                     let del_key = format!("-{}", dellen);
-                    self.remember_historical_del_rightseq_if_loaded(p3, &del_key);
                     let vref = Self::get_or_create_variation(
                         &mut data.non_insertion_variants,
                         p3,
@@ -2335,7 +2360,7 @@ impl StructuralVariantsProcessor {
         let minr = instance().conf.minr;
 
         for idx in 0..data.svfdup.len() {
-            let (used, ms, _me, cnt, mut end, _start, pmean, qmean, q_mean, nm, softp, soft_map) = {
+            let (used, ms, me, cnt, mut end, _start, pmean, qmean, q_mean, nm, softp, soft_map) = {
                 let dup = &data.svfdup[idx];
                 (
                     dup.used(),
@@ -2365,7 +2390,11 @@ impl StructuralVariantsProcessor {
             let mut bp = ms - read_len_adj / 2;
             let mut pe = end;
 
+            let span_preloaded = self.is_span_loaded(ms, me);
             self.ensure_reference_span(bp - 150, bp + 150);
+            if !span_preloaded {
+                self.load_uncovered_reference_coverage(data, ms - 200, me + 200);
+            }
 
             let mut cntf = cnt;
             let mut cntr = cnt;
@@ -2509,7 +2538,7 @@ impl StructuralVariantsProcessor {
         }
 
         for idx in 0..data.svrdup.len() {
-            let (used, _ms, me, cnt, _end, start, pmean, qmean, q_mean, nm, soft_map) = {
+            let (used, ms, me, cnt, _end, start, pmean, qmean, q_mean, nm, soft_map) = {
                 let dup = &data.svrdup[idx];
                 (
                     dup.used(),
@@ -2539,7 +2568,11 @@ impl StructuralVariantsProcessor {
             let mut pe = mlen + bp - 1;
             let mut tpe = pe;
 
+            let span_preloaded = self.is_span_loaded(ms, me);
             self.ensure_reference_span(pe - 150, pe + 150);
+            if !span_preloaded {
+                self.load_uncovered_reference_coverage(data, ms - 200, me + 200);
+            }
 
             let mut cntf = cnt;
             let mut cntr = cnt;
@@ -2747,17 +2780,6 @@ impl StructuralVariantsProcessor {
         mm: usize,
     ) -> MatchResult {
         self.find_match_rev_internal(seq, position, dir, seed_len, mm, true, false)
-    }
-
-    fn find_match_rev_with_historical(
-        &self,
-        seq: &[u8],
-        position: i64,
-        dir: i64,
-        seed_len: usize,
-        mm: usize,
-    ) -> MatchResult {
-        self.find_match_rev_internal(seq, position, dir, seed_len, mm, true, true)
     }
 
     fn find_match_rev_internal(
@@ -3094,18 +3116,7 @@ impl StructuralVariantsProcessor {
         seed_len: usize,
         mm: usize,
     ) -> MatchResult {
-        self.find_match_internal(seq, position, dir, seed_len, mm, true, true)
-    }
-
-    fn find_match_without_shared_fallback(
-        &self,
-        seq: &[u8],
-        position: i64,
-        dir: i64,
-        seed_len: usize,
-        mm: usize,
-    ) -> MatchResult {
-        self.find_match_internal(seq, position, dir, seed_len, mm, false, false)
+        self.find_match_internal(seq, position, dir, seed_len, mm, true, false)
     }
 
     fn find_match_internal(
@@ -3236,6 +3247,8 @@ impl StructuralVariantsProcessor {
         self.get_ref_base(pos).map(|b| b != ch).unwrap_or(false)
     }
 
+    /// Ported from: `com.astrazeneca.vardict.modules.VariationRealigner.ismatchref()`
+    /// Java source: `VariationRealigner.java:L2914-L2931`
     fn is_match_ref(&self, seq: &[u8], position: i64, dir: i64, mm: usize) -> bool {
         if seq.is_empty() {
             return false;
@@ -3599,13 +3612,6 @@ impl StructuralVariantsProcessor {
             self.original_ref_start + self.original_reference_seq.len() as i64 - 1
         };
 
-        if !self.original_reference_seq.is_empty()
-            && start >= self.original_ref_start
-            && end <= original_end
-        {
-            return;
-        }
-
         let requested_start = start.max(1);
         let requested_end = end.max(requested_start);
 
@@ -3620,6 +3626,16 @@ impl StructuralVariantsProcessor {
             && requested_start >= current_start
             && requested_end <= current_end
         {
+            return;
+        }
+
+        // If the original reference covers the requested span, restore it instead of
+        // loading from shared_reference. This avoids unnecessary remote lookups.
+        if !self.original_reference_seq.is_empty()
+            && requested_start >= self.original_ref_start
+            && requested_end <= original_end
+        {
+            self.restore_original_reference_window_preserving_history();
             return;
         }
 
@@ -3688,6 +3704,24 @@ impl StructuralVariantsProcessor {
         windows
             .iter()
             .any(|window| start >= window.start && end <= window.end)
+    }
+
+    /// Returns true when [start, end] is fully within the original reference
+    /// or a previously tracked loaded region. Does NOT check the current
+    /// ephemeral reference window - only stable regions.
+    fn is_region_loaded(&self, start: i64, end: i64) -> bool {
+        if start > end {
+            return false;
+        }
+        if !self.original_reference_seq.is_empty() {
+            let original_end = self.original_ref_start + self.original_reference_seq.len() as i64 - 1;
+            if start >= self.original_ref_start && end <= original_end {
+                return true;
+            }
+        }
+        self.loaded_regions
+            .iter()
+            .any(|&(loaded_start, loaded_end)| start >= loaded_start && end <= loaded_end)
     }
 
     fn is_reference_coverage_loaded(&self, start: i64, end: i64) -> bool {
@@ -3826,39 +3860,28 @@ impl StructuralVariantsProcessor {
         self.historical_reference_windows.push(window);
     }
 
-    fn remember_historical_del_rightseq_if_loaded(&mut self, position: i64, del_key: &str) {
-        if self.reference_seq.is_empty() {
-            return;
-        }
-
-        if self.ref_start == self.original_ref_start
-            && Arc::ptr_eq(&self.reference_seq, &self.original_reference_seq)
-        {
-            return;
-        }
-
-        let Some(del_len) = del_key.strip_prefix('-').and_then(|suffix| {
-            let digits: String = suffix.chars().take_while(|ch| ch.is_ascii_digit()).collect();
-            if digits.is_empty() {
-                None
-            } else {
-                digits.parse::<i64>().ok()
+    fn record_del_rightseq_from_loaded_regions(&mut self, data: &RealignedVariationData) {
+        let mut candidates: Vec<(i64, String)> = Vec::new();
+        for (&position, variations) in &data.non_insertion_variants {
+            for key in variations.keys() {
+                let del_key = key.to_key_string();
+                if del_key.starts_with('-') {
+                    candidates.push((position, del_key));
+                }
             }
-        }) else {
-            return;
-        };
-
-        let right_start = position + del_len;
-        let right_end = right_start + 19;
-        let current_end = self.ref_start + self.reference_seq.len() as i64 - 1;
-        if right_start < self.ref_start || right_end > current_end {
-            return;
         }
-
-        self.historical_del_rightseq_variants
-            .entry(position)
-            .or_default()
-            .insert(del_key.to_string());
+        for (position, del_key) in candidates {
+            if let Some(del_len) = del_key.strip_prefix('-').and_then(|suffix| suffix.parse::<i64>().ok()) {
+                let right_start = position + del_len;
+                let right_end = right_start + 19;
+                if self.is_region_loaded(right_start, right_end) {
+                    self.historical_del_rightseq_variants
+                        .entry(position)
+                        .or_default()
+                        .insert(del_key);
+                }
+            }
+        }
     }
 
     fn remember_reference_coverage_window(&mut self, start: i64, end: i64) {
@@ -4427,115 +4450,6 @@ mod tests {
     }
 
     #[test]
-    fn test_find_match_without_shared_fallback_skips_global_only_hits() {
-        let chrom = "testchr".to_string();
-        let full_sequence = b"AAAAAAAAAAAAAAAAAAAAACGTACGTACGATTTTTTTTTTTTTTTTTTTTTTTTTTTT";
-
-        let mut original_reference = Reference::new_with_start(full_sequence[..20].to_vec(), 1);
-        original_reference.build_seed_map(20, Some(full_sequence.len()));
-
-        let mut current_reference = Reference::new_with_start(full_sequence[40..].to_vec(), 41);
-        current_reference.build_seed_map(full_sequence.len() as i64, Some(full_sequence.len()));
-
-        let mut chromosomes: HashMap<String, ChromosomeData, LibDefaultHasher> = Default::default();
-        chromosomes.insert(
-            chrom.clone(),
-            ChromosomeData {
-                sequence: full_sequence.to_vec(),
-                length: full_sequence.len(),
-            },
-        );
-
-        let shared_reference = Arc::new(SharedReference {
-            chromosomes,
-            chromosome_names: vec![chrom.clone()],
-            total_size: full_sequence.len(),
-        });
-
-        let mut processor = StructuralVariantsProcessor::new_with_context(
-            Arc::new(original_reference.ref_seq.clone()),
-            Arc::new(original_reference.seed.clone()),
-            1,
-            Some(chrom),
-            Vec::new(),
-            Some(shared_reference),
-        );
-
-        processor.reference_seq = Arc::new(current_reference.ref_seq.clone());
-        processor.reference_seed = Arc::new(current_reference.seed.clone());
-        processor.ref_start = 41;
-
-        assert_eq!(
-            processor
-                .find_match(b"ACGTACGTACGA", 50, 1, 12, 0)
-                .base_position,
-            21
-        );
-        assert_eq!(
-            processor
-                .find_match_without_shared_fallback(b"ACGTACGTACGA", 50, 1, 12, 0)
-                .base_position,
-            0
-        );
-    }
-
-    #[test]
-    fn test_find_match_without_shared_fallback_skips_historical_window_hits() {
-        let chrom = "testchr".to_string();
-        let full_sequence = b"AAAAAAAAAAAAAAAAAAAAACGTACGTACGAACGTACGATTTTTTTTTTTTTTTTTTTT";
-
-        let mut original_reference = Reference::new_with_start(full_sequence[..20].to_vec(), 1);
-        original_reference.build_seed_map(20, Some(full_sequence.len()));
-
-        let mut current_reference = Reference::new_with_start(full_sequence[40..].to_vec(), 41);
-        current_reference.build_seed_map(full_sequence.len() as i64, Some(full_sequence.len()));
-
-        let mut chromosomes: HashMap<String, ChromosomeData, LibDefaultHasher> = Default::default();
-        chromosomes.insert(
-            chrom.clone(),
-            ChromosomeData {
-                sequence: full_sequence.to_vec(),
-                length: full_sequence.len(),
-            },
-        );
-
-        let shared_reference = Arc::new(SharedReference {
-            chromosomes,
-            chromosome_names: vec![chrom.clone()],
-            total_size: full_sequence.len(),
-        });
-
-        let mut processor = StructuralVariantsProcessor::new_with_context(
-            Arc::new(original_reference.ref_seq.clone()),
-            Arc::new(original_reference.seed.clone()),
-            1,
-            Some(chrom),
-            Vec::new(),
-            Some(shared_reference),
-        );
-
-        processor.reference_seq = Arc::new(current_reference.ref_seq.clone());
-        processor.reference_seed = Arc::new(current_reference.seed.clone());
-        processor.ref_start = 41;
-        processor
-            .historical_reference_windows
-            .push(ReferenceWindow { start: 21, end: 40 });
-
-        assert_eq!(
-            processor
-                .find_match(b"ACGTACGTACGA", 50, 1, 12, 0)
-                .base_position,
-            21
-        );
-        assert_eq!(
-            processor
-                .find_match_without_shared_fallback(b"ACGTACGTACGA", 50, 1, 12, 0)
-                .base_position,
-            0
-        );
-    }
-
-    #[test]
     fn test_find_del_forward_nosoftp_uses_java_like_match_scope() {
         let _ = INSTANCE.get_or_init(GlobalReadOnlyScope::default);
 
@@ -4634,6 +4548,54 @@ mod tests {
             vec![ReferenceWindow { start: 21, end: 55 }]
         );
         assert!(processor.is_reference_coverage_loaded(30, 50));
+    }
+
+    #[test]
+    fn test_is_region_loaded_checks_original_and_loaded_regions() {
+        let mut processor =
+            StructuralVariantsProcessor::new(b"ACGTACGT".to_vec(), Default::default(), 100);
+        processor.loaded_regions.push((210, 229));
+
+        assert!(processor.is_region_loaded(100, 107));
+        assert!(processor.is_region_loaded(210, 229));
+        assert!(!processor.is_region_loaded(208, 229));
+    }
+
+    #[test]
+    fn test_record_del_rightseq_from_loaded_regions_marks_loaded_region_del() {
+        let mut processor =
+            StructuralVariantsProcessor::new(b"ACGTACGT".to_vec(), Default::default(), 100);
+        processor.loaded_regions.push((210, 229));
+
+        let mut data = RealignedVariationData::default();
+        let variation =
+            StructuralVariantsProcessor::get_or_create_variation(&mut data.non_insertion_variants, 200, "-10");
+        variation.alt_depth = 1;
+
+        processor.record_del_rightseq_from_loaded_regions(&data);
+
+        assert!(processor
+            .historical_del_rightseq_variants
+            .get(&200)
+            .is_some_and(|descriptions| descriptions.contains("-10")));
+    }
+
+    #[test]
+    fn test_record_del_rightseq_from_loaded_regions_ignores_unloaded_del() {
+        let mut processor =
+            StructuralVariantsProcessor::new(b"ACGTACGT".to_vec(), Default::default(), 100);
+
+        let mut data = RealignedVariationData::default();
+        let variation =
+            StructuralVariantsProcessor::get_or_create_variation(&mut data.non_insertion_variants, 200, "-10");
+        variation.alt_depth = 1;
+
+        processor.record_del_rightseq_from_loaded_regions(&data);
+
+        assert!(processor
+            .historical_del_rightseq_variants
+            .get(&200)
+            .is_none());
     }
 
     #[test]

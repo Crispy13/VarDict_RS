@@ -4,7 +4,7 @@ description: Researches and outlines multi-step plans
 argument-hint: Outline the goal or problem to research
 target: vscode
 user-invocable: false
-model: ['Claude Opus 4.6 (copilot)']
+model: ['Claude Opus 4.6 (copilot)', 'GPT-5.4 (copilot)']
 tools: ['search', 'read', 'web', 'vscode/memory', 'github/issue_read', 'github.vscode-pull-request-github/issue_fetch', 'github.vscode-pull-request-github/activePullRequest', 'execute/getTerminalOutput', 'execute/testFailure', 'agent', 'vscode/askQuestions']
 agents: ['Explore']
 handoffs:

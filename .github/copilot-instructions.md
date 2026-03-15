@@ -1,33 +1,65 @@
-# Project Guidelines
+# VarDictJava → Rust Parity Project
 
-## Mission
+## Project Overview
 
-- This repository ports VarDictJava to Rust.
-- The default objective for code changes is exact Java output parity first, then better runtime than Java.
-- Do not trade output parity for speed unless the change is explicitly marked, measured, and validated against parity tests.
+This project is a Rust port of [VarDictJava](https://github.com/AstraZeneca-NGS/VarDictJava), a variant discovery tool for next-generation sequencing (NGS) data. The primary goal is **100% output parity** with the original Java implementation while achieving idiomatic Rust and improved performance.
+
+VarDictJava calls SNVs, MNVs, indels, complex variants, and structural variants from BAM files against a reference genome. It supports three modes: **Simple** (single-sample), **Somatic** (tumor/normal paired), and **Amplicon** (targeted sequencing).
 
 ## Architecture
 
-- Keep the main pipeline model in mind: BAM/read processing flows through `cigar_parser` -> `to_vars_builder` -> realignment and structural-variant processing -> output formatting.
-- `src/bin/vardict.rs` owns CLI compatibility and argument handling. Reusable behavior belongs in library modules under `src/mods/`, `src/data/`, `src/variants/`, and `src/scopedata/`.
-- `src/mods/vardict_pipeline.rs` and `src/mods/pipeline.rs` coordinate end-to-end behavior. Changes there can affect ordering, formatting, and parity across many tests.
-- `src/scopedata/global_read_only_scope.rs` and `src/data/shared_reference.rs` provide process-wide state and cached reference data. Treat them as shared infrastructure, not local implementation detail.
+### Java Pipeline (Reference)
+```
+SAMFileParser → RecordPreprocessor → CigarParser → VariationRealigner
+    → StructuralVariantsProcessor → ToVarsBuilder → OutputVariant
+```
 
-## Build And Test
+### Key Modules and Parity Risk
 
-- Use the `rust_build_env` conda environment for repo work. If conda activation fails under strict shell settings, surface that clearly instead of guessing.
-- Prefer `cargo test --profile debug-release` for validation and debugging. Use `cargo build --release` or `cargo build --profile deploy` only when checking optimized behavior.
-- Start with the narrowest useful test scope: fixture tests in `tests/*_fixture_test.rs` for stage-level behavior, then parity coverage in `tests/integration_test.rs`.
-- Use `tests/parity_case_manifest.csv` to understand which Java-backed parity cases are expected to run now and which tags they cover.
-- Keep temporary outputs and debug artifacts under `./tmp/`, never system `/tmp`.
+| Module | Java LOC | Risk | Critical For |
+|--------|----------|------|--------------|
+| CigarParser | ~2,400 | HIGH | SNP/indel detection from CIGAR strings |
+| VariationRealigner | ~1,200 | HIGH | Local realignment, position adjustment |
+| StructuralVariantsProcessor | ~2,100 | HIGH | DEL/DUP/INV from discordant pairs |
+| ToVarsBuilder | ~1,500 | MEDIUM | MSI, genotype, variant filtering |
+| OutputVariant printers | ~400 | MEDIUM | Column formatting, float precision |
+| FisherExact | ~200 | LOW | Strand bias statistics |
+| Configuration/CLI | ~300 | LOW | Argument mapping |
+
+## Parity Rules
+
+1. **Output must be byte-identical** to Java for the same inputs — this is the non-negotiable standard
+2. **Floating-point formatting**: Java uses `DecimalFormat("0.0000")`; Rust must match exactly, including trailing zeros and rounding behavior
+3. **Collection ordering**: Use `IndexMap` instead of `HashMap` wherever Java uses `LinkedHashMap`
+4. **Integer arithmetic**: Match Java's signed 32/64-bit overflow semantics using `wrapping_add`, `wrapping_mul` etc. where Java would silently overflow
+5. **Null mapping**: Java `null` → Rust `Option::None`; every null-check branch in Java must have an equivalent `Option` match in Rust
+6. **String handling**: Use `String`/`&str` with UTF-8; genomic data is ASCII-safe but validate at boundaries
+7. **Tab-delimited output**: Columns must match exactly — count, order, and content
+
+## Build and Test
+
+```bash
+# Build
+cargo build --release
+
+# Run tests
+cargo test
+
+# Run parity test against Java output
+# (compare Rust output with reference Java output for test regions)
+diff <(./target/release/vardict -G ref.fa -b test.bam -N sample regions.bed) expected_java_output.tsv
+
+# Lint
+cargo clippy -- -D warnings
+cargo fmt --check
+```
 
 ## Conventions
 
-- Follow the more specific rules in `.github/instructions/*.md`; keep this file limited to repo-wide guidance.
-- Preserve Java-compatible output details, including record ordering, formatting, and numeric text rendering. Exact text parity matters in this project.
-- Use `tracing`-based logging, not `println!`, for new diagnostic output.
-- Prefer measuring before optimizing. Check repository memory notes before retrying known performance ideas that already regressed or proved unstable.
-- When debugging pipeline stages, prefer the existing JSONL fixture and snapshot workflow over ad hoc print-based debugging.
-
-## Note
-- Run `cargo build --profile debug-release` before running `target/debug-release/vardict`.
+- Follow `rust.instructions.md` for general Rust style
+- Every Rust function porting a Java method must reference the original Java class and method name in a doc comment
+- When Java logic is intentionally complex or subtle, preserve the algorithmic structure even if it looks non-idiomatic — correctness over style
+- Test each module independently against Java reference output before integration
+- Use `#[cfg(test)]` modules co-located with implementation
+- Thread model: `rayon` for data parallelism (replaces Java `CompletableFuture` + `ExecutorService`)
+- BAM I/O: `rust-htslib` or `noodles` — document which is used and why

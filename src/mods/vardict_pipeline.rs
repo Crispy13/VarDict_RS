@@ -3334,7 +3334,8 @@ impl VarDictPipeline {
                             position,
                             &description_string,
                             reference,
-                            region,
+                            shared_reference,
+                            region.chr(),
                         );
                         msi = msi_val;
                         shift3 = shift_val;
@@ -3394,8 +3395,13 @@ impl VarDictPipeline {
                             varallele = description_string.clone();
                         }
 
-                        let (msi_val, shift_val, msint_val) =
-                            self.proceed_vref_is_deletion(position, deletion_length, reference);
+                        let (msi_val, shift_val, msint_val) = self.proceed_vref_is_deletion(
+                            position,
+                            deletion_length,
+                            reference,
+                            shared_reference,
+                            region.chr(),
+                        );
                         msi = msi_val;
                         shift3 = shift_val;
                         msint = msint_val;
@@ -3459,8 +3465,12 @@ impl VarDictPipeline {
                         ));
                     }
                 } else {
-                    let (msi_val, msint_val, shift_val) =
-                        self.detect_microsatellite_snp(reference, position);
+                    let (msi_val, msint_val, shift_val) = self.detect_microsatellite_snp(
+                        reference,
+                        shared_reference,
+                        region.chr(),
+                        position,
+                    );
                     msi = msi_val;
                     msint = msint_val;
                     shift3 = shift_val;
@@ -3481,8 +3491,10 @@ impl VarDictPipeline {
                     let extra = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                     if !extra.is_empty() {
                         varallele = varallele.replacen('&', "", 1);
-                        let tch = self.get_reference_range(
+                        let tch = self.get_reference_range_with_fallback(
                             reference,
+                            shared_reference,
+                            region.chr(),
                             end_position + 1,
                             end_position + extra.len() as i64,
                         );
@@ -3495,8 +3507,10 @@ impl VarDictPipeline {
                             let vextra = caps2.get(1).map(|m| m.as_str()).unwrap_or("");
                             if !vextra.is_empty() {
                                 varallele = varallele.replacen('&', "", 1);
-                                let tch2 = self.get_reference_range(
+                                let tch2 = self.get_reference_range_with_fallback(
                                     reference,
+                                    shared_reference,
+                                    region.chr(),
                                     end_position + 1,
                                     end_position + vextra.len() as i64,
                                 );
@@ -3543,8 +3557,10 @@ impl VarDictPipeline {
                     let tail = caps.get(2).map(|m| m.as_str()).unwrap_or("");
 
                     end_position += matched_seq.len() as i64;
-                    refallele.push_str(&self.get_reference_range(
+                    refallele.push_str(&self.get_reference_range_with_fallback(
                         reference,
+                        shared_reference,
+                        region.chr(),
                         end_position - matched_seq.len() as i64 + 1,
                         end_position,
                     ));
@@ -3556,8 +3572,10 @@ impl VarDictPipeline {
                             .unwrap_or("0")
                             .parse::<i64>()
                         {
-                            refallele.push_str(&self.get_reference_range(
+                            refallele.push_str(&self.get_reference_range_with_fallback(
                                 reference,
+                                shared_reference,
+                                region.chr(),
                                 end_position + 1,
                                 end_position + deletion,
                             ));
@@ -3819,8 +3837,11 @@ impl VarDictPipeline {
         position: i64,
         del_len: usize,
         reference: &Reference,
+        shared_reference: Option<&SharedReferenceHandle>,
+        chromosome: &str,
     ) -> (f64, i32, f64) {
-        let (msi, msint, shift3) = self.detect_microsatellite(reference, position, del_len);
+        let (msi, msint, shift3) =
+            self.detect_microsatellite(reference, shared_reference, chromosome, position, del_len);
         (msi, shift3, msint)
     }
 
@@ -3829,14 +3850,27 @@ impl VarDictPipeline {
         position: i64,
         desc: &str,
         reference: &Reference,
-        region: &Region,
+        shared_reference: Option<&SharedReferenceHandle>,
+        chromosome: &str,
     ) -> (f64, i32, f64) {
         let tseq1 = desc.trim_start_matches('+');
-        let leftseq = self.get_reference_range(reference, (position - 50).max(1), position);
-        let chr_len = instance().chr_lens.get(region.chr()).copied().unwrap_or(0) as i64;
+        let leftseq = self.get_reference_range_with_fallback(
+            reference,
+            shared_reference,
+            chromosome,
+            (position - 50).max(1),
+            position,
+        );
+        let chr_len = instance().chr_lens.get(chromosome).copied().unwrap_or(0) as i64;
         let fallback_len = reference.region_start + reference.ref_seq.len() as i64 - 1;
         let chr_len = if chr_len > 0 { chr_len } else { fallback_len };
-        let tseq2 = self.get_reference_range(reference, position + 1, (position + 70).min(chr_len));
+        let tseq2 = self.get_reference_range_with_fallback(
+            reference,
+            shared_reference,
+            chromosome,
+            position + 1,
+            (position + 70).min(chr_len),
+        );
 
         let (mut msi, mut msint, shift3) = self.find_msi(tseq1, &tseq2, Some(&leftseq));
 
@@ -3860,6 +3894,8 @@ impl VarDictPipeline {
         var_map: RawVarMap,
         ref_coverage: &RefCovMap,
         reference: &Reference,
+        shared_reference: Option<&SharedReferenceHandle>,
+        chromosome: &str,
         ref_counts_by_pos: &mut HashMap<i64, (usize, usize)>,
         hicov_by_pos: &RefCovMap,
         duprate: f64,
@@ -3969,6 +4005,8 @@ impl VarDictPipeline {
                 position,
                 ttcov,
                 reference,
+                shared_reference,
+                chromosome,
                 position_hicov,
                 extra_frequency,
                 duprate,
@@ -4117,6 +4155,8 @@ impl VarDictPipeline {
         position: i64,
         total_coverage: usize,
         reference: &Reference,
+        shared_reference: Option<&SharedReferenceHandle>,
+        chromosome: &str,
         position_hicov: usize,
         extra_frequency: f64,
         duprate: f64,
@@ -4266,7 +4306,13 @@ impl VarDictPipeline {
                     // Pure deletion or deletion with mismatches - use deletion MSI calculation
                     let del_len = *len as usize;
                     if del_len > 0 {
-                        self.detect_microsatellite(reference, position, del_len)
+                        self.detect_microsatellite(
+                            reference,
+                            shared_reference,
+                            chromosome,
+                            position,
+                            del_len,
+                        )
                     } else {
                         (0.0, 0.0, 0)
                     }
@@ -4276,24 +4322,46 @@ impl VarDictPipeline {
                     // or a substitution (same length)
                     if ref_seq.len() > alt_seq.len() {
                         // Net deletion: use deletion MSI calculation with ref_seq length
-                        self.detect_microsatellite(reference, position, ref_seq.len())
+                        self.detect_microsatellite(
+                            reference,
+                            shared_reference,
+                            chromosome,
+                            position,
+                            ref_seq.len(),
+                        )
                     } else {
                         // Same length or net insertion: use SNP/MNP MSI calculation
                         // Java: tseq1 = joinRef(ref, position - 30, position + 1)
                         //       tseq2 = joinRef(ref, position + 2, position + 70)
-                        self.detect_microsatellite_snp(reference, position)
+                        self.detect_microsatellite_snp(
+                            reference,
+                            shared_reference,
+                            chromosome,
+                            position,
+                        )
                     }
                 }
                 VarDesc::SNV { .. } => {
                     // SNV: use SNP/MNP MSI calculation
-                    self.detect_microsatellite_snp(reference, position)
+                    self.detect_microsatellite_snp(
+                        reference,
+                        shared_reference,
+                        chromosome,
+                        position,
+                    )
                 }
                 VarDesc::Raw { desc } => {
                     if desc.starts_with(b"-") {
                         let tail = String::from_utf8_lossy(&desc[1..]);
                         if let Some(del_len) = parse_leading_digits(&tail) {
                             if del_len > 0 {
-                                self.detect_microsatellite(reference, position, del_len)
+                                self.detect_microsatellite(
+                                    reference,
+                                    shared_reference,
+                                    chromosome,
+                                    position,
+                                    del_len,
+                                )
                             } else {
                                 (0.0, 0.0, 0)
                             }
@@ -4301,7 +4369,12 @@ impl VarDictPipeline {
                             (0.0, 0.0, 0)
                         }
                     } else {
-                        self.detect_microsatellite_snp(reference, position)
+                        self.detect_microsatellite_snp(
+                            reference,
+                            shared_reference,
+                            chromosome,
+                            position,
+                        )
                     }
                 }
                 _ => (0.0, 0.0, 0),
@@ -4645,15 +4718,29 @@ impl VarDictPipeline {
     fn detect_microsatellite(
         &self,
         reference: &Reference,
+        shared_reference: Option<&SharedReferenceHandle>,
+        chromosome: &str,
         position: i64,
         del_len: usize,
     ) -> (f64, f64, i32) {
         // Get left sequence (70 bases before position)
-        let leftseq = self.get_reference_range(reference, position - 70, position - 1);
+        let leftseq = self.get_reference_range_with_fallback(
+            reference,
+            shared_reference,
+            chromosome,
+            position - 70,
+            position - 1,
+        );
 
         // Get tseq (from position to position + deletion_len + 70)
         // For deletions, tseq1 is the deleted portion, tseq2 is what follows
-        let tseq = self.get_reference_range(reference, position, position + (del_len as i64) + 70);
+        let tseq = self.get_reference_range_with_fallback(
+            reference,
+            shared_reference,
+            chromosome,
+            position,
+            position + (del_len as i64) + 70,
+        );
 
         if tseq.len() < del_len {
             return (0.0, 0.0, 0);
@@ -4692,12 +4779,30 @@ impl VarDictPipeline {
     /// Java-compatible implementation for variants that don't start with + or -
     /// Java: tseq1 = joinRef(ref, position - 30, position + 1)
     ///       tseq2 = joinRef(ref, position + 2, position + 70)
-    fn detect_microsatellite_snp(&self, reference: &Reference, position: i64) -> (f64, f64, i32) {
+    fn detect_microsatellite_snp(
+        &self,
+        reference: &Reference,
+        shared_reference: Option<&SharedReferenceHandle>,
+        chromosome: &str,
+        position: i64,
+    ) -> (f64, f64, i32) {
         // tseq1 = reference from (position - 30) to (position + 1)
-        let tseq1 = self.get_reference_range(reference, (position - 30).max(1), position + 1);
+        let tseq1 = self.get_reference_range_with_fallback(
+            reference,
+            shared_reference,
+            chromosome,
+            (position - 30).max(1),
+            position + 1,
+        );
 
         // tseq2 = reference from (position + 2) to (position + 70)
-        let tseq2 = self.get_reference_range(reference, position + 2, position + 70);
+        let tseq2 = self.get_reference_range_with_fallback(
+            reference,
+            shared_reference,
+            chromosome,
+            position + 2,
+            position + 70,
+        );
 
         // Call findMSI with no left sequence
         let (msi, msint, shift3) = self.find_msi(&tseq1, &tseq2, None);
