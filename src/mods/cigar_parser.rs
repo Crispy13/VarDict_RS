@@ -654,6 +654,8 @@ impl CigarParser {
         false
     }
 
+    /// Ported from: `com.astrazeneca.vardict.modules.CigarParser.prepareSVStructuresForAnalysis()`
+    /// Java source: `CigarParser.java:L2018-L2306`
     fn prepare_sv_deletion_structures_for_analysis(
         &mut self,
         record: &Record,
@@ -698,11 +700,14 @@ impl CigarParser {
         let read_dir_num = if read_direction { -1i64 } else { 1i64 };
         let mate_dir_num = if mate_direction { 1i64 } else { -1i64 };
         let mlen = record.insert_size();
+        let same_chr = record.tid() == record.mtid();
+
+        let mut skip_mate_sv_assignment = false;
 
         if let Ok(Some(mc_aux)) = record.aux_option(b"MC") {
             if let Ok(mc_tag) = mc_aux.try_get_str() {
                 if Self::mc_has_softclip_both_ends(mc_tag) {
-                    return;
+                    skip_mate_sv_assignment = true;
                 }
             }
         }
@@ -710,9 +715,13 @@ impl CigarParser {
         if let Ok(Some(mq_aux)) = record.aux_option(b"MQ") {
             if let Some(mq) = Self::aux_as_i64(&mq_aux) {
                 if mq < 15 {
-                    return;
+                    skip_mate_sv_assignment = true;
                 }
             }
+        }
+
+        if same_chr && skip_mate_sv_assignment {
+            return;
         }
 
         let min_cluster_dist = Configuration::MINSVCDIST * self.max_read_len.max(1) as f64;
@@ -720,10 +729,7 @@ impl CigarParser {
 
         let qmean = query_qual[min_map_base] as f64;
         let pmean = self.max_read_len.max(1) as f64 / 2.0;
-        if record.tid() == record.mtid()
-            && read_dir_num * mate_dir_num == -1
-            && mlen * read_dir_num > 0
-        {
+        if same_chr && read_dir_num * mate_dir_num == -1 && mlen * read_dir_num > 0 {
             let span = if mate_start > start {
                 mend - start
             } else {
@@ -831,112 +837,14 @@ impl CigarParser {
             return;
         }
 
-        if record.tid() == record.mtid()
-            && read_dir_num * mate_dir_num == -1
-            && mlen * read_dir_num < 0
-        {
-            if read_dir_num == 1 {
-                if self.svfdup.is_empty() || (start - self.svdupfend) as f64 > min_cluster_dist {
-                    self.svfdup.push(SoftClip::default());
-                }
-                if let Some(last) = self.svfdup.last_mut() {
-                    Self::add_discordant_cluster(
-                        last,
-                        start,
-                        end,
-                        mate_start,
-                        mend,
-                        read_dir_num,
-                        total_length_including_softclip as i64,
-                        mlen as i32,
-                        soft3,
-                        pmean,
-                        qmean,
-                        record.mapq() as f64,
-                        number_of_mismatches as f64,
-                        instance().conf.goodq,
-                    );
-                }
-                self.svdupfend = end;
-            } else {
-                if self.svrdup.is_empty() || (start - self.svduprend) as f64 > min_cluster_dist {
-                    self.svrdup.push(SoftClip::default());
-                }
-                if let Some(last) = self.svrdup.last_mut() {
-                    Self::add_discordant_cluster(
-                        last,
-                        start,
-                        end,
-                        mate_start,
-                        mend,
-                        read_dir_num,
-                        total_length_including_softclip as i64,
-                        mlen as i32,
-                        soft5,
-                        pmean,
-                        qmean,
-                        record.mapq() as f64,
-                        number_of_mismatches as f64,
-                        instance().conf.goodq,
-                    );
-                }
-                self.svduprend = end;
-            }
-
-            if !self.svfdup.is_empty()
-                && ((start - self.svdupfend).abs() as f64) <= min_cluster_dist
-            {
-                if let Some(last) = self.svfdup.last_mut() {
-                    Self::add_discordant_count(last);
-                }
-            }
-            if !self.svrdup.is_empty()
-                && ((start - self.svduprend).abs() as f64) <= min_cluster_dist
-            {
-                if let Some(last) = self.svrdup.last_mut() {
-                    Self::add_discordant_count(last);
-                }
-            }
-            if !self.svfdel.is_empty() && (start - self.svdelfend).abs() <= min_d {
-                if let Some(last) = self.svfdel.last_mut() {
-                    Self::add_discordant_count(last);
-                }
-            }
-            if !self.svrdel.is_empty() && (start - self.svdelrend).abs() <= min_d {
-                if let Some(last) = self.svrdel.last_mut() {
-                    Self::add_discordant_count(last);
-                }
-            }
-            if !self.svfinv5.is_empty() && (start - self.svinvfend5).abs() <= min_d {
-                if let Some(last) = self.svfinv5.last_mut() {
-                    Self::add_discordant_count(last);
-                }
-            }
-            if !self.svrinv5.is_empty() && (start - self.svinvrend5).abs() <= min_d {
-                if let Some(last) = self.svrinv5.last_mut() {
-                    Self::add_discordant_count(last);
-                }
-            }
-            if !self.svfinv3.is_empty() && (start - self.svinvfend3).abs() <= min_d {
-                if let Some(last) = self.svfinv3.last_mut() {
-                    Self::add_discordant_count(last);
-                }
-            }
-            if !self.svrinv3.is_empty() && (start - self.svinvrend3).abs() <= min_d {
-                if let Some(last) = self.svrinv3.last_mut() {
-                    Self::add_discordant_count(last);
-                }
-            }
-        } else if record.tid() == record.mtid() && read_dir_num * mate_dir_num == 1 {
-            let max_read_len_i64 = self.max_read_len.max(1) as i64;
-            if read_dir_num == 1 && mlen != 0 {
-                if mlen < -3 * max_read_len_i64 {
-                    if self.svfinv3.is_empty()
-                        || (start - self.svinvfend3) as f64 > min_cluster_dist
+        if same_chr {
+            if read_dir_num * mate_dir_num == -1 && mlen * read_dir_num < 0 {
+                if read_dir_num == 1 {
+                    if self.svfdup.is_empty() || (start - self.svdupfend) as f64 > min_cluster_dist
                     {
-                        self.svfinv3.push(SoftClip::default());
+                        self.svfdup.push(SoftClip::default());
                     }
-                    if let Some(last) = self.svfinv3.last_mut() {
+                    if let Some(last) = self.svfdup.last_mut() {
                         Self::add_discordant_cluster(
                             last,
                             start,
@@ -953,44 +861,14 @@ impl CigarParser {
                             number_of_mismatches as f64,
                             instance().conf.goodq,
                         );
-                        Self::add_discordant_count(last);
                     }
-                    self.svinvfend3 = end;
-                } else if mlen > 3 * max_read_len_i64 {
-                    if self.svfinv5.is_empty()
-                        || (start - self.svinvfend5) as f64 > min_cluster_dist
+                    self.svdupfend = end;
+                } else {
+                    if self.svrdup.is_empty() || (start - self.svduprend) as f64 > min_cluster_dist
                     {
-                        self.svfinv5.push(SoftClip::default());
+                        self.svrdup.push(SoftClip::default());
                     }
-                    if let Some(last) = self.svfinv5.last_mut() {
-                        Self::add_discordant_cluster(
-                            last,
-                            start,
-                            end,
-                            mate_start,
-                            mend,
-                            read_dir_num,
-                            total_length_including_softclip as i64,
-                            mlen as i32,
-                            soft3,
-                            pmean,
-                            qmean,
-                            record.mapq() as f64,
-                            number_of_mismatches as f64,
-                            instance().conf.goodq,
-                        );
-                        Self::add_discordant_count(last);
-                    }
-                    self.svinvfend5 = end;
-                }
-            } else if mlen != 0 {
-                if mlen < -3 * max_read_len_i64 {
-                    if self.svrinv3.is_empty()
-                        || (start - self.svinvrend3) as f64 > min_cluster_dist
-                    {
-                        self.svrinv3.push(SoftClip::default());
-                    }
-                    if let Some(last) = self.svrinv3.last_mut() {
+                    if let Some(last) = self.svrdup.last_mut() {
                         Self::add_discordant_cluster(
                             last,
                             start,
@@ -1007,61 +885,193 @@ impl CigarParser {
                             number_of_mismatches as f64,
                             instance().conf.goodq,
                         );
-                        Self::add_discordant_count(last);
                     }
-                    self.svinvrend3 = end;
-                } else if mlen > 3 * max_read_len_i64 {
-                    if self.svrinv5.is_empty()
-                        || (start - self.svinvrend5) as f64 > min_cluster_dist
-                    {
-                        self.svrinv5.push(SoftClip::default());
-                    }
-                    if let Some(last) = self.svrinv5.last_mut() {
-                        Self::add_discordant_cluster(
-                            last,
-                            start,
-                            end,
-                            mate_start,
-                            mend,
-                            read_dir_num,
-                            total_length_including_softclip as i64,
-                            mlen as i32,
-                            soft5,
-                            pmean,
-                            qmean,
-                            record.mapq() as f64,
-                            number_of_mismatches as f64,
-                            instance().conf.goodq,
-                        );
-                        Self::add_discordant_count(last);
-                    }
-                    self.svinvrend5 = end;
+                    self.svduprend = end;
                 }
-            }
 
-            if mlen != 0 {
-                if !self.svfdel.is_empty() && (start - self.svdelfend) <= min_d {
-                    if let Some(last) = self.svfdel.last_mut() {
-                        Self::add_discordant_count(last);
-                    }
-                }
-                if !self.svrdel.is_empty() && (start - self.svdelrend) <= min_d {
-                    if let Some(last) = self.svrdel.last_mut() {
-                        Self::add_discordant_count(last);
-                    }
-                }
-                if !self.svfdup.is_empty() && (start - self.svdupfend) <= min_d {
+                if !self.svfdup.is_empty()
+                    && ((start - self.svdupfend).abs() as f64) <= min_cluster_dist
+                {
                     if let Some(last) = self.svfdup.last_mut() {
                         Self::add_discordant_count(last);
                     }
                 }
-                if !self.svrdup.is_empty() && (start - self.svduprend) <= min_d {
+                if !self.svrdup.is_empty()
+                    && ((start - self.svduprend).abs() as f64) <= min_cluster_dist
+                {
                     if let Some(last) = self.svrdup.last_mut() {
                         Self::add_discordant_count(last);
                     }
                 }
+                if !self.svfdel.is_empty() && (start - self.svdelfend).abs() <= min_d {
+                    if let Some(last) = self.svfdel.last_mut() {
+                        Self::add_discordant_count(last);
+                    }
+                }
+                if !self.svrdel.is_empty() && (start - self.svdelrend).abs() <= min_d {
+                    if let Some(last) = self.svrdel.last_mut() {
+                        Self::add_discordant_count(last);
+                    }
+                }
+                if !self.svfinv5.is_empty() && (start - self.svinvfend5).abs() <= min_d {
+                    if let Some(last) = self.svfinv5.last_mut() {
+                        Self::add_discordant_count(last);
+                    }
+                }
+                if !self.svrinv5.is_empty() && (start - self.svinvrend5).abs() <= min_d {
+                    if let Some(last) = self.svrinv5.last_mut() {
+                        Self::add_discordant_count(last);
+                    }
+                }
+                if !self.svfinv3.is_empty() && (start - self.svinvfend3).abs() <= min_d {
+                    if let Some(last) = self.svfinv3.last_mut() {
+                        Self::add_discordant_count(last);
+                    }
+                }
+                if !self.svrinv3.is_empty() && (start - self.svinvrend3).abs() <= min_d {
+                    if let Some(last) = self.svrinv3.last_mut() {
+                        Self::add_discordant_count(last);
+                    }
+                }
+            } else if read_dir_num * mate_dir_num == 1 {
+                let max_read_len_i64 = self.max_read_len.max(1) as i64;
+                if read_dir_num == 1 && mlen != 0 {
+                    if mlen < -3 * max_read_len_i64 {
+                        if self.svfinv3.is_empty()
+                            || (start - self.svinvfend3) as f64 > min_cluster_dist
+                        {
+                            self.svfinv3.push(SoftClip::default());
+                        }
+                        if let Some(last) = self.svfinv3.last_mut() {
+                            Self::add_discordant_cluster(
+                                last,
+                                start,
+                                end,
+                                mate_start,
+                                mend,
+                                read_dir_num,
+                                total_length_including_softclip as i64,
+                                mlen as i32,
+                                soft3,
+                                pmean,
+                                qmean,
+                                record.mapq() as f64,
+                                number_of_mismatches as f64,
+                                instance().conf.goodq,
+                            );
+                            Self::add_discordant_count(last);
+                        }
+                        self.svinvfend3 = end;
+                    } else if mlen > 3 * max_read_len_i64 {
+                        if self.svfinv5.is_empty()
+                            || (start - self.svinvfend5) as f64 > min_cluster_dist
+                        {
+                            self.svfinv5.push(SoftClip::default());
+                        }
+                        if let Some(last) = self.svfinv5.last_mut() {
+                            Self::add_discordant_cluster(
+                                last,
+                                start,
+                                end,
+                                mate_start,
+                                mend,
+                                read_dir_num,
+                                total_length_including_softclip as i64,
+                                mlen as i32,
+                                soft3,
+                                pmean,
+                                qmean,
+                                record.mapq() as f64,
+                                number_of_mismatches as f64,
+                                instance().conf.goodq,
+                            );
+                            Self::add_discordant_count(last);
+                        }
+                        self.svinvfend5 = end;
+                    }
+                } else if mlen != 0 {
+                    if mlen < -3 * max_read_len_i64 {
+                        if self.svrinv3.is_empty()
+                            || (start - self.svinvrend3) as f64 > min_cluster_dist
+                        {
+                            self.svrinv3.push(SoftClip::default());
+                        }
+                        if let Some(last) = self.svrinv3.last_mut() {
+                            Self::add_discordant_cluster(
+                                last,
+                                start,
+                                end,
+                                mate_start,
+                                mend,
+                                read_dir_num,
+                                total_length_including_softclip as i64,
+                                mlen as i32,
+                                soft5,
+                                pmean,
+                                qmean,
+                                record.mapq() as f64,
+                                number_of_mismatches as f64,
+                                instance().conf.goodq,
+                            );
+                            Self::add_discordant_count(last);
+                        }
+                        self.svinvrend3 = end;
+                    } else if mlen > 3 * max_read_len_i64 {
+                        if self.svrinv5.is_empty()
+                            || (start - self.svinvrend5) as f64 > min_cluster_dist
+                        {
+                            self.svrinv5.push(SoftClip::default());
+                        }
+                        if let Some(last) = self.svrinv5.last_mut() {
+                            Self::add_discordant_cluster(
+                                last,
+                                start,
+                                end,
+                                mate_start,
+                                mend,
+                                read_dir_num,
+                                total_length_including_softclip as i64,
+                                mlen as i32,
+                                soft5,
+                                pmean,
+                                qmean,
+                                record.mapq() as f64,
+                                number_of_mismatches as f64,
+                                instance().conf.goodq,
+                            );
+                            Self::add_discordant_count(last);
+                        }
+                        self.svinvrend5 = end;
+                    }
+                }
+
+                if mlen != 0 {
+                    if !self.svfdel.is_empty() && (start - self.svdelfend) <= min_d {
+                        if let Some(last) = self.svfdel.last_mut() {
+                            Self::add_discordant_count(last);
+                        }
+                    }
+                    if !self.svrdel.is_empty() && (start - self.svdelrend) <= min_d {
+                        if let Some(last) = self.svrdel.last_mut() {
+                            Self::add_discordant_count(last);
+                        }
+                    }
+                    if !self.svfdup.is_empty() && (start - self.svdupfend) <= min_d {
+                        if let Some(last) = self.svfdup.last_mut() {
+                            Self::add_discordant_count(last);
+                        }
+                    }
+                    if !self.svrdup.is_empty() && (start - self.svduprend) <= min_d {
+                        if let Some(last) = self.svrdup.last_mut() {
+                            Self::add_discordant_count(last);
+                        }
+                    }
+                }
             }
-        } else {
+            return;
+        }
+
+        if !skip_mate_sv_assignment {
             let mate_tid = record.mtid();
             if read_dir_num == 1 {
                 let should_start_new = self
@@ -1124,58 +1134,46 @@ impl CigarParser {
                 }
                 self.svfusrend.insert(mate_tid, end);
             }
+        }
 
-            if !self.svfdel.is_empty() && (start - self.svdelfend) <= Configuration::MINSVPOS as i64
-            {
-                if let Some(last) = self.svfdel.last_mut() {
-                    Self::add_discordant_count(last);
-                }
+        if !self.svfdel.is_empty() && (start - self.svdelfend) <= Configuration::MINSVPOS as i64 {
+            if let Some(last) = self.svfdel.last_mut() {
+                Self::add_discordant_count(last);
             }
-            if !self.svrdel.is_empty() && (start - self.svdelrend) <= Configuration::MINSVPOS as i64
-            {
-                if let Some(last) = self.svrdel.last_mut() {
-                    Self::add_discordant_count(last);
-                }
+        }
+        if !self.svrdel.is_empty() && (start - self.svdelrend) <= Configuration::MINSVPOS as i64 {
+            if let Some(last) = self.svrdel.last_mut() {
+                Self::add_discordant_count(last);
             }
-            if !self.svfdup.is_empty() && (start - self.svdupfend) <= Configuration::MINSVPOS as i64
-            {
-                if let Some(last) = self.svfdup.last_mut() {
-                    Self::add_discordant_count(last);
-                }
+        }
+        if !self.svfdup.is_empty() && (start - self.svdupfend) <= Configuration::MINSVPOS as i64 {
+            if let Some(last) = self.svfdup.last_mut() {
+                Self::add_discordant_count(last);
             }
-            if !self.svrdup.is_empty() && (start - self.svduprend) <= Configuration::MINSVPOS as i64
-            {
-                if let Some(last) = self.svrdup.last_mut() {
-                    Self::add_discordant_count(last);
-                }
+        }
+        if !self.svrdup.is_empty() && (start - self.svduprend) <= Configuration::MINSVPOS as i64 {
+            if let Some(last) = self.svrdup.last_mut() {
+                Self::add_discordant_count(last);
             }
-            if !self.svfinv5.is_empty()
-                && (start - self.svinvfend5) <= Configuration::MINSVPOS as i64
-            {
-                if let Some(last) = self.svfinv5.last_mut() {
-                    Self::add_discordant_count(last);
-                }
+        }
+        if !self.svfinv5.is_empty() && (start - self.svinvfend5) <= Configuration::MINSVPOS as i64 {
+            if let Some(last) = self.svfinv5.last_mut() {
+                Self::add_discordant_count(last);
             }
-            if !self.svrinv5.is_empty()
-                && (start - self.svinvrend5) <= Configuration::MINSVPOS as i64
-            {
-                if let Some(last) = self.svrinv5.last_mut() {
-                    Self::add_discordant_count(last);
-                }
+        }
+        if !self.svrinv5.is_empty() && (start - self.svinvrend5) <= Configuration::MINSVPOS as i64 {
+            if let Some(last) = self.svrinv5.last_mut() {
+                Self::add_discordant_count(last);
             }
-            if !self.svfinv3.is_empty()
-                && (start - self.svinvfend3) <= Configuration::MINSVPOS as i64
-            {
-                if let Some(last) = self.svfinv3.last_mut() {
-                    Self::add_discordant_count(last);
-                }
+        }
+        if !self.svfinv3.is_empty() && (start - self.svinvfend3) <= Configuration::MINSVPOS as i64 {
+            if let Some(last) = self.svfinv3.last_mut() {
+                Self::add_discordant_count(last);
             }
-            if !self.svrinv3.is_empty()
-                && (start - self.svinvrend3) <= Configuration::MINSVPOS as i64
-            {
-                if let Some(last) = self.svrinv3.last_mut() {
-                    Self::add_discordant_count(last);
-                }
+        }
+        if !self.svrinv3.is_empty() && (start - self.svinvrend3) <= Configuration::MINSVPOS as i64 {
+            if let Some(last) = self.svrinv3.last_mut() {
+                Self::add_discordant_count(last);
             }
         }
     }
@@ -1368,7 +1366,9 @@ impl CigarParser {
 
             //Ignore reads that are softclipped at both ends and both greater than 10 bp
             match cigar.0.as_slice() {
-                [Cigar::SoftClip(sl1), .., Cigar::SoftClip(sl2)] if *sl1 >= 10 && *sl2 >= 10 => {
+                [Cigar::SoftClip(sl1), .., Cigar::SoftClip(sl2)]
+                    if *sl1 >= 10 && *sl1 < 100 && *sl2 >= 10 && *sl2 < 100 =>
+                {
                     if trace_target {
                         event!(
                             Level::WARN,

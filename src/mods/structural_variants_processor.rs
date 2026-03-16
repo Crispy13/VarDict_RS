@@ -46,6 +46,8 @@ pub struct RealignedVariationData {
     pub soft_clips_3end: HashMap<i64, SoftClip, LibDefaultHasher>,
     /// Reference coverage by position
     pub ref_coverage: HashMap<i64, usize, LibDefaultHasher>,
+    /// Splice junction positions carried forward for RNA-seq-specific SV filtering.
+    pub splice: HashSet<String>,
     /// Maximum read length seen
     pub max_read_length: usize,
     /// Duplication rate
@@ -530,21 +532,10 @@ impl StructuralVariantsProcessor {
                         continue;
                     }
 
-                    let mut m = self.find_match(
-                        &seq,
-                        candidate,
-                        1,
-                        Configuration::SEED_1 as usize,
-                        3,
-                    );
+                    let mut m =
+                        self.find_match(&seq, candidate, 1, Configuration::SEED_1 as usize, 3);
                     if m.base_position == 0 {
-                        m = self.find_match(
-                            &seq,
-                            candidate,
-                            1,
-                            Configuration::SEED_2 as usize,
-                            0,
-                        );
+                        m = self.find_match(&seq, candidate, 1, Configuration::SEED_2 as usize, 0);
                     }
                     if m.base_position == 0 {
                         event!(
@@ -695,8 +686,7 @@ impl StructuralVariantsProcessor {
             let span_preloaded = self.is_span_loaded(mstart, mend);
             self.ensure_reference_span(mstart - 300, mend + 300);
             if !region_was_loaded {
-                self.loaded_regions
-                    .push((mstart - 300, mend + 300));
+                self.loaded_regions.push((mstart - 300, mend + 300));
             }
 
             let softp = Self::select_primary_soft_pos(&soft_map).unwrap_or(0);
@@ -1033,8 +1023,7 @@ impl StructuralVariantsProcessor {
             self.ensure_reference_span(inv.mstart - 500, inv.mend + 500);
             append_rss_stage_log_if_enabled(region, "sv_find_inv_after_ensure_reference_span");
             if !region_was_loaded {
-                self.loaded_regions
-                    .push((inv.mstart - 500, inv.mend + 500));
+                self.loaded_regions.push((inv.mstart - 500, inv.mend + 500));
             }
 
             if !inv_span_preloaded {
@@ -1068,13 +1057,8 @@ impl StructuralVariantsProcessor {
                     if scv_seq.is_empty() {
                         continue;
                     }
-                    let mut m = self.find_match_rev(
-                        scv_seq,
-                        softp,
-                        dir,
-                        Configuration::SEED_1 as usize,
-                        3,
-                    );
+                    let mut m =
+                        self.find_match_rev(scv_seq, softp, dir, Configuration::SEED_1 as usize, 3);
                     if m.base_position == 0 {
                         m = self.find_match_rev(
                             scv_seq,
@@ -1102,13 +1086,8 @@ impl StructuralVariantsProcessor {
                     if scv_seq.is_empty() {
                         continue;
                     }
-                    let mut m = self.find_match_rev(
-                        scv_seq,
-                        softp,
-                        dir,
-                        Configuration::SEED_1 as usize,
-                        3,
-                    );
+                    let mut m =
+                        self.find_match_rev(scv_seq, softp, dir, Configuration::SEED_1 as usize, 3);
                     if m.base_position == 0 {
                         m = self.find_match_rev(
                             scv_seq,
@@ -1374,7 +1353,11 @@ impl StructuralVariantsProcessor {
         }
     }
 
-    fn find_svs_del_candidates(&mut self, data: &mut RealignedVariationData, region: Option<&Region>) {
+    fn find_svs_del_candidates(
+        &mut self,
+        data: &mut RealignedVariationData,
+        region: Option<&Region>,
+    ) {
         let minr = instance().conf.minr;
         let region_bounds = region
             .map(|current_region| (current_region.start() as i64, current_region.end() as i64));
@@ -1426,13 +1409,7 @@ impl StructuralVariantsProcessor {
                 continue;
             }
 
-            let m = self.find_match(
-                &seq,
-                p5,
-                -1,
-                Configuration::SEED_1 as usize,
-                3,
-            );
+            let m = self.find_match(&seq, p5, -1, Configuration::SEED_1 as usize, 3);
             let mut bp = m.base_position;
             event!(Level::DEBUG, phase = "findsv_5_candidate", p5, cnt5, bp,);
             if bp != 0 {
@@ -1647,13 +1624,7 @@ impl StructuralVariantsProcessor {
                 continue;
             }
 
-            let m = self.find_match(
-                &seq,
-                p3,
-                1,
-                Configuration::SEED_1 as usize,
-                3,
-            );
+            let m = self.find_match(&seq, p3, 1, Configuration::SEED_1 as usize, 3);
             let mut bp = m.base_position;
             event!(Level::DEBUG, phase = "findsv_3_candidate", p3, cnt3, bp,);
             if bp != 0 {
@@ -1884,12 +1855,25 @@ impl StructuralVariantsProcessor {
         best.map(|(_, used)| used).unwrap_or(false)
     }
 
-    fn find_del_disc(&self, data: &mut RealignedVariationData) {
+    /// Ported from: `com.astrazeneca.vardict.modules.StructuralVariantsProcessor.findDELdisc()`
+    /// Java source: `StructuralVariantsProcessor.java:L1198-L1338`
+    fn find_del_disc(&mut self, data: &mut RealignedVariationData) {
         let min_dist = 8 * data.max_read_length as i64;
         let minr = instance().conf.minr;
 
         for idx in 0..data.svfdel.len() {
-            let (used, vars_count, end, mstart, mean_mapq, mean_qual, mean_pos, nm, softp) = {
+            let (
+                used,
+                vars_count,
+                end,
+                mstart,
+                mean_mapq,
+                mean_qual,
+                mean_pos,
+                nm,
+                softp,
+                del_mlen,
+            ) = {
                 let del = &data.svfdel[idx];
                 (
                     del.used(),
@@ -1901,10 +1885,14 @@ impl StructuralVariantsProcessor {
                     del.var.mean_pos,
                     del.var.nm,
                     del.softp,
+                    del.mlen,
                 )
             };
 
             if used || vars_count < minr + 5 {
+                continue;
+            }
+            if !data.splice.is_empty() && i64::from(del_mlen).abs() < 250_000 {
                 continue;
             }
             if mstart <= end + min_dist {
@@ -1923,6 +1911,10 @@ impl StructuralVariantsProcessor {
             if softp != 0 {
                 bp = softp as i64;
             }
+
+            self.ensure_reference_span(bp - 150, bp + 150);
+            let ext = mlen.min(1000);
+            self.loaded_regions.push((bp - 150 - ext, bp + 150 + ext));
 
             let del_key = format!("-{}", mlen);
             let vref =
@@ -1972,37 +1964,58 @@ impl StructuralVariantsProcessor {
         }
 
         for idx in 0..data.svrdel.len() {
-            let (used, vars_count, start, mend, mean_mapq, mean_qual, mean_pos, nm, softp) = {
+            let (
+                used,
+                vars_count,
+                start,
+                del_mstart,
+                del_mend,
+                mean_mapq,
+                mean_qual,
+                mean_pos,
+                nm,
+                softp,
+                del_mlen,
+            ) = {
                 let del = &data.svrdel[idx];
                 (
                     del.used(),
                     del.var.alt_depth,
                     del.start,
+                    del.mstart,
                     del.mend,
                     del.var.mean_mapq,
                     del.var.mean_qual,
                     del.var.mean_pos,
                     del.var.nm,
                     del.softp,
+                    del.mlen,
                 )
             };
 
             if used || vars_count < minr + 5 {
                 continue;
             }
-            if start <= mend + min_dist {
+            if !data.splice.is_empty() && i64::from(del_mlen).abs() < 250_000 {
+                continue;
+            }
+            if start <= del_mend + min_dist {
                 continue;
             }
             if vars_count == 0 || mean_mapq / vars_count as f64 <= Configuration::DISCPAIRQUAL {
                 continue;
             }
 
-            let mlen = start - mend - data.max_read_length as i64 / (vars_count + 1) as i64;
+            let mlen = start - del_mend - data.max_read_length as i64 / (vars_count + 1) as i64;
             if !(mlen > 0 && mlen > min_dist) {
                 continue;
             }
 
-            let bp = mend + (data.max_read_length as i64 / (vars_count + 1) as i64) / 2;
+            let bp = del_mend + (data.max_read_length as i64 / (vars_count + 1) as i64) / 2;
+
+            self.ensure_reference_span(bp - 150, bp + 150);
+            let ext = mlen.min(1000);
+            self.loaded_regions.push((bp - 150 - ext, bp + 150 + ext));
 
             let del_key = format!("-{}", mlen);
             let vref =
@@ -2011,7 +2024,7 @@ impl StructuralVariantsProcessor {
 
             let splits = data
                 .soft_clips_3end
-                .get(&(mend + 1))
+                .get(&(del_mend + 1))
                 .map(|s| s.var.alt_depth)
                 .unwrap_or(0)
                 + data
@@ -2060,7 +2073,14 @@ impl StructuralVariantsProcessor {
             if let Some(del) = data.svrdel.get_mut(idx) {
                 del.mark_used();
             }
-            Self::mark_sv(mend, start, &mut data.svfdel, data.max_read_length as i64);
+            self.ensure_reference_span(del_mstart - 100, del_mend + 100);
+            self.loaded_regions.push((del_mstart - 300, del_mend + 300));
+            Self::mark_sv(
+                del_mend,
+                start,
+                &mut data.svfdel,
+                data.max_read_length as i64,
+            );
         }
     }
 
@@ -2390,11 +2410,8 @@ impl StructuralVariantsProcessor {
             let mut bp = ms - read_len_adj / 2;
             let mut pe = end;
 
-            let span_preloaded = self.is_span_loaded(ms, me);
             self.ensure_reference_span(bp - 150, bp + 150);
-            if !span_preloaded {
-                self.load_uncovered_reference_coverage(data, ms - 200, me + 200);
-            }
+            self.load_uncovered_reference_coverage(data, ms - 200, me + 200);
 
             let mut cntf = cnt;
             let mut cntr = cnt;
@@ -2568,11 +2585,8 @@ impl StructuralVariantsProcessor {
             let mut pe = mlen + bp - 1;
             let mut tpe = pe;
 
-            let span_preloaded = self.is_span_loaded(ms, me);
             self.ensure_reference_span(pe - 150, pe + 150);
-            if !span_preloaded {
-                self.load_uncovered_reference_coverage(data, ms - 200, me + 200);
-            }
+            self.load_uncovered_reference_coverage(data, ms - 200, me + 200);
 
             let mut cntf = cnt;
             let mut cntr = cnt;
@@ -3714,7 +3728,8 @@ impl StructuralVariantsProcessor {
             return false;
         }
         if !self.original_reference_seq.is_empty() {
-            let original_end = self.original_ref_start + self.original_reference_seq.len() as i64 - 1;
+            let original_end =
+                self.original_ref_start + self.original_reference_seq.len() as i64 - 1;
             if start >= self.original_ref_start && end <= original_end {
                 return true;
             }
@@ -3871,14 +3886,20 @@ impl StructuralVariantsProcessor {
             }
         }
         for (position, del_key) in candidates {
-            if let Some(del_len) = del_key.strip_prefix('-').and_then(|suffix| suffix.parse::<i64>().ok()) {
-                let right_start = position + del_len;
-                let right_end = right_start + 19;
-                if self.is_region_loaded(right_start, right_end) {
-                    self.historical_del_rightseq_variants
-                        .entry(position)
-                        .or_default()
-                        .insert(del_key);
+            if del_key.starts_with('-') {
+                let numeric_part = del_key[1..]
+                    .split(|c: char| c == '#' || c == '^' || c == '&')
+                    .next()
+                    .unwrap_or("");
+                if let Some(del_len) = numeric_part.parse::<i64>().ok() {
+                    let right_start = position + del_len;
+                    let right_end = right_start + 19;
+                    if self.is_region_loaded(right_start, right_end) {
+                        self.historical_del_rightseq_variants
+                            .entry(position)
+                            .or_default()
+                            .insert(del_key);
+                    }
                 }
             }
         }
@@ -4568,16 +4589,21 @@ mod tests {
         processor.loaded_regions.push((210, 229));
 
         let mut data = RealignedVariationData::default();
-        let variation =
-            StructuralVariantsProcessor::get_or_create_variation(&mut data.non_insertion_variants, 200, "-10");
+        let variation = StructuralVariantsProcessor::get_or_create_variation(
+            &mut data.non_insertion_variants,
+            200,
+            "-10",
+        );
         variation.alt_depth = 1;
 
         processor.record_del_rightseq_from_loaded_regions(&data);
 
-        assert!(processor
-            .historical_del_rightseq_variants
-            .get(&200)
-            .is_some_and(|descriptions| descriptions.contains("-10")));
+        assert!(
+            processor
+                .historical_del_rightseq_variants
+                .get(&200)
+                .is_some_and(|descriptions| descriptions.contains("-10"))
+        );
     }
 
     #[test]
@@ -4586,16 +4612,47 @@ mod tests {
             StructuralVariantsProcessor::new(b"ACGTACGT".to_vec(), Default::default(), 100);
 
         let mut data = RealignedVariationData::default();
-        let variation =
-            StructuralVariantsProcessor::get_or_create_variation(&mut data.non_insertion_variants, 200, "-10");
+        let variation = StructuralVariantsProcessor::get_or_create_variation(
+            &mut data.non_insertion_variants,
+            200,
+            "-10",
+        );
         variation.alt_depth = 1;
 
         processor.record_del_rightseq_from_loaded_regions(&data);
 
-        assert!(processor
-            .historical_del_rightseq_variants
-            .get(&200)
-            .is_none());
+        assert!(
+            processor
+                .historical_del_rightseq_variants
+                .get(&200)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_record_del_rightseq_from_loaded_regions_marks_complex_del_key() {
+        let mut processor =
+            StructuralVariantsProcessor::new(b"ACGTACGT".to_vec(), Default::default(), 100);
+        processor.loaded_regions.push((1925, 1944));
+
+        let mut data = RealignedVariationData::default();
+        let variation = StructuralVariantsProcessor::get_or_create_variation(
+            &mut data.non_insertion_variants,
+            200,
+            "-1725#TTGTGAAGATATTT^-1713&AGGCCTATTTAGG",
+        );
+        variation.alt_depth = 1;
+
+        processor.record_del_rightseq_from_loaded_regions(&data);
+
+        assert!(
+            processor
+                .historical_del_rightseq_variants
+                .get(&200)
+                .is_some_and(|descriptions| {
+                    descriptions.contains("-1725#TTGTGAAGATATTT^-1713&AGGCCTATTTAGG")
+                })
+        );
     }
 
     #[test]

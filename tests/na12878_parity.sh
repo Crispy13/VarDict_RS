@@ -25,7 +25,6 @@ JAVA_HEAP="2g"
 FREQ="0.01"
 STOP_ON_FAIL=1
 ALL_CHR=0
-CLEAN=0
 CLEAN_RUST=0
 
 TOTAL_SHARDS=0
@@ -65,7 +64,6 @@ Options:
   --java-heap SIZE  Java heap size per worker (default: 2g)
   --freq F          Override VarDict frequency threshold (default: 0.01)
   --no-stop         Continue past mismatches instead of stopping after the first failed batch
-  --clean           Remove all cached outputs (Java + Rust) before running
   --clean-rust      Remove only Rust + diff outputs (preserves Java cache)
   --help            Show this help
 
@@ -194,9 +192,7 @@ prepare_dirs() {
     RUST_DIR="${BASE_DIR}/${CHR}/rust"
     DIFF_DIR="${BASE_DIR}/${CHR}/diff"
 
-    if (( CLEAN )); then
-        rm -rf "${BASE_DIR}/${CHR}"
-    elif (( CLEAN_RUST )); then
+    if (( CLEAN_RUST )); then
         rm -rf "$RUST_DIR" "$DIFF_DIR"
     fi
 
@@ -683,9 +679,6 @@ parse_args() {
                 ;;
             --no-stop)
                 STOP_ON_FAIL=0
-                ;;
-            --clean)
-                CLEAN=1
                 ;;
             --clean-rust)
                 CLEAN_RUST=1

@@ -2464,6 +2464,7 @@ impl VarDictPipeline {
             soft_clips_5end,
             soft_clips_3end,
             ref_coverage,
+            splice,
             max_read_length: max_read_len,
             duprate,
             svfdel,
@@ -2554,7 +2555,7 @@ impl VarDictPipeline {
                 ref_coverage: processed.ref_coverage,
                 duprate: processed.duprate,
                 max_read_len: processed.max_read_length,
-                splice,
+                splice: processed.splice,
                 historical_reference_windows,
                 historical_del_rightseq_variants,
             },
@@ -3680,11 +3681,7 @@ impl VarDictPipeline {
                 let right_start = end_position + 1;
                 let right_end = (end_position + 20).min(chr_len);
                 let del_rightseq_loaded = varallele != "<DEL>"
-                    || self.local_reference_span_loaded(
-                        reference,
-                        right_start,
-                        right_end,
-                    )
+                    || self.local_reference_span_loaded(reference, right_start, right_end)
                     || self.historical_del_rightseq_loaded(
                         historical_del_rightseq_variants,
                         position,
@@ -6537,8 +6534,7 @@ mod tests {
             })
             .collect();
 
-        let mut chromosomes: HashMap<String, ChromosomeData, LibDefaultHasher> =
-            Default::default();
+        let mut chromosomes: HashMap<String, ChromosomeData, LibDefaultHasher> = Default::default();
         chromosomes.insert(
             "chr1".to_string(),
             ChromosomeData {

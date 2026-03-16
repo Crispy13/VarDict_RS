@@ -5238,6 +5238,7 @@ mod tests {
             soft_clips_5end: parser.take_soft_clips_5end(),
             soft_clips_3end: parser.take_soft_clips_3end(),
             ref_coverage: parser.take_ref_coverage(),
+            splice: Default::default(),
             max_read_length: parser.get_max_read_len(),
             duprate: 0.0,
             svfdel: parser.take_svfdel(),
