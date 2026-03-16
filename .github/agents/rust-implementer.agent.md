@@ -1,6 +1,6 @@
 ---
 description: "Implement or fix Rust code for VarDictJava parity. Use when writing Rust translations of Java methods, fixing parity mismatches, implementing variant calling algorithms in Rust, or adapting Java patterns to idiomatic Rust while preserving exact output behavior."
-tools: [read, search, edit, execute]
+tools: [read, search, edit, execute, web]
 model: ['GPT-5.4 (copilot)']
 user-invocable: false
 ---
