@@ -108,6 +108,30 @@ struct Args {
     #[arg(short = 'Z', long = "downsample")]
     downsampling: Option<f64>,
 
+    /// Move indels to 3' end (Java: -3)
+    #[arg(short = '3', long = "move-indels-3prime")]
+    move_indels_3prime: bool,
+
+    /// The read position filter (Java: -P)
+    #[arg(short = 'P', long = "read-pos-filter", default_value = "5.0")]
+    read_pos_filter: f64,
+
+    /// The Qratio of good quality reads to bad quality reads (Java: -o)
+    #[arg(short = 'o', long = "qratio", default_value = "1.5")]
+    qratio: f64,
+
+    /// Minimum match count threshold (Java: -M)
+    #[arg(short = 'M', long = "min-match", default_value = "0")]
+    min_match: i32,
+
+    /// Trim bases after this position (Java: -T)
+    #[arg(short = 'T', long = "trim-bases-after", default_value = "0")]
+    trim_bases_after: i32,
+
+    /// Minimum reads per strand to avoid strand bias (Java: -B)
+    #[arg(short = 'B', long = "min-bias-reads", default_value = "2")]
+    min_bias_reads: usize,
+
     /// Turn off structural variant calling
     #[arg(short = 'U', long = "nosv")]
     no_sv: bool,
@@ -136,6 +160,26 @@ struct Args {
     #[arg(long = "fisher")]
     fisher: bool,
 
+    /// Mean insert size (Java: -w)
+    #[arg(short = 'w', long = "insert-size", default_value = "300")]
+    insert_size: i32,
+
+    /// Insert size standard deviation (Java: -W)
+    #[arg(short = 'W', long = "insert-std", default_value = "100")]
+    insert_std: i32,
+
+    /// Number of insert size standard deviations for discordant filtering (Java: -A)
+    #[arg(short = 'A', long = "insert-std-amt", default_value = "4")]
+    insert_std_amt: i32,
+
+    /// Minimum structural variant length (Java: -L)
+    #[arg(short = 'L', long = "sv-min-len", default_value = "1000")]
+    sv_min_len: usize,
+
+    /// Enable chimeric read filtering
+    #[arg(long = "chimeric")]
+    chimeric: bool,
+
     /// CRISPR cutting site position (Java: -J / --crispr)
     #[arg(short = 'J', long = "crispr", default_value = "0")]
     crispr_cutting_site: i32,
@@ -151,6 +195,10 @@ struct Args {
     /// Indicate whether coordinates are zero-based: 1 for zero-based, 0 for one-based
     #[arg(short = 'z', long = "zero", value_parser = clap::value_parser!(u8).range(0..=1))]
     zero_based: Option<u8>,
+
+    /// Count N bases in total depth (Java: -K)
+    #[arg(short = 'K', long = "include-n")]
+    include_n: bool,
 
     /// Perform local realignment (default: 1). Use 0 to disable.
     #[arg(short = 'k', long = "realign", default_value = "1")]
@@ -397,6 +445,11 @@ fn run_variant_calling(
     };
     conf.vext = args.vext;
     conf.mismatch = args.mismatch;
+    conf.min_match = args.min_match;
+    conf.trim_bases_after = args.trim_bases_after;
+    conf.read_pos_filter = args.read_pos_filter;
+    conf.qratio = args.qratio;
+    conf.min_bias_reads = args.min_bias_reads;
     conf.mapping_quality = if args.min_mapping_quality > 0 {
         Some(args.min_mapping_quality)
     } else {
@@ -404,14 +457,22 @@ fn run_variant_calling(
     };
     conf.sam_filter = sam_filter;
     conf.downsampling = args.downsampling;
+    conf.move_indels_to_3 = args.move_indels_3prime;
+    conf.chimeric_filter = args.chimeric;
     conf.remove_duplicated_reads = args.remove_duplicates;
     conf.disable_sv = args.no_sv;
     conf.unique_mode_alignment_enabled = args.unique_mode_alignment;
     conf.unique_mode_second_in_pair_enabled = args.unique_mode_second_in_pair;
     conf.delete_duplicate_variants = args.delete_duplicate_variants;
+    conf.debug = args.debug;
     conf.fisher = args.fisher;
+    conf.inssize = args.insert_size;
+    conf.insstd = args.insert_std;
+    conf.insstdamt = args.insert_std_amt;
+    conf.sv_min_len = args.sv_min_len;
     conf.crispr_cutting_site = args.crispr_cutting_site;
     conf.crispr_filtering_bp = args.crispr_filtering_bp;
+    conf.include_n_in_total_depth = args.include_n;
     conf.amplicon_based_calling = amplicon_based_calling.clone();
     conf.perform_local_realignment = args.local_realignment == 1;
     conf.number_nucleotide_to_extend = args.number_nucleotide_to_extend;
@@ -790,11 +851,16 @@ fn select_region_batches_for_execution(
     execution_mode: ExecutionMode,
     regions: Vec<Region>,
     amplicon_region_groups: Option<Vec<Vec<Region>>>,
-    _num_threads: usize,
+    num_threads: usize,
 ) -> Vec<Vec<Region>> {
     match execution_mode {
-        ExecutionMode::Simple => vec![regions],
-        ExecutionMode::Somatic | ExecutionMode::Splicing => vec![regions],
+        ExecutionMode::Simple | ExecutionMode::Somatic | ExecutionMode::Splicing => {
+            let batch_size = (num_threads * 4).max(8);
+            regions
+                .chunks(batch_size)
+                .map(|chunk| chunk.to_vec())
+                .collect()
+        }
         ExecutionMode::Amplicon => {
             if let Some(groups) = amplicon_region_groups {
                 if groups.is_empty() {
@@ -921,7 +987,7 @@ fn get_regions(args: &Args, primary_bam_path: &Path) -> Result<RegionLoadResult>
             args.zero_based.unwrap_or(0) == 1,
             Some(&bam_targets),
         )?;
-        regions.push(region);
+        regions.push(extend_region(region, args.number_nucleotide_to_extend));
         return Ok(RegionLoadResult {
             regions,
             amplicon_based_calling: None,
@@ -947,6 +1013,25 @@ fn get_regions(args: &Args, primary_bam_path: &Path) -> Result<RegionLoadResult>
         amplicon_based_calling: None,
         amplicon_region_groups: None,
     })
+}
+
+fn extend_region(region: Region, number_nucleotide_to_extend: i32) -> Region {
+    let x = number_nucleotide_to_extend.max(0) as usize;
+    if x == 0 {
+        return region;
+    }
+
+    let display_start = region.start() as i64 - x as i64;
+    let clamped_start = region.start().saturating_sub(x);
+    let extended_end = region.end().saturating_add(x);
+
+    Region::new_extended(
+        region.chr().to_string(),
+        clamped_start,
+        extended_end,
+        region.gene().to_string(),
+        display_start,
+    )
 }
 
 /// Parse a region string like "chr1:1000-2000" or "chr1:1000"
@@ -1125,7 +1210,10 @@ fn parse_standard_regions(
             (start, end)
         };
 
-        regions.push(Region::new(chr, start, end, gene));
+        regions.push(extend_region(
+            Region::new(chr, start, end, gene),
+            args.number_nucleotide_to_extend,
+        ));
     }
 
     Ok(regions)
@@ -1306,6 +1394,38 @@ mod tests {
     fn test_parse_region_string_invalid() {
         assert!(parse_region_string("invalid", false, None).is_err());
         assert!(parse_region_string("chr1", false, None).is_err());
+    }
+
+    #[test]
+    fn test_extend_region_preserves_negative_display_start() {
+        let region = Region::new("20".to_string(), 1, 1_000_000, "20".to_string());
+
+        let extended = extend_region(region, 150);
+
+        assert_eq!(extended.start(), 0);
+        assert_eq!(extended.display_start(), -149);
+        assert_eq!(extended.end(), 1_000_150);
+    }
+
+    #[test]
+    fn test_parse_standard_regions_applies_x_extension() {
+        let args = parse_args_for_test([
+            "vardict",
+            "-G",
+            "ref.fa",
+            "-b",
+            "reads.bam",
+            "-x",
+            "150",
+        ]);
+        let bed_lines = vec!["20\t0\t1000000\t20".to_string()];
+
+        let regions = parse_standard_regions(&bed_lines, &args, None, true).unwrap();
+
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].start(), 0);
+        assert_eq!(regions[0].display_start(), -149);
+        assert_eq!(regions[0].end(), 1_000_150);
     }
 
     #[test]
@@ -1674,8 +1794,12 @@ mod tests {
 
         let batches = select_region_batches_for_execution(ExecutionMode::Simple, regions, None, 1);
 
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].len(), 65);
+        assert_eq!(batches.len(), 9);
+        assert_eq!(batches[0].len(), 8);
+        assert_eq!(batches[7].len(), 8);
+        assert_eq!(batches[8].len(), 1);
+        assert_eq!(batches[0][0].start(), 1);
+        assert_eq!(batches[8][0].start(), 641);
     }
 
     #[test]

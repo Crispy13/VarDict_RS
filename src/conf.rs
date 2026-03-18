@@ -57,6 +57,9 @@ pub struct Configuration {
     /// Minimum number of variant reads
     pub minr: usize,
 
+    /// Minimum reads per strand required to avoid strand bias (Java: minBiasReads / -B)
+    pub min_bias_reads: usize,
+
     /// The read position filter
     pub read_pos_filter: f64,
 
@@ -130,6 +133,7 @@ impl Default for Configuration {
             freq: 0.01,
             lofreq: 0.05,
             minr: 2,
+            min_bias_reads: 2,
             read_pos_filter: 5.0,
             qratio: 1.5,
             mapq: 0.0,

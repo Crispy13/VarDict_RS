@@ -907,7 +907,10 @@ impl VariantRealigner {
         start: i64,
         end: i64,
     ) {
-        if self.bam_paths.is_empty() || start > end {
+        // Preserve Java boundary behavior for on-demand coverage loads: a fully
+        // left-of-chromosome window must stay empty, not clamp to position 1
+        // and replay already-counted reference evidence.
+        if self.bam_paths.is_empty() || start > end || end < 1 {
             return;
         }
 
@@ -5002,6 +5005,41 @@ mod tests {
         assert_eq!(realigner.get_ref_base(103), Some(b'T'));
         assert_eq!(realigner.get_ref_base(200), Some(b'T'));
         assert_eq!(realigner.get_ref_base(204), None);
+    }
+
+    #[test]
+    fn test_load_partial_ref_coverage_skips_windows_left_of_chromosome_start() {
+        let realigner = VariantRealigner::new_with_context(
+            Arc::new(b"ACGT".to_vec()),
+            Arc::new(Default::default()),
+            1,
+            Some("MT".to_string()),
+            vec!["unused.bam".to_string()],
+        );
+        let mut data = RealignedVariationData::default();
+        let key = VarDesc::snv_key(b'G');
+
+        let mut existing = Variant::default();
+        existing.alt_depth = 350;
+        existing.alt_depth_fwd = 347;
+        existing.alt_depth_rev = 3;
+        data.non_insertion_variants
+            .entry(1)
+            .or_default()
+            .insert(key.clone(), existing);
+        data.ref_coverage.insert(1, 350);
+
+        realigner.load_partial_ref_coverage(&mut data, -199, 0);
+
+        let variant = data
+            .non_insertion_variants
+            .get(&1)
+            .and_then(|vars| vars.get(&key))
+            .expect("existing breakpoint reference variant");
+        assert_eq!(variant.alt_depth, 350);
+        assert_eq!(variant.alt_depth_fwd, 347);
+        assert_eq!(variant.alt_depth_rev, 3);
+        assert_eq!(data.ref_coverage.get(&1), Some(&350));
     }
 
     #[test]

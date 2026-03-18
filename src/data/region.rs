@@ -3,6 +3,7 @@ pub struct Region {
     pub(crate) chrom: String,
     pub(crate) start: usize,
     pub(crate) end: usize,
+    pub(crate) display_start: i64,
     pub(crate) gene: String,
     pub(crate) ins_start: usize,
     pub(crate) ins_end: usize,
@@ -15,6 +16,26 @@ impl Region {
             chrom,
             start,
             end,
+            display_start: start as i64,
+            gene,
+            ins_start: 0,
+            ins_end: 0,
+        }
+    }
+
+    /// Create a new region with distinct display and computational starts.
+    pub fn new_extended(
+        chrom: String,
+        start: usize,
+        end: usize,
+        gene: String,
+        display_start: i64,
+    ) -> Self {
+        Self {
+            chrom,
+            start,
+            end,
+            display_start,
             gene,
             ins_start: 0,
             ins_end: 0,
@@ -34,6 +55,7 @@ impl Region {
             chrom,
             start,
             end,
+            display_start: start as i64,
             gene,
             ins_start,
             ins_end,
@@ -53,6 +75,11 @@ impl Region {
     /// Get the end position (1-based, inclusive)
     pub fn end(&self) -> usize {
         self.end
+    }
+
+    /// Get the display start position, which may be negative for extended regions.
+    pub fn display_start(&self) -> i64 {
+        self.display_start
     }
 
     /// Get the gene name
@@ -86,6 +113,34 @@ impl Region {
 
     /// Format as "chr:start-end"
     pub fn to_region_string(&self) -> String {
-        format!("{}:{}-{}", self.chrom, self.start, self.end)
+        format!("{}:{}-{}", self.chrom, self.display_start, self.end)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Region;
+
+    #[test]
+    fn new_defaults_display_start_to_start() {
+        let region = Region::new("chr1".to_string(), 100, 200, "GENE".to_string());
+
+        assert_eq!(region.display_start(), 100);
+        assert_eq!(region.to_region_string(), "chr1:100-200");
+    }
+
+    #[test]
+    fn new_extended_preserves_negative_display_start() {
+        let region = Region::new_extended(
+            "20".to_string(),
+            1,
+            1_000_150,
+            "20".to_string(),
+            -149,
+        );
+
+        assert_eq!(region.start(), 1);
+        assert_eq!(region.display_start(), -149);
+        assert_eq!(region.to_region_string(), "20:-149-1000150");
     }
 }

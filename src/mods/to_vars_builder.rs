@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 
 use crate::mods::simple_variant_caller::SimpleVarKey;
+use crate::scopedata::global_read_only_scope::INSTANCE;
 use crate::variants::variants::StructuralVariantCounts;
 
 /// Variant type enumeration
@@ -105,6 +106,8 @@ pub struct Variant {
 
     // === Frequencies ===
     pub frequency: f64,
+    // Preserves the pre-reference-adjustment frequency used by Java's conf.freq gate.
+    pub threshold_frequency: f64,
     pub high_quality_reads_frequency: f64,
     pub extra_frequency: f64,
 
@@ -162,6 +165,7 @@ impl Variant {
             position_coverage: 0,
             total_pos_coverage: 0,
             frequency: 0.0,
+            threshold_frequency: 0.0,
             high_quality_reads_frequency: 0.0,
             extra_frequency: 0.0,
             mean_position: 0.0,
@@ -277,6 +281,7 @@ impl Default for Variant {
 pub struct Vars {
     pub variants: Vec<Variant>,
     pub reference_variant: Option<Variant>,
+    pub debug: String,
     pub sv: String,
     pub sv_flags: StructuralVariantCounts,
 }
@@ -498,6 +503,7 @@ impl ToVarsBuilder {
             let vars = Vars {
                 variants: variant_list,
                 reference_variant: None,
+                debug: String::new(),
                 sv: String::new(),
                 sv_flags: StructuralVariantCounts::default(),
             };
@@ -569,7 +575,10 @@ pub fn has_at_least_2_distinct_f64(values: &[f64]) -> bool {
 pub fn check_strand_bias(forward: usize, reverse: usize) -> StrandBiasValue {
     let total = forward + reverse;
     let bias_threshold = 0.05; // Java: instance().conf.bias = 0.05
-    let min_bias_reads = 2usize; // Java: instance().conf.minBiasReads = 2
+    let min_bias_reads = INSTANCE
+        .get()
+        .map(|scope| scope.conf.min_bias_reads)
+        .unwrap_or(2); // Java: instance().conf.minBiasReads = 2
 
     // using p=0.01, because prop.test(1,12) = 0.01
     if total <= 12 {

@@ -26,6 +26,9 @@ FREQ="0.01"
 STOP_ON_FAIL=1
 ALL_CHR=0
 CLEAN_RUST=0
+CLEANUP=1
+EXTRA_OPTS=""
+OPTS_LABEL="default"
 
 TOTAL_SHARDS=0
 PASS_COUNT=0
@@ -47,7 +50,6 @@ declare -a SHARD_ENDS=()
 declare -a ACTIVE_PIDS=()
 declare -a FAIL_MESSAGES=()
 
-JAVA_SEM_FD=""
 BATCH_FIRST_FAIL_IDX=""
 
 usage() {
@@ -59,17 +61,29 @@ Options:
   --all-chr         Run all chromosomes from the FAI index sequentially
   --chr-len LEN     Chromosome length; defaults to lookup in ${REF_FASTA_FAI}
   --shard-size N    Override shard size in bases (default: 1000000)
-  --parallel N      Override shard pipeline worker count (default: 10)
-  --java-parallel N Override concurrent Java worker count within shard pipelines (default: 10)
+  --parallel N      Override worker count for Java/Rust phases (default: 10)
+  --java-parallel N (Ignored — kept for backwards compatibility)
   --java-heap SIZE  Java heap size per worker (default: 2g)
   --freq F          Override VarDict frequency threshold (default: 0.01)
   --no-stop         Continue past mismatches instead of stopping after the first failed batch
   --clean-rust      Remove only Rust + diff outputs (preserves Java cache)
+  --no-cleanup      Keep all output files after comparison (default: cleanup passing outputs)
+  --opts "FLAGS"    Extra CLI flags passed to both Java and Rust (default: none)
+  --opts-label LBL  Cache subdirectory label for this option set (default: "default")
   --help            Show this help
+
+Execution model:
+  Phase 1: Generate Java outputs for all shards (MAX_PARALLEL concurrent)
+  Phase 2: Generate Rust outputs for all shards (MAX_PARALLEL concurrent)
+  Phase 3: Compare outputs (sequential, lightweight)
+  Phase 4: Cleanup passing outputs to save disk (unless --no-cleanup)
+  Java and Rust never run simultaneously, preventing memory exhaustion.
 
 Caching:
   Java outputs are cached and reused across runs (deterministic).
   Rust outputs are automatically regenerated when the binary is newer.
+  After all shards pass, a .verified marker is created and outputs are deleted.
+  Re-runs skip verified configs unless the Rust binary has been rebuilt.
 EOF
 }
 
@@ -101,9 +115,15 @@ remove_stale_diff() {
 
 kill_active_jobs() {
     local pid
+    local child_pid
 
+    # Kill child processes (Java/Rust) of each background subshell first
     for pid in "${ACTIVE_PIDS[@]}"; do
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            # Kill all descendants of the subshell
+            for child_pid in $(pgrep -P "$pid" 2>/dev/null); do
+                kill "$child_pid" 2>/dev/null || true
+            done
             kill "$pid" 2>/dev/null || true
         fi
     done
@@ -117,15 +137,7 @@ kill_active_jobs() {
     ACTIVE_PIDS=()
 }
 
-cleanup_java_semaphore() {
-    if [[ -n "${JAVA_SEM_FD:-}" ]]; then
-        exec {JAVA_SEM_FD}>&-
-        JAVA_SEM_FD=""
-    fi
-}
-
 cleanup_script() {
-    cleanup_java_semaphore
     kill_active_jobs
 }
 
@@ -188,9 +200,9 @@ generate_shards() {
 }
 
 prepare_dirs() {
-    JAVA_DIR="${BASE_DIR}/${CHR}/java"
-    RUST_DIR="${BASE_DIR}/${CHR}/rust"
-    DIFF_DIR="${BASE_DIR}/${CHR}/diff"
+    JAVA_DIR="${BASE_DIR}/${OPTS_LABEL}/${CHR}/java"
+    RUST_DIR="${BASE_DIR}/${OPTS_LABEL}/${CHR}/rust"
+    DIFF_DIR="${BASE_DIR}/${OPTS_LABEL}/${CHR}/diff"
 
     if (( CLEAN_RUST )); then
         rm -rf "$RUST_DIR" "$DIFF_DIR"
@@ -229,33 +241,6 @@ find_first_difference_line() {
             }
         }
     ' "$left_file" "$right_file"
-}
-
-init_java_semaphore() {
-    local control_dir="${BASE_DIR}/${CHR}/.control"
-    local fifo_path="${control_dir}/java_tokens.fifo"
-    local idx
-
-    cleanup_java_semaphore
-    mkdir -p "$control_dir"
-    rm -f "$fifo_path"
-    mkfifo "$fifo_path"
-    exec {JAVA_SEM_FD}<>"$fifo_path"
-    rm -f "$fifo_path"
-
-    for ((idx = 0; idx < JAVA_MAX_PARALLEL; idx++)); do
-        printf '.' >&"$JAVA_SEM_FD"
-    done
-}
-
-acquire_java_slot() {
-    local token=''
-
-    read -r -n 1 -u "$JAVA_SEM_FD" token
-}
-
-release_java_slot() {
-    printf '.' >&"$JAVA_SEM_FD"
 }
 
 needs_missing_outputs() {
@@ -350,7 +335,76 @@ failure_summary_for_idx() {
     printf 'mismatch'
 }
 
-process_shard() {
+generate_java_shard() {
+    local idx=$1
+    local shard_num=${SHARD_IDS[$idx]}
+    local start=${SHARD_STARTS[$idx]}
+    local end=${SHARD_ENDS[$idx]}
+    local region="${CHR}:${start}-${end}"
+    local java_file="${JAVA_DIR}/shard_${shard_num}.tsv"
+    local java_log="${JAVA_DIR}/shard_${shard_num}.log"
+    local java_rc=0
+    local freq_flag="-f $FREQ"
+    if [[ "$EXTRA_OPTS" =~ (^|[[:space:]])-f[[:space:]] ]]; then
+        freq_flag=""
+    fi
+
+    if [[ -f "$java_file" ]]; then
+        return 0
+    fi
+
+    # shellcheck disable=SC2086
+    java "-Xmx${JAVA_HEAP}" -classpath "$JAVA_JAR" com.astrazeneca.vardict.Main \
+        -G "$REF_FASTA" \
+        -b "$BAM_PATH" \
+        -N NA12878 $freq_flag -th 1 \
+        $EXTRA_OPTS \
+        -R "$region" \
+        >"$java_file" 2>"$java_log" || java_rc=$?
+
+    if (( java_rc != 0 )); then
+        rm -f "$java_file"
+        echo "JAVA_FAIL shard_${shard_num} (${region}): exit ${java_rc}" >&2
+        return 1
+    fi
+}
+
+generate_rust_shard() {
+    local idx=$1
+    local shard_num=${SHARD_IDS[$idx]}
+    local start=${SHARD_STARTS[$idx]}
+    local end=${SHARD_ENDS[$idx]}
+    local region="${CHR}:${start}-${end}"
+    local rust_file="${RUST_DIR}/shard_${shard_num}.tsv"
+    local rust_log="${RUST_DIR}/shard_${shard_num}.log"
+    local rust_rc=0
+    local freq_flag="-f $FREQ"
+    if [[ "$EXTRA_OPTS" =~ (^|[[:space:]])-f[[:space:]] ]]; then
+        freq_flag=""
+    fi
+
+    if [[ -f "$rust_file" ]] && ! [[ "$RUST_BIN" -nt "$rust_file" ]]; then
+        return 0
+    fi
+
+    rm -f "$rust_file"
+    # shellcheck disable=SC2086
+    "$RUST_BIN" \
+        -G "$REF_FASTA" \
+        -b "$BAM_PATH" \
+        -N NA12878 $freq_flag \
+        $EXTRA_OPTS \
+        -R "$region" \
+        >"$rust_file" 2>"$rust_log" || rust_rc=$?
+
+    if (( rust_rc != 0 )); then
+        rm -f "$rust_file"
+        echo "RUST_FAIL shard_${shard_num} (${region}): exit ${rust_rc}" >&2
+        return 1
+    fi
+}
+
+compare_shard() {
     local idx=$1
     local shard_num=${SHARD_IDS[$idx]}
     local start=${SHARD_STARTS[$idx]}
@@ -363,8 +417,6 @@ process_shard() {
     local status_file
     local meta_file
     local diff_file
-    local java_rc=0
-    local rust_rc=0
     local java_lines=0
     local rust_lines=0
     local first_diff_line=""
@@ -376,50 +428,6 @@ process_shard() {
     diff_file=$(diff_file_for_idx "$idx")
 
     rm -f "$status_file" "$meta_file" "$diff_file"
-
-    if [[ ! -f "$java_file" ]]; then
-        acquire_java_slot || {
-            printf 'FAIL\n' >"$status_file"
-            printf 'Unable to acquire Java worker slot\n' >"$diff_file"
-            write_failure_meta "$meta_file" "$region" "$shard_num" "$java_file" "$rust_file" "$diff_file" "$java_log" "$rust_log" "0" "0" "" "java worker slot unavailable" "java_slot_unavailable"
-            return 0
-        }
-
-        java "-Xmx${JAVA_HEAP}" -classpath "$JAVA_JAR" com.astrazeneca.vardict.Main \
-            -G "$REF_FASTA" \
-            -b "$BAM_PATH" \
-            -N NA12878 -f "$FREQ" -th 1 \
-            -R "$region" \
-            >"$java_file" 2>"$java_log" || java_rc=$?
-
-        release_java_slot
-
-        if (( java_rc != 0 )); then
-            rm -f "$java_file"
-            printf 'Java command failed with exit code %s\n' "$java_rc" >"$diff_file"
-            printf 'FAIL\n' >"$status_file"
-            write_failure_meta "$meta_file" "$region" "$shard_num" "$java_file" "$rust_file" "$diff_file" "$java_log" "$rust_log" "0" "0" "" "java command failed (exit ${java_rc})" "java_command_failed"
-            return 0
-        fi
-    fi
-
-    if [[ ! -f "$rust_file" ]] || [[ -f "$rust_file" && "$RUST_BIN" -nt "$rust_file" ]]; then
-        rm -f "$rust_file"
-        "$RUST_BIN" \
-            -G "$REF_FASTA" \
-            -b "$BAM_PATH" \
-            -N NA12878 -f "$FREQ" \
-            -R "$region" \
-            >"$rust_file" 2>"$rust_log" || rust_rc=$?
-
-        if (( rust_rc != 0 )); then
-            rm -f "$rust_file"
-            printf 'Rust command failed with exit code %s\n' "$rust_rc" >"$diff_file"
-            printf 'FAIL\n' >"$status_file"
-            write_failure_meta "$meta_file" "$region" "$shard_num" "$java_file" "$rust_file" "$diff_file" "$java_log" "$rust_log" "0" "0" "" "rust command failed (exit ${rust_rc})" "rust_command_failed"
-            return 0
-        fi
-    fi
 
     if [[ ! -f "$java_file" || ! -f "$rust_file" ]]; then
         printf 'FAIL\n' >"$status_file"
@@ -473,6 +481,14 @@ process_shard() {
 
     printf 'FAIL\n' >"$status_file"
     write_failure_meta "$meta_file" "$region" "$shard_num" "$java_file" "$rust_file" "$diff_file" "$java_log" "$rust_log" "$java_lines" "$rust_lines" "$first_diff_line" "$summary" "$reason"
+}
+
+# Legacy combined function (kept for backwards compatibility, not used by run_chr)
+process_shard() {
+    local idx=$1
+    generate_java_shard "$idx" || true
+    generate_rust_shard "$idx" || true
+    compare_shard "$idx"
 }
 
 wait_for_batch_jobs() {
@@ -683,6 +699,19 @@ parse_args() {
             --clean-rust)
                 CLEAN_RUST=1
                 ;;
+            --no-cleanup)
+                CLEANUP=0
+                ;;
+            --opts)
+                shift
+                [[ $# -gt 0 ]] || fail "Missing value for --opts"
+                EXTRA_OPTS="$1"
+                ;;
+            --opts-label)
+                shift
+                [[ $# -gt 0 ]] || fail "Missing value for --opts-label"
+                OPTS_LABEL="$1"
+                ;;
             --help)
                 usage
                 exit 0
@@ -692,6 +721,91 @@ parse_args() {
                 ;;
         esac
         shift
+    done
+}
+
+is_verified() {
+    local verified_file="${BASE_DIR}/${OPTS_LABEL}/${CHR}/.verified"
+
+    if [[ ! -f "$verified_file" ]]; then
+        return 1
+    fi
+
+    # Stale if Rust binary has been rebuilt
+    local stored_mtime
+    stored_mtime=$(grep '^RUST_BINARY_MTIME=' "$verified_file" | cut -d= -f2)
+    local current_mtime
+    current_mtime=$(stat -c %Y "$RUST_BIN" 2>/dev/null) || return 1
+    [[ "$stored_mtime" == "$current_mtime" ]]
+}
+
+write_verified() {
+    local verified_file="${BASE_DIR}/${OPTS_LABEL}/${CHR}/.verified"
+    local rust_mtime
+    rust_mtime=$(stat -c %Y "$RUST_BIN" 2>/dev/null || echo unknown)
+
+    mkdir -p "$(dirname "$verified_file")"
+    {
+        printf 'RUST_BINARY_MTIME=%s\n' "$rust_mtime"
+        printf 'PASS_COUNT=%s\n' "$PASS_COUNT"
+        printf 'EMPTY_COUNT=%s\n' "$EMPTY_COUNT"
+        printf 'TOTAL_SHARDS=%s\n' "$TOTAL_SHARDS"
+        printf 'VERIFIED_AT=%s\n' "$(date -Iseconds)"
+    } >"$verified_file"
+}
+
+cleanup_outputs() {
+    if (( FAIL_COUNT == 0 )); then
+        # All passed — remove Java + Rust + diff dirs entirely
+        rm -rf "$JAVA_DIR" "$RUST_DIR" "$DIFF_DIR"
+        echo "  Cleaned up all outputs (verified)"
+    else
+        # Partial pass — remove only passing shard outputs
+        local idx
+        local status_file
+        local status_value
+        local shard_num
+        local cleaned=0
+
+        for ((idx = 0; idx < TOTAL_SHARDS; idx++)); do
+            status_file=$(status_file_for_idx "$idx")
+            if [[ -f "$status_file" ]]; then
+                status_value=$(<"$status_file")
+                if [[ "$status_value" == "PASS" || "$status_value" == "EMPTY" ]]; then
+                    shard_num=${SHARD_IDS[$idx]}
+                    rm -f "${JAVA_DIR}/shard_${shard_num}.tsv" "${JAVA_DIR}/shard_${shard_num}.log"
+                    rm -f "${RUST_DIR}/shard_${shard_num}.tsv" "${RUST_DIR}/shard_${shard_num}.log"
+                    rm -f "$status_file" "$(meta_file_for_idx "$idx")"
+                    cleaned=$((cleaned + 1))
+                fi
+            fi
+        done
+        echo "  Cleaned ${cleaned} passing shard outputs (kept ${FAIL_COUNT} failing)"
+    fi
+}
+
+run_parallel_phase() {
+    local phase_func=$1
+    local phase_label=$2
+    local batch_start=0
+    local batch_end=0
+    local idx
+    local java_fail_count=0
+
+    while (( batch_start < TOTAL_SHARDS )); do
+        batch_end=$((batch_start + MAX_PARALLEL - 1))
+        if (( batch_end >= TOTAL_SHARDS )); then
+            batch_end=$((TOTAL_SHARDS - 1))
+        fi
+
+        ACTIVE_PIDS=()
+        for ((idx = batch_start; idx <= batch_end; idx++)); do
+            "$phase_func" "$idx" &
+            ACTIVE_PIDS+=("$!")
+        done
+
+        wait_for_batch_jobs || true
+        batch_start=$((batch_end + 1))
     done
 }
 
@@ -708,6 +822,19 @@ run_chr() {
     fi
     resolve_chr_length
     generate_shards
+
+    # Skip if already verified with the current binary
+    if is_verified; then
+        echo "=== $(summary_chr_label): already verified (${TOTAL_SHARDS} shards) ==="
+        PASS_COUNT=$TOTAL_SHARDS
+        FAIL_COUNT=0
+        EMPTY_COUNT=0
+        GLOBAL_PASS=$((GLOBAL_PASS + TOTAL_SHARDS))
+        GLOBAL_SHARDS=$((GLOBAL_SHARDS + TOTAL_SHARDS))
+        GLOBAL_CHR_PASS=$((GLOBAL_CHR_PASS + 1))
+        return 0
+    fi
+
     prepare_dirs
 
     if needs_missing_outputs "java"; then
@@ -722,41 +849,50 @@ run_chr() {
     EMPTY_COUNT=0
     FAIL_MESSAGES=()
 
-    init_java_semaphore
-
-    echo "=== Processing $(summary_chr_label) (${TOTAL_SHARDS} shards, ${MAX_PARALLEL} pipelines, ${JAVA_MAX_PARALLEL} Java workers) ==="
+    echo "=== Processing $(summary_chr_label) (${TOTAL_SHARDS} shards, ${MAX_PARALLEL} workers) ==="
     start_ns=$(date +%s%N)
 
-    while (( batch_start < TOTAL_SHARDS )); do
-        batch_end=$((batch_start + MAX_PARALLEL - 1))
-        if (( batch_end >= TOTAL_SHARDS )); then
-            batch_end=$((TOTAL_SHARDS - 1))
-        fi
+    # Phase 1: Generate all Java outputs (no Rust processes running)
+    if needs_missing_outputs "java"; then
+        echo "--- Phase 1: Java (${TOTAL_SHARDS} shards, ${MAX_PARALLEL} parallel) ---"
+        run_parallel_phase generate_java_shard "java"
+    else
+        echo "--- Phase 1: Java (all cached) ---"
+    fi
 
-        ACTIVE_PIDS=()
-        for ((idx = batch_start; idx <= batch_end; idx++)); do
-            process_shard "$idx" &
-            ACTIVE_PIDS+=("$!")
-        done
+    # Phase 2: Generate all Rust outputs (no Java processes running)
+    if needs_missing_outputs "rust"; then
+        echo "--- Phase 2: Rust (${TOTAL_SHARDS} shards, ${MAX_PARALLEL} parallel) ---"
+        run_parallel_phase generate_rust_shard "rust"
+    else
+        echo "--- Phase 2: Rust (all cached) ---"
+    fi
 
-        wait_for_batch_jobs || fail "Shard pipeline execution failed unexpectedly"
-        collect_batch_results "$batch_start" "$batch_end"
-
-        if [[ -n "$BATCH_FIRST_FAIL_IDX" ]] && (( STOP_ON_FAIL )); then
-            end_ns=$(date +%s%N)
-            LAST_CHR_ELAPSED=$(format_elapsed "$start_ns" "$end_ns")
-            print_failure_details "$BATCH_FIRST_FAIL_IDX"
-            cleanup_java_semaphore
-            return 1
-        fi
-
-        batch_start=$((batch_end + 1))
+    # Phase 3: Compare outputs (lightweight — runs sequentially)
+    echo "--- Phase 3: Compare ---"
+    BATCH_FIRST_FAIL_IDX=""
+    for ((idx = 0; idx < TOTAL_SHARDS; idx++)); do
+        compare_shard "$idx"
     done
+    collect_batch_results 0 $((TOTAL_SHARDS - 1))
 
     end_ns=$(date +%s%N)
     LAST_CHR_ELAPSED=$(format_elapsed "$start_ns" "$end_ns")
-    cleanup_java_semaphore
+
+    if [[ -n "$BATCH_FIRST_FAIL_IDX" ]] && (( STOP_ON_FAIL )); then
+        print_failure_details "$BATCH_FIRST_FAIL_IDX"
+    fi
+
     print_summary
+
+    # Phase 4: Cleanup outputs to save disk space
+    if (( CLEANUP )); then
+        echo "--- Phase 4: Cleanup ---"
+        cleanup_outputs
+        if (( FAIL_COUNT == 0 )); then
+            write_verified
+        fi
+    fi
 
     GLOBAL_PASS=$((GLOBAL_PASS + PASS_COUNT))
     GLOBAL_FAIL=$((GLOBAL_FAIL + FAIL_COUNT))
@@ -777,7 +913,6 @@ main() {
 
     validate_positive_integer "shard size" "$SHARD_SIZE"
     validate_positive_integer "parallel worker count" "$MAX_PARALLEL"
-    validate_positive_integer "java parallel worker count" "$JAVA_MAX_PARALLEL"
     if [[ -n "$REQUESTED_CHR_LEN" ]]; then
         validate_positive_integer "chromosome length" "$REQUESTED_CHR_LEN"
     fi

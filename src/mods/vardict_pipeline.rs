@@ -28,6 +28,7 @@ use crate::data::shared_reference::SharedReferenceHandle;
 use crate::mods::cigar_parser::CigarParser;
 use crate::mods::output_variant::{
     AmpliconOutputVariant, Region as OutputRegion, SimpleOutputVariant, SomaticOutputVariant,
+    format_variant_debug_content,
 };
 use crate::mods::simple_variant_caller::SimpleVarKey;
 use crate::mods::structural_variants_processor::{
@@ -1494,6 +1495,13 @@ impl VarDictPipeline {
             }
         }
 
+        // Java htsjdk region queries do not return unmapped reads even if 0x4 is
+        // not in the -F filter. Match that behavior by explicitly skipping them
+        // unless -F 0 disables all filtering.
+        if sam_filter != 0 && record.is_unmapped() {
+            return false;
+        }
+
         // 2. Java preprocessRecord line 117: Ignore low mapping quality reads
         let min_mapq = instance()
             .conf
@@ -1751,6 +1759,7 @@ impl VarDictPipeline {
             chr: group_region.chr().to_string(),
             start: group_region.start() as i64,
             end: group_region.end() as i64,
+            display_start: group_region.display_start(),
             gene: group_region.gene().to_string(),
         };
 
@@ -2835,6 +2844,9 @@ impl VarDictPipeline {
                     &mut debug_lines,
                     duprate,
                 );
+                if instance().conf.debug {
+                    variations_at_pos.debug = debug_lines.join(" & ");
+                }
                 if trace_this_pos {
                     let post_ref_summary = variations_at_pos
                         .variants
@@ -2940,7 +2952,7 @@ impl VarDictPipeline {
         sv_counts: Option<StructuralVariantCounts>,
         total_pos_coverage: usize,
         var_list: &mut Vec<Variant>,
-        _debug_lines: &mut Vec<String>,
+        debug_lines: &mut Vec<String>,
         keys: &[&VarDesc],
         hicov: usize,
         duprate: f64,
@@ -3000,6 +3012,7 @@ impl VarDictPipeline {
             variant.vars_count_on_reverse = rev;
             variant.strand_bias_flag = StrandBiasFlag::new(StrandBiasValue::CantAssess, bias);
             variant.frequency = round_half_even("0.0000", total_count as f64 / ttcov as f64);
+            variant.threshold_frequency = variant.frequency;
             variant.mean_position = round_half_even("0.0", raw_var.mean_pos / total_count as f64);
             variant.is_at_least_at_2_positions = raw_var.pstd;
             variant.mean_quality = base_quality;
@@ -3025,6 +3038,9 @@ impl VarDictPipeline {
             variant.start_position = position;
             variant.end_position = position;
 
+            if instance().conf.debug {
+                debug_lines.push(format_variant_debug_content(&variant));
+            }
             var_list.push(variant);
         }
 
@@ -3048,7 +3064,7 @@ impl VarDictPipeline {
         ref_coverage: &RefCovMap,
         reference: &Reference,
         var_list: &mut Vec<Variant>,
-        _debug_lines: &mut Vec<String>,
+        debug_lines: &mut Vec<String>,
         hicov: usize,
         duprate: f64,
     ) -> usize {
@@ -3134,6 +3150,7 @@ impl VarDictPipeline {
             variant.vars_count_on_reverse = rev;
             variant.strand_bias_flag = StrandBiasFlag::new(StrandBiasValue::CantAssess, bias);
             variant.frequency = round_half_even("0.0000", total_count as f64 / ttcov as f64);
+            variant.threshold_frequency = variant.frequency;
             variant.mean_position = round_half_even("0.0", cnt.mean_pos / total_count as f64);
             variant.is_at_least_at_2_positions = cnt.pstd;
             variant.mean_quality = vqual;
@@ -3159,6 +3176,9 @@ impl VarDictPipeline {
             variant.start_position = position;
             variant.end_position = position;
 
+            if instance().conf.debug {
+                debug_lines.push(format_variant_debug_content(&variant));
+            }
             var_list.push(variant);
         }
 
@@ -3238,6 +3258,18 @@ impl VarDictPipeline {
             CARET_ATGNC, DUP_NUM, HASH_GROUP_CARET_GROUP, INV_NUM, SOME_SV_NUMBERS,
         };
         use crate::mods::to_vars_builder::{StrandBiasFlag, StrandBiasValue};
+
+        if variations_at_pos.reference_variant.is_none() {
+            variations_at_pos.reference_variant = self.build_reference_variant_from_raw(
+                position,
+                total_pos_coverage,
+                non_insertion_vars,
+                reference,
+                shared_reference,
+                region.chr(),
+                duprate,
+            );
+        }
 
         let mut reference_forward_coverage = 0usize;
         let mut reference_reverse_coverage = 0usize;
@@ -3772,6 +3804,82 @@ impl VarDictPipeline {
         }
     }
 
+    /// Ported from: `com.astrazeneca.vardict.modules.ToVarsBuilder.collectReferenceVariants()`
+    /// Java parity: materialize the raw reference call when the initial position bucket did not
+    /// retain it, so later simple-mode filtering sees real reference-call quality statistics.
+    fn build_reference_variant_from_raw(
+        &self,
+        position: i64,
+        total_pos_coverage: usize,
+        non_insertion_vars: &RawVarByPos,
+        reference: &Reference,
+        shared_reference: Option<&SharedReferenceHandle>,
+        chromosome: &str,
+        duprate: f64,
+    ) -> Option<Variant> {
+        let reference_base = self.get_reference_base_with_fallback(
+            reference,
+            shared_reference,
+            chromosome,
+            position,
+        )?;
+        let raw_ref_variant = non_insertion_vars.get(&position)?.get(&VarDesc::SNV {
+            ref_base: reference_base,
+        })?;
+        if raw_ref_variant.alt_depth == 0 {
+            return None;
+        }
+
+        let reference_allele = self.validate_refallele(&(reference_base as char).to_string());
+        let total_pos_coverage = total_pos_coverage.max(raw_ref_variant.alt_depth);
+        let mut reference_variant = Variant::new();
+        reference_variant.description_string = (reference_base as char).to_string();
+        reference_variant.refallele = reference_allele.clone();
+        reference_variant.varallele = reference_allele.clone();
+        reference_variant.start_position = position;
+        reference_variant.end_position = position;
+        reference_variant.position_coverage = raw_ref_variant.alt_depth;
+        reference_variant.total_pos_coverage = total_pos_coverage;
+        reference_variant.vars_count_on_forward = raw_ref_variant.alt_depth_fwd;
+        reference_variant.vars_count_on_reverse = raw_ref_variant.alt_depth_rev;
+        reference_variant.ref_forward_count = raw_ref_variant.alt_depth_fwd;
+        reference_variant.ref_reverse_count = raw_ref_variant.alt_depth_rev;
+        reference_variant.frequency = round_half_even(
+            "0.0000",
+            raw_ref_variant.alt_depth as f64 / total_pos_coverage as f64,
+        );
+        reference_variant.threshold_frequency = reference_variant.frequency;
+        reference_variant.mean_position = round_half_even(
+            "0.0",
+            raw_ref_variant.mean_pos / raw_ref_variant.alt_depth as f64,
+        );
+        reference_variant.mean_quality = round_half_even(
+            "0.0",
+            raw_ref_variant.mean_qual / raw_ref_variant.alt_depth as f64,
+        );
+        reference_variant.mean_mapping_quality = round_half_even(
+            "0.0",
+            raw_ref_variant.mean_mapq / raw_ref_variant.alt_depth as f64,
+        );
+        reference_variant.strand_bias_flag = StrandBiasFlag::new(
+            crate::mods::to_vars_builder::StrandBiasValue::CantAssess,
+            check_strand_bias(raw_ref_variant.alt_depth_fwd, raw_ref_variant.alt_depth_rev),
+        );
+        reference_variant.is_at_least_at_2_positions = raw_ref_variant.pstd;
+        reference_variant.has_at_least_2_diff_qualities = raw_ref_variant.qstd;
+        reference_variant.nm = round_half_even(
+            "0.0",
+            raw_ref_variant.nm / raw_ref_variant.alt_depth as f64,
+        );
+        reference_variant.high_qual_read_cnt = raw_ref_variant.high_qual_read_cnt;
+        reference_variant.low_qual_read_cnt = raw_ref_variant.low_qual_read_cnt;
+        reference_variant.hicov = raw_ref_variant.high_qual_read_cnt;
+        reference_variant.genotype = format!("{0}/{0}", reference_allele);
+        reference_variant.duprate = duprate;
+
+        Some(reference_variant)
+    }
+
     fn update_ref_variant(
         &self,
         position: i64,
@@ -4047,6 +4155,7 @@ impl VarDictPipeline {
         Vars {
             variants,
             reference_variant: reference_variant_opt,
+            debug: String::new(),
             sv: String::new(),
             sv_flags: Default::default(),
         }
@@ -4390,6 +4499,7 @@ impl VarDictPipeline {
             position_coverage: total_count,
             total_pos_coverage: total_coverage,
             frequency,
+            threshold_frequency: frequency,
             high_quality_reads_frequency: if total_coverage > 0 {
                 if hicov > 0 {
                     round_half_even("0.0000", raw.high_qual_read_cnt as f64 / hicov as f64)
@@ -5038,6 +5148,7 @@ impl VarDictPipeline {
             chr: region.chr().to_string(),
             start: region.start() as i64,
             end: region.end() as i64,
+            display_start: region.display_start(),
             gene: region.gene().to_string(),
         };
 
@@ -5819,6 +5930,7 @@ impl VarDictPipeline {
             chr: region.chr().to_string(),
             start: region.start() as i64,
             end: region.end() as i64,
+            display_start: region.display_start(),
             gene: region.gene().to_string(),
         };
 
@@ -5837,6 +5949,7 @@ impl VarDictPipeline {
             let Some(vars) = data.aligned_variants.get(&position) else {
                 continue;
             };
+            let shared_debug = vars.debug.clone();
             event!(
                 Level::DEBUG,
                 "[PostProcessor] Processing position {}: {} variants",
@@ -5870,15 +5983,18 @@ impl VarDictPipeline {
                 }
                 // In pileup mode, output reference (or empty if none)
                 if let Some(ref ref_var) = vars.reference_variant {
-                    let output = SimpleOutputVariant::from_variant(
+                    let mut output = SimpleOutputVariant::from_variant(
                         ref_var,
                         &output_region,
                         &self.sample_name,
                         &vars.sv,
                     );
+                    if instance().conf.debug {
+                        output.debug = shared_debug.clone();
+                    }
                     output_lines.push(output.to_string());
                 } else {
-                    let output = SimpleOutputVariant::empty_with_sv(
+                    let output = SimpleOutputVariant::empty_null_variant_with_sv(
                         position,
                         &output_region,
                         &self.sample_name,
@@ -5927,16 +6043,27 @@ impl VarDictPipeline {
                 if variant.start_position != position && self.do_pileup && vars.variants.len() == 1
                 {
                     if let Some(ref ref_var) = vars.reference_variant {
-                        let output = SimpleOutputVariant::from_variant(
+                        let mut output = SimpleOutputVariant::from_variant(
                             ref_var,
                             &output_region,
                             &self.sample_name,
                             &vars.sv,
                         );
+                        if instance().conf.debug {
+                            output.debug = shared_debug.clone();
+                        }
                         output_lines.push(output.to_string());
                     } else {
-                        let output = SimpleOutputVariant::empty_with_sv(
+                        let output = SimpleOutputVariant::empty_null_variant_with_sv(
                             position,
+                            &output_region,
+                            &self.sample_name,
+                            &vars.sv,
+                        );
+                        output_lines.push(output.to_string());
+
+                        let output = SimpleOutputVariant::empty_with_sv(
+                            0,
                             &output_region,
                             &self.sample_name,
                             &vars.sv,
@@ -5967,12 +6094,15 @@ impl VarDictPipeline {
                 event!(Level::DEBUG, "[PostProcessor] Adding variant to output");
 
                 // Generate output
-                let output = SimpleOutputVariant::from_variant(
+                let mut output = SimpleOutputVariant::from_variant(
                     &variant,
                     &output_region,
                     &self.sample_name,
                     &vars.sv,
                 );
+                if instance().conf.debug {
+                    output.debug = shared_debug.clone();
+                }
                 output_lines.push(output.to_string());
             }
         }
@@ -6009,7 +6139,7 @@ impl VarDictPipeline {
             .map(|value| value.to_string())
             .unwrap_or_else(|| var_type_string(&variant.refallele, &variant.varallele));
 
-        if variant.frequency < instance().conf.freq
+        if variant.threshold_frequency < instance().conf.freq
             || variant.high_qual_read_cnt < instance().conf.minr
             || variant.mean_position < instance().conf.read_pos_filter
             || variant.mean_quality < instance().conf.goodq
@@ -6017,7 +6147,7 @@ impl VarDictPipeline {
             event!(
                 Level::DEBUG,
                 "[is_good_var] FAILED: freq={} (need>={}), hicnt={} (need>={}), meanpos={} (need>={}), meanq={} (need>={})",
-                variant.frequency,
+                variant.threshold_frequency,
                 instance().conf.freq,
                 variant.high_qual_read_cnt,
                 instance().conf.minr,

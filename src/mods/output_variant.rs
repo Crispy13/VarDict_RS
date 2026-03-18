@@ -54,6 +54,7 @@ pub struct Region {
     pub chr: String,
     pub start: i64,
     pub end: i64,
+    pub display_start: i64,
     pub gene: String,
 }
 
@@ -63,13 +64,14 @@ impl Region {
             chr: chr.to_string(),
             start,
             end,
+            display_start: start,
             gene: gene.to_string(),
         }
     }
 
     /// Format as "chr:start-end"
     pub fn to_region_string(&self) -> String {
-        format!("{}:{}-{}", self.chr, self.start, self.end)
+        format!("{}:{}-{}", self.chr, self.display_start, self.end)
     }
 }
 
@@ -131,6 +133,7 @@ pub struct SimpleOutputVariant {
     pub duprate: f64,
     pub crispr: i32,
     pub sv: String,
+    pub debug: String,
 }
 
 impl SimpleOutputVariant {
@@ -236,7 +239,7 @@ impl SimpleOutputVariant {
             } else {
                 variant.rightseq.clone()
             },
-            region: format!("{}:{}-{}", chr, region.start, region.end),
+            region: format!("{}:{}-{}", chr, region.display_start, region.end),
             var_type: final_var_type,
             duprate: variant.duprate,
             crispr: variant.crispr,
@@ -245,11 +248,77 @@ impl SimpleOutputVariant {
             } else {
                 sv.to_string()
             },
+            debug: if INSTANCE
+                .get()
+                .map(|scope| scope.conf.debug)
+                .unwrap_or(false)
+            {
+                format_variant_debug_content(variant)
+            } else {
+                String::new()
+            },
         }
     }
 
-    /// Create an empty variant (for positions with no variants)
+    /// Create an empty position-0 sentinel row.
+    ///
+    /// Java creates these with a default-constructed Variant (non-null), so all fields use
+    /// Variant defaults: genotype=null→"0", strandBiasFlag="0", leftseq=null→"0", rightseq=null→"0".
     pub fn empty(position: i64, region: &Region, sample: &str) -> Self {
+        let chr = normalize_chr_for_output(&region.chr);
+        SimpleOutputVariant {
+            sample: sample.to_string(),
+            gene: region.gene.clone(),
+            chr: chr.clone(),
+            start_position: position,
+            end_position: position,
+            ref_allele: String::new(),
+            var_allele: String::new(),
+
+            total_coverage: 0,
+            variant_coverage: 0,
+            reference_forward_count: 0,
+            reference_reverse_count: 0,
+            variant_forward_count: 0,
+            variant_reverse_count: 0,
+
+            genotype: "0".to_string(),
+            frequency: 0.0,
+            bias: "0".to_string(),
+
+            pmean: 0.0,
+            pstd: 0,
+            qual: 0.0,
+            qstd: 0,
+            mapq: 0.0,
+            qratio: 0.0,
+            hifreq: 0.0,
+            extrafreq: 0.0,
+
+            shift3: 0,
+            msi: 0.0,
+            msint: 0.0,
+            nm: 0.0,
+            hicnt: 0,
+            hicov: 0,
+
+            left_sequence: "0".to_string(),
+            right_sequence: "0".to_string(),
+            region: format!("{}:{}-{}", chr, region.display_start, region.end),
+            var_type: String::new(),
+            duprate: 0.0,
+            crispr: 0,
+            sv: "0".to_string(),
+            debug: String::new(),
+        }
+    }
+
+    /// Create an empty variant for a zero-coverage real position (null-variant path).
+    ///
+    /// Java creates these via `new SimpleOutputVariant(null, region, sv, position)` when
+    /// referenceVariant is null and variants is empty. Uses SimpleOutputVariant field defaults:
+    /// genotype="" (empty), bias="0;0", leftseq="" (empty), rightseq="" (empty).
+    pub fn empty_null_variant(position: i64, region: &Region, sample: &str) -> Self {
         let chr = normalize_chr_for_output(&region.chr);
         SimpleOutputVariant {
             sample: sample.to_string(),
@@ -289,17 +358,32 @@ impl SimpleOutputVariant {
 
             left_sequence: String::new(),
             right_sequence: String::new(),
-            region: format!("{}:{}-{}", chr, region.start, region.end),
+            region: format!("{}:{}-{}", chr, region.display_start, region.end),
             var_type: String::new(),
             duprate: 0.0,
             crispr: 0,
             sv: "0".to_string(),
+            debug: String::new(),
         }
     }
 
     /// Create an empty variant and preserve Java-compatible SV column value
     pub fn empty_with_sv(position: i64, region: &Region, sample: &str, sv: &str) -> Self {
         let mut out = Self::empty(position, region, sample);
+        if !sv.is_empty() {
+            out.sv = sv.to_string();
+        }
+        out
+    }
+
+    /// Create a null-variant empty row with SV field
+    pub fn empty_null_variant_with_sv(
+        position: i64,
+        region: &Region,
+        sample: &str,
+        sv: &str,
+    ) -> Self {
+        let mut out = Self::empty_null_variant(position, region, sample);
         if !sv.is_empty() {
             out.sv = sv.to_string();
         }
@@ -417,7 +501,12 @@ impl SimpleOutputVariant {
         parts.join("\t")
     }
 
-    fn to_string_with_flags(&self, fisher_enabled: bool, crispr_enabled: bool) -> String {
+    fn to_string_with_flags_and_debug(
+        &self,
+        fisher_enabled: bool,
+        crispr_enabled: bool,
+        debug_enabled: bool,
+    ) -> String {
         let mut output_variant = if fisher_enabled {
             self.to_string_38_columns()
         } else {
@@ -429,7 +518,20 @@ impl SimpleOutputVariant {
             output_variant.push_str(&self.crispr.to_string());
         }
 
+        if debug_enabled {
+            output_variant.push('\t');
+            output_variant.push_str(&self.debug);
+        }
+
         output_variant
+    }
+
+    fn to_string_with_flags(&self, fisher_enabled: bool, crispr_enabled: bool) -> String {
+        let debug_enabled = INSTANCE
+            .get()
+            .map(|scope| scope.conf.debug)
+            .unwrap_or(false);
+        self.to_string_with_flags_and_debug(fisher_enabled, crispr_enabled, debug_enabled)
     }
 }
 
@@ -914,7 +1016,7 @@ impl SomaticOutputVariant {
             msint: 0.0,
             left_sequence: String::new(),
             right_sequence: String::new(),
-            region: format!("{}:{}-{}", region.chr, region.start, region.end),
+            region: format!("{}:{}-{}", region.chr, region.display_start, region.end),
             var_label: var_label.to_string(),
             var_type: String::new(),
             debug: String::new(),
@@ -1262,7 +1364,7 @@ fn build_amplicon_debug(
     debug
 }
 
-fn format_variant_debug_content(variant: &Variant) -> String {
+pub(crate) fn format_variant_debug_content(variant: &Variant) -> String {
     let mut key = variant.description_string.clone();
     if key.starts_with('+') {
         key = format!("I{}", key);
@@ -1467,12 +1569,26 @@ impl FisherExact {
 
     fn odd_ratio(&self) -> String {
         let odd_ratio = self.mle(self.x as f64);
+        self.format_odd_ratio_value(odd_ratio)
+    }
+
+    /// Ported from: `com.astrazeneca.vardict.data.fishertest.FisherExact.getOddRatio()`
+    /// Java source: `FisherExact.java:L136-L144`
+    fn format_odd_ratio_value(&self, odd_ratio: f64) -> String {
         if odd_ratio.is_infinite() {
             "Inf".to_string()
         } else if odd_ratio == odd_ratio.round() {
-            format!("{:.0}", odd_ratio)
+            format!("{}", odd_ratio as i64)
         } else {
-            self.round_as_r(odd_ratio).to_string()
+            Self::format_java_double(self.round_as_r(odd_ratio))
+        }
+    }
+
+    fn format_java_double(value: f64) -> String {
+        if value.is_finite() && value == value.round() {
+            format!("{value:.1}")
+        } else {
+            value.to_string()
         }
     }
 
@@ -1930,6 +2046,14 @@ mod tests {
     }
 
     #[test]
+    fn test_region_to_string_uses_display_start() {
+        let mut region = Region::new("20", 1, 1_000_150, "20");
+        region.display_start = -149;
+
+        assert_eq!(region.to_region_string(), "20:-149-1000150");
+    }
+
+    #[test]
     fn test_format_f64_zero() {
         assert_eq!(format_f64(0.0, 4), "0");
     }
@@ -2003,6 +2127,7 @@ mod tests {
             position_coverage: 3,
             total_pos_coverage: 8,
             frequency: 0.375,
+            threshold_frequency: 0.375,
             high_quality_reads_frequency: 0.4286,
             extra_frequency: 0.375,
             mean_position: 34.3,
@@ -2050,6 +2175,7 @@ mod tests {
             position_coverage: 17,
             total_pos_coverage: 20,
             frequency: 0.85,
+            threshold_frequency: 0.85,
             high_quality_reads_frequency: 0.8095,
             extra_frequency: 0.0,
             mean_position: 19.9,
@@ -2086,9 +2212,40 @@ mod tests {
 
         assert_eq!(output.sample, "sample1");
         assert_eq!(output.start_position, 1500);
+        assert_eq!(output.genotype, "0");
+        assert_eq!(output.bias, "0");
+        assert_eq!(output.left_sequence, "0");
+        assert_eq!(output.right_sequence, "0");
+        assert_eq!(output.sv, "0");
+        assert_eq!(output.debug, "");
+    }
+
+    #[test]
+    fn test_empty_position_zero_row_matches_java_simple_placeholder_parity() {
+        let region = Region::new("20", 1, 1_000_000, "20");
+        let output = SimpleOutputVariant::empty_with_sv(0, &region, "NA12878", "");
+
+        assert_eq!(
+            output.to_string_36_columns(),
+            "NA12878\t20\t20\t0\t0\t\t\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t20:1-1000000\t\t0\t0"
+        );
+    }
+
+    #[test]
+    fn test_empty_null_variant_row_matches_java_zero_coverage_parity() {
+        let region = Region::new("20", 1, 1_000_000, "20");
+        let output =
+            SimpleOutputVariant::empty_null_variant_with_sv(122276, &region, "NA12878", "");
+
+        // Java null-variant path: genotype="", bias="0;0", left_seq="", right_seq=""
         assert_eq!(output.genotype, "");
         assert_eq!(output.bias, "0;0");
-        assert_eq!(output.sv, "0");
+        assert_eq!(output.left_sequence, "");
+        assert_eq!(output.right_sequence, "");
+        assert_eq!(
+            output.to_string_36_columns(),
+            "NA12878\t20\t20\t122276\t122276\t\t\t0\t0\t0\t0\t0\t0\t\t0\t0;0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t\t\t20:1-1000000\t\t0\t0"
+        );
     }
 
     #[test]
@@ -2106,6 +2263,7 @@ mod tests {
             position_coverage: 10,
             total_pos_coverage: 100,
             frequency: 0.10,
+            threshold_frequency: 0.10,
             high_quality_reads_frequency: 0.08,
             extra_frequency: 0.0,
             mean_position: 25.0,
@@ -2260,6 +2418,18 @@ mod tests {
     }
 
     #[test]
+    fn test_simple_output_variant_debug_column_behavior_parity() {
+        let region = Region::new("chr1", 1000, 2000, "GENE1");
+        let mut output = SimpleOutputVariant::empty(1500, &region, "sample1");
+        output.debug = "T:5:F-2:R-3:1.0000:2:21.8:1:42.8:1:1.0000:53.8:10.000".to_string();
+
+        let line = output.to_string_with_flags_and_debug(false, false, true);
+        let fields: Vec<&str> = line.split('\t').collect();
+        assert_eq!(fields.len(), 37);
+        assert_eq!(fields[36], output.debug);
+    }
+
+    #[test]
     fn test_amplicon_output_variant_to_string_38_columns() {
         let _ = INSTANCE.get_or_init(GlobalReadOnlyScope::default);
         let region = Region::new("chr1", 1000, 2000, "GENE1");
@@ -2275,6 +2445,7 @@ mod tests {
             position_coverage: 10,
             total_pos_coverage: 100,
             frequency: 0.10,
+            threshold_frequency: 0.10,
             high_quality_reads_frequency: 0.08,
             extra_frequency: 0.0,
             mean_position: 25.0,
@@ -2347,6 +2518,7 @@ mod tests {
             position_coverage: 10,
             total_pos_coverage: 100,
             frequency: 0.10,
+            threshold_frequency: 0.10,
             high_quality_reads_frequency: 0.08,
             extra_frequency: 0.0,
             mean_position: 25.0,
@@ -2443,6 +2615,7 @@ mod tests {
             position_coverage: 5,
             total_pos_coverage: 20,
             frequency: 0.25,
+            threshold_frequency: 0.25,
             high_quality_reads_frequency: 0.20,
             extra_frequency: 0.0,
             mean_position: 30.0,
@@ -2517,6 +2690,7 @@ mod tests {
             position_coverage: 5,
             total_pos_coverage: 20,
             frequency: 0.25,
+            threshold_frequency: 0.25,
             high_quality_reads_frequency: 0.20,
             extra_frequency: 0.0,
             mean_position: 30.0,
@@ -2673,5 +2847,19 @@ mod tests {
                 .expect("odd ratio should be numeric for Java parity cases");
             assert_eq!(round_half_even("0.00000", parsed_odd_ratio), odd_ratio);
         }
+    }
+
+    #[test]
+    fn test_fisher_exact_odd_ratio_string_java_parity() {
+        let fisher = FisherExact::new(0, 0, 0, 0);
+
+        assert_eq!(fisher.format_odd_ratio_value(0.0), "0");
+        assert_eq!(fisher.format_odd_ratio_value(1.0), "1");
+        assert_eq!(fisher.format_odd_ratio_value(6.0), "6");
+        assert_eq!(fisher.format_odd_ratio_value(5.999_999_999_999_999), "6.0");
+        assert_eq!(fisher.format_odd_ratio_value(f64::INFINITY), "Inf");
+        assert_eq!(fisher.format_odd_ratio_value(2.449_494_999_999_999_7), "2.44949");
+        assert_eq!(fisher.format_odd_ratio_value(0.047_619_999_999_999_996), "0.04762");
+        assert_eq!(fisher.format_odd_ratio_value(0.5), "0.5");
     }
 }

@@ -668,6 +668,7 @@ fn test_generate_output_for_verification() {
         chr: "chr1".to_string(),
         start: 990,
         end: 1010,
+        display_start: 990,
         gene: "test_gene".to_string(),
     };
 
