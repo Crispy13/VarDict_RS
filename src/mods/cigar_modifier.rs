@@ -74,6 +74,11 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
     }
 
     pub fn modify_cigar(&mut self) -> Result<ModifiedCigar<'b>, Error> {
+        const DEBUG_CIGAR_MOD_ALIGN_START_55286090: i64 = 55_286_090;
+
+        let debug_pos_55286157 = std::env::var("VARDICT_DEBUG_POS_55286157").is_ok();
+        let original_global_align_start = self.pos + self.ref_data.region_start;
+        let original_cigar_text = self.original_cigar.to_string();
         let mut flag = true;
 
         let mut cigar_vec = VecDeque::from_iter(self.cigar_str.0.iter().copied());
@@ -258,12 +263,26 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
             _ => {}
         }
 
+        let modified_cigar_text = CigarString(cigar_vec.iter().copied().collect::<Vec<_>>()).to_string();
+
         let mc = ModifiedCigar::new(
             ref_start_pos as i64,
             cigar_vec,
             self.query_sequence,
             self.query_quality,
         );
+
+        if debug_pos_55286157
+            && original_global_align_start == DEBUG_CIGAR_MOD_ALIGN_START_55286090
+        {
+            eprintln!(
+                "[DEBUG-55286157] CIGAR_MOD align_start={} original_cigar={} modified_align_start={} modified_cigar={}",
+                original_global_align_start,
+                original_cigar_text,
+                mc.align_start_pos + self.ref_data.region_start,
+                modified_cigar_text
+            );
+        }
 
         Ok(mc)
     }

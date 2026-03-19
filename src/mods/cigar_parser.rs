@@ -112,6 +112,7 @@ pub struct CigarParser {
     last_modified_pos: Option<i64>,
     last_modified_cigar: Option<String>,
     debug_pos: Option<i64>,
+    debug_pos_55286157: bool,
     trace_target_qname: Option<String>,
     trace_ins_qname: Option<String>,
     trace_merge_ins: bool,
@@ -172,6 +173,7 @@ impl Default for CigarParser {
             last_modified_pos: None,
             last_modified_cigar: None,
             debug_pos: Self::debug_pos_from_env(),
+            debug_pos_55286157: Self::trace_flag_from_env("VARDICT_DEBUG_POS_55286157"),
             trace_target_qname: Self::trace_qname_from_env("VARDICT_TRACE_QNAME"),
             trace_ins_qname: Self::trace_qname_from_env("VARDICT_TRACE_INS_QNAME"),
             trace_merge_ins: Self::trace_flag_from_env("VARDICT_TRACE_MERGED_INS"),
@@ -219,9 +221,56 @@ impl CigarParser {
 
     fn needs_current_qname(&self) -> bool {
         self.debug_pos.is_some()
+            || self.debug_pos_55286157
             || self.trace_target_qname.is_some()
             || self.trace_ins_qname.is_some()
             || self.trace_merge_ins
+    }
+
+    fn debug_alignment_end_55286157(align_start: i64, cigar: &CigarStringView) -> i64 {
+        let mut align_end = align_start - 1;
+        for op in cigar.iter() {
+            match *op {
+                Cigar::Match(len)
+                | Cigar::Equal(len)
+                | Cigar::Diff(len)
+                | Cigar::Del(len)
+                | Cigar::RefSkip(len) => {
+                    align_end += len as i64;
+                }
+                _ => {}
+            }
+        }
+        align_end
+    }
+
+    fn debug_read_start_55286157(
+        &self,
+        align_start: i64,
+        cigar: &CigarStringView,
+        cigar_text: &str,
+        processed: bool,
+    ) {
+        const DEBUG_TARGET_POS_55286157: i64 = 55_286_157;
+
+        if !self.debug_pos_55286157 {
+            return;
+        }
+
+        let align_end = Self::debug_alignment_end_55286157(align_start, cigar);
+        let covers_target = align_start <= DEBUG_TARGET_POS_55286157
+            && align_end >= DEBUG_TARGET_POS_55286157;
+
+        if covers_target {
+            eprintln!(
+                "[DEBUG-55286157] READ_START qname={} align_start={} cigar={} covers_target={} processed={}",
+                self.current_qname.as_deref().unwrap_or("-"),
+                align_start,
+                cigar_text,
+                covers_target,
+                processed
+            );
+        }
     }
 
     /// Create a new CigarParser for processing a region
@@ -279,6 +328,7 @@ impl CigarParser {
             last_modified_pos: None,
             last_modified_cigar: None,
             debug_pos: Self::debug_pos_from_env(),
+            debug_pos_55286157: Self::trace_flag_from_env("VARDICT_DEBUG_POS_55286157"),
             trace_target_qname: Self::trace_qname_from_env("VARDICT_TRACE_QNAME"),
             trace_ins_qname: Self::trace_qname_from_env("VARDICT_TRACE_INS_QNAME"),
             trace_merge_ins: Self::trace_flag_from_env("VARDICT_TRACE_MERGED_INS"),
@@ -1179,6 +1229,9 @@ impl CigarParser {
     }
 
     fn parse_cigar(&mut self, record: &mut Record) -> Result<(), Error> {
+        const DEBUG_TARGET_POS_55286157: i64 = 55_286_157;
+        const DEBUG_TARGET_QNAME_55286157: &str = "SRR622461.75718831";
+
         let mut query_seq_owned = self
             .query_seq_buf
             .take()
@@ -1195,6 +1248,7 @@ impl CigarParser {
 
         let result = (|| -> Result<(), Error> {
             event!(Level::DEBUG, "Starting for record at pos {}", record.pos());
+            let debug_pos_55286157 = self.debug_pos_55286157;
             self.current_qname = self
                 .needs_current_qname()
                 .then(|| String::from_utf8_lossy(record.qname()).to_string());
@@ -1219,6 +1273,7 @@ impl CigarParser {
 
             record.cache_cigar_if_empty();
             let mut cigar = record.cigar();
+            let original_cigar_text = cigar.to_string();
 
             event!(Level::DEBUG, "CIGAR: {:?}", cigar);
             if record.qname() == b"read_1" {
@@ -1275,6 +1330,7 @@ impl CigarParser {
             }
 
             if nm > instance().conf.mismatch {
+                self.debug_read_start_55286157(record.pos() + 1, &cigar, &original_cigar_text, false);
                 if trace_target {
                     event!(Level::WARN, "[trace_target] return: nm > mismatch");
                 }
@@ -1284,6 +1340,7 @@ impl CigarParser {
             if self.instance.amplicon_based_calling.is_some()
                 && self.parse_cigar_with_amp_case(record, &cigar, record.tid() == record.mtid())
             {
+                self.debug_read_start_55286157(record.pos() + 1, &cigar, &original_cigar_text, false);
                 if trace_target {
                     event!(
                         Level::WARN,
@@ -1369,6 +1426,12 @@ impl CigarParser {
                 [Cigar::SoftClip(sl1), .., Cigar::SoftClip(sl2)]
                     if *sl1 >= 10 && *sl1 < 100 && *sl2 >= 10 && *sl2 < 100 =>
                 {
+                    self.debug_read_start_55286157(
+                        pos,
+                        &cigar,
+                        self.last_modified_cigar.as_deref().unwrap_or("-"),
+                        false,
+                    );
                     if trace_target {
                         event!(
                             Level::WARN,
@@ -1390,6 +1453,12 @@ impl CigarParser {
             if instance().conf.min_match != 0
                 && read_match_ins_len < instance().conf.min_match as usize
             {
+                self.debug_read_start_55286157(
+                    pos,
+                    &cigar,
+                    self.last_modified_cigar.as_deref().unwrap_or("-"),
+                    false,
+                );
                 if trace_target {
                     event!(
                         Level::WARN,
@@ -1409,6 +1478,12 @@ impl CigarParser {
             if instance().conf.sam_filter != 0 {
                 const SUPPLEMENTARY_ALIGNMENT: u16 = 0x800;
                 if (record.flags() & SUPPLEMENTARY_ALIGNMENT) != 0 {
+                    self.debug_read_start_55286157(
+                        pos,
+                        &cigar,
+                        self.last_modified_cigar.as_deref().unwrap_or("-"),
+                        false,
+                    );
                     if trace_target {
                         event!(
                             Level::WARN,
@@ -1421,6 +1496,12 @@ impl CigarParser {
 
             // Skip sites that are not in region of interest in CRISPR mode
             if self.skip_sites_out_region_of_interest(cigar.0.as_slice()) {
+                self.debug_read_start_55286157(
+                    pos,
+                    &cigar,
+                    self.last_modified_cigar.as_deref().unwrap_or("-"),
+                    false,
+                );
                 if trace_target {
                     event!(
                         Level::WARN,
@@ -1465,6 +1546,12 @@ impl CigarParser {
 
             self.cigar = cigar;
             let cigar_view = self.cigar.clone();
+            self.debug_read_start_55286157(
+                alignment_start,
+                &cigar_view,
+                self.last_modified_cigar.as_deref().unwrap_or("-"),
+                true,
+            );
 
             'process_cigar: {
                 let mut ci = 0;
@@ -1571,11 +1658,34 @@ impl CigarParser {
                             self.is_trim_at_opt_t_bases(is_reverse, read_len_including_softclips);
 
                         let ch1 = *query_seq.get_or_err(self.read_pos_including_softclip)?;
+                        let debug_loop_55286157 = debug_pos_55286157
+                            && self.current_qname.as_deref() == Some(DEBUG_TARGET_QNAME_55286157);
+                        let mut loop_exit_reason = "normal_end";
+
+                        if debug_loop_55286157 {
+                            eprintln!(
+                                "[DEBUG-55286157] LOOP_ITER qname={} ci={} i={} cigar_len={} start={} read_pos_incl={} ch1={}",
+                                DEBUG_TARGET_QNAME_55286157,
+                                ci,
+                                i,
+                                self.cigar_len,
+                                self.start,
+                                self.read_pos_including_softclip,
+                                ch1 as char
+                            );
+                        }
+
                         let mut s = SmallVecBytes::new();
                         s.push(ch1);
                         let mut start_with_deletion = false;
 
                         if ch1 == b'N' {
+                            if debug_loop_55286157 {
+                                eprintln!(
+                                    "[DEBUG-55286157] LOOP_EXIT qname={} reason=N_BASE",
+                                    DEBUG_TARGET_QNAME_55286157
+                                );
+                            }
                             if instance().conf.include_n_in_total_depth {
                                 inc_cnt(&mut self.ref_coverage, self.start, 1);
                             }
@@ -1684,6 +1794,7 @@ impl CigarParser {
                                         self.read_pos_excluding_softclip += ssn;
                                         i += ssn;
                                         self.start += ssn as i64;
+                                        loop_exit_reason = "MNV_extend";
                                     }
                                 }
                                 None => {
@@ -1788,6 +1899,8 @@ impl CigarParser {
                                     }
                                 }
                             }
+
+                            loop_exit_reason = "del_adjacent";
                         } else if self.is_closer_then_vext_and_good_base(
                             query_seq,
                             query_qual,
@@ -1851,14 +1964,38 @@ impl CigarParser {
                             ci += 1;
                             qibases -= 1;
                             qbases += 1;
+                            loop_exit_reason = "ins_adjacent";
+                        }
+
+                        if trim {
+                            loop_exit_reason = "trim";
                         }
 
                         if !trim {
                             let pos = self.start - qbases as i64 + 1;
-                            if pos >= self.region.start as i64
+                            let will_add_variation = pos >= self.region.start as i64
                                 && pos <= self.region.end as i64
-                                && !s.iter().any(|&b| b == b'N')
+                                && !s.iter().any(|&b| b == b'N');
+
+                            if debug_pos_55286157
+                                && (self.start == DEBUG_TARGET_POS_55286157
+                                    || pos == DEBUG_TARGET_POS_55286157)
                             {
+                                let traced_pos = if pos == DEBUG_TARGET_POS_55286157 {
+                                    pos
+                                } else {
+                                    self.start
+                                };
+                                eprintln!(
+                                    "[DEBUG-55286157] MATCH_BASE qname={} pos={} s={} will_add={}",
+                                    self.current_qname.as_deref().unwrap_or("-"),
+                                    traced_pos,
+                                    String::from_utf8_lossy(s.as_slice()),
+                                    will_add_variation
+                                );
+                            }
+
+                            if will_add_variation {
                                 self.add_variation_for_matching_part(
                                     mapping_quality,
                                     nm,
@@ -1902,10 +2039,34 @@ impl CigarParser {
                             is_reverse,
                             mpos,
                         ) {
+                            if debug_loop_55286157 {
+                                eprintln!(
+                                    "[DEBUG-55286157] LOOP_EXIT qname={} reason={}",
+                                    DEBUG_TARGET_QNAME_55286157,
+                                    loop_exit_reason
+                                );
+                            }
                             break 'process_cigar;
                         }
 
+                        if debug_loop_55286157 {
+                            eprintln!(
+                                "[DEBUG-55286157] LOOP_EXIT qname={} reason={}",
+                                DEBUG_TARGET_QNAME_55286157,
+                                loop_exit_reason
+                            );
+                        }
+
                         i += 1;
+
+                        if debug_loop_55286157 {
+                            eprintln!(
+                                "[DEBUG-55286157] LOOP_POST qname={} i={} start={}",
+                                DEBUG_TARGET_QNAME_55286157,
+                                i,
+                                self.start
+                            );
+                        }
                     }
 
                     if moffset != 0 {
@@ -3070,8 +3231,11 @@ impl CigarParser {
         ddlen: usize,
         pos: i64,
     ) {
+        const DEBUG_TARGET_POS_55286157: i64 = 55_286_157;
+
         let debug_pos = self.debug_pos;
         let trace_merge_ins = self.trace_merge_ins;
+        let debug_pos_55286157 = self.debug_pos_55286157;
 
         // Build VarDesc from s string
         // s format examples: "A", "A&TGC" (MNV), "+ATC" (insertion), "-2&AT" (deletion+match), etc.
@@ -3222,14 +3386,32 @@ impl CigarParser {
 
             let covered_bases = qbases.saturating_sub(shift);
             for qi in 1..=covered_bases {
-                inc_cnt(&mut self.ref_coverage, self.start - qi as i64 + 1, 1);
+                let coverage_pos = self.start - qi as i64 + 1;
+                inc_cnt(&mut self.ref_coverage, coverage_pos, 1);
+                if debug_pos_55286157 && coverage_pos == DEBUG_TARGET_POS_55286157 {
+                    eprintln!(
+                        "[DEBUG-55286157] COVERAGE_INC qname={} pos={} ref_coverage_after={}",
+                        self.current_qname.as_deref().unwrap_or("-"),
+                        coverage_pos,
+                        self.ref_coverage.get(&coverage_pos).copied().unwrap_or(0)
+                    );
+                }
             }
 
             if start_with_deletion {
                 let s_str = String::from_utf8_lossy(s);
                 Self::increment_position_count(&mut self.position_to_deletions_count, pos, &s_str);
                 for qi in 1..ddlen {
-                    inc_cnt(&mut self.ref_coverage, self.start + qi as i64, 1);
+                    let coverage_pos = self.start + qi as i64;
+                    inc_cnt(&mut self.ref_coverage, coverage_pos, 1);
+                    if debug_pos_55286157 && coverage_pos == DEBUG_TARGET_POS_55286157 {
+                        eprintln!(
+                            "[DEBUG-55286157] COVERAGE_INC qname={} pos={} ref_coverage_after={}",
+                            self.current_qname.as_deref().unwrap_or("-"),
+                            coverage_pos,
+                            self.ref_coverage.get(&coverage_pos).copied().unwrap_or(0)
+                        );
+                    }
                 }
             }
         }

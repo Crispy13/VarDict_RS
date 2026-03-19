@@ -2957,7 +2957,7 @@ impl VarDictPipeline {
         hicov: usize,
         duprate: f64,
     ) -> Option<String> {
-        use crate::mods::to_vars_builder::{StrandBiasFlag, StrandBiasValue, check_strand_bias};
+        use crate::mods::to_vars_builder::{StrandBiasFlag, StrandBiasValue};
         use std::collections::BTreeMap;
 
         let mut sv_string: Option<String> = None;
@@ -3068,7 +3068,7 @@ impl VarDictPipeline {
         hicov: usize,
         duprate: f64,
     ) -> usize {
-        use crate::mods::to_vars_builder::{StrandBiasFlag, StrandBiasValue, check_strand_bias};
+        use crate::mods::to_vars_builder::{StrandBiasFlag, StrandBiasValue};
         use std::collections::BTreeMap;
 
         let Some(insertion_variations) = insertion_vars else {
@@ -3890,7 +3890,7 @@ impl VarDictPipeline {
         reference_reverse_coverage: usize,
         duprate: f64,
     ) {
-        use crate::mods::to_vars_builder::{StrandBiasFlag, StrandBiasValue, check_strand_bias};
+        use crate::mods::to_vars_builder::{StrandBiasFlag, StrandBiasValue};
 
         vref.total_pos_coverage = total_pos_coverage;
         vref.position_coverage = 0;
@@ -3920,7 +3920,7 @@ impl VarDictPipeline {
         vref.duprate = duprate;
         vref.crispr = 0;
         vref.strand_bias_flag = StrandBiasFlag::new(
-            check_strand_bias(reference_forward_coverage, reference_reverse_coverage),
+            vref.strand_bias_flag.var_bias,
             StrandBiasValue::CantAssess,
         );
     }
