@@ -1495,13 +1495,6 @@ impl VarDictPipeline {
             }
         }
 
-        // Java htsjdk region queries do not return unmapped reads even if 0x4 is
-        // not in the -F filter. Match that behavior by explicitly skipping them
-        // unless -F 0 disables all filtering.
-        if sam_filter != 0 && record.is_unmapped() {
-            return false;
-        }
-
         // 2. Java preprocessRecord line 117: Ignore low mapping quality reads
         let min_mapq = instance()
             .conf
@@ -2704,7 +2697,9 @@ impl VarDictPipeline {
 
             let mut total_pos_coverage = match ref_coverage.get(&position) {
                 Some(coverage) if *coverage > 0 => *coverage,
-                _ => continue,
+                _ => {
+                    continue;
+                }
             };
 
             if trace_this_pos {
