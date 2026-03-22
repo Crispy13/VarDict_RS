@@ -21,7 +21,7 @@
 //!       Collect results ──► Output
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::Result;
+use crossbeam_channel::{Receiver, Sender};
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use rust_htslib::bam::{HeaderView, Record, ext::BamRecordExtensions};
 
@@ -298,6 +299,30 @@ impl ParallelPipeline {
         )
     }
 
+    /// Process regions using the VarDict pipeline with streaming output through a bounded
+    /// channel, matching Java's BlockingQueue(10) backpressure semantics.
+    pub fn process_regions_vardict_streaming<
+        P: AsRef<Path> + Send + Sync + Clone + 'static,
+    >(
+        &self,
+        bam_path: P,
+        regions: Vec<Region>,
+        sender: Sender<(usize, RegionResult)>,
+    ) {
+        if regions.is_empty() {
+            return;
+        }
+
+        process_regions_vardict_streaming_impl(
+            regions,
+            Arc::clone(&self.reference),
+            self.config.clone(),
+            bam_path,
+            self.thread_pool.as_deref(),
+            sender,
+        );
+    }
+
     /// Process regions using VarDict pipeline and return all output lines
     pub fn process_regions_vardict_to_output<P: AsRef<Path> + Send + Sync + Clone + 'static>(
         &self,
@@ -443,6 +468,113 @@ fn process_regions_vardict_one_region_per_task<P: AsRef<Path> + Send + Sync + Cl
         .into_iter()
         .map(|(_, result)| result)
         .collect()
+}
+
+fn process_regions_vardict_streaming_impl<P: AsRef<Path> + Send + Sync + Clone + 'static>(
+    regions: Vec<Region>,
+    reference: SharedReferenceHandle,
+    config: PipelineConfig,
+    bam_path: P,
+    thread_pool: Option<&ThreadPool>,
+    sender: Sender<(usize, RegionResult)>,
+) {
+    let bam_path_owned = bam_path.as_ref().to_path_buf();
+
+    let build_context = || {
+        let bam_reader = BamReader::open(&bam_path_owned).map_err(|error| error.to_string());
+        let pipeline = VarDictPipeline::new(&config.sample_name)
+            .with_min_frequency(config.min_frequency)
+            .with_min_base_quality(config.quality_threshold)
+            .with_min_mapping_quality(config.mapq_threshold)
+            .with_pileup(config.pileup);
+        let global_scope = Arc::new(instance().clone());
+        (bam_reader, pipeline, global_scope)
+    };
+
+    if let Some(thread_pool) = thread_pool {
+        thread_pool.install(|| {
+            regions
+                .into_par_iter()
+                .enumerate()
+                .map_init(
+                    build_context,
+                    |(bam_reader_result, pipeline, global_scope), (index, region)| {
+                        let result = match bam_reader_result {
+                            Ok(bam_reader) => match pipeline.process_region_from_bam(
+                                &region,
+                                &reference,
+                                bam_reader,
+                                Arc::clone(global_scope),
+                            ) {
+                                Ok(output_lines) => RegionResult {
+                                    region,
+                                    output_lines,
+                                    error: None,
+                                },
+                                Err(error) => RegionResult {
+                                    region,
+                                    output_lines: Vec::new(),
+                                    error: Some(format!("Processing error: {}", error)),
+                                },
+                            },
+                            Err(error) => RegionResult {
+                                region,
+                                output_lines: Vec::new(),
+                                error: Some(format!("Failed to open BAM: {}", error)),
+                            },
+                        };
+
+                        let _ = sender.send((index, result));
+                    },
+                )
+                .for_each(|_| {});
+        });
+    } else {
+        let mut bam_reader = match BamReader::open(&bam_path_owned) {
+            Ok(reader) => reader,
+            Err(error) => {
+                for (index, region) in regions.into_iter().enumerate() {
+                    let _ = sender.send((
+                        index,
+                        RegionResult {
+                            region,
+                            output_lines: Vec::new(),
+                            error: Some(format!("Failed to open BAM: {}", error)),
+                        },
+                    ));
+                }
+                return;
+            }
+        };
+        let pipeline = VarDictPipeline::new(&config.sample_name)
+            .with_min_frequency(config.min_frequency)
+            .with_min_base_quality(config.quality_threshold)
+            .with_min_mapping_quality(config.mapq_threshold)
+            .with_pileup(config.pileup);
+        let global_scope = Arc::new(instance().clone());
+
+        for (index, region) in regions.into_iter().enumerate() {
+            let result = match pipeline.process_region_from_bam(
+                &region,
+                &reference,
+                &mut bam_reader,
+                Arc::clone(&global_scope),
+            ) {
+                Ok(output_lines) => RegionResult {
+                    region,
+                    output_lines,
+                    error: None,
+                },
+                Err(error) => RegionResult {
+                    region,
+                    output_lines: Vec::new(),
+                    error: Some(format!("Processing error: {}", error)),
+                },
+            };
+
+            let _ = sender.send((index, result));
+        }
+    }
 }
 
 fn build_prefetch_region_groups(regions: Vec<Region>) -> Vec<Vec<(usize, Region)>> {
@@ -910,6 +1042,56 @@ fn process_single_region(
             output_lines: Vec::new(),
             error: Some(format!("Pipeline error: {}", e)),
         },
+    }
+}
+
+/// Ordered consumer that receives indexed RegionResults through a bounded channel and writes
+/// them to stdout in BED-file order, matching Java's BlockingQueue(10) semantics.
+#[derive(Debug)]
+pub struct OrderedStreamConsumer {
+    receiver: Receiver<(usize, RegionResult)>,
+    debug: bool,
+}
+
+impl OrderedStreamConsumer {
+    pub fn new(receiver: Receiver<(usize, RegionResult)>, debug: bool) -> Self {
+        Self { receiver, debug }
+    }
+
+    pub fn run(self) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let mut stdout = std::io::stdout().lock();
+        let mut next_expected: usize = 0;
+        let mut buffer: BTreeMap<usize, RegionResult> = BTreeMap::new();
+
+        for (index, result) in self.receiver.iter() {
+            buffer.insert(index, result);
+            while let Some(result) = buffer.remove(&next_expected) {
+                if let Some(ref error) = result.error {
+                    if self.debug {
+                        eprintln!(
+                            "WARN: Error processing {}:{}-{}: {}",
+                            result.region.chr(),
+                            result.region.start(),
+                            result.region.end(),
+                            error
+                        );
+                    }
+                } else {
+                    for line in &result.output_lines {
+                        writeln!(stdout, "{}", line)?;
+                    }
+                }
+                next_expected += 1;
+            }
+        }
+
+        debug_assert!(
+            buffer.is_empty(),
+            "OrderedStreamConsumer: buffer not empty after channel closed"
+        );
+        Ok(())
     }
 }
 

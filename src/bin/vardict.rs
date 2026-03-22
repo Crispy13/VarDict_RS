@@ -385,7 +385,9 @@ fn run_variant_calling(
     use std::time::Instant;
     use vardict_rs::conf::Configuration;
     use vardict_rs::data::shared_reference::load_shared_reference_chroms;
-    use vardict_rs::mods::parallel_pipeline::ParallelPipeline;
+    use vardict_rs::mods::parallel_pipeline::{
+        OrderedStreamConsumer, ParallelPipeline, RegionResult,
+    };
     use vardict_rs::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE};
 
     if bam_paths.is_empty() {
@@ -528,12 +530,24 @@ fn run_variant_calling(
     match execution_mode {
         ExecutionMode::Simple => {
             let pipeline = ParallelPipeline::new(reference, config, num_threads);
-            let mut stdout = io::stdout().lock();
-            for batch in region_batches {
-                let batch_results =
-                    pipeline.process_regions_vardict(primary_bam_path.clone(), batch);
-                for result in batch_results {
-                    if let Some(error) = result.error {
+            let all_regions: Vec<Region> = region_batches.into_iter().flatten().collect();
+
+            if num_threads > 1 {
+                let (sender, receiver) = crossbeam_channel::bounded::<(usize, RegionResult)>(10);
+                let debug = args.debug;
+
+                let consumer_handle = std::thread::spawn(move || {
+                    OrderedStreamConsumer::new(receiver, debug).run()
+                });
+
+                pipeline.process_regions_vardict_streaming(primary_bam_path, all_regions, sender);
+
+                consumer_handle.join().expect("consumer thread panicked")?;
+            } else {
+                let mut stdout = io::stdout().lock();
+                let results = pipeline.process_regions_vardict(primary_bam_path, all_regions);
+                for result in results {
+                    if let Some(ref error) = result.error {
                         if args.debug {
                             event!(
                                 Level::WARN,
