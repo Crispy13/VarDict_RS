@@ -1,0 +1,3 @@
+- Simple-mode `-D` debug content is position-scoped, not variant-scoped.
+- Build debug entries during ToVars position assembly, join with ` & `, and reuse the same string for every row at that locus.
+- Recomputing debug text from only the emitted top variant in `SimpleOutputVariant` drops sibling variant entries and breaks Java parity.

@@ -1,0 +1,3 @@
+- Option parity scripts execute the debug-release binary, not the test-profile binary.
+- After source edits, rerun cargo build --profile debug-release before trusting na12878_option_parity.sh results.
+- A stale debug-release build can make parity output look unchanged even when unit tests exercise the new code.

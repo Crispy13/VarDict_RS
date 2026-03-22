@@ -1,0 +1,5 @@
+- Frequency option caches can silently reuse default chr20 Java outputs when tmp/na12878_parity/<label>/20/java was generated from stale data.
+- Evidence on 2026-03-17: before purge, freq-high shard_005 and shard_020 Java caches differed from fresh Java by 2 and 4 diff lines respectively, while freq-high/freq-low/freq-zero shard_005 matched default cache exactly.
+- Fresh Java shard_030 for -f 0.05 matched Rust exactly after sorting and in original order; stale-cache suspicion was Java-side, not Rust-side.
+- Fix path: remove tmp/na12878_parity/freq-high/ and rerun bash tests/na12878_option_parity.sh --config-id T1-06 --no-stop --parallel 4 in rust_build_env; T1-06 then passed fully.
+- Audit signal for other frequency labels: freq-low and freq-zero shard_005/020/030 Java caches were byte-identical to default chr20 Java caches, so treat them as stale until regenerated.

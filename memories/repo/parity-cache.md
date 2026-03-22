@@ -1,0 +1,5 @@
+- T3-02 pileup-strict chr20 false failures can come from corrupted Java cache files under tmp/na12878_parity/pileup-strict/20/java.
+- Verified on 2026-03-19: cached shard_032/034/037/038 differed from fresh Java reruns; fresh Java outputs were byte-identical to Rust.
+- Fast triage pattern: compare cache mtime/size, rerun Java into tmp/t3_02_investigation, then cmp regenerated Java against Rust before treating new shard failures as Rust regressions.
+- Verified on 2026-03-21: chr20 still had later truncated Java shards beyond the previously checked ones: pileup shard_052 (Java 582999 lines vs Rust 991278) and pileup-strict shard_037 (Java 27934 vs Rust 982306).
+- Do not pipe tests/na12878_option_parity_v2.sh or tests/na12878_parity_v2.sh into tail while preserving pipefail semantics during diagnosis; the compare phase can exit 141 on SIGPIPE and hide the real first failing shard.

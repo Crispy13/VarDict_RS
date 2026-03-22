@@ -1,0 +1,4 @@
+- Rust htslib region fetches can return unmapped mate-anchored reads, unlike Java htsjdk region queries.
+- When `-F` omits `0x4` (for example `0x700` or `0x100`), `passes_preprocess()` must still reject `record.is_unmapped()` when `sam_filter != 0`.
+- Safe placement: after the configurable bitwise `-F` check and before the hardcoded secondary-alignment guard in `src/mods/vardict_pipeline.rs`.
+- Effect observed on NA12878 option parity: fixes widespread chr20/chr22 depth mismatches for `T2-09` (`-F 0x700`); remaining chrMT mismatch is separate.
