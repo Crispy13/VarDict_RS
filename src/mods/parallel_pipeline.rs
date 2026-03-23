@@ -39,7 +39,7 @@ use crate::data::shared_reference::SharedReferenceHandle;
 use crate::mods::pipeline::{Pipeline, PipelineConfig};
 use crate::mods::simple_variant_caller::SimpleVariantCaller;
 use crate::mods::vardict_pipeline::VarDictPipeline;
-use crate::scopedata::global_read_only_scope::instance;
+use crate::scopedata::global_read_only_scope::{instance, instance_arc};
 
 const SMALL_BATCH_PREFETCH_MULTIPLIER: usize = 4;
 const MAX_PREFETCH_GROUP_SPAN_BP: usize = 2_500_000;
@@ -374,7 +374,7 @@ fn process_regions_vardict_one_region_per_task<P: AsRef<Path> + Send + Sync + Cl
             .with_min_base_quality(config.quality_threshold)
             .with_min_mapping_quality(config.mapq_threshold)
             .with_pileup(config.pileup);
-        let global_scope = Arc::new(instance().clone());
+        let global_scope = instance_arc();
         (bam_reader, pipeline, global_scope)
     };
 
@@ -435,7 +435,7 @@ fn process_regions_vardict_one_region_per_task<P: AsRef<Path> + Send + Sync + Cl
             .with_min_base_quality(config.quality_threshold)
             .with_min_mapping_quality(config.mapq_threshold)
             .with_pileup(config.pileup);
-        let global_scope = Arc::new(instance().clone());
+        let global_scope = instance_arc();
 
         regions
             .into_iter()
@@ -487,7 +487,7 @@ fn process_regions_vardict_streaming_impl<P: AsRef<Path> + Send + Sync + Clone +
             .with_min_base_quality(config.quality_threshold)
             .with_min_mapping_quality(config.mapq_threshold)
             .with_pileup(config.pileup);
-        let global_scope = Arc::new(instance().clone());
+        let global_scope = instance_arc();
         (bam_reader, pipeline, global_scope)
     };
 
@@ -551,7 +551,7 @@ fn process_regions_vardict_streaming_impl<P: AsRef<Path> + Send + Sync + Clone +
             .with_min_base_quality(config.quality_threshold)
             .with_min_mapping_quality(config.mapq_threshold)
             .with_pileup(config.pileup);
-        let global_scope = Arc::new(instance().clone());
+        let global_scope = instance_arc();
 
         for (index, region) in regions.into_iter().enumerate() {
             let result = match pipeline.process_region_from_bam(
@@ -690,7 +690,7 @@ fn process_prefetched_region_groups_vardict<P: AsRef<Path>>(
         }
     };
 
-    let global_scope = Arc::new(instance().clone());
+    let global_scope = instance_arc();
     let mut bam_reader = match BamReader::open(bam_path_str) {
         Ok(reader) => reader,
         Err(error) => {
@@ -888,7 +888,7 @@ fn process_region_chunk_vardict<P: AsRef<Path>>(
         .with_min_base_quality(config.quality_threshold)
         .with_min_mapping_quality(config.mapq_threshold);
 
-    let global_scope = Arc::new(instance().clone());
+    let global_scope = instance_arc();
 
     // Reuse one indexed BAM handle across the worker's region chunk to avoid
     // reopening the BAM and index for every single-region shard.
@@ -1028,7 +1028,7 @@ fn process_single_region(
         .with_pileup(config.pileup); // Use config's pileup setting
 
     // Get GlobalReadOnlyScope instance
-    let gros = Arc::new(instance().clone());
+    let gros = instance_arc();
 
     // Process region through the real VarDict pipeline
     match pipeline.process_region_from_bam(region, reference, bam_reader, gros) {

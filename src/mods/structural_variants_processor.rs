@@ -272,18 +272,9 @@ impl StructuralVariantsProcessor {
     }
 
     pub fn into_reference(self) -> Reference {
-        let ref_seq = match Arc::try_unwrap(self.original_reference_seq) {
-            Ok(ref_seq) => ref_seq,
-            Err(reference_seq) => (*reference_seq).clone(),
-        };
-        let seed = match Arc::try_unwrap(self.original_reference_seed) {
-            Ok(seed) => seed,
-            Err(reference_seed) => (*reference_seed).clone(),
-        };
-
         Reference {
-            ref_seq,
-            seed,
+            ref_seq: self.original_reference_seq,
+            seed: self.original_reference_seed,
             region_start: self.original_ref_start,
         }
     }
@@ -3678,8 +3669,8 @@ impl StructuralVariantsProcessor {
         let mut reference = Reference::new_with_start(sequence, new_start);
         reference.build_seed_map(new_end, chr_len);
 
-        self.reference_seq = Arc::new(reference.ref_seq);
-        self.reference_seed = Arc::new(reference.seed);
+        self.reference_seq = reference.ref_seq;
+        self.reference_seed = reference.seed;
         self.ref_start = new_start;
     }
 
@@ -4139,7 +4130,7 @@ mod tests {
         let reference = processor.into_reference();
 
         assert_eq!(reference.region_start, 100);
-        assert_eq!(reference.ref_seq, b"ACGTACGT".to_vec());
+        assert_eq!(*reference.ref_seq, b"ACGTACGT".to_vec());
     }
 
     #[test]
@@ -4222,16 +4213,16 @@ mod tests {
         });
 
         let mut processor = StructuralVariantsProcessor::new_with_context(
-            Arc::new(original_reference.ref_seq.clone()),
-            Arc::new(original_reference.seed.clone()),
+            Arc::clone(&original_reference.ref_seq),
+            Arc::clone(&original_reference.seed),
             1,
             Some(chrom),
             Vec::new(),
             Some(shared_reference),
         );
 
-        processor.reference_seq = Arc::new(current_reference.ref_seq.clone());
-        processor.reference_seed = Arc::new(current_reference.seed.clone());
+        processor.reference_seq = Arc::clone(&current_reference.ref_seq);
+        processor.reference_seed = Arc::clone(&current_reference.seed);
         processor.ref_start = 41;
         processor
             .historical_reference_windows
@@ -4271,16 +4262,16 @@ mod tests {
         });
 
         let mut processor = StructuralVariantsProcessor::new_with_context(
-            Arc::new(original_reference.ref_seq.clone()),
-            Arc::new(original_reference.seed.clone()),
+            Arc::clone(&original_reference.ref_seq),
+            Arc::clone(&original_reference.seed),
             1,
             Some(chrom),
             Vec::new(),
             Some(shared_reference),
         );
 
-        processor.reference_seq = Arc::new(current_reference.ref_seq.clone());
-        processor.reference_seed = Arc::new(current_reference.seed.clone());
+        processor.reference_seq = Arc::clone(&current_reference.ref_seq);
+        processor.reference_seed = Arc::clone(&current_reference.seed);
         processor.ref_start = 41;
 
         let seed = b"ACGTACGTACGA";
@@ -4313,8 +4304,8 @@ mod tests {
         });
 
         let processor = StructuralVariantsProcessor::new_with_context(
-            Arc::new(original_reference.ref_seq.clone()),
-            Arc::new(original_reference.seed.clone()),
+            Arc::clone(&original_reference.ref_seq),
+            Arc::clone(&original_reference.seed),
             1,
             Some(chrom),
             Vec::new(),
@@ -4351,8 +4342,8 @@ mod tests {
         });
 
         let mut processor = StructuralVariantsProcessor::new_with_context(
-            Arc::new(restored_reference.ref_seq.clone()),
-            Arc::new(restored_reference.seed.clone()),
+            Arc::clone(&restored_reference.ref_seq),
+            Arc::clone(&restored_reference.seed),
             41,
             Some(chrom),
             Vec::new(),
@@ -4395,16 +4386,16 @@ mod tests {
         });
 
         let mut processor = StructuralVariantsProcessor::new_with_context(
-            Arc::new(original_reference.ref_seq.clone()),
-            Arc::new(original_reference.seed.clone()),
+            Arc::clone(&original_reference.ref_seq),
+            Arc::clone(&original_reference.seed),
             1,
             Some(chrom),
             Vec::new(),
             Some(shared_reference),
         );
 
-        processor.reference_seq = Arc::new(current_reference.ref_seq.clone());
-        processor.reference_seed = Arc::new(current_reference.seed.clone());
+        processor.reference_seq = Arc::clone(&current_reference.ref_seq);
+        processor.reference_seed = Arc::clone(&current_reference.seed);
         processor.ref_start = 41;
         processor
             .historical_reference_windows
@@ -4449,16 +4440,16 @@ mod tests {
         });
 
         let mut processor = StructuralVariantsProcessor::new_with_context(
-            Arc::new(original_reference.ref_seq.clone()),
-            Arc::new(original_reference.seed.clone()),
+            Arc::clone(&original_reference.ref_seq),
+            Arc::clone(&original_reference.seed),
             1,
             Some(chrom),
             Vec::new(),
             Some(shared_reference),
         );
 
-        processor.reference_seq = Arc::new(current_reference.ref_seq.clone());
-        processor.reference_seed = Arc::new(current_reference.seed.clone());
+        processor.reference_seq = Arc::clone(&current_reference.ref_seq);
+        processor.reference_seed = Arc::clone(&current_reference.seed);
         processor.ref_start = 41;
         processor
             .historical_reference_windows
@@ -4499,8 +4490,8 @@ mod tests {
         });
 
         let mut processor = StructuralVariantsProcessor::new_with_context(
-            Arc::new(original_reference.ref_seq.clone()),
-            Arc::new(original_reference.seed.clone()),
+            Arc::clone(&original_reference.ref_seq),
+            Arc::clone(&original_reference.seed),
             1,
             Some(chrom),
             Vec::new(),

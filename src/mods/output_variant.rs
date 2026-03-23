@@ -1660,7 +1660,9 @@ impl FisherExact {
             let value = match distribution {
                 Ok(distribution) => {
                     let value = distribution.ln_pmf(*element as u64);
-                    if value.is_finite() { value } else { 0.0 }
+                    // Java: if (Double.isNaN(value)) value = 0; — only NaN is replaced,
+                    // -Infinity is kept (exp(-inf)=0 is correct in downstream dnhyper)
+                    if value.is_nan() { 0.0 } else { value }
                 }
                 Err(_) => 0.0,
             };

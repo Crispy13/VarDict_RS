@@ -281,7 +281,9 @@ find_first_difference_line() {
     local left_file=$1
     local right_file=$2
 
-    paste -d$'\x01' "$left_file" "$right_file" | awk -F$'\x01' '{ if ($1 != $2) { print NR; exit } }'
+    # || true: awk exits early after first diff, causing SIGPIPE (141) on paste;
+    # harmless but fatal under set -euo pipefail without this guard.
+    paste -d$'\x01' "$left_file" "$right_file" | awk -F$'\x01' '{ if ($1 != $2) { print NR; exit } }' || true
 }
 
 write_failure_meta() {

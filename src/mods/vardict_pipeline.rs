@@ -41,7 +41,7 @@ use crate::mods::to_vars_builder::{
 use crate::mods::variant_realigner::VariantRealigner;
 use crate::prelude::LibDefaultHasher;
 use crate::scopedata::global_read_only_scope::GlobalReadOnlyScope;
-use crate::scopedata::global_read_only_scope::instance;
+use crate::scopedata::global_read_only_scope::{instance, instance_arc};
 use crate::utils::round_half_even;
 use crate::variants::variants::{
     SoftClip, StructuralVariantCounts, VarDesc, Variant as RawVariant,
@@ -2351,7 +2351,7 @@ impl VarDictPipeline {
         reference: &Reference,
         bam_paths: &[String],
     ) -> Result<CigarParserOutput> {
-        let scope = Arc::new(instance().clone());
+        let scope = instance_arc();
         let sam_filter = instance().conf.sam_filter;
         self.run_cigar_parser_from_bam_paths(region, reference, scope, bam_paths, sam_filter)
     }
@@ -2484,8 +2484,8 @@ impl VarDictPipeline {
 
         // Perform minimal deletion realignment using soft clips when enabled
         // Re-enable realigner to match Java behavior
-        let shared_reference_seq = Arc::new(reference.ref_seq.clone());
-        let shared_reference_seed = Arc::new(reference.seed.clone());
+        let shared_reference_seq = Arc::clone(&reference.ref_seq);
+        let shared_reference_seed = Arc::clone(&reference.seed);
 
         let realigner = VariantRealigner::new_with_context(
             Arc::clone(&shared_reference_seq),

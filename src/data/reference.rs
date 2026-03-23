@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use rust_htslib::faidx;
@@ -9,10 +10,13 @@ use crate::prelude::LibDefaultHasher;
 pub type ReferenceSeedMap = HashMap<Vec<u8>, Vec<i64>, LibDefaultHasher>;
 
 /// Reference sequence data
+///
+/// Fields use Arc internally so that `Reference::clone()` is O(1) (refcount bump)
+/// rather than deep-copying the sequence and seed map.
 #[derive(Default, Clone)]
 pub struct Reference {
-    pub ref_seq: Vec<u8>,
-    pub seed: ReferenceSeedMap,
+    pub ref_seq: Arc<Vec<u8>>,
+    pub seed: Arc<ReferenceSeedMap>,
     /// Start position of this reference slice in genomic coordinates (1-based)
     pub region_start: i64,
 }
@@ -21,7 +25,7 @@ impl Reference {
     /// Create a new Reference from a sequence slice
     pub fn from_seq(seq: &[u8]) -> Self {
         Reference {
-            ref_seq: seq.to_vec(),
+            ref_seq: Arc::new(seq.to_vec()),
             seed: Default::default(),
             region_start: 0,
         }
@@ -30,7 +34,7 @@ impl Reference {
     /// Create a new Reference from a sequence slice with region start position
     pub fn from_seq_with_start(seq: &[u8], region_start: i64) -> Self {
         Reference {
-            ref_seq: seq.to_vec(),
+            ref_seq: Arc::new(seq.to_vec()),
             seed: Default::default(),
             region_start,
         }
@@ -39,7 +43,7 @@ impl Reference {
     /// Create a new Reference with owned sequence
     pub fn new(ref_seq: Vec<u8>) -> Self {
         Reference {
-            ref_seq,
+            ref_seq: Arc::new(ref_seq),
             seed: Default::default(),
             region_start: 0,
         }
@@ -48,7 +52,7 @@ impl Reference {
     /// Create a new Reference with owned sequence and region start
     pub fn new_with_start(ref_seq: Vec<u8>, region_start: i64) -> Self {
         Reference {
-            ref_seq,
+            ref_seq: Arc::new(ref_seq),
             seed: Default::default(),
             region_start,
         }
@@ -56,7 +60,8 @@ impl Reference {
 
     /// Build the reference seed map using SEED_1 and SEED_2 lengths.
     pub fn build_seed_map(&mut self, region_end: i64, chr_len: Option<usize>) {
-        self.seed.clear();
+        let seed_map = Arc::make_mut(&mut self.seed);
+        seed_map.clear();
 
         if self.ref_seq.is_empty() {
             return;
@@ -79,7 +84,7 @@ impl Reference {
 
             if i + seed1 <= seq_len {
                 let key = self.ref_seq[i..i + seed1].to_vec();
-                self.seed
+                seed_map
                     .entry(key)
                     .or_insert_with(Vec::new)
                     .push(self.region_start + i as i64);
@@ -87,7 +92,7 @@ impl Reference {
 
             if i + seed2 <= seq_len {
                 let key = self.ref_seq[i..i + seed2].to_vec();
-                self.seed
+                seed_map
                     .entry(key)
                     .or_insert_with(Vec::new)
                     .push(self.region_start + i as i64);
@@ -179,7 +184,7 @@ impl FastaReader {
     pub fn get_reference(&self, chrom: &str, start: usize, end: usize) -> Result<Reference> {
         let ref_seq = self.fetch_seq(chrom, start, end)?;
         let mut reference = Reference {
-            ref_seq,
+            ref_seq: Arc::new(ref_seq),
             seed: Default::default(),
             region_start: start as i64,
         };

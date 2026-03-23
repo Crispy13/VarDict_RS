@@ -4868,7 +4868,7 @@ mod tests {
     use crate::data::reference::FastaReader;
     use crate::data::region::Region;
     use crate::mods::cigar_parser::CigarParser;
-    use crate::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE, instance};
+    use crate::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE, instance_arc};
     use rust_htslib::bam::{Read, Reader};
     use std::sync::Arc;
 
@@ -5259,7 +5259,7 @@ mod tests {
             .get_reference(region.chr(), ref_start, ref_end)
             .expect("Failed to fetch reference sequence");
 
-        let scope_instance = Arc::new(instance().clone());
+        let scope_instance = instance_arc();
         let mut parser = CigarParser::new(region.clone(), reference.clone(), scope_instance);
 
         let mut records = vec![record];
@@ -5292,11 +5292,13 @@ mod tests {
             softp2sv_first_used: Default::default(),
         };
 
-        if instance().conf.perform_local_realignment {
-            let realigner = VariantRealigner::new(
-                reference.ref_seq.clone(),
-                reference.seed.clone(),
+        if instance_arc().conf.perform_local_realignment {
+            let realigner = VariantRealigner::new_with_context(
+                Arc::clone(&reference.ref_seq),
+                Arc::clone(&reference.seed),
                 reference.region_start,
+                None,
+                Vec::new(),
             );
             realigner.process_deletions(&mut sv_input, &position_to_deletions_count);
         }

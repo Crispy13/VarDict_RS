@@ -4569,7 +4569,7 @@ mod tests {
     fn test_cigar_parser_mapped_read_ref_loaded_no_indels() {
         use crate::data::reference::FastaReader;
         use crate::data::region::Region;
-        use crate::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE, instance};
+        use crate::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE, instance_arc};
         use rust_htslib::bam::{Read, Reader};
         use std::sync::Arc;
 
@@ -4612,7 +4612,7 @@ mod tests {
             .get_reference(region.chr(), ref_start, ref_end)
             .expect("Failed to fetch reference sequence");
 
-        let instance = Arc::new(instance().clone());
+        let instance = instance_arc();
         let mut parser = CigarParser::new(region, reference, instance);
 
         let mut records = vec![record];
@@ -4653,7 +4653,7 @@ mod tests {
         use crate::data::reference::FastaReader;
         use crate::data::region::Region;
         use crate::mods::vardict_pipeline::VarDictPipeline;
-        use crate::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE, instance};
+        use crate::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE, instance_arc};
         use crate::variants::variants::VarDesc;
         use std::collections::HashMap;
         use std::fs::File;
@@ -4724,7 +4724,7 @@ mod tests {
             .get_reference(region.chr(), ref_start, ref_end)
             .expect("Failed to fetch reference sequence");
 
-        let instance = Arc::new(instance().clone());
+        let instance = instance_arc();
         let pipeline = VarDictPipeline::new("test");
         let sam_filter = 0x504u32;
         let mut bam_reader = BamReader::open(bam_path).expect("Failed to open BAM");
