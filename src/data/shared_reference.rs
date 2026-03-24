@@ -53,7 +53,7 @@ fn normalize_chrom_name(reader: &faidx::Reader, chrom: &str) -> Option<String> {
 #[derive(Debug)]
 pub struct ChromosomeData {
     /// Sequence bytes (uppercase)
-    pub sequence: Vec<u8>,
+    pub sequence: Arc<Vec<u8>>,
     /// Length of the sequence
     pub length: usize,
 }
@@ -111,16 +111,16 @@ impl SharedReference {
         let seq = reader
             .fetch_seq(&ref_chrom, 0, length as usize - 1)
             .with_context(|| format!("Failed to fetch chromosome {}", ref_chrom))?;
-
         let sequence: Vec<u8> = seq.into_iter().map(|b| b.to_ascii_uppercase()).collect();
         let seq_len = sequence.len();
+        let sequence = Arc::new(sequence);
 
         let mut chromosomes: HashMap<String, ChromosomeData, LibDefaultHasher> = Default::default();
         // Store under BOTH the original name and the reference name for lookup flexibility
         chromosomes.insert(
             chrom.to_string(),
             ChromosomeData {
-                sequence: sequence.clone(),
+                sequence: Arc::clone(&sequence),
                 length: seq_len,
             },
         );
@@ -170,16 +170,16 @@ impl SharedReference {
             let seq = reader
                 .fetch_seq(&ref_chrom, 0, length as usize - 1)
                 .with_context(|| format!("Failed to fetch chromosome {}", ref_chrom))?;
-
             let sequence: Vec<u8> = seq.into_iter().map(|b| b.to_ascii_uppercase()).collect();
             let seq_len = sequence.len();
             total_size += seq_len;
+            let sequence = Arc::new(sequence);
 
             // Store under the original name (from BED file) for lookup
             chromosomes.insert(
                 chrom.to_string(),
                 ChromosomeData {
-                    sequence: sequence.clone(),
+                    sequence: Arc::clone(&sequence),
                     length: seq_len,
                 },
             );
@@ -232,10 +232,10 @@ impl SharedReference {
             let seq = reader
                 .fetch_seq(&chrom_name, 0, length as usize - 1)
                 .with_context(|| format!("Failed to fetch chromosome {}", chrom_name))?;
-
             let sequence: Vec<u8> = seq.into_iter().map(|b| b.to_ascii_uppercase()).collect();
             let seq_len = sequence.len();
             total_size += seq_len;
+            let sequence = Arc::new(sequence);
 
             chromosomes.insert(
                 chrom_name.clone(),
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn test_chromosome_data_get_base() {
         let data = ChromosomeData {
-            sequence: b"ACGTACGT".to_vec(),
+            sequence: Arc::new(b"ACGTACGT".to_vec()),
             length: 8,
         };
 
@@ -342,7 +342,7 @@ mod tests {
     #[test]
     fn test_chromosome_data_get_subseq() {
         let data = ChromosomeData {
-            sequence: b"ACGTACGT".to_vec(),
+            sequence: Arc::new(b"ACGTACGT".to_vec()),
             length: 8,
         };
 
@@ -361,14 +361,14 @@ mod tests {
         chromosomes.insert(
             "chr1".to_string(),
             ChromosomeData {
-                sequence: b"ACGTACGTACGT".to_vec(),
+                sequence: Arc::new(b"ACGTACGTACGT".to_vec()),
                 length: 12,
             },
         );
         chromosomes.insert(
             "chr2".to_string(),
             ChromosomeData {
-                sequence: b"GGGGCCCCAAAA".to_vec(),
+                sequence: Arc::new(b"GGGGCCCCAAAA".to_vec()),
                 length: 12,
             },
         );

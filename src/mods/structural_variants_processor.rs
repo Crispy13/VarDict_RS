@@ -1537,7 +1537,6 @@ impl StructuralVariantsProcessor {
                         String::from_utf8_lossy(&extra),
                     );
                 }
-
                 let _ =
                     Self::get_or_create_variation(&mut data.non_insertion_variants, p5_inv, &vn);
                 Self::add_sv_counts(
@@ -2784,7 +2783,7 @@ impl StructuralVariantsProcessor {
         seed_len: usize,
         mm: usize,
     ) -> MatchResult {
-        self.find_match_rev_internal(seq, position, dir, seed_len, mm, true, false)
+        self.find_match_rev_internal(seq, position, dir, seed_len, mm, true)
     }
 
     fn find_match_rev_internal(
@@ -2795,7 +2794,6 @@ impl StructuralVariantsProcessor {
         seed_len: usize,
         mm: usize,
         include_historical_windows: bool,
-        include_shared_reference_fallback: bool,
     ) -> MatchResult {
         let mut seq_work = seq.to_vec();
         if dir == 1 {
@@ -2812,11 +2810,8 @@ impl StructuralVariantsProcessor {
 
         for i in (0..=seq_work.len() - seed_len).rev() {
             let seed = &seq_work[i..i + seed_len];
-            let seeds = if include_shared_reference_fallback {
-                self.seed_positions(seed, include_historical_windows)
-            } else {
-                self.seed_positions_with_scope(seed, include_historical_windows, false)
-            };
+            let seeds =
+                self.seed_positions_with_scope(seed, include_historical_windows, false);
             if seeds.len() != 1 {
                 continue;
             }
@@ -2828,7 +2823,8 @@ impl StructuralVariantsProcessor {
                 first_seed - i as i64
             };
 
-            if self.is_match_ref(&seq_work, bp, -dir, mm) {
+            let initial_match = self.is_match_ref(&seq_work, bp, -dir, mm);
+            if initial_match {
                 return MatchResult {
                     base_position: bp,
                     matched_sequence: Vec::new(),
@@ -2883,7 +2879,8 @@ impl StructuralVariantsProcessor {
                     break;
                 }
 
-                if self.is_match_ref(&sseq, bp, -dir, 1) {
+                let retry_match = self.is_match_ref(&sseq, bp, -dir, 1);
+                if retry_match {
                     return MatchResult {
                         base_position: bp,
                         matched_sequence: extra.to_vec(),
@@ -4201,7 +4198,7 @@ mod tests {
         chromosomes.insert(
             chrom.clone(),
             ChromosomeData {
-                sequence: full_sequence.to_vec(),
+                sequence: Arc::new(full_sequence.to_vec()),
                 length: full_sequence.len(),
             },
         );
@@ -4250,7 +4247,7 @@ mod tests {
         chromosomes.insert(
             chrom.clone(),
             ChromosomeData {
-                sequence: full_sequence.to_vec(),
+                sequence: Arc::new(full_sequence.to_vec()),
                 length: full_sequence.len(),
             },
         );
@@ -4292,7 +4289,7 @@ mod tests {
         chromosomes.insert(
             chrom.clone(),
             ChromosomeData {
-                sequence: full_sequence.to_vec(),
+                sequence: Arc::new(full_sequence.to_vec()),
                 length: full_sequence.len(),
             },
         );
@@ -4330,7 +4327,7 @@ mod tests {
         chromosomes.insert(
             chrom.clone(),
             ChromosomeData {
-                sequence: full_sequence.to_vec(),
+                sequence: Arc::new(full_sequence.to_vec()),
                 length: full_sequence.len(),
             },
         );
@@ -4374,7 +4371,7 @@ mod tests {
         chromosomes.insert(
             chrom.clone(),
             ChromosomeData {
-                sequence: full_sequence.to_vec(),
+                sequence: Arc::new(full_sequence.to_vec()),
                 length: full_sequence.len(),
             },
         );
@@ -4428,7 +4425,7 @@ mod tests {
         chromosomes.insert(
             chrom.clone(),
             ChromosomeData {
-                sequence: full_sequence.to_vec(),
+                sequence: Arc::new(full_sequence.to_vec()),
                 length: full_sequence.len(),
             },
         );
@@ -4478,7 +4475,7 @@ mod tests {
         chromosomes.insert(
             chrom.clone(),
             ChromosomeData {
-                sequence: full_sequence,
+                sequence: Arc::new(full_sequence),
                 length: 1000,
             },
         );

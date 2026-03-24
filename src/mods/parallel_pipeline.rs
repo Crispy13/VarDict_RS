@@ -30,6 +30,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
+use crackle_kit::tracing::{Level, event};
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use rust_htslib::bam::{HeaderView, Record, ext::BamRecordExtensions};
 
@@ -39,7 +40,7 @@ use crate::data::shared_reference::SharedReferenceHandle;
 use crate::mods::pipeline::{Pipeline, PipelineConfig};
 use crate::mods::simple_variant_caller::SimpleVariantCaller;
 use crate::mods::vardict_pipeline::VarDictPipeline;
-use crate::scopedata::global_read_only_scope::{instance, instance_arc};
+use crate::scopedata::global_read_only_scope::instance_arc;
 
 const SMALL_BATCH_PREFETCH_MULTIPLIER: usize = 4;
 const MAX_PREFETCH_GROUP_SPAN_BP: usize = 2_500_000;
@@ -321,6 +322,58 @@ impl ParallelPipeline {
             self.thread_pool.as_deref(),
             sender,
         );
+    }
+
+    /// Process regions sequentially and write output directly to the provided sink.
+    pub fn process_regions_vardict_direct_write<P, W>(
+        &self,
+        bam_path: P,
+        regions: Vec<Region>,
+        writer: &mut W,
+        debug: bool,
+    ) -> Result<()>
+    where
+        P: AsRef<Path>,
+        W: Write,
+    {
+        if regions.is_empty() {
+            return Ok(());
+        }
+
+        let mut bam_reader = BamReader::open(bam_path.as_ref())?;
+        let pipeline = VarDictPipeline::new(&self.config.sample_name)
+            .with_min_frequency(self.config.min_frequency)
+            .with_min_base_quality(self.config.quality_threshold)
+            .with_min_mapping_quality(self.config.mapq_threshold)
+            .with_pileup(self.config.pileup);
+        let global_scope = instance_arc();
+
+        for region in regions {
+            if let Err(error) = pipeline.process_region_from_bam_streaming(
+                &region,
+                &self.reference,
+                &mut bam_reader,
+                Arc::clone(&global_scope),
+                writer,
+            ) {
+                if error.downcast_ref::<std::io::Error>().is_some() {
+                    return Err(error);
+                }
+
+                if debug {
+                    event!(
+                        Level::WARN,
+                        "Error processing {}:{}-{}: {}",
+                        region.chr(),
+                        region.start(),
+                        region.end(),
+                        error
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Process regions using VarDict pipeline and return all output lines
@@ -1112,7 +1165,7 @@ mod tests {
         chromosomes.insert(
             "chr1".to_string(),
             crate::data::shared_reference::ChromosomeData {
-                sequence: b"ACGTACGT".repeat(100),
+                sequence: std::sync::Arc::new(b"ACGTACGT".repeat(100)),
                 length: 800,
             },
         );
@@ -1140,7 +1193,7 @@ mod tests {
         chromosomes.insert(
             "chr1".to_string(),
             crate::data::shared_reference::ChromosomeData {
-                sequence: b"ACGTACGT".repeat(100),
+                sequence: std::sync::Arc::new(b"ACGTACGT".repeat(100)),
                 length: 800,
             },
         );

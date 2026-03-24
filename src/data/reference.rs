@@ -100,6 +100,17 @@ impl Reference {
         }
     }
 
+    /// Clear the seed map after realignment to release memory early.
+    pub fn clear_seed_map(&mut self) {
+        if Arc::strong_count(&self.seed) == 1 {
+            let seed_map = Arc::make_mut(&mut self.seed);
+            seed_map.clear();
+            seed_map.shrink_to_fit();
+        } else {
+            self.seed = Default::default();
+        }
+    }
+
     /// Get the base at a genomic position (0-based or 1-based depending on region_start)
     /// Returns None if position is out of bounds
     pub fn get(&self, genomic_pos: i64) -> Option<u8> {

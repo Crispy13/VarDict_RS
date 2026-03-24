@@ -126,6 +126,24 @@ fn append_rss_stage_log_if_enabled(region: &Region, elapsed_ms: u128, stage: &st
     );
 }
 
+#[cfg(all(
+    target_os = "linux",
+    not(feature = "mimalloc-global"),
+    not(feature = "jemalloc-global")
+))]
+fn trim_process_allocator() {
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(any(
+    not(target_os = "linux"),
+    feature = "mimalloc-global",
+    feature = "jemalloc-global"
+))]
+fn trim_process_allocator() {}
+
 /// Data produced by CigarParser - mirrors Java VariationData
 #[derive(Default)]
 pub struct CigarParserOutput {
@@ -1084,7 +1102,47 @@ impl VarDictPipeline {
             output_lines.len()
         );
 
+        trim_process_allocator();
+
         Ok(output_lines)
+    }
+
+    /// Process a region using BamReader and SharedReference, streaming output directly to a
+    /// writer instead of accumulating lines in memory.
+    pub fn process_region_from_bam_streaming<W: Write>(
+        &self,
+        region: &Region,
+        shared_reference: &SharedReferenceHandle,
+        bam_reader: &mut BamReader,
+        instance: Arc<GlobalReadOnlyScope>,
+        writer: &mut W,
+    ) -> Result<()> {
+        let region_output = self.process_region_to_aligned_vars_from_bam(
+            region,
+            shared_reference,
+            bam_reader,
+            Arc::clone(&instance),
+        )?;
+
+        let start_post = std::time::Instant::now();
+        let line_count = self.run_simple_post_processor_streaming(
+            region_output.aligned_vars,
+            region,
+            &region_output.splice,
+            writer,
+        )?;
+        let elapsed_post = start_post.elapsed();
+
+        event!(
+            Level::INFO,
+            "[TIMING] PostProcessor: {:.3}s - {} lines",
+            elapsed_post.as_secs_f64(),
+            line_count
+        );
+
+        trim_process_allocator();
+
+        Ok(())
     }
 
     pub fn process_region_from_cached_records(
@@ -1117,6 +1175,8 @@ impl VarDictPipeline {
             elapsed_post.as_secs_f64(),
             output_lines.len()
         );
+
+        trim_process_allocator();
 
         Ok(output_lines)
     }
@@ -1267,7 +1327,7 @@ impl VarDictPipeline {
         self.process_region_to_aligned_vars_from_cigar_output(
             cigar_output,
             region,
-            &reference,
+            reference,
             bam_paths,
             Some(shared_reference),
             start_region,
@@ -1339,7 +1399,7 @@ impl VarDictPipeline {
         self.process_region_to_aligned_vars_from_cigar_output(
             cigar_output,
             region,
-            &reference,
+            reference,
             bam_paths,
             Some(shared_reference),
             start_region,
@@ -1407,7 +1467,7 @@ impl VarDictPipeline {
         self.process_region_to_aligned_vars_from_cigar_output(
             cigar_output,
             region,
-            &reference,
+            reference,
             bam_paths,
             Some(shared_reference),
             start_region,
@@ -1652,7 +1712,7 @@ impl VarDictPipeline {
         let region_output = self.process_region_to_aligned_vars_from_cigar_output(
             cigar_output,
             region,
-            reference,
+            reference.clone(),
             bam_paths,
             None,
             Instant::now(),
@@ -1680,17 +1740,17 @@ impl VarDictPipeline {
         &self,
         cigar_output: CigarParserOutput,
         region: &Region,
-        reference: &Reference,
+        reference: Reference,
         bam_paths: &[String],
         shared_reference: Option<&SharedReferenceHandle>,
         start_region: Instant,
     ) -> Result<RegionAlignedVarsOutput> {
         let start_realign = std::time::Instant::now();
-        let (realigned_output, structural_reference) = self
+        let (realigned_output, mut structural_reference) = self
             .run_variant_realigner_and_sv_processor(
                 cigar_output,
                 region,
-                reference,
+                &reference,
                 bam_paths,
                 shared_reference,
                 start_region,
@@ -1709,6 +1769,9 @@ impl VarDictPipeline {
             start_region.elapsed().as_millis(),
             "realigner_sv_complete",
         );
+
+        drop(reference);
+        structural_reference.clear_seed_map();
 
         let start_tovars = std::time::Instant::now();
         let splice = realigned_output.splice.clone();
@@ -1733,6 +1796,7 @@ impl VarDictPipeline {
             "tovars_complete",
         );
 
+        drop(structural_reference);
         Ok(RegionAlignedVarsOutput {
             aligned_vars,
             splice,
@@ -2573,12 +2637,6 @@ impl VarDictPipeline {
         region: &Region,
         shared_reference: Option<&SharedReferenceHandle>,
     ) -> Result<AlignedVarsData> {
-        let mut aligned_variants: VarsByPos = Default::default();
-        let mut aligned_variants_order: Vec<i64> = Vec::new();
-        let mut aligned_variants_java_size = 0usize;
-        let mut aligned_variants_java_capacity = 16usize;
-        let mut aligned_variants_java_threshold =
-            aligned_variants_java_capacity - (aligned_variants_java_capacity >> 2);
         let RealignedOutput {
             non_insertion_vars,
             sv_counts,
@@ -2591,8 +2649,14 @@ impl VarDictPipeline {
             historical_del_rightseq_variants,
             ..
         } = input;
+        let mut aligned_variants: VarsByPos = Default::default();
+        let mut aligned_variants_order: Vec<i64> = Vec::new();
+        let mut aligned_variants_java_size = 0usize;
+        let mut aligned_variants_java_capacity = 16usize;
+        let mut aligned_variants_java_threshold =
+            aligned_variants_java_capacity - (aligned_variants_java_capacity >> 2);
         let mut non_insertion_vars = non_insertion_vars;
-        let insertion_vars = insertion_vars;
+        let mut insertion_vars = insertion_vars;
 
         let debug_pos = self.debug_pos;
 
@@ -2609,7 +2673,7 @@ impl VarDictPipeline {
             );
         }
 
-        let position_insert_index = non_insertion_vars_insert_index.clone();
+        let position_insert_index = non_insertion_vars_insert_index;
         let position_keys: Vec<i64> = non_insertion_vars.keys().copied().collect();
 
         let nonins_java_capacity =
@@ -2623,22 +2687,22 @@ impl VarDictPipeline {
         for position in positions {
             let trace_this_pos = debug_pos == Some(position);
             let vars_at_pos = non_insertion_vars
-                .get(&position)
-                .cloned()
+                .remove(&position)
                 .unwrap_or_default();
+            let ins_at_pos = insertion_vars.remove(&position);
 
             if trace_this_pos {
                 event!(
                     Level::DEBUG,
                     position,
                     nonins_count = vars_at_pos.len(),
-                    has_insertion = insertion_vars.contains_key(&position),
+                    has_insertion = ins_at_pos.is_some(),
                     has_refcov = ref_coverage.contains_key(&position),
                     "to_vars_builder: position encountered"
                 );
             }
 
-            if vars_at_pos.is_empty() && !insertion_vars.contains_key(&position) {
+            if vars_at_pos.is_empty() && ins_at_pos.is_none() {
                 if trace_this_pos {
                     event!(
                         Level::DEBUG,
@@ -2682,7 +2746,7 @@ impl VarDictPipeline {
             if self.is_same_variation_on_ref(
                 position,
                 &vars_at_pos,
-                insertion_vars.get(&position),
+                ins_at_pos.as_ref(),
                 reference,
             ) {
                 if trace_this_pos {
@@ -2712,7 +2776,7 @@ impl VarDictPipeline {
                 );
             }
 
-            let hicov = self.calc_hicov(insertion_vars.get(&position), &vars_at_pos);
+            let hicov = self.calc_hicov(ins_at_pos.as_ref(), &vars_at_pos);
 
             let mut var_list: Vec<Variant> = Vec::new();
             let mut debug_lines: Vec<String> = Vec::new();
@@ -2735,7 +2799,7 @@ impl VarDictPipeline {
             total_pos_coverage = self.create_insertion_records(
                 position,
                 total_pos_coverage,
-                insertion_vars.get(&position),
+                ins_at_pos.as_ref(),
                 &mut non_insertion_vars,
                 &ref_coverage,
                 reference,
@@ -2828,6 +2892,7 @@ impl VarDictPipeline {
                 self.collect_reference_variants(
                     position,
                     total_pos_coverage,
+                    &vars_at_pos,
                     variations_at_pos,
                     &ref_coverage,
                     &mut non_insertion_vars,
@@ -3237,6 +3302,7 @@ impl VarDictPipeline {
         &self,
         position: i64,
         mut total_pos_coverage: usize,
+        vars_at_pos: &RawVarMap,
         variations_at_pos: &mut Vars,
         ref_coverage: &RefCovMap,
         non_insertion_vars: &mut RawVarByPos,
@@ -3258,7 +3324,7 @@ impl VarDictPipeline {
             variations_at_pos.reference_variant = self.build_reference_variant_from_raw(
                 position,
                 total_pos_coverage,
-                non_insertion_vars,
+                vars_at_pos,
                 reference,
                 shared_reference,
                 region.chr(),
@@ -3806,7 +3872,7 @@ impl VarDictPipeline {
         &self,
         position: i64,
         total_pos_coverage: usize,
-        non_insertion_vars: &RawVarByPos,
+        vars_at_pos: &RawVarMap,
         reference: &Reference,
         shared_reference: Option<&SharedReferenceHandle>,
         chromosome: &str,
@@ -3818,7 +3884,7 @@ impl VarDictPipeline {
             chromosome,
             position,
         )?;
-        let raw_ref_variant = non_insertion_vars.get(&position)?.get(&VarDesc::SNV {
+        let raw_ref_variant = vars_at_pos.get(&VarDesc::SNV {
             ref_base: reference_base,
         })?;
         if raw_ref_variant.alt_depth == 0 {
@@ -5914,7 +5980,7 @@ impl VarDictPipeline {
     /// Step 4: Run SimplePostProcessor to filter and format output
     fn run_simple_post_processor(
         &self,
-        data: AlignedVarsData,
+        mut data: AlignedVarsData,
         region: &Region,
         splice: &HashSet<String>,
     ) -> Result<Vec<String>> {
@@ -5941,7 +6007,7 @@ impl VarDictPipeline {
         );
 
         for position in ordered_positions {
-            let Some(vars) = data.aligned_variants.get(&position) else {
+            let Some(vars) = data.aligned_variants.remove(&position) else {
                 continue;
             };
             let shared_debug = vars.debug.clone();
@@ -6103,6 +6169,206 @@ impl VarDictPipeline {
         }
 
         Ok(output_lines)
+    }
+
+    fn run_simple_post_processor_streaming<W: Write>(
+        &self,
+        mut data: AlignedVarsData,
+        region: &Region,
+        splice: &HashSet<String>,
+        writer: &mut W,
+    ) -> Result<usize> {
+        let mut line_count = 0usize;
+
+        // Output uses the same coordinate base as the parsed regions
+        let output_region = OutputRegion {
+            chr: region.chr().to_string(),
+            start: region.start() as i64,
+            end: region.end() as i64,
+            display_start: region.display_start(),
+            gene: region.gene().to_string(),
+        };
+
+        let mut aligned_order_index: HashMap<i64, usize, LibDefaultHasher> = Default::default();
+        for (idx, pos) in data.aligned_variants_order.iter().enumerate() {
+            aligned_order_index.insert(*pos, idx);
+        }
+
+        let ordered_positions = java_hashmap_iteration_order_with_capacity(
+            data.aligned_variants.keys().copied(),
+            data.aligned_variants_java_capacity.max(16),
+            Some(&aligned_order_index),
+        );
+
+        for position in ordered_positions {
+            let Some(vars) = data.aligned_variants.remove(&position) else {
+                continue;
+            };
+            let shared_debug = vars.debug.clone();
+            event!(
+                Level::DEBUG,
+                "[PostProcessor] Processing position {}: {} variants",
+                position,
+                vars.variants.len()
+            );
+
+            // Skip positions outside region only when SV marker is absent (Java parity)
+            if (position < region.start() as i64 || position > region.end() as i64)
+                && vars.sv.is_empty()
+            {
+                event!(
+                    Level::DEBUG,
+                    "[PostProcessor] Skipping position {} - outside region {}-{}",
+                    position,
+                    region.start(),
+                    region.end()
+                );
+                continue;
+            }
+
+            // Skip empty variants unless pileup mode
+            if vars.variants.is_empty() {
+                event!(
+                    Level::DEBUG,
+                    "[PostProcessor] Position {} has 0 variants",
+                    position
+                );
+                if !self.do_pileup {
+                    continue;
+                }
+                // In pileup mode, output reference (or empty if none)
+                if let Some(ref ref_var) = vars.reference_variant {
+                    let mut output = SimpleOutputVariant::from_variant(
+                        ref_var,
+                        &output_region,
+                        &self.sample_name,
+                        &vars.sv,
+                    );
+                    if instance().conf.debug {
+                        output.debug = shared_debug.clone();
+                    }
+                    writeln!(writer, "{}", output)?;
+                    line_count += 1;
+                } else {
+                    let output = SimpleOutputVariant::empty_null_variant_with_sv(
+                        position,
+                        &output_region,
+                        &self.sample_name,
+                        &vars.sv,
+                    );
+                    writeln!(writer, "{}", output)?;
+                    line_count += 1;
+                }
+                continue;
+            }
+
+            for variant in &vars.variants {
+                event!(
+                    Level::DEBUG,
+                    "[PostProcessor] Variant: pos={} ref={} alt={} freq={:.3} good={} type={:?} hicnt={} meanpos={:.1} meanq={:.1} fwd={} rev={}",
+                    variant.start_position,
+                    variant.refallele,
+                    variant.varallele,
+                    variant.frequency,
+                    self.is_good_var(variant, vars.reference_variant.as_ref(), splice),
+                    variant.vartype,
+                    variant.high_qual_read_cnt,
+                    variant.mean_position,
+                    variant.mean_quality,
+                    variant.vars_count_on_forward,
+                    variant.vars_count_on_reverse
+                );
+
+                // Skip if ref contains N
+                if variant.refallele.contains('N') {
+                    event!(Level::DEBUG, "[PostProcessor] Skipping - ref contains N");
+                    continue;
+                }
+
+                // Skip reference calls unless pileup mode
+                if variant.refallele == variant.varallele {
+                    event!(
+                        Level::DEBUG,
+                        "[PostProcessor] Skipping - ref call (ref==alt)"
+                    );
+                    if !self.do_pileup {
+                        continue;
+                    }
+                }
+
+                // If variant start position shifted (pileup + single variant), output reference
+                if variant.start_position != position && self.do_pileup && vars.variants.len() == 1
+                {
+                    if let Some(ref ref_var) = vars.reference_variant {
+                        let mut output = SimpleOutputVariant::from_variant(
+                            ref_var,
+                            &output_region,
+                            &self.sample_name,
+                            &vars.sv,
+                        );
+                        if instance().conf.debug {
+                            output.debug = shared_debug.clone();
+                        }
+                        writeln!(writer, "{}", output)?;
+                        line_count += 1;
+                    } else {
+                        let output = SimpleOutputVariant::empty_null_variant_with_sv(
+                            position,
+                            &output_region,
+                            &self.sample_name,
+                            &vars.sv,
+                        );
+                        writeln!(writer, "{}", output)?;
+                        line_count += 1;
+
+                        let output = SimpleOutputVariant::empty_with_sv(
+                            0,
+                            &output_region,
+                            &self.sample_name,
+                            &vars.sv,
+                        );
+                        writeln!(writer, "{}", output)?;
+                        line_count += 1;
+                    }
+                }
+
+                let var_type = var_type_string(&variant.refallele, &variant.varallele);
+
+                // Apply quality filter (isGoodVar equivalent)
+                if !self.is_good_var(variant, vars.reference_variant.as_ref(), splice) {
+                    event!(
+                        Level::DEBUG,
+                        "[PostProcessor] Skipping - failed isGoodVar filter"
+                    );
+                    if !self.do_pileup {
+                        continue;
+                    }
+                }
+
+                let mut variant = variant.clone();
+                variant.vartype = var_type_label_to_enum(&var_type, &variant.varallele);
+                if var_type == "Complex" {
+                    variant.adj_complex();
+                }
+
+                event!(Level::DEBUG, "[PostProcessor] Adding variant to output");
+
+                // Generate output
+                let mut output = SimpleOutputVariant::from_variant(
+                    &variant,
+                    &output_region,
+                    &self.sample_name,
+                    &vars.sv,
+                );
+                if instance().conf.debug {
+                    output.debug = shared_debug.clone();
+                }
+                writeln!(writer, "{}", output)?;
+                line_count += 1;
+            }
+        }
+
+        Ok(line_count)
     }
 
     /// Quality filter - equivalent to Java Variant.isGoodVar()
@@ -6573,7 +6839,7 @@ mod tests {
         chromosomes.insert(
             "chr1".to_string(),
             ChromosomeData {
-                sequence: full_sequence,
+                sequence: Arc::new(full_sequence),
                 length: 2200,
             },
         );
@@ -6618,6 +6884,7 @@ mod tests {
         pipeline.collect_reference_variants(
             105,
             8,
+            &RawVarMap::default(),
             &mut vars,
             &ref_coverage,
             &mut non_insertion_vars,
@@ -6663,7 +6930,7 @@ mod tests {
         chromosomes.insert(
             "chr1".to_string(),
             ChromosomeData {
-                sequence: full_sequence,
+                sequence: Arc::new(full_sequence),
                 length: 2200,
             },
         );
@@ -6713,6 +6980,7 @@ mod tests {
         pipeline.collect_reference_variants(
             105,
             8,
+            &RawVarMap::default(),
             &mut vars,
             &ref_coverage,
             &mut non_insertion_vars,

@@ -9,6 +9,17 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+#[cfg(feature = "jemalloc-global")]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(feature = "jemalloc-global")]
+#[global_allocator]
+static GLOBAL_JE: Jemalloc = Jemalloc;
+
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
@@ -259,6 +270,9 @@ fn parse_args() -> Args {
 }
 
 fn main() -> Result<()> {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
+
     let args = parse_args();
 
     setup_logging_stderr_only(args.log_level)?;
@@ -545,25 +559,12 @@ fn run_variant_calling(
                 consumer_handle.join().expect("consumer thread panicked")?;
             } else {
                 let mut stdout = io::stdout().lock();
-                let results = pipeline.process_regions_vardict(primary_bam_path, all_regions);
-                for result in results {
-                    if let Some(ref error) = result.error {
-                        if args.debug {
-                            event!(
-                                Level::WARN,
-                                "Error processing {}:{}-{}: {}",
-                                result.region.chr(),
-                                result.region.start(),
-                                result.region.end(),
-                                error
-                            );
-                        }
-                    } else {
-                        for line in result.output_lines {
-                            writeln!(stdout, "{}", line)?;
-                        }
-                    }
-                }
+                pipeline.process_regions_vardict_direct_write(
+                    primary_bam_path,
+                    all_regions,
+                    &mut stdout,
+                    args.debug,
+                )?;
             }
 
             let elapsed_processing = start_processing.elapsed();

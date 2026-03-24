@@ -46,7 +46,7 @@
 use crate::mods::to_vars_builder::{StrandBiasFlag, VarType, Variant, var_type_string};
 use crate::scopedata::global_read_only_scope::{INSTANCE, instance};
 use crate::utils::round_half_even;
-use statrs::distribution::{Discrete, DiscreteCDF, Hypergeometric};
+use statrs::distribution::{DiscreteCDF, Hypergeometric};
 
 /// Region information for output
 #[derive(Debug, Clone, Default)]
@@ -1538,6 +1538,143 @@ struct FisherExact {
     p_value_two_sided: f64,
 }
 
+const APACHE_COMMONS_MATH_TWO_PI: f64 = 2.0 * std::f64::consts::PI;
+const APACHE_COMMONS_HALF_LOG_2_PI: f64 = 0.918_938_533_204_672_8;
+const EXACT_STIRLING_ERRORS: [f64; 31] = [
+    0.0,
+    0.153_426_409_720_027_36,
+    0.081_061_466_795_327_26,
+    0.054_814_121_051_917_654,
+    0.041_340_695_955_409_294,
+    0.033_162_873_519_936_29,
+    0.027_677_925_684_998_34,
+    0.023_746_163_656_297_497,
+    0.020_790_672_103_765_093,
+    0.018_488_450_532_673_186,
+    0.016_644_691_189_821_19,
+    0.015_134_973_221_917_379,
+    0.013_876_128_823_070_749,
+    0.012_810_465_242_920_227,
+    0.011_896_709_945_891_77,
+    0.011_104_559_758_206_918,
+    0.010_411_265_261_972_097,
+    0.009_799_416_126_158_803,
+    0.009_255_462_182_712_733,
+    0.008_768_700_134_139_386,
+    0.008_330_563_433_362_871,
+    0.007_934_114_564_314_02,
+    0.007_573_675_487_951_841,
+    0.007_244_554_301_320_383,
+    0.006_942_840_107_209_53,
+    0.006_665_247_032_707_6825,
+    0.006_408_994_188_004_207,
+    0.006_171_712_263_039_4575,
+    0.005_951_370_112_758_848,
+    0.005_746_216_513_010_116,
+    0.005_554_733_551_962_8015,
+];
+
+/// Ported from: `org.apache.commons.math3.distribution.SaddlePointExpansion.getStirlingError()`
+/// Java source: `SaddlePointExpansion.java`
+fn stirling_error(z: f64) -> f64 {
+    if z < 15.0 {
+        let z2 = 2.0 * z;
+        if z2.floor() == z2 {
+            EXACT_STIRLING_ERRORS[z2 as usize]
+        } else {
+            let log_gamma = statrs::function::gamma::ln_gamma(z + 1.0);
+            log_gamma - (z + 0.5) * z.ln() + z - APACHE_COMMONS_HALF_LOG_2_PI
+        }
+    } else {
+        let z2 = z * z;
+        (0.083_333_333_333_333_33
+            - (0.002_777_777_777_777_778
+                - (0.000_793_650_793_650_793_7
+                    - (0.000_595_238_095_238_095_3 - 0.000_841_750_841_750_841_8 / z2) / z2)
+                    / z2)
+                / z2)
+            / z
+    }
+}
+
+/// Ported from: `org.apache.commons.math3.distribution.SaddlePointExpansion.getDeviancePart()`
+/// Java source: `SaddlePointExpansion.java`
+fn deviance_part(x: f64, mu: f64) -> f64 {
+    if (x - mu).abs() < 0.1 * (x + mu) {
+        let d = x - mu;
+        let mut v = d / (x + mu);
+        let mut s1 = v * d;
+        let mut s = f64::NAN;
+        let mut ej = 2.0 * x * v;
+        v *= v;
+        let mut j = 1;
+
+        while s1 != s {
+            s = s1;
+            ej *= v;
+            s1 = s + ej / ((j << 1) + 1) as f64;
+            j += 1;
+        }
+
+        s1
+    } else {
+        x * (x / mu).ln() + mu - x
+    }
+}
+
+/// Ported from: `org.apache.commons.math3.distribution.SaddlePointExpansion.logBinomialProbability()`
+/// Java source: `SaddlePointExpansion.java`
+fn log_binomial_probability(x: i32, n: i32, p: f64, q: f64) -> f64 {
+    if x == 0 {
+        if p < 0.1 {
+            -deviance_part(n as f64, n as f64 * q) - n as f64 * p
+        } else {
+            n as f64 * q.ln()
+        }
+    } else if x == n {
+        if q < 0.1 {
+            -deviance_part(n as f64, n as f64 * p) - n as f64 * q
+        } else {
+            n as f64 * p.ln()
+        }
+    } else {
+        let mut result =
+            stirling_error(n as f64) - stirling_error(x as f64) - stirling_error((n - x) as f64);
+        result -= deviance_part(x as f64, n as f64 * p);
+        result -= deviance_part((n - x) as f64, n as f64 * q);
+        let f = (APACHE_COMMONS_MATH_TWO_PI * x as f64 * (n - x) as f64) / n as f64;
+        -0.5 * f.ln() + result
+    }
+}
+
+/// Ported from: `org.apache.commons.math3.distribution.HypergeometricDistribution.logProbability()`
+/// Java source: `HypergeometricDistribution.java`
+fn log_hypergeometric_probability(
+    x: i32,
+    population_size: i32,
+    number_of_successes: i32,
+    sample_size: i32,
+) -> f64 {
+    let lower_domain = (sample_size - (population_size - number_of_successes)).max(0);
+    let upper_domain = sample_size.min(number_of_successes);
+
+    if x < lower_domain || x > upper_domain {
+        f64::NEG_INFINITY
+    } else {
+        let p = sample_size as f64 / population_size as f64;
+        let q = (population_size - sample_size) as f64 / population_size as f64;
+        let p1 = log_binomial_probability(x, number_of_successes, p, q);
+        let p2 = log_binomial_probability(
+            sample_size - x,
+            population_size - number_of_successes,
+            p,
+            q,
+        );
+        let p3 = log_binomial_probability(sample_size, population_size, p, q);
+        p1 + p2 - p3
+    }
+}
+
 impl FisherExact {
     fn new(ref_fwd: usize, ref_rev: usize, alt_fwd: usize, alt_rev: usize) -> Self {
         let m = (ref_fwd + ref_rev) as i32;
@@ -1654,18 +1791,10 @@ impl FisherExact {
                 continue;
             }
 
-            let distribution =
-                Hypergeometric::new((self.m + self.n) as u64, self.m as u64, self.k as u64);
-
-            let value = match distribution {
-                Ok(distribution) => {
-                    let value = distribution.ln_pmf(*element as u64);
-                    // Java: if (Double.isNaN(value)) value = 0; — only NaN is replaced,
-                    // -Infinity is kept (exp(-inf)=0 is correct in downstream dnhyper)
-                    if value.is_nan() { 0.0 } else { value }
-                }
-                Err(_) => 0.0,
-            };
+            let value = log_hypergeometric_probability(*element, self.m + self.n, self.m, self.k);
+            // Java: if (Double.isNaN(value)) value = 0; — only NaN is replaced,
+            // -Infinity is kept (exp(-inf)=0 is correct in downstream dnhyper)
+            let value = if value.is_nan() { 0.0 } else { value };
             values.push(round_half_even("0.0000000", value));
         }
 
@@ -1684,7 +1813,7 @@ impl FisherExact {
             .iter()
             .map(|value| (*value - max_value).exp())
             .collect::<Vec<_>>();
-        let sum: f64 = exponent.iter().sum();
+        let sum = java_double_sum(exponent.iter().copied());
         exponent
             .iter()
             .map(|value| *value / sum)
@@ -1700,11 +1829,12 @@ impl FisherExact {
         }
 
         let dnhyper = self.dnhyper(ncp);
-        self.support
-            .iter()
-            .zip(dnhyper.iter())
-            .map(|(support_value, probability)| *support_value as f64 * *probability)
-            .sum()
+        java_double_sum(
+            self.support
+                .iter()
+                .zip(dnhyper.iter())
+                .map(|(support_value, probability)| *support_value as f64 * *probability),
+        )
     }
 
     fn mle(&self, x: f64) -> f64 {
@@ -1809,6 +1939,30 @@ where
             c = a;
             fc = fa;
         }
+    }
+}
+
+fn java_double_sum<I>(values: I) -> f64
+where
+    I: IntoIterator<Item = f64>,
+{
+    let mut sum = 0.0;
+    let mut compensation = 0.0;
+    let mut simple_sum = 0.0;
+
+    for value in values {
+        let tmp = value - compensation;
+        let velvel = sum + tmp;
+        compensation = (velvel - sum) - tmp;
+        sum = velvel;
+        simple_sum += value;
+    }
+
+    let result = sum + compensation;
+    if result.is_nan() && simple_sum.is_infinite() {
+        simple_sum
+    } else {
+        result
     }
 }
 
@@ -2863,5 +3017,15 @@ mod tests {
         assert_eq!(fisher.format_odd_ratio_value(2.449_494_999_999_999_7), "2.44949");
         assert_eq!(fisher.format_odd_ratio_value(0.047_619_999_999_999_996), "0.04762");
         assert_eq!(fisher.format_odd_ratio_value(0.5), "0.5");
+    }
+
+    #[test]
+    fn test_fisher_exact_odds_ratio_saddle_point_regression() {
+        let fisher = FisherExact::new(10, 8, 1, 3);
+        let expected_logdc = vec![-3.0985897, -1.3938416, -0.8830159, -1.3938416, -3.0985897];
+
+        assert_eq!(fisher.logdc, expected_logdc);
+
+        assert_eq!(fisher.odd_ratio(), "3.53775");
     }
 }

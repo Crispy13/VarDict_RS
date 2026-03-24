@@ -1409,17 +1409,18 @@ fn run_vardict_pipeline_simple_raw_case_with_sv_default(
     let mut chromosomes: std::collections::HashMap<String, ChromosomeData, LibDefaultHasher> =
         Default::default();
     let mut chrom_names = vec![resolved_ref_chrom.clone()];
+    let shared_sequence = Arc::new(synthetic_sequence);
     let shared_data = ChromosomeData {
-        sequence: synthetic_sequence.clone(),
-        length: synthetic_sequence.len(),
+        sequence: Arc::clone(&shared_sequence),
+        length: shared_sequence.len(),
     };
     chromosomes.insert(resolved_ref_chrom.clone(), shared_data);
     if resolved_fetch_chrom != resolved_ref_chrom {
         chromosomes.insert(
             resolved_fetch_chrom.clone(),
             ChromosomeData {
-                sequence: synthetic_sequence.clone(),
-                length: synthetic_sequence.len(),
+                sequence: Arc::clone(&shared_sequence),
+                length: shared_sequence.len(),
             },
         );
         chrom_names.push(resolved_fetch_chrom.clone());
@@ -1428,7 +1429,7 @@ fn run_vardict_pipeline_simple_raw_case_with_sv_default(
         chromosomes.insert(
             config.chrom.clone(),
             ChromosomeData {
-                sequence: synthetic_sequence,
+                sequence: Arc::clone(&shared_sequence),
                 length: synthetic_chr_len,
             },
         );
@@ -1689,17 +1690,18 @@ fn run_vardict_pipeline_amplicon_raw_case(
     let mut chromosomes: std::collections::HashMap<String, ChromosomeData, LibDefaultHasher> =
         Default::default();
     let mut chrom_names = vec![resolved_ref_chrom.clone()];
+    let shared_sequence = Arc::new(synthetic_sequence);
     let shared_data = ChromosomeData {
-        sequence: synthetic_sequence.clone(),
-        length: synthetic_sequence.len(),
+        sequence: Arc::clone(&shared_sequence),
+        length: shared_sequence.len(),
     };
     chromosomes.insert(resolved_ref_chrom.clone(), shared_data);
     if resolved_fetch_chrom != resolved_ref_chrom {
         chromosomes.insert(
             resolved_fetch_chrom.clone(),
             ChromosomeData {
-                sequence: synthetic_sequence.clone(),
-                length: synthetic_sequence.len(),
+                sequence: Arc::clone(&shared_sequence),
+                length: shared_sequence.len(),
             },
         );
         chrom_names.push(resolved_fetch_chrom.clone());
@@ -1708,7 +1710,7 @@ fn run_vardict_pipeline_amplicon_raw_case(
         chromosomes.insert(
             config.chrom.clone(),
             ChromosomeData {
-                sequence: synthetic_sequence,
+                sequence: Arc::clone(&shared_sequence),
                 length: synthetic_chr_len,
             },
         );
@@ -1982,9 +1984,10 @@ fn run_vardict_pipeline_somatic_raw_case(
     let mut chromosomes: std::collections::HashMap<String, ChromosomeData, LibDefaultHasher> =
         Default::default();
     let mut chrom_names = vec![resolved_ref_chrom.clone()];
+    let shared_sequence = Arc::new(synthetic_sequence);
     let shared_data = ChromosomeData {
-        sequence: synthetic_sequence.clone(),
-        length: synthetic_sequence.len(),
+        sequence: Arc::clone(&shared_sequence),
+        length: shared_sequence.len(),
     };
     chromosomes.insert(resolved_ref_chrom.clone(), shared_data);
 
@@ -1999,7 +2002,7 @@ fn run_vardict_pipeline_somatic_raw_case(
         chromosomes.insert(
             chrom.clone(),
             ChromosomeData {
-                sequence: synthetic_sequence.clone(),
+                sequence: Arc::clone(&shared_sequence),
                 length: synthetic_chr_len,
             },
         );
