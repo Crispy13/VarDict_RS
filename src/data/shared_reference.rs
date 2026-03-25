@@ -9,44 +9,59 @@
 //! - No locks needed since data is immutable after initialization
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
+use bio::io::fasta::{IndexedReader, Sequence};
 use crackle_kit::tracing::{Level, event};
-use rust_htslib::faidx;
 
 use crate::prelude::LibDefaultHasher;
 
 /// Normalize chromosome name to match reference
 ///
 /// Tries the original name first, then with/without "chr" prefix
-fn normalize_chrom_name(reader: &faidx::Reader, chrom: &str) -> Option<String> {
-    // Note: fetch_seq_len returns u64::MAX for non-existent chromosomes
-    const MAX_VALID_LEN: u64 = i64::MAX as u64;
-
+fn normalize_chrom_name(sequences: &[Sequence], chrom: &str) -> Option<String> {
     // Try exact match first
-    let len1 = reader.fetch_seq_len(chrom);
-    if len1 > 0 && len1 < MAX_VALID_LEN {
+    if chromosome_len(sequences, chrom).is_some() {
         return Some(chrom.to_string());
     }
 
     // Try with "chr" prefix stripped
     if let Some(stripped) = chrom.strip_prefix("chr") {
-        let len2 = reader.fetch_seq_len(stripped);
-        if len2 > 0 && len2 < MAX_VALID_LEN {
+        if chromosome_len(sequences, stripped).is_some() {
             return Some(stripped.to_string());
         }
     }
 
     // Try with "chr" prefix added
     let with_chr = format!("chr{}", chrom);
-    let len3 = reader.fetch_seq_len(&with_chr);
-    if len3 > 0 && len3 < MAX_VALID_LEN {
+    if chromosome_len(sequences, &with_chr).is_some() {
         return Some(with_chr);
     }
 
     None
+}
+
+fn chromosome_len(sequences: &[Sequence], chrom: &str) -> Option<usize> {
+    sequences
+        .iter()
+        .find(|sequence| sequence.name == chrom && sequence.len > 0)
+        .map(|sequence| sequence.len as usize)
+}
+
+fn read_fetched_sequence(reader: &mut IndexedReader<File>) -> Result<Vec<u8>> {
+    let mut sequence = Vec::new();
+    reader
+        .read(&mut sequence)
+        .context("Failed to read fetched FASTA sequence")?;
+
+    for base in &mut sequence {
+        *base = base.to_ascii_uppercase();
+    }
+
+    Ok(sequence)
 }
 
 /// Chromosome sequence data
@@ -96,22 +111,24 @@ impl SharedReference {
     ///
     /// Handles chromosome name normalization (e.g., "chr20" -> "20" or vice versa)
     pub fn load_chromosome<P: AsRef<Path>>(path: P, chrom: &str) -> Result<Self> {
-        let reader = faidx::Reader::from_path(path.as_ref())
+        let fasta_path = path.as_ref();
+        let mut reader = IndexedReader::from_file(&fasta_path)
             .with_context(|| format!("Failed to open FASTA: {:?}", path.as_ref()))?;
+        let sequences = reader.index.sequences();
 
         // Normalize chromosome name to match reference
-        let ref_chrom = normalize_chrom_name(&reader, chrom).ok_or_else(|| {
+        let ref_chrom = normalize_chrom_name(&sequences, chrom).ok_or_else(|| {
             anyhow!(
                 "Chromosome '{}' not found in reference (tried with/without 'chr' prefix)",
                 chrom
             )
         })?;
 
-        let length = reader.fetch_seq_len(&ref_chrom);
-        let seq = reader
-            .fetch_seq(&ref_chrom, 0, length as usize - 1)
+        reader
+            .fetch_all(&ref_chrom)
             .with_context(|| format!("Failed to fetch chromosome {}", ref_chrom))?;
-        let sequence: Vec<u8> = seq.into_iter().map(|b| b.to_ascii_uppercase()).collect();
+        let sequence = read_fetched_sequence(&mut reader)
+            .with_context(|| format!("Failed to load chromosome {}", ref_chrom))?;
         let seq_len = sequence.len();
         let sequence = Arc::new(sequence);
 
@@ -145,8 +162,10 @@ impl SharedReference {
     ///
     /// Handles chromosome name normalization (e.g., "chr20" -> "20" or vice versa)
     pub fn load_chromosomes<P: AsRef<Path>>(path: P, chroms: &[&str]) -> Result<Self> {
-        let reader = faidx::Reader::from_path(path.as_ref())
+        let fasta_path = path.as_ref();
+        let mut reader = IndexedReader::from_file(&fasta_path)
             .with_context(|| format!("Failed to open FASTA: {:?}", path.as_ref()))?;
+        let sequences = reader.index.sequences();
 
         let mut chromosomes: HashMap<String, ChromosomeData, LibDefaultHasher> = Default::default();
         let mut chromosome_names = Vec::new();
@@ -154,7 +173,7 @@ impl SharedReference {
 
         for chrom in chroms {
             // Normalize chromosome name to match reference
-            let ref_chrom = match normalize_chrom_name(&reader, chrom) {
+            let ref_chrom = match normalize_chrom_name(&sequences, chrom) {
                 Some(name) => name,
                 None => {
                     event!(
@@ -166,11 +185,11 @@ impl SharedReference {
                 }
             };
 
-            let length = reader.fetch_seq_len(&ref_chrom);
-            let seq = reader
-                .fetch_seq(&ref_chrom, 0, length as usize - 1)
+            reader
+                .fetch_all(&ref_chrom)
                 .with_context(|| format!("Failed to fetch chromosome {}", ref_chrom))?;
-            let sequence: Vec<u8> = seq.into_iter().map(|b| b.to_ascii_uppercase()).collect();
+            let sequence = read_fetched_sequence(&mut reader)
+                .with_context(|| format!("Failed to load chromosome {}", ref_chrom))?;
             let seq_len = sequence.len();
             total_size += seq_len;
             let sequence = Arc::new(sequence);
@@ -208,43 +227,37 @@ impl SharedReference {
     /// Note: For human genome (~3GB), this will allocate ~3GB of memory.
     /// This is suitable for modern hardware with 8GB+ RAM.
     pub fn load_all<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let reader = faidx::Reader::from_path(path.as_ref())
+        let fasta_path = path.as_ref();
+        let mut reader = IndexedReader::from_file(&fasta_path)
             .with_context(|| format!("Failed to open FASTA: {:?}", path.as_ref()))?;
-
-        // Get number of sequences
-        let n_seqs = reader.n_seqs();
+        let sequences = reader.index.sequences();
 
         let mut chromosomes: HashMap<String, ChromosomeData, LibDefaultHasher> = Default::default();
-        let mut chromosome_names = Vec::with_capacity(n_seqs as usize);
+        let mut chromosome_names = Vec::with_capacity(sequences.len());
         let mut total_size = 0usize;
 
-        for i in 0..n_seqs {
-            // Get sequence name using the index
-            let chrom_name = reader
-                .seq_name(i as i32)
-                .with_context(|| format!("Failed to get sequence name for index {}", i))?;
-
-            let length = reader.fetch_seq_len(&chrom_name);
-            if length == 0 {
+        for sequence_info in sequences {
+            if sequence_info.len == 0 {
                 continue;
             }
 
-            let seq = reader
-                .fetch_seq(&chrom_name, 0, length as usize - 1)
-                .with_context(|| format!("Failed to fetch chromosome {}", chrom_name))?;
-            let sequence: Vec<u8> = seq.into_iter().map(|b| b.to_ascii_uppercase()).collect();
+            reader
+                .fetch_all(&sequence_info.name)
+                .with_context(|| format!("Failed to fetch chromosome {}", sequence_info.name))?;
+            let sequence = read_fetched_sequence(&mut reader)
+                .with_context(|| format!("Failed to load chromosome {}", sequence_info.name))?;
             let seq_len = sequence.len();
             total_size += seq_len;
             let sequence = Arc::new(sequence);
 
             chromosomes.insert(
-                chrom_name.clone(),
+                sequence_info.name.clone(),
                 ChromosomeData {
                     sequence,
                     length: seq_len,
                 },
             );
-            chromosome_names.push(chrom_name);
+            chromosome_names.push(sequence_info.name);
         }
 
         event!(

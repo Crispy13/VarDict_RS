@@ -1772,6 +1772,7 @@ impl VarDictPipeline {
 
         drop(reference);
         structural_reference.clear_seed_map();
+        trim_process_allocator();
 
         let start_tovars = std::time::Instant::now();
         let splice = realigned_output.splice.clone();
@@ -2687,7 +2688,8 @@ impl VarDictPipeline {
         for position in positions {
             let trace_this_pos = debug_pos == Some(position);
             let vars_at_pos = non_insertion_vars
-                .remove(&position)
+                .get(&position)
+                .cloned()
                 .unwrap_or_default();
             let ins_at_pos = insertion_vars.remove(&position);
 
@@ -6681,6 +6683,7 @@ mod tests {
         variant.hicov = total_coverage;
         variant.high_quality_reads_frequency = frequency;
         variant.genotype = format!("{}/{}", ref_allele, var_allele);
+            variant.threshold_frequency = frequency;
         variant
     }
 
@@ -7304,6 +7307,7 @@ mod tests {
         good_var.is_at_least_at_2_positions = true;
         good_var.has_at_least_2_diff_qualities = true;
         good_var.frequency = 0.3;
+            good_var.threshold_frequency = 0.3;
         good_var.high_qual_read_cnt = 5;
         good_var.mean_position = 10.0;
         good_var.mean_quality = 30.0;
@@ -7318,6 +7322,7 @@ mod tests {
         bad_var.is_at_least_at_2_positions = true;
         bad_var.has_at_least_2_diff_qualities = true;
         bad_var.frequency = 0.05; // Low frequency + "2;1" pattern = bad
+            bad_var.threshold_frequency = 0.05;
         bad_var.high_qual_read_cnt = 5;
         bad_var.mean_position = 10.0;
         bad_var.mean_quality = 30.0;
@@ -7332,6 +7337,7 @@ mod tests {
         high_freq_bias.is_at_least_at_2_positions = true;
         high_freq_bias.has_at_least_2_diff_qualities = true;
         high_freq_bias.frequency = 0.5; // High enough to pass despite 2;1 pattern
+            high_freq_bias.threshold_frequency = 0.5;
         high_freq_bias.high_qual_read_cnt = 5;
         high_freq_bias.mean_position = 10.0;
         high_freq_bias.mean_quality = 30.0;

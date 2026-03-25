@@ -1,9 +1,10 @@
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use rust_htslib::faidx;
+use bio::io::fasta::IndexedReader;
 
 use crate::conf::Configuration;
 use crate::prelude::LibDefaultHasher;
@@ -140,15 +141,16 @@ impl Reference {
 
 /// FASTA file reader with indexed access
 pub struct FastaReader {
-    reader: faidx::Reader,
+    reader: IndexedReader<File>,
 }
 
 impl FastaReader {
     /// Open a FASTA file with its index
     ///
-    /// The .fai index must exist (run `samtools faidx <fasta>` to create)
+    /// The .fai index must exist next to the FASTA file.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let reader = faidx::Reader::from_path(path.as_ref())
+        let fasta_path = path.as_ref();
+        let reader = IndexedReader::from_file(&fasta_path)
             .with_context(|| format!("Failed to open FASTA: {:?}", path.as_ref()))?;
         Ok(FastaReader { reader })
     }
@@ -161,7 +163,7 @@ impl FastaReader {
     /// * `end` - End position (1-based, inclusive)
     ///
     /// Returns the sequence as uppercase bytes
-    pub fn fetch_seq(&self, chrom: &str, start: usize, end: usize) -> Result<Vec<u8>> {
+    pub fn fetch_seq(&mut self, chrom: &str, start: usize, end: usize) -> Result<Vec<u8>> {
         if start == 0 {
             return Err(anyhow!("Start position must be 1-based (got 0)"));
         }
@@ -173,26 +175,38 @@ impl FastaReader {
             ));
         }
 
-        // Convert 1-based inclusive to 0-based half-open for faidx
+        // Convert 1-based inclusive to 0-based half-open for IndexedReader.
         let begin_0based = start - 1;
-        let end_0based = end - 1; // faidx uses 0-based inclusive end
+        let stop_0based = end;
 
-        let seq = self
-            .reader
-            .fetch_seq(chrom, begin_0based, end_0based)
+        self.reader
+            .fetch(chrom, begin_0based as u64, stop_0based as u64)
             .with_context(|| format!("Failed to fetch {}:{}-{}", chrom, start, end))?;
+        let mut seq = Vec::new();
+        self.reader
+            .read(&mut seq)
+            .with_context(|| format!("Failed to read {}:{}-{}", chrom, start, end))?;
 
-        // Convert to uppercase
-        Ok(seq.into_iter().map(|b| b.to_ascii_uppercase()).collect())
+        for base in &mut seq {
+            *base = base.to_ascii_uppercase();
+        }
+
+        Ok(seq)
     }
 
     /// Get the length of a chromosome/contig
     pub fn seq_len(&self, chrom: &str) -> usize {
-        self.reader.fetch_seq_len(chrom) as usize
+        self.reader
+            .index
+            .sequences()
+            .into_iter()
+            .find(|sequence| sequence.name == chrom)
+            .map(|sequence| sequence.len as usize)
+            .unwrap_or(0)
     }
 
     /// Create a Reference struct with sequence for a region
-    pub fn get_reference(&self, chrom: &str, start: usize, end: usize) -> Result<Reference> {
+    pub fn get_reference(&mut self, chrom: &str, start: usize, end: usize) -> Result<Reference> {
         let ref_seq = self.fetch_seq(chrom, start, end)?;
         let mut reference = Reference {
             ref_seq: Arc::new(ref_seq),

@@ -301,7 +301,7 @@ fn main() -> Result<()> {
     };
     if !fai_path.exists() && !fai_path2.exists() {
         return Err(anyhow!(
-            "Reference index (.fai) not found. Please run: samtools faidx {:?}",
+            "Reference index (.fai) not found for {:?}. Please generate the FASTA index with samtools and retry.",
             args.reference
         ));
     }

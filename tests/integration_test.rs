@@ -586,7 +586,7 @@ fn test_somatic_mode_test_cases() {
 /// Run the actual variant calling pipeline on a test case
 /// This is the TRUE integration test that matches Java IntegrationTest.integrationTest
 #[test]
-#[ignore] // Ignored by default - requires BAM files which are not in repo
+#[ignore = "requires VarDictJava testdata/integrationtestcases/; run with --ignored"]
 fn test_run_simple_variant_calling() {
     let testdata_dir = get_testdata_dir();
     let test_cases_dir = testdata_dir.join("integrationtestcases");
@@ -626,7 +626,7 @@ fn test_run_simple_variant_calling() {
 /// Generate output for manual verification
 /// Run with: cargo test test_generate_output_for_verification -- --ignored --nocapture
 #[test]
-#[ignore]
+#[ignore = "manual: uses non-production Pipeline mock API for visual verification"]
 fn test_generate_output_for_verification() {
     use std::collections::HashMap;
     use vardict_rs::mods::pipeline::{Pipeline, PipelineConfig};
@@ -2290,7 +2290,7 @@ fn run_vardict_pipeline_somatic_raw_case(
 ///
 /// Run with: cargo test test_real_integration_hard_clip -- --ignored --nocapture
 #[test]
-#[ignore]
+#[ignore = "hard_clip pipeline test; requires VarDictJava submodule BAM resources"]
 fn test_real_integration_hard_clip() {
     use vardict_rs::data::bam_reader::BamReader;
     use vardict_rs::data::bam_reader::passes_filter;
@@ -2420,7 +2420,7 @@ fn test_real_integration_hard_clip() {
 ///
 /// Run with: cargo test test_all_simple_integration -- --ignored --nocapture
 #[test]
-#[ignore]
+#[ignore = "runs all RUN_NOW Simple manifest cases; slow, requires VarDictJava submodule resources"]
 fn test_all_simple_integration() {
     let testdata_dir = get_testdata_dir();
     let test_cases_dir = testdata_dir.join("integrationtestcases");
@@ -2655,7 +2655,7 @@ fn test_all_simple_integration() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "manifest-driven tier1 Simple parity; requires VarDictJava submodule resources"]
 fn test_manifest_tier1_simple_raw_rust_vs_java_first_mismatch() {
     if env::var("VARDICT_DEBUG_POS").is_ok() {
         let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
@@ -2965,7 +2965,7 @@ fn test_manifest_tier1_simple_raw_rust_vs_java_first_mismatch() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "NA12878 chr11 target-BAM parity; requires parity_case_inputs/ fixture"]
 fn test_target_bam_na12878_low_coverage_chr11_raw_parity() {
     if env::var("VARDICT_DEBUG_POS").is_ok() {
         let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
@@ -3031,7 +3031,7 @@ fn test_target_bam_na12878_low_coverage_chr11_raw_parity() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "manifest-driven SV-core parity; requires VarDictJava submodule resources"]
 fn test_manifest_simple_sv_core_raw_rust_vs_java_first_mismatch() {
     if env::var("VARDICT_DEBUG_POS").is_ok() {
         let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
@@ -3273,7 +3273,7 @@ fn test_manifest_simple_sv_core_raw_rust_vs_java_first_mismatch() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "manifest-driven splicing parity; requires VarDictJava submodule resources"]
 fn test_manifest_simple_splicing_raw_rust_vs_java_first_mismatch() {
     if env::var("VARDICT_DEBUG_POS").is_ok() {
         let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
@@ -3476,7 +3476,7 @@ fn test_manifest_simple_splicing_raw_rust_vs_java_first_mismatch() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "manifest-driven unique-mode parity; requires VarDictJava submodule resources"]
 fn test_manifest_simple_unique_mode_raw_rust_vs_java_first_mismatch() {
     if env::var("VARDICT_DEBUG_POS").is_ok() {
         let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
@@ -3678,7 +3678,7 @@ fn test_manifest_simple_unique_mode_raw_rust_vs_java_first_mismatch() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "manifest-driven realigner-complex parity; requires VarDictJava submodule resources"]
 fn test_manifest_simple_realigner_complex_raw_rust_vs_java_first_mismatch() {
     if env::var("VARDICT_DEBUG_POS").is_ok() {
         let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
@@ -3880,7 +3880,7 @@ fn test_manifest_simple_realigner_complex_raw_rust_vs_java_first_mismatch() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "manifest-driven Amplicon parity; requires VarDictJava submodule resources"]
 fn test_manifest_amplicon_raw_rust_vs_java_first_mismatch() {
     if env::var("VARDICT_DEBUG_POS").is_ok() {
         let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
@@ -4076,7 +4076,7 @@ fn test_manifest_amplicon_raw_rust_vs_java_first_mismatch() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "manifest-driven Somatic parity; requires VarDictJava submodule resources"]
 fn test_manifest_somatic_raw_rust_vs_java_first_mismatch() {
     if env::var("VARDICT_DEBUG_POS").is_ok() {
         let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
@@ -4345,7 +4345,7 @@ fn test_multithreaded_variant_calling_concept() {
 /// Test using VarDictPipeline (the real Java-equivalent pipeline)
 /// Run with: cargo test test_vardict_pipeline_hard_clip -- --ignored --nocapture
 #[test]
-#[ignore]
+#[ignore = "VarDictPipeline hard_clip test; requires VarDictJava submodule BAM resources"]
 fn test_vardict_pipeline_hard_clip() {
     use std::sync::Arc;
     use vardict_rs::conf::Configuration;
@@ -4516,7 +4516,7 @@ fn test_vardict_pipeline_hard_clip() {
 /// Comprehensive test comparing Rust output with Java expected output
 /// Tests exact field-by-field matching for the hard_clip test case
 #[test]
-#[ignore]
+#[ignore = "field-by-field Rust vs Java output comparison; requires VarDictJava submodule BAM resources"]
 fn test_rust_vs_java_output_comparison() {
     use std::fs;
     use std::sync::Arc;

@@ -901,6 +901,31 @@ impl VariantRealigner {
         positive_candidate
     }
 
+    fn emit_realigner_insertion_diag(
+        &self,
+        _data: &RealignedVariationData,
+        _position: i64,
+        _source: &str,
+    ) {
+        let _ = self;
+    }
+
+    fn emit_refcov_inc_diag(
+        _data: &RealignedVariationData,
+        _position: i64,
+        _amount: usize,
+        _source: &str,
+    ) {
+    }
+
+    fn emit_refcov_inc_diag_with_before(
+        _before: usize,
+        _position: i64,
+        _amount: usize,
+        _source: &str,
+    ) {
+    }
+
     pub fn load_partial_ref_coverage(
         &self,
         data: &mut RealignedVariationData,
@@ -949,6 +974,7 @@ impl VariantRealigner {
         Self::merge_soft_clips(&mut data.soft_clips_3end, extra.soft_clips_3end);
 
         for (position, coverage) in extra.ref_coverage {
+            Self::emit_refcov_inc_diag(data, position, coverage, "realigner_merge");
             *data.ref_coverage.entry(position).or_insert(0) += coverage;
         }
     }
@@ -1280,6 +1306,12 @@ impl VariantRealigner {
                 }
 
                 if mm.mismatch_position > position && mm.end == 5 {
+                    Self::emit_refcov_inc_diag(
+                        data,
+                        position,
+                        tv.alt_depth,
+                        "realigner_process_insertions_mm_end5",
+                    );
                     *data.ref_coverage.entry(position).or_insert(0) += tv.alt_depth;
                 }
 
@@ -1355,6 +1387,11 @@ impl VariantRealigner {
             }
 
             for sc5pp in r5.scp.iter().copied() {
+                let refcov_before = if position == 6970385 {
+                    data.ref_coverage.get(&6970385_i64).copied().unwrap_or(0)
+                } else {
+                    0
+                };
                 if let Some(tv) = data.soft_clips_5end.get_mut(&sc5pp) {
                     if tv.used() {
                         continue;
@@ -1362,8 +1399,15 @@ impl VariantRealigner {
                     let seq = find_conseq_transient(tv, 0);
                     let matched = !seq.is_empty() && Self::is_match_bytes(&seq, &wupseq, -1);
                     if matched {
+                        let added_alt_depth = tv.var.alt_depth;
                         cache_transient_conseq(tv, &seq);
                         if sc5pp > position {
+                            Self::emit_refcov_inc_diag_with_before(
+                                refcov_before,
+                                position,
+                                tv.var.alt_depth,
+                                "realigner_process_insertions_sc5",
+                            );
                             *data.ref_coverage.entry(position).or_insert(0) += tv.var.alt_depth;
                         }
                         if let Some(vref) = data
@@ -1379,6 +1423,11 @@ impl VariantRealigner {
             }
 
             for sc3pp in r3.scp.iter().copied() {
+                let refcov_before = if position == 6970385 {
+                    data.ref_coverage.get(&6970385_i64).copied().unwrap_or(0)
+                } else {
+                    0
+                };
                 if let Some(tv) = data.soft_clips_3end.get_mut(&sc3pp) {
                     if tv.used() {
                         continue;
@@ -1392,6 +1441,7 @@ impl VariantRealigner {
                     };
                     let matched = !seq.is_empty() && Self::is_match_bytes(&seq, &mseq, 1);
                     if matched {
+                        let added_alt_depth = tv.var.alt_depth;
                         cache_transient_conseq(tv, &seq);
                         let mean_pos = if tv.var.alt_depth > 0 {
                             tv.var.mean_pos / tv.var.alt_depth as f64
@@ -1399,6 +1449,12 @@ impl VariantRealigner {
                             0.0
                         };
                         if sc3pp <= position || insert.len() as f64 > mean_pos {
+                            Self::emit_refcov_inc_diag_with_before(
+                                refcov_before,
+                                position,
+                                tv.var.alt_depth,
+                                "realigner_process_insertions_sc3",
+                            );
                             *data.ref_coverage.entry(position).or_insert(0) += tv.var.alt_depth;
                         }
 
@@ -1434,7 +1490,6 @@ impl VariantRealigner {
                             }
                         }
                         tv.mark_used();
-
                         if insert.len() + 1 == vn.len()
                             && insert.len() > data.max_read_length
                             && sc3pp >= position + 1 + insert.len() as i64
@@ -1801,6 +1856,12 @@ impl VariantRealigner {
                     sc5v.mark_used();
                 }
 
+                Self::emit_refcov_inc_diag(
+                    data,
+                    bi,
+                    sc5_var.alt_depth,
+                    "realigner_softclip_bridge",
+                );
                 *data.ref_coverage.entry(bi).or_insert(0) += sc5_var.alt_depth;
 
                 let ins_starts_with_plus = ins_desc.first() == Some(&b'+');
@@ -1902,6 +1963,7 @@ impl VariantRealigner {
                     );
                     tins.insert(bi, map);
                     self.process_insertions(data, &tins);
+                    self.emit_realigner_insertion_diag(data, bi, "softclip_bridge");
                 } else if ins_starts_with_minus {
                     let vref_key =
                         self.del_desc_to_key(&ins_desc)
@@ -2169,6 +2231,12 @@ impl VariantRealigner {
 
             if dellen > 0 && dellen < indel_size {
                 for tp in bp..(bp + dellen) {
+                    Self::emit_refcov_inc_diag(
+                        data,
+                        tp,
+                        sc5_contribution.alt_depth,
+                        "realigner_lgdel_5_sc5_span",
+                    );
                     *data.ref_coverage.entry(tp).or_insert(0) += sc5_contribution.alt_depth;
                 }
             }
@@ -2216,6 +2284,12 @@ impl VariantRealigner {
 
                 if sc3p == bp && dellen > 0 && dellen < indel_size {
                     for tp in bp..(bp + dellen) {
+                        Self::emit_refcov_inc_diag(
+                            data,
+                            tp,
+                            sc3_contribution.alt_depth,
+                            "realigner_lgdel_5_sc3_span",
+                        );
                         *data.ref_coverage.entry(tp).or_insert(0) += sc3_contribution.alt_depth;
                     }
                 }
@@ -2441,6 +2515,12 @@ impl VariantRealigner {
             if deleted_len < indel_size {
                 let span = deleted_len + extra.len() as i64 + matched_extra.len() as i64;
                 for tp in anchor_pos..(anchor_pos + span) {
+                    Self::emit_refcov_inc_diag(
+                        data,
+                        tp,
+                        cnt,
+                        "realigner_lgdel_3_span",
+                    );
                     *data.ref_coverage.entry(tp).or_insert(0) += cnt;
                 }
             }
@@ -2595,6 +2675,12 @@ impl VariantRealigner {
                         data.ref_coverage.insert(p - 1, cnt);
                     }
                 } else if cnt > ref_cov_p1.unwrap_or(0) {
+                    Self::emit_refcov_inc_diag(
+                        data,
+                        p - 1,
+                        cnt,
+                        "realigner_lgins_5_prev_anchor",
+                    );
                     *data.ref_coverage.entry(p - 1).or_insert(0) += cnt;
                 }
 
@@ -2631,6 +2717,12 @@ impl VariantRealigner {
 
             if let Some(variation_map) = data.non_insertion_variants.get(&bi) {
                 if !Self::has_sv_marker(variation_map) {
+                    Self::emit_refcov_inc_diag(
+                        data,
+                        bi,
+                        sc5_var.alt_depth,
+                        "realigner_lgins_5_anchor",
+                    );
                     *data.ref_coverage.entry(bi).or_insert(0) += sc5_var.alt_depth;
                 }
             }
@@ -2655,6 +2747,12 @@ impl VariantRealigner {
                     adj_cnt(tvr, tv);
                     tvr.pstd = true;
                     tvr.qstd = true;
+                    Self::emit_refcov_inc_diag(
+                        data,
+                        pii,
+                        tv.alt_depth,
+                        "realigner_lgins_5_tail_snv",
+                    );
                     *data.ref_coverage.entry(pii).or_insert(0) += tv.alt_depth;
                 }
             }
@@ -2676,6 +2774,7 @@ impl VariantRealigner {
             tins.insert(bi, map);
             let before_insertions = data.insertion_variants.get(&bi).cloned();
             self.process_insertions(data, &tins);
+            self.emit_realigner_insertion_diag(data, bi, "realign_large_deletions_5end");
 
             let updated_ins_count = Self::resolved_insertion_key_after_realign(
                 before_insertions.as_ref(),
@@ -2854,6 +2953,12 @@ impl VariantRealigner {
                         data.ref_coverage.insert(bi, cnt);
                     }
                 } else if cnt > ref_cov_bi.unwrap_or(0) {
+                    Self::emit_refcov_inc_diag(
+                        data,
+                        bi,
+                        cnt,
+                        "realigner_lgins_3_anchor",
+                    );
                     *data.ref_coverage.entry(bi).or_insert(0) += cnt;
                 }
             }
@@ -2905,6 +3010,8 @@ impl VariantRealigner {
                 }
             }
 
+            let original_ins_count = iref.alt_depth;
+
             let mut len = ins.len();
             if ins.iter().any(|b| *b == b'&') {
                 len = len.saturating_sub(1);
@@ -2921,6 +3028,12 @@ impl VariantRealigner {
                         continue;
                     };
                     let key = VarDesc::SNV { ref_base: base };
+                    Self::emit_refcov_inc_diag(
+                        data,
+                        pii,
+                        tv.alt_depth,
+                        "realigner_lgins_3_tail_snv",
+                    );
                     let vref = get_variants_from_map(&mut data.non_insertion_variants, pii, &key);
                     adj_cnt(vref, tv);
                     vref.pstd = true;
@@ -2933,8 +3046,6 @@ impl VariantRealigner {
                 sc3v.mark_used();
             }
 
-            let original_ins_count = iref.alt_depth;
-
             let mut tins: HashMap<i64, HashMap<String, usize, LibDefaultHasher>, LibDefaultHasher> =
                 Default::default();
             let mut map: HashMap<String, usize, LibDefaultHasher> = Default::default();
@@ -2945,6 +3056,7 @@ impl VariantRealigner {
             tins.insert(bi, map);
             let before_insertions = data.insertion_variants.get(&bi).cloned();
             self.process_insertions(data, &tins);
+            self.emit_realigner_insertion_diag(data, bi, "realign_large_deletions_3end");
 
             let updated_ins_count = Self::resolved_insertion_key_after_realign(
                 before_insertions.as_ref(),
@@ -3137,6 +3249,12 @@ impl VariantRealigner {
                                 adj_cnt(vref, &tref);
                             }
                         }
+                        Self::emit_refcov_inc_diag(
+                            data,
+                            position,
+                            tref.alt_depth,
+                            "realigner_adjust_mnp_right",
+                        );
                         *data.ref_coverage.entry(position).or_insert(0) += tref.alt_depth;
 
                         if let Some(vars_right) = data.non_insertion_variants.get_mut(&right_pos) {
@@ -3146,6 +3264,11 @@ impl VariantRealigner {
                 }
             }
 
+            let refcov_before_sc3 = if position == 6970385 {
+                data.ref_coverage.get(&6970385_i64).copied().unwrap_or(0)
+            } else {
+                0
+            };
             if let Some(sc3v) = data.soft_clips_3end.get_mut(&position) {
                 if !sc3v.used() {
                     let seq = find_conseq_transient(sc3v, 0);
@@ -3162,6 +3285,12 @@ impl VariantRealigner {
                                     adj_cnt(vref, &sc3v.var);
                                 }
                             }
+                            Self::emit_refcov_inc_diag_with_before(
+                                refcov_before_sc3,
+                                position,
+                                sc3v.var.alt_depth,
+                                "realigner_adjust_mnp_sc3",
+                            );
                             *data.ref_coverage.entry(position).or_insert(0) += sc3v.var.alt_depth;
                             sc3v.mark_used();
                         }
@@ -3170,6 +3299,11 @@ impl VariantRealigner {
             }
 
             let pos_5end = position + mnt.len() as i64;
+            let refcov_before_sc5 = if position == 6970385 {
+                data.ref_coverage.get(&6970385_i64).copied().unwrap_or(0)
+            } else {
+                0
+            };
             if let Some(sc5v) = data.soft_clips_5end.get_mut(&pos_5end) {
                 if !sc5v.used() {
                     let seq = find_conseq_transient(sc5v, 0);
@@ -3187,6 +3321,12 @@ impl VariantRealigner {
                                         adj_cnt(vref, &sc5v.var);
                                     }
                                 }
+                                Self::emit_refcov_inc_diag_with_before(
+                                    refcov_before_sc5,
+                                    position,
+                                    sc5v.var.alt_depth,
+                                    "realigner_adjust_mnp_sc5",
+                                );
                                 *data.ref_coverage.entry(position).or_insert(0) +=
                                     sc5v.var.alt_depth;
                                 sc5v.mark_used();
@@ -3355,6 +3495,7 @@ impl VariantRealigner {
                 };
                 let f = f.clamp(0.0, 1.0);
                 let add = (tv.alt_depth as f64 * f) as usize;
+                Self::emit_refcov_inc_diag(data, pos, add, "realigner_del_mm_fraction");
                 *data.ref_coverage.entry(pos).or_insert(0) += add;
 
                 if let Some(ref_base) = self.get_ref_base(pos) {
@@ -3432,6 +3573,11 @@ impl VariantRealigner {
         }
 
         for sc5pp in r5.scp {
+            let refcov_before = if pos == 6970385 {
+                data.ref_coverage.get(&6970385_i64).copied().unwrap_or(0)
+            } else {
+                0
+            };
             if let Some(tv) = data.soft_clips_5end.get_mut(&sc5pp) {
                 if tv.used() {
                     continue;
@@ -3447,6 +3593,12 @@ impl VariantRealigner {
                 if is_match {
                     cache_transient_conseq(tv, &seq);
                     if sc5pp > pos {
+                        Self::emit_refcov_inc_diag_with_before(
+                            refcov_before,
+                            pos,
+                            tv.var.alt_depth,
+                            "realigner_del_sc5",
+                        );
                         *data.ref_coverage.entry(pos).or_insert(0) += tv.var.alt_depth;
                     }
                     if let Some(vref) = data
@@ -3462,6 +3614,11 @@ impl VariantRealigner {
         }
 
         for sc3pp in r3.scp {
+            let refcov_before = if pos == 6970385 {
+                data.ref_coverage.get(&6970385_i64).copied().unwrap_or(0)
+            } else {
+                0
+            };
             if let Some(tv) = data.soft_clips_3end.get_mut(&sc3pp) {
                 if tv.used() {
                     continue;
@@ -3478,6 +3635,12 @@ impl VariantRealigner {
                 if is_match {
                     cache_transient_conseq(tv, &seq);
                     if sc3pp <= pos {
+                        Self::emit_refcov_inc_diag_with_before(
+                            refcov_before,
+                            pos,
+                            tv.var.alt_depth,
+                            "realigner_del_sc3",
+                        );
                         *data.ref_coverage.entry(pos).or_insert(0) += tv.var.alt_depth;
                     }
 
@@ -3559,6 +3722,11 @@ impl VariantRealigner {
     ) {
         let positions: Vec<i64> = data.soft_clips_5end.keys().cloned().collect();
         for sc_pos in positions {
+            let refcov_before = if pos == 6970385 {
+                data.ref_coverage.get(&6970385_i64).copied().unwrap_or(0)
+            } else {
+                0
+            };
             let Some(sclip) = data.soft_clips_5end.get_mut(&sc_pos) else {
                 continue;
             };
@@ -3582,6 +3750,12 @@ impl VariantRealigner {
                 }
             }
             if sc_pos > pos {
+                Self::emit_refcov_inc_diag_with_before(
+                    refcov_before,
+                    pos,
+                    sclip.var.alt_depth,
+                    "realigner_softclips_5end",
+                );
                 *data.ref_coverage.entry(pos).or_insert(0) += sclip.var.alt_depth;
             }
             sclip.mark_used();
@@ -3597,6 +3771,11 @@ impl VariantRealigner {
     ) {
         let positions: Vec<i64> = data.soft_clips_3end.keys().cloned().collect();
         for sc_pos in positions {
+            let refcov_before = if pos == 6970385 {
+                data.ref_coverage.get(&6970385_i64).copied().unwrap_or(0)
+            } else {
+                0
+            };
             let Some(sclip) = data.soft_clips_3end.get_mut(&sc_pos) else {
                 continue;
             };
@@ -3615,6 +3794,12 @@ impl VariantRealigner {
 
             cache_transient_conseq(sclip, &seq);
             if sc_pos <= pos {
+                Self::emit_refcov_inc_diag_with_before(
+                    refcov_before,
+                    pos,
+                    sclip.var.alt_depth,
+                    "realigner_softclips_3end",
+                );
                 *data.ref_coverage.entry(pos).or_insert(0) += sclip.var.alt_depth;
             }
             if let Some(var_map) = data.non_insertion_variants.get_mut(&pos) {
@@ -5231,8 +5416,7 @@ mod tests {
         });
 
         let bam_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/test_168714.bam");
-        let fasta_path =
-            "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/reference/hs37d5.fa";
+        let fasta_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/hs37d5.fa");
 
         let mut reader = Reader::from_path(bam_path).expect("Failed to open test BAM");
         let mut target: Option<rust_htslib::bam::Record> = None;
@@ -5254,7 +5438,7 @@ mod tests {
         }
         let ref_end = region.end + 1200;
 
-        let fasta = FastaReader::open(fasta_path).expect("Failed to open reference FASTA");
+        let mut fasta = FastaReader::open(fasta_path).expect("Failed to open reference FASTA");
         let reference = fasta
             .get_reference(region.chr(), ref_start, ref_end)
             .expect("Failed to fetch reference sequence");

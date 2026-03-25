@@ -4581,8 +4581,7 @@ mod tests {
         });
 
         let bam_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/test_168714.bam");
-        let fasta_path =
-            "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/reference/hs37d5.fa";
+        let fasta_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/hs37d5.fa");
 
         let mut reader = Reader::from_path(bam_path).expect("Failed to open test BAM");
 
@@ -4607,7 +4606,7 @@ mod tests {
         }
         let ref_end = region.end + 1200;
 
-        let fasta = FastaReader::open(fasta_path).expect("Failed to open reference FASTA");
+        let mut fasta = FastaReader::open(fasta_path).expect("Failed to open reference FASTA");
         let reference = fasta
             .get_reference(region.chr(), ref_start, ref_end)
             .expect("Failed to fetch reference sequence");
@@ -4673,8 +4672,7 @@ mod tests {
 
         let bam_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/input/NA12878.chrom20.ILLUMINA.bwa.CEU.exome.20121211.bam";
         let bed_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/input/20120518.consensus.annotation.bed.chr20";
-        let fasta_path =
-            "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/reference/hs37d5.fa";
+        let fasta_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/hs37d5.fa");
 
         let file = File::open(bed_path).expect("Failed to open BED file");
         let mut reader = BufReader::new(file);
@@ -4719,7 +4717,7 @@ mod tests {
         }
         let ref_end = region.end + 1200;
 
-        let fasta = FastaReader::open(fasta_path).expect("Failed to open reference FASTA");
+        let mut fasta = FastaReader::open(fasta_path).expect("Failed to open reference FASTA");
         let reference = fasta
             .get_reference(region.chr(), ref_start, ref_end)
             .expect("Failed to fetch reference sequence");

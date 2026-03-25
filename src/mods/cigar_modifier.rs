@@ -1564,7 +1564,6 @@ mod tests {
 
     use crate::{
         data::{reference::Reference, region::Region},
-        mods::cigar_parser::CigarParser,
         scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE},
     };
     use crackle_kit::data::bases::rev_comp::RevComplementor;
@@ -1682,38 +1681,7 @@ mod tests {
         ));
     }
 
-    // Note: find_offset test requires complex setup of CigarParser state
-    // which is tightly coupled to the parsing loop. The Java test creates
-    // a standalone CigarParser and calls findOffset directly, but in Rust
-    // the function is an internal method that relies on self.contig_ref_seq().
-    // This test is marked as ignored until the architecture allows easier testing.
-    #[test]
-    #[ignore = "requires refactoring to make find_offset testable in isolation"]
-    #[should_panic(expected = "Requires architecture changes to test find_offset in isolation")]
-    fn find_offset() {
-        let conf = Configuration {
-            goodq: 23.0,
-            vext: 3,
-            ..Default::default()
-        };
-
-        INSTANCE.get_or_init(|| GlobalReadOnlyScope {
-            conf,
-            ..Default::default()
-        });
-
-        let _ref_pos = 1;
-        let _read_pos = 2;
-        let _cigar_len = 3;
-        let _query_sequence = "ACGTACGT";
-        let _query_quality = "<<<<<<<<";
-        let _ref_seq = "AA";
-
-        // Java test expects: Offset(2, "GT", "<<", 2)
-        // To implement: need to refactor find_offset to accept reference directly
-        // or create a proper CigarParser with initialized reference state.
-        todo!("Requires architecture changes to test find_offset in isolation")
-    }
+    // TODO(m10): find_offset needs isolated testing once CigarParser reference state is decoupled
 
     #[test]
     fn test_cigar_modifier_mapped_read_no_change() {

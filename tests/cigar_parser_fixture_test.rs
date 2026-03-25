@@ -81,17 +81,17 @@ fn test_cigar_parser_snapshot_fixture() {
             168500,
             168760,
             "tests/fixtures/cigar_parser_chr20_168500_168760.jsonl",
-            "VarDictJava/tests/integration/input/NA12878.chrom20.ILLUMINA.bwa.CEU.exome.20121211.bam",
+            "testdata/NA12878.chrom20.ILLUMINA.bwa.CEU.exome.20121211.bam",
         ),
         (
             "20",
             126269,
             126333,
             "tests/fixtures/cigar_parser_chr20_126269_126333.jsonl",
-            "VarDictJava/tests/integration/input/NA12878.chrom20.ILLUMINA.bwa.CEU.exome.20121211.bam",
+            "testdata/NA12878.chrom20.ILLUMINA.bwa.CEU.exome.20121211.bam",
         ),
     ];
-    let ref_path = manifest_dir.join("VarDictJava/tests/integration/reference/hs37d5.fa");
+    let ref_path = manifest_dir.join("testdata/hs37d5.fa");
 
     for (_, _, _, fixture, bam_rel) in fixture_cases {
         let fixture_path = manifest_dir.join(fixture);
