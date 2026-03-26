@@ -1,0 +1,59 @@
+# VarDict CLI Pairwise Testing Model (PICT format)
+# Generated: 2026-03-25
+# 
+# Usage: pict vardict_pict_model.txt > vardict_pairwise_configs.tsv
+# Or with Python: pip install allpairspy && python generate_pairwise.py
+#
+# Each parameter has 2-3 values: default, and 1-2 non-default alternatives.
+# Boolean flags: off (default) / on
+# Numeric flags: default / low / high
+#
+# Infrastructure-only flags (--ref, --bam, --threads, --name, etc.) are excluded
+# because they don't affect variant calling output.
+
+# === Tier 1: Core variant calling parameters ===
+pileup:         off, on
+freq:           0.01, 0.001, 0.05
+minr:           2, 1, 5
+qual:           22.5, 0, 30
+mapq:           0, 10, 30
+realign:        1, 0
+nosv:           off, on
+fisher:         off, on
+debug:          off, on
+
+# === Tier 2: Filtering and tuning ===
+vext:           2, 0, 5
+mismatch:       8, 3, 15
+filter:         0x504, 0x700, 0x100
+move_3prime:    off, on
+read_pos:       5.0, 0, 10
+qratio:         1.5, 0.5, 2.0
+chimeric:       off, on
+deldupvar:      off, on
+include_n:      off, on
+
+# === Tier 3: Region and structural parameters ===
+extend:         0, 150
+ref_extension:  1200, 600, 2000
+insert_size:    300, 200
+insert_std:     100, 50
+trim_bases:     0, 130
+min_match:      0, 25
+
+# === Tier 4: Untested flags (added for coverage) ===
+unique_mode:    off, u, UN
+insert_std_amt: 4, 2, 6
+sv_min_len:     1000, 500, 2000
+min_bias_reads: 2, 1, 4
+zero_based:     default, 0, 1
+
+# === Constraints ===
+# pileup=on requires freq <= 0.01 (pileup outputs everything, high freq makes no sense)
+IF [pileup] = "on" THEN [freq] <> "0.05";
+
+# nosv=on makes SV-related parameters irrelevant
+IF [nosv] = "on" THEN [insert_size] = "300" AND [insert_std] = "100" AND [sv_min_len] = "1000" AND [insert_std_amt] = "4";
+
+# debug mode should be tested but not combinatorially (it only adds stderr output)
+IF [debug] = "on" THEN [pileup] = "off" AND [nosv] = "off";
