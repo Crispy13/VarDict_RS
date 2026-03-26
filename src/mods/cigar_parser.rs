@@ -2963,6 +2963,9 @@ impl CigarParser {
                 Some(read_len_including_match_ins),
             );
 
+            let insertion_pstd = var.pstd;
+            let insertion_qstd = var.qstd;
+
             // Adjust the reference count for insertion reads
             let index_in_query =
                 (self.read_pos_including_softclip as i64 - 1) - (self.start - 1 - insertion_pos);
@@ -3015,15 +3018,8 @@ impl CigarParser {
                         from_end
                     };
 
-                    if !ref_var.pstd && ref_var.pp != 0 && tp != ref_var.pp {
-                        ref_var.pstd = true;
-                    }
-                    if !ref_var.qstd
-                        && ref_var.pq != 0.0
-                        && (tmpq - ref_var.pq).abs() > f64::EPSILON
-                    {
-                        ref_var.qstd = true;
-                    }
+                    ref_var.pstd = insertion_pstd;
+                    ref_var.qstd = insertion_qstd;
                     ref_var.mean_pos += tp as f64;
                     ref_var.mean_qual += tmpq;
                     ref_var.mean_mapq += mapq as f64;

@@ -3928,8 +3928,8 @@ impl VarDictPipeline {
             crate::mods::to_vars_builder::StrandBiasValue::CantAssess,
             check_strand_bias(raw_ref_variant.alt_depth_fwd, raw_ref_variant.alt_depth_rev),
         );
-        reference_variant.is_at_least_at_2_positions = raw_ref_variant.pstd;
-        reference_variant.has_at_least_2_diff_qualities = raw_ref_variant.qstd;
+        reference_variant.is_at_least_at_2_positions = false;
+        reference_variant.has_at_least_2_diff_qualities = false;
         reference_variant.nm = round_half_even(
             "0.0",
             raw_ref_variant.nm / raw_ref_variant.alt_depth as f64,
