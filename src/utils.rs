@@ -10,6 +10,7 @@ use std::{
 };
 
 pub mod aligner;
+pub mod vec_map;
 
 pub fn print_exception_and_continue(
     exception: &Error,

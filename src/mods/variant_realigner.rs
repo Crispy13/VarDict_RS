@@ -1,6 +1,5 @@
 use rust_htslib::bam::{Record, record::Cigar};
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use crate::{
@@ -15,11 +14,17 @@ use crate::{
     mods::structural_variants_processor::RealignedVariationData,
     mods::vardict_pipeline::VarDictPipeline,
     prelude::{LibDefaultHasher, SmallVecBytes},
+    utils::vec_map::{Entry as VecEntry, VecMap},
     variants::{
         var_utils::{find_conseq, get_variants_from_map},
         variants::{InsOrDelLen, SoftClip, VarDesc, Variant},
     },
 };
+
+type VariantMap = VecMap<VarDesc, Variant>;
+type VariantMapByPos = HashMap<i64, VariantMap, LibDefaultHasher>;
+type CountMap = VecMap<String, usize>;
+type CountMapByPos = HashMap<i64, CountMap, LibDefaultHasher>;
 
 /// Result of finding 3'/5' end matches between two sequences
 #[derive(Debug, Clone)]
@@ -154,11 +159,7 @@ impl VariantRealigner {
     pub fn process_deletions(
         &self,
         data: &mut RealignedVariationData,
-        position_to_deletions_count: &std::collections::HashMap<
-            i64,
-            std::collections::HashMap<String, usize, LibDefaultHasher>,
-            LibDefaultHasher,
-        >,
+        position_to_deletions_count: &CountMapByPos,
     ) {
         self.process_deletions_with_passing_check(data, position_to_deletions_count, true);
     }
@@ -166,11 +167,7 @@ impl VariantRealigner {
     fn process_deletions_with_passing_check(
         &self,
         data: &mut RealignedVariationData,
-        position_to_deletions_count: &std::collections::HashMap<
-            i64,
-            std::collections::HashMap<String, usize, LibDefaultHasher>,
-            LibDefaultHasher,
-        >,
+        position_to_deletions_count: &CountMapByPos,
         enable_passing_reads_check: bool,
     ) {
         let positions: Vec<i64> = data.non_insertion_variants.keys().copied().collect();
@@ -274,7 +271,7 @@ impl VariantRealigner {
     }
 
     fn find_desc_by_key_string<'a>(
-        var_map: &'a HashMap<VarDesc, Variant, LibDefaultHasher>,
+        var_map: &'a VariantMap,
         key_string: &str,
     ) -> Option<&'a VarDesc> {
         var_map
@@ -474,7 +471,7 @@ impl VariantRealigner {
         Some(base.to_string())
     }
 
-    fn merge_duplicate_deletion_keys(pos_map: &mut HashMap<VarDesc, Variant, LibDefaultHasher>) {
+    fn merge_duplicate_deletion_keys(pos_map: &mut VariantMap) {
         let mut grouped: HashMap<String, Vec<VarDesc>, LibDefaultHasher> = Default::default();
         for key in pos_map.keys() {
             let key_str = key.to_key_string();
@@ -536,8 +533,8 @@ impl VariantRealigner {
     }
 
     fn merge_suffix_shift_insertion_keys(
-        pos_map: &mut HashMap<VarDesc, Variant, LibDefaultHasher>,
-        position_to_insertion_count: Option<&HashMap<String, usize, LibDefaultHasher>>,
+        pos_map: &mut VariantMap,
+        position_to_insertion_count: Option<&CountMap>,
     ) {
         let mut keys: Vec<(VarDesc, Vec<u8>)> = pos_map
             .keys()
@@ -616,7 +613,7 @@ impl VariantRealigner {
         }
     }
 
-    fn has_sv_marker(variation_map: &HashMap<VarDesc, Variant, LibDefaultHasher>) -> bool {
+    fn has_sv_marker(variation_map: &VariantMap) -> bool {
         variation_map
             .keys()
             .any(|desc| matches!(desc, VarDesc::Raw { desc } if desc.as_slice() == b"SV"))
@@ -846,8 +843,8 @@ impl VariantRealigner {
     }
 
     fn updated_insertion_count_after_realign(
-        before: Option<&HashMap<VarDesc, Variant, LibDefaultHasher>>,
-        after: Option<&HashMap<VarDesc, Variant, LibDefaultHasher>>,
+        before: Option<&VariantMap>,
+        after: Option<&VariantMap>,
         original_key: &VarDesc,
     ) -> Option<usize> {
         let before_map = before?;
@@ -873,8 +870,8 @@ impl VariantRealigner {
     }
 
     fn resolved_insertion_key_after_realign(
-        before: Option<&HashMap<VarDesc, Variant, LibDefaultHasher>>,
-        after: Option<&HashMap<VarDesc, Variant, LibDefaultHasher>>,
+        before: Option<&VariantMap>,
+        after: Option<&VariantMap>,
         original_key: &VarDesc,
     ) -> Option<VarDesc> {
         let after_map = after?;
@@ -1007,15 +1004,15 @@ impl VariantRealigner {
     }
 
     fn merge_variant_maps(
-        dest: &mut HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher>,
-        src: HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher>,
+        dest: &mut VariantMapByPos,
+        src: VariantMapByPos,
     ) {
         for (position, src_map) in src {
             let dest_map = dest.entry(position).or_default();
             for (desc, src_var) in src_map {
                 match dest_map.entry(desc) {
-                    Entry::Occupied(mut occupied) => adj_cnt(occupied.get_mut(), &src_var),
-                    Entry::Vacant(vacant) => {
+                    VecEntry::Occupied(mut occupied) => adj_cnt(occupied.get_mut(), &src_var),
+                    VecEntry::Vacant(vacant) => {
                         vacant.insert(src_var);
                     }
                 }
@@ -1101,11 +1098,7 @@ impl VariantRealigner {
     pub fn process_insertions(
         &self,
         data: &mut RealignedVariationData,
-        position_to_insertion_count: &std::collections::HashMap<
-            i64,
-            std::collections::HashMap<String, usize, LibDefaultHasher>,
-            LibDefaultHasher,
-        >,
+        position_to_insertion_count: &CountMapByPos,
     ) {
         if position_to_insertion_count.is_empty() {
             return;
@@ -1951,12 +1944,8 @@ impl VariantRealigner {
                         .map(|v| v.alt_depth)
                         .unwrap_or(0);
 
-                    let mut tins: HashMap<
-                        i64,
-                        HashMap<String, usize, LibDefaultHasher>,
-                        LibDefaultHasher,
-                    > = Default::default();
-                    let mut map: HashMap<String, usize, LibDefaultHasher> = Default::default();
+                    let mut tins: CountMapByPos = Default::default();
+                    let mut map: CountMap = Default::default();
                     map.insert(
                         String::from_utf8_lossy(&ins_desc).to_string(),
                         current_ins_count,
@@ -2330,9 +2319,8 @@ impl VariantRealigner {
                 .map(|v| v.alt_depth)
                 .unwrap_or(0);
 
-            let mut dels: HashMap<i64, HashMap<String, usize, LibDefaultHasher>, LibDefaultHasher> =
-                Default::default();
-            let mut inner: HashMap<String, usize, LibDefaultHasher> = Default::default();
+            let mut dels: CountMapByPos = Default::default();
+            let mut inner: CountMap = Default::default();
             inner.insert(gt.clone(), tv_before_realign);
             dels.insert(bp, inner);
             self.process_deletions_with_passing_check(data, &dels, true);
@@ -2554,9 +2542,8 @@ impl VariantRealigner {
                 .map(|v| v.alt_depth)
                 .unwrap_or(0);
 
-            let mut dels: HashMap<i64, HashMap<String, usize, LibDefaultHasher>, LibDefaultHasher> =
-                Default::default();
-            let mut inner: HashMap<String, usize, LibDefaultHasher> = Default::default();
+            let mut dels: CountMapByPos = Default::default();
+            let mut inner: CountMap = Default::default();
             inner.insert(gt.clone(), tv_before_realign);
             dels.insert(anchor_pos, inner);
             self.process_deletions_with_passing_check(data, &dels, true);
@@ -2764,9 +2751,8 @@ impl VariantRealigner {
                 }
             }
 
-            let mut tins: HashMap<i64, HashMap<String, usize, LibDefaultHasher>, LibDefaultHasher> =
-                Default::default();
-            let mut map: HashMap<String, usize, LibDefaultHasher> = Default::default();
+            let mut tins: CountMapByPos = Default::default();
+            let mut map: CountMap = Default::default();
             map.insert(
                 format!("+{}", String::from_utf8_lossy(&ins)),
                 original_ins_count,
@@ -3046,9 +3032,8 @@ impl VariantRealigner {
                 sc3v.mark_used();
             }
 
-            let mut tins: HashMap<i64, HashMap<String, usize, LibDefaultHasher>, LibDefaultHasher> =
-                Default::default();
-            let mut map: HashMap<String, usize, LibDefaultHasher> = Default::default();
+            let mut tins: CountMapByPos = Default::default();
+            let mut map: CountMap = Default::default();
             map.insert(
                 format!("+{}", String::from_utf8_lossy(&ins)),
                 original_ins_count,
@@ -3135,11 +3120,7 @@ impl VariantRealigner {
     pub fn adjust_mnp(
         &self,
         data: &mut RealignedVariationData,
-        mnp: &std::collections::HashMap<
-            i64,
-            std::collections::HashMap<String, usize, LibDefaultHasher>,
-            LibDefaultHasher,
-        >,
+        mnp: &CountMapByPos,
     ) {
         let mut tmp: Vec<(i64, String, usize)> = Vec::new();
         for (pos, desc_map) in mnp {
@@ -5127,10 +5108,8 @@ mod tests {
 
     #[test]
     fn test_merge_variant_maps_preserves_new_variant_fields() {
-        let mut dest: HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher> =
-            Default::default();
-        let mut src: HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher> =
-            Default::default();
+        let mut dest: VariantMapByPos = Default::default();
+        let mut src: VariantMapByPos = Default::default();
 
         let key = VarDesc::snv_key(b'A');
         let mut source_variant = Variant::default();
@@ -5282,7 +5261,7 @@ mod tests {
 
     #[test]
     fn test_merge_suffix_shift_insertion_keys_keeps_independently_supported_short_suffix_key() {
-        let mut pos_map: HashMap<VarDesc, Variant, LibDefaultHasher> = HashMap::default();
+        let mut pos_map: VariantMap = VecMap::default();
         pos_map.insert(
             VarDesc::Ins {
                 seq: b"AA".to_vec().into(),
@@ -5314,7 +5293,7 @@ mod tests {
             },
         );
 
-        let mut insertion_counts: HashMap<String, usize, LibDefaultHasher> = HashMap::default();
+        let mut insertion_counts: CountMap = VecMap::default();
         insertion_counts.insert("+AA".to_string(), 6);
         insertion_counts.insert("+A".to_string(), 1);
 
@@ -5346,7 +5325,7 @@ mod tests {
 
     #[test]
     fn test_merge_suffix_shift_insertion_keys_merges_unsupported_short_suffix_key() {
-        let mut pos_map: HashMap<VarDesc, Variant, LibDefaultHasher> = HashMap::default();
+        let mut pos_map: VariantMap = VecMap::default();
         pos_map.insert(
             VarDesc::Ins {
                 seq: b"AA".to_vec().into(),
@@ -5378,7 +5357,7 @@ mod tests {
             },
         );
 
-        let mut insertion_counts: HashMap<String, usize, LibDefaultHasher> = HashMap::default();
+        let mut insertion_counts: CountMap = VecMap::default();
         insertion_counts.insert("+AA".to_string(), 6);
 
         VariantRealigner::merge_suffix_shift_insertion_keys(&mut pos_map, Some(&insertion_counts));

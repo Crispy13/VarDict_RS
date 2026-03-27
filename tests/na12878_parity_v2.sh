@@ -9,7 +9,7 @@ readonly REF_FASTA="testdata/hs37d5.fa"
 readonly REF_FASTA_FAI="${REF_FASTA}.fai"
 readonly BAM_PATH="testdata/NA12878.mapped.ILLUMINA.bwa.CEU.low_coverage.20121211.bam"
 readonly JAVA_JAR="VarDictJava/build/libs/VarDict-1.8.3.jar"
-readonly RUST_BIN="target/debug-release/vardict"
+RUST_BIN="${RUST_BIN:-target/debug-release/vardict}"
 readonly BASE_DIR="tmp/na12878_parity"
 readonly DISK_ABORT_GB=5
 
@@ -28,6 +28,8 @@ FREQ="0.01"
 STOP_ON_FAIL=1
 ALL_CHR=0
 CLEAN_RUST=0
+CLEAN_ALL=0
+RUST_ONLY=0
 CLEANUP=1
 EXTRA_OPTS=""
 OPTS_LABEL="default"
@@ -35,6 +37,9 @@ SHARD_TIMEOUT=600
 MEM_WARN_GB=4
 MEM_ABORT_GB=2
 DISK_WARN_GB=10
+RELEASE_BUILD=0
+RUST_BIN_OVERRIDE=""
+NO_BUILD=0
 
 TOTAL_SHARDS=0
 PASS_COUNT=0
@@ -81,6 +86,11 @@ Options:
   --no-stop            Continue past mismatches instead of stopping after the first failed batch
   --clean-rust         Remove only Rust + diff outputs (preserves Java cache)
   --no-cleanup         Keep all output files after comparison (default: cleanup passing outputs)
+  --clean-all          Delete ALL outputs including Java cache on cleanup (default: preserve Java)
+  --rust-only          Skip Java generation entirely; fail if Java cache is incomplete
+    --release            Use target/release/vardict and auto-build with cargo build --release
+    --rust-bin PATH      Use a specific Rust binary path
+    --no-build           Skip Rust auto-build and staleness checks
   --opts "FLAGS"       Extra CLI flags passed to both Java and Rust (default: none)
   --opts-label LBL     Cache subdirectory label for this option set (default: "default")
   --timeout SECONDS    Per-shard timeout for Java and Rust commands (default: 600)
@@ -114,6 +124,50 @@ require_file() {
     local path=$1
 
     [[ -f "$path" ]] || fail "Required file not found: $path"
+}
+
+resolve_rust_bin() {
+    if (( RELEASE_BUILD )) && [[ -n "$RUST_BIN_OVERRIDE" ]]; then
+        fail "--release and --rust-bin cannot be used together"
+    fi
+
+    if (( RELEASE_BUILD )); then
+        RUST_BIN="target/release/vardict"
+    elif [[ -n "$RUST_BIN_OVERRIDE" ]]; then
+        RUST_BIN="$RUST_BIN_OVERRIDE"
+    fi
+}
+
+auto_build_if_needed() {
+    local newer_source
+
+    if (( NO_BUILD )); then
+        return 0
+    fi
+
+    if [[ ! -f "$RUST_BIN" ]]; then
+        case "$RUST_BIN" in
+            *target/release/*)
+                echo "Rust binary missing: $RUST_BIN"
+                echo "Building Rust binary via: cargo build --release"
+                cargo build --release || fail "Failed to build Rust binary: $RUST_BIN"
+                ;;
+            *target/debug-release/*)
+                echo "Rust binary missing: $RUST_BIN"
+                echo "Building Rust binary via: cargo build --profile debug-release"
+                cargo build --profile debug-release || fail "Failed to build Rust binary: $RUST_BIN"
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+        return 0
+    fi
+
+    newer_source=$(find src/ -name '*.rs' -newer "$RUST_BIN" -print -quit 2>/dev/null || true)
+    if [[ -n "$newer_source" ]]; then
+        echo "WARNING: $RUST_BIN may be stale — consider rebuilding" >&2
+    fi
 }
 
 format_elapsed() {
@@ -646,6 +700,24 @@ needs_missing_outputs() {
     (( ${#missing_indices_ref[@]} > 0 ))
 }
 
+validate_java_cache() {
+    local missing=0
+    local idx
+    local out_file
+
+    for ((idx = 0; idx < TOTAL_SHARDS; idx++)); do
+        out_file="${JAVA_DIR}/shard_${SHARD_IDS[$idx]}.tsv"
+        if [[ ! -f "$out_file" ]]; then
+            echo "  Missing Java shard: $out_file" >&2
+            missing=$((missing + 1))
+        fi
+    done
+
+    if (( missing > 0 )); then
+        fail "--rust-only: ${missing} Java shard(s) missing for $(summary_chr_label). Run without --rust-only first to generate Java cache."
+    fi
+}
+
 generate_java_shard() {
     local idx=$1
     local shard_num=${SHARD_IDS[$idx]}
@@ -1102,6 +1174,23 @@ parse_args() {
             --clean-rust)
                 CLEAN_RUST=1
                 ;;
+            --clean-all)
+                CLEAN_ALL=1
+                ;;
+            --rust-only)
+                RUST_ONLY=1
+                ;;
+            --release)
+                RELEASE_BUILD=1
+                ;;
+            --rust-bin)
+                shift
+                [[ $# -gt 0 ]] || fail "Missing value for --rust-bin"
+                RUST_BIN_OVERRIDE="$1"
+                ;;
+            --no-build)
+                NO_BUILD=1
+                ;;
             --no-cleanup)
                 CLEANUP=0
                 ;;
@@ -1234,8 +1323,13 @@ write_results_json() {
 
 cleanup_outputs() {
     if (( FAIL_COUNT == 0 )); then
-        rm -rf "$JAVA_DIR" "$RUST_DIR" "$DIFF_DIR"
-        echo "  Cleaned up all outputs (verified)"
+        if (( CLEAN_ALL )); then
+            rm -rf "$JAVA_DIR" "$RUST_DIR" "$DIFF_DIR"
+            echo "  Cleaned up all outputs (verified)"
+        else
+            rm -rf "$RUST_DIR" "$DIFF_DIR"
+            echo "  Cleaned up Rust + diff outputs (Java cache preserved)"
+        fi
     else
         local idx
         local status_file
@@ -1249,7 +1343,9 @@ cleanup_outputs() {
                 status_value=$(<"$status_file")
                 if [[ "$status_value" == "PASS" || "$status_value" == "EMPTY" ]]; then
                     shard_num=${SHARD_IDS[$idx]}
-                    rm -f "${JAVA_DIR}/shard_${shard_num}.tsv" "${JAVA_DIR}/shard_${shard_num}.log"
+                    if (( CLEAN_ALL )); then
+                        rm -f "${JAVA_DIR}/shard_${shard_num}.tsv" "${JAVA_DIR}/shard_${shard_num}.log"
+                    fi
                     rm -f "${RUST_DIR}/shard_${shard_num}.tsv" "${RUST_DIR}/shard_${shard_num}.log"
                     rm -f "$status_file" "$(meta_file_for_idx "$idx")"
                     rm -f "$(phase_state_file_for_idx java "$idx")" "$(phase_state_file_for_idx rust "$idx")"
@@ -1355,12 +1451,17 @@ run_chr() {
     prepare_dirs
     ensure_resource_log
 
-    needs_missing_outputs "java" java_needed_indices || true
-    needs_missing_outputs "rust" rust_needed_indices || true
-
-    if (( ${#java_needed_indices[@]} > 0 )); then
-        require_file "$JAVA_JAR"
+    if (( RUST_ONLY )); then
+        validate_java_cache
+        echo "--- Phase 1: Java (--rust-only, cache validated) ---"
+    else
+        needs_missing_outputs "java" java_needed_indices || true
+        if (( ${#java_needed_indices[@]} > 0 )); then
+            require_file "$JAVA_JAR"
+        fi
     fi
+
+    needs_missing_outputs "rust" rust_needed_indices || true
     if (( ${#rust_needed_indices[@]} > 0 )); then
         require_file "$RUST_BIN"
     fi
@@ -1374,7 +1475,9 @@ run_chr() {
     echo "=== Processing $(summary_chr_label) (${TOTAL_SHARDS} shards, ${MAX_PARALLEL} workers) ==="
     start_ns=$(date +%s%N)
 
-    if (( ${#java_needed_indices[@]} > 0 )); then
+    if (( RUST_ONLY )); then
+        : # Phase 1 already validated above
+    elif (( ${#java_needed_indices[@]} > 0 )); then
         check_preflight_resources "Phase 1 (Java)"
         echo "--- Phase 1: Java (${#java_needed_indices[@]} shards, ${MAX_PARALLEL} parallel) ---"
         run_parallel_phase generate_java_shard "Phase 1 (Java)" java_needed_indices || fail "Phase 1 (Java) aborted due to low memory"
@@ -1433,6 +1536,7 @@ run_chr() {
 
 main() {
     parse_args "$@"
+    resolve_rust_bin
 
     validate_positive_integer "shard size" "$SHARD_SIZE"
     validate_positive_integer "parallel worker count" "$MAX_PARALLEL"
@@ -1453,6 +1557,7 @@ main() {
     mkdir -p ./tmp
     require_file "$REF_FASTA"
     require_file "$BAM_PATH"
+    auto_build_if_needed
 
     if (( ALL_CHR )); then
         require_file "$REF_FASTA_FAI"

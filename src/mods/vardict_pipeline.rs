@@ -42,15 +42,16 @@ use crate::mods::variant_realigner::VariantRealigner;
 use crate::prelude::LibDefaultHasher;
 use crate::scopedata::global_read_only_scope::GlobalReadOnlyScope;
 use crate::scopedata::global_read_only_scope::{instance, instance_arc};
+use crate::utils::vec_map::VecMap;
 use crate::utils::round_half_even;
 use crate::variants::variants::{
     SoftClip, StructuralVariantCounts, VarDesc, Variant as RawVariant,
 };
 use rand::Rng;
 
-type RawVarMap = HashMap<VarDesc, RawVariant, LibDefaultHasher>;
+type RawVarMap = VecMap<VarDesc, RawVariant>;
 type RawVarByPos = HashMap<i64, RawVarMap, LibDefaultHasher>;
-type CountMap = HashMap<String, usize, LibDefaultHasher>;
+type CountMap = VecMap<String, usize>;
 type CountByPos = HashMap<i64, CountMap, LibDefaultHasher>;
 type RefCovMap = HashMap<i64, usize, LibDefaultHasher>;
 type VarsByPos = HashMap<i64, Vars, LibDefaultHasher>;
@@ -148,15 +149,13 @@ fn trim_process_allocator() {}
 #[derive(Default)]
 pub struct CigarParserOutput {
     /// Non-insertion variants by position
-    pub non_insertion_vars:
-        HashMap<i64, HashMap<VarDesc, RawVariant, LibDefaultHasher>, LibDefaultHasher>,
+    pub non_insertion_vars: RawVarByPos,
     /// Java VariationMap.sv equivalent counts by position.
     pub sv_counts: HashMap<i64, StructuralVariantCounts, LibDefaultHasher>,
     /// Insertion order of non-insertion variant positions
     pub non_insertion_vars_insert_index: HashMap<i64, usize, LibDefaultHasher>,
     /// Insertion variants by position (key is position before insertion)
-    pub insertion_vars:
-        HashMap<i64, HashMap<VarDesc, RawVariant, LibDefaultHasher>, LibDefaultHasher>,
+    pub insertion_vars: RawVarByPos,
     /// 5' end soft clips by position
     pub soft_clips_5end: HashMap<i64, SoftClip, LibDefaultHasher>,
     /// 3' end soft clips by position
@@ -184,13 +183,11 @@ pub struct CigarParserOutput {
     /// Reference coverage by position
     pub ref_coverage: HashMap<i64, usize, LibDefaultHasher>,
     /// MNP map (position -> description -> count)
-    pub mnp: HashMap<i64, HashMap<String, usize, LibDefaultHasher>, LibDefaultHasher>,
+    pub mnp: CountByPos,
     /// Insertion counts by position and description (Java: positionToInsertionCount)
-    pub position_to_insertion_count:
-        HashMap<i64, HashMap<String, usize, LibDefaultHasher>, LibDefaultHasher>,
+    pub position_to_insertion_count: CountByPos,
     /// Deletion counts by position and description (Java: positionToDeletionCount)
-    pub position_to_deletions_count:
-        HashMap<i64, HashMap<String, usize, LibDefaultHasher>, LibDefaultHasher>,
+    pub position_to_deletions_count: CountByPos,
     /// Maximum read length seen
     pub max_read_len: usize,
     /// Discordant read count
@@ -198,7 +195,7 @@ pub struct CigarParserOutput {
     /// Splice positions ("start-end")
     pub splice: HashSet<String>,
     /// Splice counts by intron key ("start-end")
-    pub splice_count: HashMap<String, usize, LibDefaultHasher>,
+    pub splice_count: CountMap,
     /// Java HashMap-equivalent iteration order for splice_count keys
     pub splice_output_order: Vec<String>,
     /// Duplication rate
@@ -803,15 +800,13 @@ fn json_escape(value: &str) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct RealignedOutput {
     /// Non-insertion variants (may be modified by realigner)
-    pub non_insertion_vars:
-        HashMap<i64, HashMap<VarDesc, RawVariant, LibDefaultHasher>, LibDefaultHasher>,
+    pub non_insertion_vars: RawVarByPos,
     /// Java VariationMap.sv equivalent counts by position.
     pub sv_counts: HashMap<i64, StructuralVariantCounts, LibDefaultHasher>,
     /// Insertion order of non-insertion variant positions
     pub non_insertion_vars_insert_index: HashMap<i64, usize, LibDefaultHasher>,
     /// Insertion variants
-    pub insertion_vars:
-        HashMap<i64, HashMap<VarDesc, RawVariant, LibDefaultHasher>, LibDefaultHasher>,
+    pub insertion_vars: RawVarByPos,
     /// Reference coverage by position
     pub ref_coverage: HashMap<i64, usize, LibDefaultHasher>,
     /// Duplication rate
@@ -7099,21 +7094,12 @@ mod tests {
         let desc = VarDesc::Raw {
             desc: SmallVecBytes::from_slice(b"T"),
         };
-        let mut insertion_variations: HashMap<VarDesc, RawVariant, LibDefaultHasher> =
-            Default::default();
+        let mut insertion_variations: RawVarMap = Default::default();
         insertion_variations.insert(desc.clone(), raw);
-        let mut insertion_vars: HashMap<
-            i64,
-            HashMap<VarDesc, RawVariant, LibDefaultHasher>,
-            LibDefaultHasher,
-        > = Default::default();
+        let mut insertion_vars: RawVarByPos = Default::default();
         insertion_vars.insert(position, insertion_variations);
 
-        let mut non_insertion_vars: HashMap<
-            i64,
-            HashMap<VarDesc, RawVariant, LibDefaultHasher>,
-            LibDefaultHasher,
-        > = Default::default();
+        let mut non_insertion_vars: RawVarByPos = Default::default();
         let ref_coverage: HashMap<i64, usize, LibDefaultHasher> = Default::default();
         let reference = Reference::from_seq_with_start(b"A", 1);
 

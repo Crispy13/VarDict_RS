@@ -6,23 +6,24 @@ use crate::{
     conf::Configuration,
     prelude::LibDefaultHasher,
     scopedata::global_read_only_scope::instance,
+    utils::vec_map::VecMap,
     variants::variants::{SoftClip, VarDesc, Variant},
 };
 
 pub(crate) fn get_variants_from_map<'a>(
-    var_map: &'a mut HashMap<i64, HashMap<VarDesc, Variant, LibDefaultHasher>, LibDefaultHasher>,
+    var_map: &'a mut HashMap<i64, VecMap<VarDesc, Variant>, LibDefaultHasher>,
     start: i64,
     var_desc: &VarDesc,
 ) -> &'a mut Variant {
     let pos_map = var_map
         .entry(start)
-        .or_insert_with(|| HashMap::with_capacity_and_hasher(1, LibDefaultHasher::default()));
+        .or_insert_with(|| VecMap::with_capacity(1));
 
     get_variant_from_pos_map(pos_map, var_desc)
 }
 
 pub(crate) fn get_variant_from_pos_map<'a>(
-    pos_map: &'a mut HashMap<VarDesc, Variant, LibDefaultHasher>,
+    pos_map: &'a mut VecMap<VarDesc, Variant>,
     var_desc: &VarDesc,
 ) -> &'a mut Variant {
     let variant_ptr = if let Some(variant) = pos_map.get_mut(var_desc) {

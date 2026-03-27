@@ -66,9 +66,18 @@ declare -a TEST_MATRIX=(
 declare -a RESULTS=()
 
 USE_ALL_CHR=0
-CUSTOM_CHRS=0
+CHR_OVERRIDE=0
 NO_STOP=0
 NO_CLEANUP=0
+RUST_ONLY=0
+CLEAN_ALL=0
+RELEASE_BUILD=0
+RUST_BIN_OVERRIDE=""
+NO_BUILD=0
+CONFIG_OVERRIDE=0
+TIER_USED=0
+PRESET=""
+REAL_CHRS_ONLY=0
 DRY_RUN=0
 STATUS_ONLY=0
 PARALLEL_WORKERS=""
@@ -87,10 +96,16 @@ Usage: ${SCRIPT_NAME} [options]
 Options:
   --tier N            Run only tier N (1-4). Can be repeated.
   --config-id ID      Run only a specific config ID. Can be repeated.
+  --preset NAME       Apply a standard config+chromosome preset: smoke, dev, release.
   --chr CHR           Override chromosomes (default: 20 22 MT). Can be repeated.
   --all-chr           Run each selected config across all contigs from the FAI index.
   --no-stop           Continue to later configs after a failure.
   --no-cleanup        Keep all output files after comparison (disable disk cleanup).
+  --rust-only         Skip Java generation; fail if Java cache is incomplete
+  --clean-all         Delete ALL outputs including Java cache on cleanup
+    --release           Pass --release through to na12878_parity_v2.sh
+    --rust-bin PATH     Pass a specific Rust binary path through to na12878_parity_v2.sh
+    --no-build          Pass --no-build through to na12878_parity_v2.sh
   --parallel N        Override parallel worker count (default: 10).
   --dry-run           Print the configs/chromosomes that would run without executing.
   --status            Print the current config x chromosome parity status matrix.
@@ -106,6 +121,11 @@ Matrix:
   Tier 3: 8 configs
   Tier 4: 6 configs
   Total:  44 configs
+
+Presets:
+  smoke:   3 configs x 3 chromosomes  (T1-01, T1-03, T1-13 on 20, 22, MT)
+  dev:    10 configs x 10 chromosomes (repr set on 1, 2, 5, 10, 14, 17, 20, 22, X, MT)
+  release: all 44 configs x all real chromosomes from the FAI index
 EOF
 }
 
@@ -218,6 +238,16 @@ current_rust_binary_mtime() {
     fi
 }
 
+configure_rust_bin() {
+    if (( RELEASE_BUILD )); then
+        RUST_BIN="target/release/vardict"
+    fi
+
+    if [[ -n "$RUST_BIN_OVERRIDE" ]]; then
+        RUST_BIN="$RUST_BIN_OVERRIDE"
+    fi
+}
+
 require_fai() {
     [[ -f "$REF_FASTA_FAI" ]] || fail "Reference FAI not found: $REF_FASTA_FAI"
 }
@@ -227,7 +257,11 @@ resolve_scope_chrs() {
 
     if (( USE_ALL_CHR )); then
         require_fai
-        mapfile -t out_ref < <(awk -F '\t' '{ print $1 }' "$REF_FASTA_FAI")
+        if (( REAL_CHRS_ONLY )); then
+            mapfile -t out_ref < <(awk -F '\t' '$1 ~ /^([1-9]|1[0-9]|2[0-2]|X|Y|MT)$/ { print $1 }' "$REF_FASTA_FAI")
+        else
+            mapfile -t out_ref < <(awk -F '\t' '{ print $1 }' "$REF_FASTA_FAI")
+        fi
     else
         out_ref=("${TEST_CHRS[@]}")
     fi
@@ -271,24 +305,39 @@ parse_args() {
                 shift
                 [[ $# -gt 0 ]] || fail "Missing value for --tier"
                 [[ "$1" =~ ^[1-4]$ ]] || fail "Tier must be 1, 2, 3, or 4: $1"
+                TIER_USED=1
                 TIER_FILTERS+=("$1")
                 ;;
             --config-id)
                 shift
                 [[ $# -gt 0 ]] || fail "Missing value for --config-id"
+                CONFIG_OVERRIDE=1
                 CONFIG_FILTERS+=("$1")
+                ;;
+            --preset)
+                shift
+                [[ $# -gt 0 ]] || fail "Missing value for --preset"
+                case "$1" in
+                    smoke|dev|release)
+                        PRESET="$1"
+                        ;;
+                    *)
+                        fail "Preset must be one of: smoke, dev, release (got: $1)"
+                        ;;
+                esac
                 ;;
             --chr)
                 shift
                 [[ $# -gt 0 ]] || fail "Missing value for --chr"
-                if (( CUSTOM_CHRS == 0 )); then
+                if (( CHR_OVERRIDE == 0 )); then
                     TEST_CHRS=()
-                    CUSTOM_CHRS=1
                 fi
+                CHR_OVERRIDE=1
                 USE_ALL_CHR=0
                 TEST_CHRS+=("$1")
                 ;;
             --all-chr)
+                CHR_OVERRIDE=1
                 USE_ALL_CHR=1
                 ;;
             --parallel)
@@ -322,6 +371,23 @@ parse_args() {
             --no-cleanup)
                 NO_CLEANUP=1
                 ;;
+            --rust-only)
+                RUST_ONLY=1
+                ;;
+            --clean-all)
+                CLEAN_ALL=1
+                ;;
+            --release)
+                RELEASE_BUILD=1
+                ;;
+            --rust-bin)
+                shift
+                [[ $# -gt 0 ]] || fail "Missing value for --rust-bin"
+                RUST_BIN_OVERRIDE="$1"
+                ;;
+            --no-build)
+                NO_BUILD=1
+                ;;
             --dry-run)
                 DRY_RUN=1
                 ;;
@@ -340,6 +406,43 @@ parse_args() {
     done
 }
 
+apply_preset() {
+    if [[ -z "$PRESET" ]]; then
+        return 0
+    fi
+
+    if (( TIER_USED )); then
+        fail "--preset cannot be combined with --tier; use one selection mechanism"
+    fi
+
+    case "$PRESET" in
+        smoke)
+            if (( CONFIG_OVERRIDE == 0 )); then
+                CONFIG_FILTERS=(T1-01 T1-03 T1-13)
+            fi
+            if (( CHR_OVERRIDE == 0 )); then
+                USE_ALL_CHR=0
+                TEST_CHRS=(20 22 MT)
+            fi
+            ;;
+        dev)
+            if (( CONFIG_OVERRIDE == 0 )); then
+                CONFIG_FILTERS=(T1-01 T1-03 T1-05 T1-10 T1-13 T1-14 T2-09 T2-16 T3-01 T4-04)
+            fi
+            if (( CHR_OVERRIDE == 0 )); then
+                USE_ALL_CHR=0
+                TEST_CHRS=(1 2 5 10 14 17 20 22 X MT)
+            fi
+            ;;
+        release)
+            if (( CHR_OVERRIDE == 0 )); then
+                REAL_CHRS_ONLY=1
+                USE_ALL_CHR=1
+            fi
+            ;;
+    esac
+}
+
 append_runner_flags() {
     local -n cmd_ref=$1
 
@@ -348,6 +451,21 @@ append_runner_flags() {
     fi
     if (( NO_CLEANUP )); then
         cmd_ref+=("--no-cleanup")
+    fi
+    if (( RUST_ONLY )); then
+        cmd_ref+=("--rust-only")
+    fi
+    if (( CLEAN_ALL )); then
+        cmd_ref+=("--clean-all")
+    fi
+    if (( RELEASE_BUILD )); then
+        cmd_ref+=("--release")
+    fi
+    if [[ -n "$RUST_BIN_OVERRIDE" ]]; then
+        cmd_ref+=("--rust-bin" "$RUST_BIN_OVERRIDE")
+    fi
+    if (( NO_BUILD )); then
+        cmd_ref+=("--no-build")
     fi
     if [[ -n "$PARALLEL_WORKERS" ]]; then
         cmd_ref+=("--parallel" "$PARALLEL_WORKERS")
@@ -550,6 +668,55 @@ print_status_matrix() {
     done
 
     (( matched > 0 )) || fail "No configs matched the selected filters"
+}
+
+print_run_banner() {
+    local entry
+    local config_id
+    local opts_label
+    local cli_flags
+    local tier
+    local config_count
+    local chr_count
+    local cell_count
+    local banner_label
+    local banner_value
+    local -a run_chrs=()
+    local -a run_configs=()
+
+    resolve_scope_chrs run_chrs
+
+    for entry in "${TEST_MATRIX[@]}"; do
+        IFS='|' read -r config_id opts_label cli_flags tier <<<"$entry"
+        should_run "$config_id" "$tier" || continue
+        run_configs+=("$config_id")
+    done
+
+    config_count=${#run_configs[@]}
+    (( config_count > 0 )) || fail "No configs matched the selected filters"
+
+    chr_count=${#run_chrs[@]}
+    cell_count=$((config_count * chr_count))
+
+    if [[ -n "$PRESET" ]]; then
+        banner_label="Preset"
+        banner_value=$PRESET
+    else
+        banner_label="Selection"
+        banner_value="custom"
+    fi
+
+    echo
+    printf '══════════════════════════════════════════════════════════════\n'
+    printf '  %s: %s | %d configs × %d chromosomes = %d cells\n' \
+        "$banner_label" \
+        "$banner_value" \
+        "$config_count" \
+        "$chr_count" \
+        "$cell_count"
+    printf '  Configs: %s\n' "${run_configs[*]}"
+    printf '  Chromosomes: %s\n' "${run_chrs[*]}"
+    printf '══════════════════════════════════════════════════════════════\n'
 }
 
 json_number_field() {
@@ -847,8 +1014,11 @@ main() {
     local start_ns
     local end_ns
     local elapsed_seconds
+    local -a run_chrs=()
 
     parse_args "$@"
+    configure_rust_bin
+    apply_preset
 
     if (( DRY_RUN )) && (( STATUS_ONLY )); then
         fail "--dry-run and --status cannot be used together"
@@ -882,6 +1052,8 @@ main() {
 
     [[ -f "$PARITY_SCRIPT" ]] || fail "Parity runner not found: $PARITY_SCRIPT"
     mkdir -p ./tmp
+    print_run_banner
+    resolve_scope_chrs run_chrs
 
     for entry in "${TEST_MATRIX[@]}"; do
         IFS='|' read -r config_id opts_label cli_flags tier <<<"$entry"
@@ -900,10 +1072,10 @@ main() {
 
         start_ns=$(date +%s%N)
         config_rc=0
-        if (( USE_ALL_CHR )); then
+        if (( USE_ALL_CHR )) && [[ "$PRESET" != "release" ]]; then
             run_parity_all_chr "$opts_label" "$cli_flags" || config_rc=$?
         else
-            for chr in "${TEST_CHRS[@]}"; do
+            for chr in "${run_chrs[@]}"; do
                 echo
                 echo "--- ${config_id}: chromosome ${chr} ---"
                 run_parity_for_chr "$opts_label" "$cli_flags" "$chr" || config_rc=$?
