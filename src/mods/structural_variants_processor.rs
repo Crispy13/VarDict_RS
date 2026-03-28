@@ -25,20 +25,19 @@ use crate::data::reference::{Reference, ReferenceSeedMap};
 use crate::data::region::Region;
 use crate::data::shared_reference::SharedReferenceHandle;
 use crate::mods::variant_realigner::VariantRealigner;
-use crate::prelude::LibDefaultHasher;
+use crate::prelude::{InnerMap, LibDefaultHasher};
 use crate::scopedata::global_read_only_scope::instance;
-use crate::utils::vec_map::VecMap;
 use crate::variants::variants::{SoftClip, StructuralVariantCounts, VarDesc, Variant};
 
 /// Input data for StructuralVariantsProcessor (from VariantRealigner)
 #[derive(Default)]
 pub struct RealignedVariationData {
     /// Non-insertion variants by position
-    pub non_insertion_variants: HashMap<i64, VecMap<VarDesc, Variant>, LibDefaultHasher>,
+    pub non_insertion_variants: HashMap<i64, InnerMap<VarDesc, Variant>, LibDefaultHasher>,
     /// Java VariationMap.sv equivalent counts by position.
     pub sv_counts: HashMap<i64, StructuralVariantCounts, LibDefaultHasher>,
     /// Insertion variants by position
-    pub insertion_variants: HashMap<i64, VecMap<VarDesc, Variant>, LibDefaultHasher>,
+    pub insertion_variants: HashMap<i64, InnerMap<VarDesc, Variant>, LibDefaultHasher>,
     /// 5' end soft clips by position
     pub soft_clips_5end: HashMap<i64, SoftClip, LibDefaultHasher>,
     /// 3' end soft clips by position  
@@ -1316,9 +1315,9 @@ impl StructuralVariantsProcessor {
                 scv.mark_used();
             }
 
-            let mut dels5: HashMap<i64, VecMap<String, usize>, LibDefaultHasher> =
+            let mut dels5: HashMap<i64, InnerMap<String, usize>, LibDefaultHasher> =
                 Default::default();
-            let mut del_map: VecMap<String, usize> = Default::default();
+            let mut del_map: InnerMap<String, usize> = Default::default();
             del_map.insert(gt.clone(), inv.vars_count);
             dels5.insert(softp, del_map);
 
@@ -2966,7 +2965,7 @@ impl StructuralVariantsProcessor {
     }
 
     fn get_or_create_variation<'a>(
-        map: &'a mut HashMap<i64, VecMap<VarDesc, Variant>, LibDefaultHasher>,
+        map: &'a mut HashMap<i64, InnerMap<VarDesc, Variant>, LibDefaultHasher>,
         pos: i64,
         key_str: &str,
     ) -> &'a mut Variant {
@@ -2982,7 +2981,7 @@ impl StructuralVariantsProcessor {
     }
 
     fn get_variation_mut_by_key_string<'a>(
-        pos_map: &'a mut VecMap<VarDesc, Variant>,
+        pos_map: &'a mut InnerMap<VarDesc, Variant>,
         key_str: &str,
     ) -> Option<&'a mut Variant> {
         let key = pos_map
@@ -2993,7 +2992,7 @@ impl StructuralVariantsProcessor {
     }
 
     fn add_sv_counts(
-        map: &mut HashMap<i64, VecMap<VarDesc, Variant>, LibDefaultHasher>,
+        map: &mut HashMap<i64, InnerMap<VarDesc, Variant>, LibDefaultHasher>,
         sv_counts: &mut HashMap<i64, StructuralVariantCounts, LibDefaultHasher>,
         pos: i64,
         pairs: usize,

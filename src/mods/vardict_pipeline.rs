@@ -39,19 +39,18 @@ use crate::mods::to_vars_builder::{
     determine_genotype, var_type_string,
 };
 use crate::mods::variant_realigner::VariantRealigner;
-use crate::prelude::LibDefaultHasher;
+use crate::prelude::{InnerMap, LibDefaultHasher};
 use crate::scopedata::global_read_only_scope::GlobalReadOnlyScope;
 use crate::scopedata::global_read_only_scope::{instance, instance_arc};
-use crate::utils::vec_map::VecMap;
 use crate::utils::round_half_even;
 use crate::variants::variants::{
     SoftClip, StructuralVariantCounts, VarDesc, Variant as RawVariant,
 };
 use rand::Rng;
 
-type RawVarMap = VecMap<VarDesc, RawVariant>;
+type RawVarMap = InnerMap<VarDesc, RawVariant>;
 type RawVarByPos = HashMap<i64, RawVarMap, LibDefaultHasher>;
-type CountMap = VecMap<String, usize>;
+type CountMap = InnerMap<String, usize>;
 type CountByPos = HashMap<i64, CountMap, LibDefaultHasher>;
 type RefCovMap = HashMap<i64, usize, LibDefaultHasher>;
 type VarsByPos = HashMap<i64, Vars, LibDefaultHasher>;

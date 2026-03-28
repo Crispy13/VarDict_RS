@@ -113,3 +113,15 @@ When output differs from Java:
 4. Trace the field back through `ToVarsBuilder` → `CigarParser`
 5. Compare the Rust equivalent at each stage
 6. Check: float formatting? collection ordering? off-by-one? null handling?
+
+## Find → Fix → Test Rule
+
+Every parity bug fix **must** include a regression test that locks in the fix. The workflow:
+
+1. **Find**: Identify the output diff (expected Java vs actual Rust)
+2. **Minimize**: Reduce to the smallest input (region, reads, options) that reproduces the diff
+3. **Fix**: Correct the Rust code to match Java behavior
+4. **Test**: Add a test — unit or integration — that fails without the fix and passes with it
+5. **Commit**: Fix and test go in the same commit
+
+This prevents regressions where fixing one parity issue silently re-breaks another.

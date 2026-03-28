@@ -13,17 +13,16 @@ use crate::{
     data::region::Region,
     mods::structural_variants_processor::RealignedVariationData,
     mods::vardict_pipeline::VarDictPipeline,
-    prelude::{LibDefaultHasher, SmallVecBytes},
-    utils::vec_map::{Entry as VecEntry, VecMap},
+    prelude::{InnerMap, InnerMapEntry, LibDefaultHasher, SmallVecBytes},
     variants::{
         var_utils::{find_conseq, get_variants_from_map},
         variants::{InsOrDelLen, SoftClip, VarDesc, Variant},
     },
 };
 
-type VariantMap = VecMap<VarDesc, Variant>;
+type VariantMap = InnerMap<VarDesc, Variant>;
 type VariantMapByPos = HashMap<i64, VariantMap, LibDefaultHasher>;
-type CountMap = VecMap<String, usize>;
+type CountMap = InnerMap<String, usize>;
 type CountMapByPos = HashMap<i64, CountMap, LibDefaultHasher>;
 
 /// Result of finding 3'/5' end matches between two sequences
@@ -1011,8 +1010,8 @@ impl VariantRealigner {
             let dest_map = dest.entry(position).or_default();
             for (desc, src_var) in src_map {
                 match dest_map.entry(desc) {
-                    VecEntry::Occupied(mut occupied) => adj_cnt(occupied.get_mut(), &src_var),
-                    VecEntry::Vacant(vacant) => {
+                    InnerMapEntry::Occupied(mut occupied) => adj_cnt(occupied.get_mut(), &src_var),
+                    InnerMapEntry::Vacant(vacant) => {
                         vacant.insert(src_var);
                     }
                 }
@@ -5261,7 +5260,7 @@ mod tests {
 
     #[test]
     fn test_merge_suffix_shift_insertion_keys_keeps_independently_supported_short_suffix_key() {
-        let mut pos_map: VariantMap = VecMap::default();
+        let mut pos_map: VariantMap = VariantMap::default();
         pos_map.insert(
             VarDesc::Ins {
                 seq: b"AA".to_vec().into(),
@@ -5293,7 +5292,7 @@ mod tests {
             },
         );
 
-        let mut insertion_counts: CountMap = VecMap::default();
+        let mut insertion_counts: CountMap = CountMap::default();
         insertion_counts.insert("+AA".to_string(), 6);
         insertion_counts.insert("+A".to_string(), 1);
 
@@ -5325,7 +5324,7 @@ mod tests {
 
     #[test]
     fn test_merge_suffix_shift_insertion_keys_merges_unsupported_short_suffix_key() {
-        let mut pos_map: VariantMap = VecMap::default();
+        let mut pos_map: VariantMap = VariantMap::default();
         pos_map.insert(
             VarDesc::Ins {
                 seq: b"AA".to_vec().into(),
@@ -5357,7 +5356,7 @@ mod tests {
             },
         );
 
-        let mut insertion_counts: CountMap = VecMap::default();
+        let mut insertion_counts: CountMap = CountMap::default();
         insertion_counts.insert("+AA".to_string(), 6);
 
         VariantRealigner::merge_suffix_shift_insertion_keys(&mut pos_map, Some(&insertion_counts));

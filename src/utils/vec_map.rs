@@ -7,6 +7,30 @@ use std::{
 };
 
 /// Compact map backed by a `Vec<(K, V)>` for tiny key sets.
+///
+/// # DIVERGENCE FROM JAVA
+///
+/// **This is an optimized data structure, NOT a faithful port of Java logic.**
+/// Java VarDictJava uses `HashMap<String, Variation>` (via `VariationMap`) for inner
+/// variant maps. This Rust port replaces those with `VecMap` for memory efficiency.
+///
+/// - Java `HashMap` lazily allocates buckets; Rust `hashbrown::HashMap` pre-allocates
+///   ~128–388 bytes per instance even for 1–4 entries. With ~5M inner maps, this caused
+///   Rust to use ~2x Java's memory.
+/// - VecMap assumes inner maps typically hold 1–4 entries (one per allele at a genomic
+///   position). This assumption is based on diploid biology, NOT guaranteed for all inputs.
+/// - Edge cases (homopolymer runs, high-coverage amplicon >1000x, noisy/repetitive regions)
+///   can produce 5–10+ entries per position.
+///
+/// # TODO
+///
+/// - **Needs more tests**: Current coverage is 8 unit tests. Should add stress tests with
+///   >10 entries and benchmark VecMap vs HashMap at various sizes.
+/// - **Revert to HashMap if benchmarks indicate regression**: If profiling on production
+///   workloads shows VecMap scan is slower than HashMap (crossover at ~15–20 entries),
+///   revert `RawVarMap` and `CountMap` type aliases in `vardict_pipeline.rs` back to
+///   `HashMap<..., LibDefaultHasher>`.
+/// - **Consider hybrid approach**: VecMap for ≤N entries, promote to HashMap above N.
 #[derive(Clone, Default, PartialEq)]
 pub struct VecMap<K, V> {
     entries: Vec<(K, V)>,

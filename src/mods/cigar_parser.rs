@@ -28,9 +28,9 @@ use crate::{
         region::Region,
     },
     mods::cigar_modifier::CigarModifier,
-    prelude::{LibDefaultHasher, SmallVecBytes},
+    prelude::{InnerMap, LibDefaultHasher, SmallVecBytes},
     scopedata::global_read_only_scope::{GlobalReadOnlyScope, instance},
-    utils::{BytesExt, SliceExt, SliceExt2, aligner::Aligner, vec_map::VecMap},
+    utils::{BytesExt, SliceExt, SliceExt2, aligner::Aligner},
     variants::{
         var_utils::{
             get_variant_from_pos_map, get_variants_from_map, get_variation_from_seq,
@@ -68,19 +68,19 @@ pub struct CigarParser {
     cigar: CigarStringView,
     cigar_len: u32,
 
-    non_insertion_vars: HashMap<i64, VecMap<VarDesc, Variant>, LibDefaultHasher>,
+    non_insertion_vars: HashMap<i64, InnerMap<VarDesc, Variant>, LibDefaultHasher>,
     non_insertion_vars_insert_index: HashMap<i64, usize, LibDefaultHasher>,
     next_non_insertion_vars_insert_index: usize,
-    insertion_vars: HashMap<i64, VecMap<VarDesc, Variant>, LibDefaultHasher>,
+    insertion_vars: HashMap<i64, InnerMap<VarDesc, Variant>, LibDefaultHasher>,
 
     /// Track MNPs (multi-nucleotide polymorphisms) by position and description string
-    mnp: HashMap<i64, VecMap<String, usize>, LibDefaultHasher>,
+    mnp: HashMap<i64, InnerMap<String, usize>, LibDefaultHasher>,
 
     /// Track insertion counts by position and description string (Java: positionToInsertionCount)
-    position_to_insertion_count: HashMap<i64, VecMap<String, usize>, LibDefaultHasher>,
+    position_to_insertion_count: HashMap<i64, InnerMap<String, usize>, LibDefaultHasher>,
 
     /// Track deletion counts by position and description string (Java: positionToDeletionCount)
-    position_to_deletions_count: HashMap<i64, VecMap<String, usize>, LibDefaultHasher>,
+    position_to_deletions_count: HashMap<i64, InnerMap<String, usize>, LibDefaultHasher>,
 
     ref_coverage: HashMap<i64, usize, LibDefaultHasher>,
 
@@ -335,14 +335,14 @@ impl CigarParser {
     /// Get the collected non-insertion variants
     pub fn get_non_insertion_vars(
         &self,
-    ) -> &HashMap<i64, VecMap<VarDesc, Variant>, LibDefaultHasher> {
+    ) -> &HashMap<i64, InnerMap<VarDesc, Variant>, LibDefaultHasher> {
         &self.non_insertion_vars
     }
 
     /// Take ownership of the collected non-insertion variants
     pub fn take_non_insertion_vars(
         &mut self,
-    ) -> HashMap<i64, VecMap<VarDesc, Variant>, LibDefaultHasher> {
+    ) -> HashMap<i64, InnerMap<VarDesc, Variant>, LibDefaultHasher> {
         std::mem::take(&mut self.non_insertion_vars)
     }
 
@@ -359,7 +359,7 @@ impl CigarParser {
                 self.non_insertion_vars_insert_index
                     .insert(pos, self.next_non_insertion_vars_insert_index);
                 self.next_non_insertion_vars_insert_index += 1;
-                entry.insert(VecMap::with_capacity(1))
+                entry.insert(Default::default())
             }
         };
 
@@ -369,32 +369,32 @@ impl CigarParser {
     /// Get the collected insertion variants
     pub fn get_insertion_vars(
         &self,
-    ) -> &HashMap<i64, VecMap<VarDesc, Variant>, LibDefaultHasher> {
+    ) -> &HashMap<i64, InnerMap<VarDesc, Variant>, LibDefaultHasher> {
         &self.insertion_vars
     }
 
     /// Take ownership of the collected insertion variants
     pub fn take_insertion_vars(
         &mut self,
-    ) -> HashMap<i64, VecMap<VarDesc, Variant>, LibDefaultHasher> {
+    ) -> HashMap<i64, InnerMap<VarDesc, Variant>, LibDefaultHasher> {
         std::mem::take(&mut self.insertion_vars)
     }
 
     pub fn take_mnp(
         &mut self,
-    ) -> HashMap<i64, VecMap<String, usize>, LibDefaultHasher> {
+    ) -> HashMap<i64, InnerMap<String, usize>, LibDefaultHasher> {
         std::mem::take(&mut self.mnp)
     }
 
     pub fn take_position_to_insertion_count(
         &mut self,
-    ) -> HashMap<i64, VecMap<String, usize>, LibDefaultHasher> {
+    ) -> HashMap<i64, InnerMap<String, usize>, LibDefaultHasher> {
         std::mem::take(&mut self.position_to_insertion_count)
     }
 
     pub fn take_position_to_deletions_count(
         &mut self,
-    ) -> HashMap<i64, VecMap<String, usize>, LibDefaultHasher> {
+    ) -> HashMap<i64, InnerMap<String, usize>, LibDefaultHasher> {
         std::mem::take(&mut self.position_to_deletions_count)
     }
 
@@ -3252,7 +3252,7 @@ impl CigarParser {
     }
 
     fn increment_position_count(
-        map: &mut HashMap<i64, VecMap<String, usize>, LibDefaultHasher>,
+        map: &mut HashMap<i64, InnerMap<String, usize>, LibDefaultHasher>,
         pos: i64,
         key: &str,
     ) {
@@ -3973,7 +3973,7 @@ fn format_variant(var: &Variant) -> String {
 }
 
 fn format_variation_pos_map(
-    map: &HashMap<i64, VecMap<VarDesc, Variant>, LibDefaultHasher>,
+    map: &HashMap<i64, InnerMap<VarDesc, Variant>, LibDefaultHasher>,
 ) -> String {
     let mut pos_keys: Vec<i64> = map.keys().copied().collect();
     pos_keys.sort_unstable();
@@ -4922,7 +4922,7 @@ mod tests {
     fn assert_variant(
         non_insertion: &std::collections::HashMap<
             i64,
-            crate::utils::vec_map::VecMap<
+            crate::prelude::InnerMap<
                 crate::variants::variants::VarDesc,
                 crate::variants::variants::Variant,
             >,
