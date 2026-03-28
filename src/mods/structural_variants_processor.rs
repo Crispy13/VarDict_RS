@@ -2803,6 +2803,8 @@ impl StructuralVariantsProcessor {
             return MatchResult::default();
         }
 
+        let mut persistent_extra: Vec<u8> = Vec::new();
+
         for i in (0..=seq_work.len() - seed_len).rev() {
             let seed = &seq_work[i..i + seed_len];
             let seeds =
@@ -2822,7 +2824,7 @@ impl StructuralVariantsProcessor {
             if initial_match {
                 return MatchResult {
                     base_position: bp,
-                    matched_sequence: Vec::new(),
+                    matched_sequence: persistent_extra,
                 };
             }
 
@@ -2869,6 +2871,8 @@ impl StructuralVariantsProcessor {
                     }
                     &seq_work[seq_work.len() - j..]
                 };
+
+                persistent_extra = extra.to_vec();
 
                 if eqcnt >= 3 && (eqcnt as f64 / j as f64) > 0.5 {
                     break;

@@ -64,6 +64,7 @@ impl Drop for TempFileGuard {
 }
 
 #[test]
+#[ignore = "requires VarDictJava integration test data (not in repo)"]
 fn test_tovars_builder_snapshot_fixture() {
     let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
 

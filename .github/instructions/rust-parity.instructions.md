@@ -122,6 +122,38 @@ Every parity bug fix **must** include a regression test that locks in the fix. T
 2. **Minimize**: Reduce to the smallest input (region, reads, options) that reproduces the diff
 3. **Fix**: Correct the Rust code to match Java behavior
 4. **Test**: Add a test — unit or integration — that fails without the fix and passes with it
-5. **Commit**: Fix and test go in the same commit
+5. **Run tests including ignored**: After any code modification, run `cargo test -- --include-ignored` locally to confirm that `#[ignore]`d tests (which require extra data) still compile and pass — they must not be silently broken by the change
+6. **Commit**: Fix and test go in the same commit
 
 This prevents regressions where fixing one parity issue silently re-breaks another.
+
+## Stop-on-Mismatch Sweep Strategy
+
+When running parity sweeps across chromosomes and configs:
+
+1. **One config × one chromosome at a time.** Do not fire-and-forget a full 250-cell sweep.
+2. **On any mismatch: STOP.** Do not continue to the next chromosome or config.
+3. **Fix the bug immediately.** Follow the Find → Fix → Test workflow above.
+4. **Rebuild the binary** with the fix compiled in.
+5. **Re-run the failed cell** to confirm the fix.
+6. **Then resume** the sweep from where it stopped.
+
+This ensures:
+- The binary under test is always the latest and best
+- No fix ever ships without its regression test
+- Failures don't accumulate, blurring signal
+- Monitoring time is replaced by fixing time
+
+**Exception**: If a failure is classified as **not a Rust bug** (e.g., Java heap OOM), document it and continue. Only stop for real parity mismatches.
+
+## Tiered Config Test Order
+
+When sweeping multiple configs per chromosome, run them in this order (cheapest/highest-signal first):
+
+1. **Core pipeline** (fast, catch most bugs): nosv (`-U`), freq-low (`-f 0.001`), fisher (`--fisher`)
+2. **Filter / variant options** (mid-cost): filter-0x700, chimeric, etc.
+3. **Combo configs**: clinical-wgs, inssize-small, etc.
+4. **Edge-case / expensive** (known failure-prone, run last): no-realign (`-k 0`), debug (`-D`)
+5. **Most expensive** (pileup — high memory, longest runtime): pileup (`-p`) and variants
+
+This order is encoded in the `TEST_MATRIX` array in `na12878_option_parity_v2.sh`. The harness iterates configs in array order, so reordering the array changes execution priority.

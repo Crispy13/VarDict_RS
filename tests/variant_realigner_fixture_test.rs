@@ -64,6 +64,7 @@ impl Drop for TempFileGuard {
 }
 
 #[test]
+#[ignore = "requires VarDictJava integration test data (not in repo)"]
 fn test_variant_realigner_snapshot_fixtures() {
     run_variant_realigner_fixture(
         "tests/fixtures/variant_realigner_chr20_168600_168800.jsonl",

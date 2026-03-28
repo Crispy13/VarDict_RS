@@ -7396,6 +7396,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires VarDictJava integration test data (not in repo)"]
     fn test_record_preprocessor_dump_all_bed_regions() {
         use crate::data::bam_reader::BamReader;
         use std::fs;

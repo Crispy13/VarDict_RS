@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -63,6 +64,18 @@ impl Drop for TempFileGuard {
     }
 }
 
+#[allow(invalid_reference_casting)]
+fn install_test_scope(scope: GlobalReadOnlyScope) {
+    if let Some(existing) = INSTANCE.get() {
+        unsafe {
+            let ptr = existing as *const GlobalReadOnlyScope as *mut GlobalReadOnlyScope;
+            let _ = std::ptr::replace(ptr, scope);
+        }
+    } else {
+        let _ = INSTANCE.set(scope);
+    }
+}
+
 #[test]
 fn test_structural_variants_snapshot_fixture() {
     let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
@@ -108,7 +121,7 @@ fn test_structural_variants_snapshot_fixture() {
         scope
     };
     scope.chr_lens = shared_reference.get_chromosome_lengths();
-    let _ = INSTANCE.set(scope.clone());
+    install_test_scope(scope.clone());
 
     let instance = Arc::new(scope);
 
@@ -131,4 +144,62 @@ fn test_structural_variants_snapshot_fixture() {
     let actual = fs::read_to_string(&output_path).expect("read snapshot");
 
     assert_eq!(actual, expected, "StructuralVariants snapshot mismatch");
+}
+
+#[test]
+#[ignore = "requires full NA12878 BAM + hs37d5 reference"]
+fn test_find_match_rev_persistent_extra_across_seeds() {
+    let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let bam_path =
+        manifest_dir.join("testdata/NA12878.mapped.ILLUMINA.bwa.CEU.low_coverage.20121211.bam");
+    let ref_path = manifest_dir.join("testdata/hs37d5.fa");
+
+    assert!(bam_path.exists(), "Missing BAM: {:?}", bam_path);
+    assert!(ref_path.exists(), "Missing reference: {:?}", ref_path);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_vardict"))
+        .current_dir(&manifest_dir)
+        .args([
+            "-G",
+            ref_path.to_str().expect("reference path"),
+            "-b",
+            bam_path.to_str().expect("bam path"),
+            "-N",
+            "NA12878",
+            "-f",
+            "0.01",
+            "-D",
+            "-R",
+            "19:11000001-12000000",
+        ])
+        .output()
+        .expect("failed to run vardict binary");
+
+    assert!(
+        output.status.success(),
+        "vardict failed with status {:?}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("vardict stdout was not UTF-8");
+
+    // Locks the chr19 debug INV row that previously lost the final `CAC` because
+    // find_match_rev_internal did not preserve persistent_extra across seed retries.
+    let inv_line = stdout
+        .lines()
+        .find(|line| line.starts_with("NA12878\t19\t19\t11413355\t11751316\tA\t<INV>\t"))
+        .unwrap_or_else(|| panic!("Missing chr19 INV regression row in debug output"));
+    let debug_column = inv_line
+        .rsplit('\t')
+        .next()
+        .expect("missing debug column on INV row");
+
+    assert!(
+        debug_column.contains("GTGTGTGTGTCAC:2:F-0:R-2"),
+        "Expected persistent_extra tail in debug column, got: {}",
+        debug_column
+    );
 }

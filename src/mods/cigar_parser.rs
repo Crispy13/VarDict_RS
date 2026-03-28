@@ -4637,6 +4637,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires VarDictJava integration test data (not in repo)"]
     fn test_cigar_parser_non_insertion_variants_first_bed_region() {
         use crate::conf::Configuration;
         use crate::data::bam_reader::BamReader;
