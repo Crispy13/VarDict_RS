@@ -2759,6 +2759,8 @@ impl CigarParser {
     /// 2. If next CIGAR is Match, look for mismatches using vext algorithm
     /// 3. Combine insertion + following mismatches into complex variant
     /// 4. Store variant at position `start - 1` (position before insertion)
+    /// Ported from: `com.astrazeneca.vardict.modules.CigarParser.processInsertion()`
+    /// Java source: CigarParser.java:L917-L1120
     fn process_insertion(
         &mut self,
         query_seq: &[u8],
@@ -2873,7 +2875,7 @@ impl CigarParser {
         } else if is_next_matched(cigar, ci) {
             let mlen = cigar.get(ci + 1).unwrap().len() as usize;
             let start_idx = self.read_pos_including_softclip + ins_len;
-            let (offset, nmoff_delta) = scan_offset_extension(
+            let (offset, nmoff_delta) = scan_insertion_offset_extension(
                 &self.reference,
                 self.start,
                 start_idx,
@@ -2882,8 +2884,6 @@ impl CigarParser {
                 query_qual,
                 instance().conf.goodq,
                 instance().conf.vext as usize,
-                true,
-                false,
             )?;
             self.offset = offset;
             nmoff += nmoff_delta;
@@ -4246,6 +4246,33 @@ fn scan_offset_extension(
     Ok((offset, nmoff))
 }
 
+/// Ported from: `com.astrazeneca.vardict.modules.CigarParser.findOffset()`
+/// Java source: CigarParser.java:L1502-L1535
+fn scan_insertion_offset_extension(
+    reference: &Reference,
+    ts: i64,
+    tn: usize,
+    seg_len: usize,
+    query_seq: &[u8],
+    query_qual: &[u8],
+    goodq: f64,
+    vext: usize,
+) -> Result<(usize, usize), Error> {
+    // NOTE: Java treats reference 'N' as a mismatch in insertion look-ahead.
+    scan_offset_extension(
+        reference,
+        ts,
+        tn,
+        seg_len,
+        query_seq,
+        query_qual,
+        goodq,
+        vext,
+        false,
+        false,
+    )
+}
+
 #[inline]
 fn is_next_ins(cigar: &CigarStringView, ci: usize) -> bool {
     if !instance().conf.perform_local_realignment {
@@ -4554,6 +4581,27 @@ mod tests {
 
         assert_eq!(stop_on_ref_n, (0, 0));
         assert_eq!(allow_ref_n_mismatch, (3, 1));
+    }
+
+    #[test]
+    fn test_scan_insertion_offset_extension_treats_reference_n_as_mismatch() {
+        let reference = Reference::new_with_start(b"NAAA".to_vec(), 1);
+        let query_seq = b"AAAA";
+        let query_qual = [30u8; 4];
+
+        let result = scan_insertion_offset_extension(
+            &reference,
+            1,
+            0,
+            query_seq.len(),
+            query_seq,
+            &query_qual,
+            20.0,
+            3,
+        )
+        .expect("scan should succeed");
+
+        assert_eq!(result, (1, 1));
     }
 
     #[test]
