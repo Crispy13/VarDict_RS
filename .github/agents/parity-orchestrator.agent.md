@@ -47,7 +47,8 @@ You don't have access to `execute` (including terminal). You must delegate any t
 3. **Implement**: Delegate to `rust-implementer` with the analysis results to write/fix Rust code
 4. **Test**: Delegate to `parity-tester` to validate output matches Java reference
 5. **Review**: Delegate to `code-reviewer` to check correctness, performance, and extensibility
-6. **Iterate**: If parity test fails, loop back to step 2 with the specific mismatch details
+6. **Performance Gate**: Verify the code-reviewer's Performance Verdict (see Performance Gate Protocol below)
+7. **Iterate**: If parity test fails, loop back to step 2 with the specific mismatch details
 
 ### For a Parity Bug Fix:
 
@@ -56,6 +57,22 @@ You don't have access to `execute` (including terminal). You must delegate any t
 3. **Fix**: Delegate to `rust-implementer` with the exact Java logic that needs matching
 4. **Validate**: Delegate to `parity-tester` to confirm the fix
 5. **Review**: Delegate to `code-reviewer` for quality gate
+6. **Performance Gate**: Verify the code-reviewer's Performance Verdict (see Performance Gate Protocol below)
+
+## Performance Gate Protocol
+
+After the code-reviewer produces a Performance Verdict (using the `change-impact-review` skill), act on the result:
+
+| Verdict | Action |
+|---------|--------|
+| `PERF_SAFE` | Proceed — mark step complete |
+| `PERF_RISK` | Log the risk, notify the user with benchmark evidence, proceed if user acknowledges |
+| `PERF_REGRESSION` | **BLOCK**. Do NOT mark complete. Choose one escalation path: |
+
+**PERF_REGRESSION escalation options**:
+1. **Redesign** — Ask `rust-implementer` for an alternative implementation that preserves parity without the regression
+2. **Deep profile** — Invoke the `perf-optimization` skill to identify root cause and targeted fix
+3. **User decision** — Present the trade-off (correctness gain vs performance cost) and let the user decide
 
 ## Module Priority Order
 

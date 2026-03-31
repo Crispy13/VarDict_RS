@@ -63,12 +63,16 @@ End-to-end workflow for achieving and verifying 100% output parity between a Var
 11. **Delegate to code-reviewer**: Request quality review covering:
     - Parity correctness checklist
     - Idiomatic Rust compliance
-    - Performance assessment
+    - Performance impact assessment (using `change-impact-review` skill)
     - Extensibility evaluation
-12. **Address review findings**:
+12. **Verify Performance Verdict**: Confirm the code-reviewer produced a Performance Verdict:
+    - `PERF_SAFE` → proceed
+    - `PERF_RISK` → document and notify user
+    - `PERF_REGRESSION` → STOP, escalate before proceeding
+13. **Address review findings**:
     - Blocking issues → loop back to Phase 2
     - Non-blocking suggestions → create follow-up tasks
-13. **Mark module as verified**: Update tracking with parity status
+14. **Mark module as verified**: Update tracking with parity status
 
 ## Iteration Protocol
 
@@ -101,5 +105,6 @@ A module passes parity check when:
 - [ ] Rust output is byte-identical to Java output for all test inputs
 - [ ] All edge cases from the analysis are tested
 - [ ] Code review has no blocking issues
+- [ ] Performance Verdict is `PERF_SAFE` or `PERF_RISK` (with documented justification)
 - [ ] `cargo test` passes for the module
 - [ ] `cargo clippy` has no warnings for the module

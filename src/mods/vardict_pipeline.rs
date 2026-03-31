@@ -3835,6 +3835,8 @@ impl VarDictPipeline {
                 total_pos_coverage,
                 ref_var,
                 reference,
+                shared_reference,
+                region.chr(),
                 reference_forward_coverage,
                 reference_reverse_coverage,
                 duprate,
@@ -3853,6 +3855,8 @@ impl VarDictPipeline {
                     total_pos_coverage,
                     ref_var,
                     reference,
+                    shared_reference,
+                    region.chr(),
                     reference_forward_coverage,
                     reference_reverse_coverage,
                     duprate,
@@ -3943,6 +3947,8 @@ impl VarDictPipeline {
         total_pos_coverage: usize,
         vref: &mut Variant,
         reference: &Reference,
+        shared_reference: Option<&SharedReferenceHandle>,
+        chromosome: &str,
         reference_forward_coverage: usize,
         reference_reverse_coverage: usize,
         duprate: f64,
@@ -3964,8 +3970,8 @@ impl VarDictPipeline {
         vref.high_quality_reads_frequency =
             round_half_even("0.0000", vref.high_quality_reads_frequency);
 
-        let reference_base = reference
-            .get(position)
+        let reference_base = self
+            .get_reference_base_with_fallback(reference, shared_reference, chromosome, position)
             .map(|b| (b as char).to_string())
             .unwrap_or_default();
 
@@ -6620,6 +6626,7 @@ fn var_type_label_to_enum(var_type: &str, varallele: &str) -> VarType {
         "SNV" => VarType::SNV(varallele.chars().next().unwrap_or('N')),
         "Insertion" => VarType::Insertion(String::new()),
         "Deletion" => VarType::Deletion(0),
+        "" => VarType::SNV('N'),
         _ => VarType::Complex {
             insertion: String::new(),
             deletion: 0,
@@ -6995,6 +7002,73 @@ mod tests {
         assert_eq!(variant.start_position, 104);
         assert_eq!(variant.end_position, 2104);
         assert_eq!(variant.rightseq, "ACGTACGTACGTACGTACGT");
+    }
+
+    #[test]
+    fn test_collect_reference_variants_uses_shared_reference_for_ref_variant_base() {
+        use crate::data::reference::Reference;
+        use crate::data::region::Region;
+        use crate::data::shared_reference::{ChromosomeData, SharedReference};
+        use crate::mods::to_vars_builder::{StrandBiasFlag, StrandBiasValue};
+        use std::sync::Arc;
+
+        let pipeline = VarDictPipeline::new("test");
+
+        let reference = Reference::new_with_start(b"ACGT".to_vec(), 100);
+        let region = Region::new("chr1".to_string(), 100, 103, "GENE".to_string());
+
+        let mut full_sequence = vec![b'A'; 1_100];
+        full_sequence[999] = b'T';
+
+        let mut chromosomes: HashMap<String, ChromosomeData, LibDefaultHasher> = Default::default();
+        chromosomes.insert(
+            "chr1".to_string(),
+            ChromosomeData {
+                sequence: Arc::new(full_sequence),
+                length: 1_100,
+            },
+        );
+        let shared_reference = Arc::new(SharedReference {
+            chromosomes,
+            chromosome_names: vec!["chr1".to_string()],
+            total_size: 1_100,
+        });
+
+        let ref_variant = Variant {
+            description_string: "T".to_string(),
+            strand_bias_flag: StrandBiasFlag::new(
+                StrandBiasValue::NoBias,
+                StrandBiasValue::CantAssess,
+            ),
+            ..Variant::new()
+        };
+
+        let mut vars = Vars {
+            variants: Vec::new(),
+            reference_variant: Some(ref_variant),
+            ..Vars::default()
+        };
+
+        pipeline.collect_reference_variants(
+            1_000,
+            10,
+            &RawVarMap::default(),
+            &mut vars,
+            &RefCovMap::default(),
+            &mut RawVarByPos::default(),
+            &reference,
+            &region,
+            Some(&shared_reference),
+            &[],
+            &HistoricalDelRightseqMap::default(),
+            &mut Vec::new(),
+            0.0,
+        );
+
+        let ref_variant = vars.reference_variant.as_ref().expect("ref variant");
+        assert_eq!(ref_variant.refallele, "T");
+        assert_eq!(ref_variant.varallele, "T");
+        assert_eq!(ref_variant.genotype, "T/T");
     }
 
     #[test]

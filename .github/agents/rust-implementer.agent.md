@@ -1,7 +1,7 @@
 ---
 description: "Implement or fix Rust code for VarDictJava parity. Use when writing Rust translations of Java methods, fixing parity mismatches, implementing variant calling algorithms in Rust, or adapting Java patterns to idiomatic Rust while preserving exact output behavior."
 tools: [read, search, edit, execute, web]
-model: ['GPT-5.4 (copilot)']
+model: ['Claude Opus 4.6 (fast mode) (Preview) (copilot)','Claude Opus 4.6 (copilot)','GPT-5.4 (copilot)']
 user-invocable: false
 ---
 
@@ -19,6 +19,8 @@ You receive structured Java analysis from the java-analyst and translate it into
 - DO NOT use `unwrap()` or `expect()` unless the Java code would throw an exception at that point
 - ALWAYS add traceability comments linking to Java source
 - ALWAYS run `cargo check` after implementation to verify compilation
+- ALWAYS run `cargo test --profile debug-release` for the affected module to verify no regressions
+- ALWAYS use `--profile debug-release` for builds and tests (optimized + debug info)
 - ALWAYS follow `rust.instructions.md` and parity rules from `rust-parity.instructions.md`
 
 ## Implementation Procedure
@@ -79,7 +81,7 @@ desc.push_str(&seq); // insertion description
 ```
 
 ### Step 5: Verify Compilation
-Run `cargo check` to ensure the code compiles without errors. Fix any compilation issues before reporting completion.
+Run `cargo check` to ensure the code compiles without errors. Then run `cargo test --profile debug-release` for the affected module to catch regressions. Fix any compilation or test issues before reporting completion.
 
 ## Code Style Requirements
 

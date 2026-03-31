@@ -1,7 +1,7 @@
 ---
 description: "Review Rust code for parity correctness, performance, extensibility, and idiomatic style. Use when reviewing ported VarDict methods, auditing parity-critical logic, checking for common porting mistakes, or validating code quality before merge."
 tools: [read, search, execute, edit, web]
-model: ['Claude Opus 4.6 (copilot)']
+model: ['Claude Opus 4.6 (fast mode) (Preview) (copilot)','Claude Opus 4.6 (copilot)',]
 user-invocable: false
 ---
 
@@ -41,13 +41,14 @@ You review Rust code against its Java original and provide structured feedback. 
 - [ ] **Clippy clean**: No obvious clippy warnings
 - [ ] **Documentation**: Traceability comments linking to Java source
 
-### 3. Performance (Advisory)
+### 3. Performance Impact (Binding)
 
-- [ ] **No unnecessary cloning**: Identify `clone()` calls that could be borrows
-- [ ] **No premature `collect()`**: Iterators stay lazy until needed
-- [ ] **Allocation efficiency**: Preallocates `Vec` with `with_capacity()` where size is known
-- [ ] **String building**: Uses `String::with_capacity()` for known-size output
-- [ ] **Hot path awareness**: Critical loops (per-read, per-base) are allocation-free where possible
+Use the `change-impact-review` skill to classify risk and benchmark when required.
+
+- [ ] **Risk classified**: Change is classified as HIGH / MEDIUM / LOW using the skill's decision tree
+- [ ] **Benchmark run** (if MEDIUM or HIGH): Before/after benchmark completed with results recorded
+- [ ] **Verdict produced**: `PERF_SAFE`, `PERF_RISK`, or `PERF_REGRESSION` with evidence
+- [ ] **PERF_REGRESSION blocks approval**: If verdict is `PERF_REGRESSION`, do NOT approve — escalate to orchestrator
 
 ### 4. Extensibility (Advisory)
 
@@ -64,7 +65,7 @@ You review Rust code against its Java original and provide structured feedback. 
 
 **File**: path/to/file.rs
 **Ported From**: Java class.method()
-**Verdict**: APPROVE / REQUEST CHANGES / NEEDS PARITY TEST
+**Verdict**: APPROVE / REQUEST CHANGES / NEEDS PARITY TEST / PERF_REGRESSION
 
 ### Blocking Issues
 1. **{Issue}** (Line {N}): {Description}
@@ -77,8 +78,13 @@ You review Rust code against its Java original and provide structured feedback. 
    - Current: {code snippet}
    - Suggested: {improved code}
 
-### Performance Notes
-1. (Line {N}): {observation and recommendation}
+### Performance Verdict
+
+**Risk**: {HIGH | MEDIUM | LOW}
+**Modules touched**: {list of hot-path modules, or "none (cold path)"}
+**Benchmark**: {bench name and result, or "not required (LOW risk)"}
+**Verdict**: {PERF_SAFE | PERF_RISK | PERF_REGRESSION}
+**Evidence**: {one-line summary}
 
 ### Parity Risk Assessment
 - HIGH: {list of areas needing parity testing}

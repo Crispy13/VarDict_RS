@@ -11,7 +11,7 @@ You MUST perform the following interactive workflow:
    - If it has nothing to do with any active mission, do not read or update any mission planning files unless the user explicitly asks.
    - Ask the user with `vscode_askQuestions` only if the mission still cannot be resolved safely.
 
-2. **Interactive Planning:** Use skill 'plan' to generate actionable steps resolving the user's request and present the plan directly within your chat message.
+2. **Interactive Planning:** Run the *Planner* subagent to generate actionable steps resolving the user's request and present the plan directly within your chat message.
    - For side quests, the plan should be generated from the user's request and the history of the current session rather than from mission planning files.
    - You MUST use the `vscode_askQuestions` tool to seek the user's explicit confirmation.
    - Do NOT place the plan text inside the tool's question property; output the plan plainly in the main chat.

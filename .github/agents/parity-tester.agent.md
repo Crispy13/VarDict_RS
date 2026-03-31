@@ -1,7 +1,7 @@
 ---
 description: "Test and validate output parity between VarDictJava and Rust port. Use when comparing outputs, creating parity test cases, debugging output mismatches, running diff analysis, or verifying byte-identical results across Simple, Somatic, and Amplicon modes."
 tools: [read, search, edit, execute]
-model: ['GPT-5.4 (copilot)']
+model: ['Claude Opus 4.6 (fast mode) (Preview) (copilot)','Claude Opus 4.6 (copilot)','GPT-5.4 (copilot)']
 user-invocable: false
 ---
 
@@ -51,7 +51,7 @@ For integration tests, use shell commands to compare outputs:
 java -jar VarDict.jar -G ref.fa -b test.bam -N sample regions.bed > java_output.tsv
 
 # Run Rust implementation
-./target/release/vardict -G ref.fa -b test.bam -N sample regions.bed > rust_output.tsv
+./target/debug-release/vardict -G ref.fa -b test.bam -N sample regions.bed > rust_output.tsv
 
 # Compare
 diff java_output.tsv rust_output.tsv

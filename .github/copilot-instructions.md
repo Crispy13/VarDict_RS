@@ -36,18 +36,24 @@ SAMFileParser → RecordPreprocessor → CigarParser → VariationRealigner
 6. **String handling**: Use `String`/`&str` with UTF-8; genomic data is ASCII-safe but validate at boundaries
 7. **Tab-delimited output**: Columns must match exactly — count, order, and content
 
-## Build and Test
+## Environment
+- **Python / Build Environment:** You MUST ALWAYS prioritize using the `rust_build_env` conda environment (`conda activate rust_build_env`). There is no need to source `conda.sh` unless you invoke a new shell. 
+- **LIBCLANG_PATH env var:** set `LIBCLANG_PATH=$CONDA_PREFIX/lib` after activating the conda environment.
+- **Conda/venv Fallback:** If the `rust_build_env` Conda environment does not work, DO NOT guess or fail silently. IMMEDIATELY stop, report the exact problem to the user, and explicitly ask whether you should continue using Conda or switch to a Python `venv`.
+- **Temporary Files:** You MUST ALWAYS use `./tmp` for creating any temporary or intermediate files. NEVER use the system `/tmp` directory.
 
+## Build and Test
+You MUST use `debug-release` profile instead of `release` for all development task.
 ```bash
 # Build
-cargo build --release
+cargo build --profile debug-release
 
 # Run tests
 cargo test
 
 # Run parity test against Java output
 # (compare Rust output with reference Java output for test regions)
-diff <(./target/release/vardict -G ref.fa -b test.bam -N sample regions.bed) expected_java_output.tsv
+diff <(./target/debug-release/vardict -G ref.fa -b test.bam -N sample regions.bed) expected_java_output.tsv
 
 # Lint
 cargo clippy -- -D warnings

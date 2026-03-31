@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::Write;
 
 use crackle_kit::nuc_base_map::NucBaseMap;
 use indexmap::IndexMap;
@@ -174,53 +175,54 @@ impl VarDesc {
 
     /// Convert to variant key string (for backward compatibility)
     pub fn to_key_string(&self) -> String {
+        use std::fmt::Write;
         match self {
-            VarDesc::SNV { ref_base } => {
-                // Only ref_base is stored, alt is determined from read data
-                format!("{}", char::from(*ref_base))
-            }
+            VarDesc::SNV { ref_base } => String::from(*ref_base as char),
             VarDesc::Ins { seq } => {
-                format!("+{}", String::from_utf8_lossy(seq))
+                let mut s = String::with_capacity(1 + seq.len());
+                s.push('+');
+                // Genomic sequences are ASCII-safe (project convention)
+                s.push_str(std::str::from_utf8(seq).unwrap());
+                s
             }
-            VarDesc::Del { len, .. } => {
-                let mut out = format!("-{}", len);
-                if let VarDesc::Del {
-                    match_seq,
-                    ins_or_del_len,
-                    mismatch_seq,
-                    ..
-                } = self
-                {
-                    if !match_seq.is_empty() {
-                        out.push('#');
-                        out.push_str(&String::from_utf8_lossy(match_seq));
-                    }
-                    match ins_or_del_len {
-                        InsOrDelLen::InsSeq(seq) => {
-                            out.push('^');
-                            out.push_str(&String::from_utf8_lossy(seq));
-                        }
-                        InsOrDelLen::DelLen(n) => {
-                            out.push('^');
-                            out.push_str(&n.to_string());
-                        }
-                        InsOrDelLen::None => {}
-                    }
-                    if !mismatch_seq.is_empty() {
-                        out.push('&');
-                        out.push_str(&String::from_utf8_lossy(mismatch_seq));
-                    }
+            VarDesc::Del {
+                len,
+                match_seq,
+                ins_or_del_len,
+                mismatch_seq,
+            } => {
+                let mut s = String::with_capacity(4 + match_seq.len() + mismatch_seq.len());
+                s.push('-');
+                write!(s, "{len}").unwrap();
+                if !match_seq.is_empty() {
+                    s.push('#');
+                    s.push_str(std::str::from_utf8(match_seq).unwrap());
                 }
-                out
+                match ins_or_del_len {
+                    InsOrDelLen::InsSeq(seq) => {
+                        s.push('^');
+                        s.push_str(std::str::from_utf8(seq).unwrap());
+                    }
+                    InsOrDelLen::DelLen(n) => {
+                        s.push('^');
+                        write!(s, "{n}").unwrap();
+                    }
+                    InsOrDelLen::None => {}
+                }
+                if !mismatch_seq.is_empty() {
+                    s.push('&');
+                    s.push_str(std::str::from_utf8(mismatch_seq).unwrap());
+                }
+                s
             }
             VarDesc::Complex { ref_seq, alt_seq } => {
-                format!(
-                    "{}>{}",
-                    String::from_utf8_lossy(ref_seq),
-                    String::from_utf8_lossy(alt_seq)
-                )
+                let mut s = String::with_capacity(ref_seq.len() + 1 + alt_seq.len());
+                s.push_str(std::str::from_utf8(ref_seq).unwrap());
+                s.push('>');
+                s.push_str(std::str::from_utf8(alt_seq).unwrap());
+                s
             }
-            VarDesc::Raw { desc } => String::from_utf8_lossy(desc).to_string(),
+            VarDesc::Raw { desc } => String::from_utf8_lossy(desc).into_owned(),
         }
     }
 }
@@ -233,7 +235,46 @@ impl Default for VarDesc {
 
 impl std::fmt::Display for VarDesc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_key_string())
+        match self {
+            VarDesc::SNV { ref_base } => f.write_char(*ref_base as char),
+            VarDesc::Ins { seq } => {
+                f.write_char('+')?;
+                f.write_str(std::str::from_utf8(seq).unwrap())
+            }
+            VarDesc::Del {
+                len,
+                match_seq,
+                ins_or_del_len,
+                mismatch_seq,
+            } => {
+                write!(f, "-{len}")?;
+                if !match_seq.is_empty() {
+                    f.write_char('#')?;
+                    f.write_str(std::str::from_utf8(match_seq).unwrap())?;
+                }
+                match ins_or_del_len {
+                    InsOrDelLen::InsSeq(seq) => {
+                        f.write_char('^')?;
+                        f.write_str(std::str::from_utf8(seq).unwrap())?;
+                    }
+                    InsOrDelLen::DelLen(n) => write!(f, "^{n}")?,
+                    InsOrDelLen::None => {}
+                }
+                if !mismatch_seq.is_empty() {
+                    f.write_char('&')?;
+                    f.write_str(std::str::from_utf8(mismatch_seq).unwrap())?;
+                }
+                Ok(())
+            }
+            VarDesc::Complex { ref_seq, alt_seq } => {
+                f.write_str(std::str::from_utf8(ref_seq).unwrap())?;
+                f.write_char('>')?;
+                f.write_str(std::str::from_utf8(alt_seq).unwrap())
+            }
+            VarDesc::Raw { desc } => {
+                write!(f, "{}", String::from_utf8_lossy(desc))
+            }
+        }
     }
 }
 

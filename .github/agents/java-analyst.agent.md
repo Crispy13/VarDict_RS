@@ -1,7 +1,7 @@
 ---
 description: "Analyze VarDictJava source code for porting. Use when extracting algorithm logic, mapping control flow, identifying edge cases, tracing data flow through Java methods, or understanding VarDict's CIGAR parsing, realignment, SV detection, and variant building logic."
 tools: [read, search, web]
-model: ['Claude Opus 4.6 (copilot)']
+model: ['Claude Opus 4.6 (fast mode) (Preview) (copilot)','Claude Opus 4.6 (copilot)',]
 user-invocable: false
 ---
 

@@ -1339,6 +1339,8 @@ impl StructuralVariantsProcessor {
         }
     }
 
+    /// Ported from: `com.astrazeneca.vardict.modules.StructuralVariantsProcessor.findsv()`
+    /// Java source: `StructuralVariantsProcessor.java:L899-L1196`
     fn find_svs_del_candidates(
         &mut self,
         data: &mut RealignedVariationData,
@@ -1378,6 +1380,17 @@ impl StructuralVariantsProcessor {
                 .unwrap_or(true);
             let softp2sv_val = Self::is_softp2sv_first_used(data, p5);
 
+            if Self::should_trace_findsv_candidate(p5, None) {
+                event!(
+                    Level::TRACE,
+                    phase = "findsv_5_softclip",
+                    p5,
+                    cnt5,
+                    used = used_val,
+                    softp2sv_used = softp2sv_val,
+                );
+            }
+
             if used_val {
                 continue;
             }
@@ -1391,12 +1404,31 @@ impl StructuralVariantsProcessor {
                 };
                 self.find_conseq(sc5v)
             };
+            if Self::should_trace_findsv_candidate(p5, None) {
+                event!(
+                    Level::TRACE,
+                    phase = "findsv_5_conseq",
+                    p5,
+                    cnt5,
+                    seq_len = seq.len(),
+                    seq = %String::from_utf8_lossy(&seq),
+                );
+            }
             if seq.is_empty() || seq.len() < Configuration::SEED_2 as usize {
                 continue;
             }
 
             let m = self.find_match(&seq, p5, -1, Configuration::SEED_1 as usize, 3);
             let mut bp = m.base_position;
+            if Self::should_trace_findsv_candidate(p5, Some(bp)) {
+                event!(
+                    Level::TRACE,
+                    phase = "findsv_5_direct_match",
+                    p5,
+                    cnt5,
+                    bp,
+                );
+            }
             event!(Level::DEBUG, phase = "findsv_5_candidate", p5, cnt5, bp,);
             if bp != 0 {
                 if bp < p5 {
@@ -1475,13 +1507,38 @@ impl StructuralVariantsProcessor {
                     // candidate duplication
                 }
             } else {
-                let m_rev = self.find_match_rev(&seq, p5, -1, Configuration::SEED_1 as usize, 3);
+                let m_rev = self.find_match_rev_findsv(&seq, p5, -1);
                 bp = m_rev.base_position;
                 let extra = m_rev.matched_sequence;
+                if Self::should_trace_findsv_candidate(p5, Some(bp)) {
+                    let java_len_check = bp > p5 && bp - p5 > 150;
+                    event!(
+                        Level::TRACE,
+                        phase = "findsv_5_reverse_match",
+                        p5,
+                        cnt5,
+                        bp,
+                        extra_len = extra.len(),
+                        extra = %String::from_utf8_lossy(&extra),
+                        java_len_check,
+                    );
+                }
                 if bp == 0 {
                     continue;
                 }
-                if (bp - p5).abs() <= Configuration::SVFLANK as i64 {
+                let flank_ok = (bp - p5).abs() > Configuration::SVFLANK as i64;
+                if Self::should_trace_findsv_candidate(p5, Some(bp)) {
+                    event!(
+                        Level::TRACE,
+                        phase = "findsv_5_length_gate",
+                        p5,
+                        bp,
+                        flank_ok,
+                        flank_gap = (bp - p5).abs(),
+                        java_len_check = bp > p5 && bp - p5 > 150,
+                    );
+                }
+                if !flank_ok {
                     continue;
                 }
 
@@ -1552,6 +1609,10 @@ impl StructuralVariantsProcessor {
                     adj_cnt_from_variant(variation, &sc5_var);
                 }
 
+                if let Some(sc5v) = data.soft_clips_5end.get_mut(&p5) {
+                    sc5v.mark_used();
+                }
+
                 Self::inc_ref_coverage(&mut data.ref_coverage, p5_inv, cnt5);
                 if let Some(bp_cov) = data.ref_coverage.get(&bp).copied() {
                     let p5_cov = data.ref_coverage.get(&p5_inv).copied().unwrap_or(0);
@@ -1592,6 +1653,17 @@ impl StructuralVariantsProcessor {
                 .unwrap_or(true);
             let softp2sv_val = Self::is_softp2sv_first_used(data, p3);
 
+            if Self::should_trace_findsv_candidate(p3, None) {
+                event!(
+                    Level::TRACE,
+                    phase = "findsv_3_softclip",
+                    p3,
+                    cnt3,
+                    used = used_val,
+                    softp2sv_used = softp2sv_val,
+                );
+            }
+
             if used_val {
                 continue;
             }
@@ -1605,12 +1677,31 @@ impl StructuralVariantsProcessor {
                 };
                 self.find_conseq(sc3v)
             };
+            if Self::should_trace_findsv_candidate(p3, None) {
+                event!(
+                    Level::TRACE,
+                    phase = "findsv_3_conseq",
+                    p3,
+                    cnt3,
+                    seq_len = seq.len(),
+                    seq = %String::from_utf8_lossy(&seq),
+                );
+            }
             if seq.is_empty() || seq.len() < Configuration::SEED_2 as usize {
                 continue;
             }
 
             let m = self.find_match(&seq, p3, 1, Configuration::SEED_1 as usize, 3);
             let mut bp = m.base_position;
+            if Self::should_trace_findsv_candidate(p3, Some(bp)) {
+                event!(
+                    Level::TRACE,
+                    phase = "findsv_3_direct_match",
+                    p3,
+                    cnt3,
+                    bp,
+                );
+            }
             event!(Level::DEBUG, phase = "findsv_3_candidate", p3, cnt3, bp,);
             if bp != 0 {
                 if bp > p3 {
@@ -1700,13 +1791,38 @@ impl StructuralVariantsProcessor {
                     // candidate duplication
                 }
             } else {
-                let m_rev = self.find_match_rev(&seq, p3, 1, Configuration::SEED_1 as usize, 3);
+                let m_rev = self.find_match_rev_findsv(&seq, p3, 1);
                 bp = m_rev.base_position;
                 let extra = m_rev.matched_sequence;
+                if Self::should_trace_findsv_candidate(p3, Some(bp)) {
+                    let java_len_check = bp > p3 && bp - p3 > 150;
+                    event!(
+                        Level::TRACE,
+                        phase = "findsv_3_reverse_match",
+                        p3,
+                        cnt3,
+                        bp,
+                        extra_len = extra.len(),
+                        extra = %String::from_utf8_lossy(&extra),
+                        java_len_check,
+                    );
+                }
                 if bp == 0 {
                     continue;
                 }
-                if (bp - p3).abs() <= Configuration::SVFLANK as i64 {
+                let flank_ok = (bp - p3).abs() > Configuration::SVFLANK as i64;
+                if Self::should_trace_findsv_candidate(p3, Some(bp)) {
+                    event!(
+                        Level::TRACE,
+                        phase = "findsv_3_length_gate",
+                        p3,
+                        bp,
+                        flank_ok,
+                        flank_gap = (bp - p3).abs(),
+                        java_len_check = bp > p3 && bp - p3 > 150,
+                    );
+                }
+                if !flank_ok {
                     continue;
                 }
 
@@ -1774,6 +1890,10 @@ impl StructuralVariantsProcessor {
                     adj_cnt_from_variant(variation, &sc3_var);
                 }
 
+                if let Some(sc3v) = data.soft_clips_3end.get_mut(&p3) {
+                    sc3v.mark_used();
+                }
+
                 Self::inc_ref_coverage(&mut data.ref_coverage, p3, cnt3);
                 if let Some(bp_cov) = data.ref_coverage.get(&bp).copied() {
                     let p3_cov = data.ref_coverage.get(&p3).copied().unwrap_or(0);
@@ -1838,6 +1958,25 @@ impl StructuralVariantsProcessor {
         }
 
         best.map(|(_, used)| used).unwrap_or(false)
+    }
+
+    fn should_trace_findsv_candidate(softp: i64, bp: Option<i64>) -> bool {
+        let Ok(raw_target) = env::var("VARDICT_TRACE_FINDSV_POS") else {
+            return false;
+        };
+        let Ok(target) = raw_target.parse::<i64>() else {
+            return false;
+        };
+        let radius = env::var("VARDICT_TRACE_FINDSV_RADIUS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(100);
+
+        if (softp - target).abs() <= radius {
+            return true;
+        }
+
+        bp.is_some_and(|candidate_bp| (candidate_bp - target).abs() <= radius)
     }
 
     /// Ported from: `com.astrazeneca.vardict.modules.StructuralVariantsProcessor.findDELdisc()`
@@ -2778,7 +2917,32 @@ impl StructuralVariantsProcessor {
         seed_len: usize,
         mm: usize,
     ) -> MatchResult {
-        self.find_match_rev_internal(seq, position, dir, seed_len, mm, true)
+        self.find_match_rev_internal(seq, position, dir, seed_len, mm, true, false, false)
+    }
+
+    fn find_match_rev_findsv(&self, seq: &[u8], position: i64, dir: i64) -> MatchResult {
+        for (seed_len, mm, include_shared_reference_fallback) in [
+            (Configuration::SEED_1 as usize, 3usize, false),
+            (Configuration::SEED_2 as usize, 0usize, false),
+            (Configuration::SEED_1 as usize, 3usize, true),
+            (Configuration::SEED_2 as usize, 0usize, true),
+        ] {
+            let result = self.find_match_rev_internal(
+                seq,
+                position,
+                dir,
+                seed_len,
+                mm,
+                true,
+                include_shared_reference_fallback,
+                include_shared_reference_fallback,
+            );
+            if result.base_position != 0 {
+                return result;
+            }
+        }
+
+        MatchResult::default()
     }
 
     fn find_match_rev_internal(
@@ -2789,6 +2953,8 @@ impl StructuralVariantsProcessor {
         seed_len: usize,
         mm: usize,
         include_historical_windows: bool,
+        include_shared_reference_fallback: bool,
+        force_shared_reference_fallback: bool,
     ) -> MatchResult {
         let mut seq_work = seq.to_vec();
         if dir == 1 {
@@ -2807,8 +2973,19 @@ impl StructuralVariantsProcessor {
 
         for i in (0..=seq_work.len() - seed_len).rev() {
             let seed = &seq_work[i..i + seed_len];
-            let seeds =
-                self.seed_positions_with_scope(seed, include_historical_windows, false);
+            let seeds = if force_shared_reference_fallback {
+                self.seed_positions_with_findsv_scope(
+                    seed,
+                    include_historical_windows,
+                    include_shared_reference_fallback,
+                )
+            } else {
+                self.seed_positions_with_scope(
+                    seed,
+                    include_historical_windows,
+                    include_shared_reference_fallback,
+                )
+            };
             if seeds.len() != 1 {
                 continue;
             }
@@ -3602,6 +3779,21 @@ impl StructuralVariantsProcessor {
         positions
     }
 
+    fn seed_positions_with_findsv_scope(
+        &self,
+        seed: &[u8],
+        include_historical_windows: bool,
+        include_shared_reference_fallback: bool,
+    ) -> Vec<i64> {
+        let mut positions = self.seed_positions_with_scope(seed, include_historical_windows, false);
+
+        if include_historical_windows && include_shared_reference_fallback && positions.len() <= 1 {
+            self.extend_seed_positions_from_shared_reference(seed, &mut positions);
+        }
+
+        positions
+    }
+
     fn ensure_reference_span(&mut self, start: i64, end: i64) {
         if start > end {
             return;
@@ -3953,36 +4145,18 @@ impl StructuralVariantsProcessor {
         }
     }
 
-    fn extend_seed_positions_from_shared_reference(&self, seed: &[u8], positions: &mut Vec<i64>) {
-        if seed.is_empty() {
-            return;
-        }
-
-        let Some(shared_reference) = self.shared_reference.as_ref() else {
-            return;
-        };
-        let Some(chromosome) = self.chromosome.as_deref() else {
-            return;
-        };
-        let Some(chromosome_data) = shared_reference.get_chromosome(chromosome) else {
-            return;
-        };
-
-        let sequence = &chromosome_data.sequence;
-        if sequence.len() < seed.len() {
-            return;
-        }
-
-        for offset in 0..=sequence.len() - seed.len() {
-            if &sequence[offset..offset + seed.len()] != seed {
-                continue;
-            }
-
-            let pos = offset as i64 + 1;
-            if !positions.contains(&pos) {
-                positions.push(pos);
-            }
-        }
+    /// Java's StructuralVariantsProcessor only looks up seeds from the bounded
+    /// `REF.seed` HashMap (the loaded reference window).  It never does a
+    /// chromosome-wide linear scan.  The previous Rust implementation scanned
+    /// the full chromosome (~249 MB for chr1) for every seed lookup that missed
+    /// the local window maps — O(chromosome_len × seed_len) per call —
+    /// causing 28× slowdown vs Java in pileup mode.
+    ///
+    /// Disabled to match Java behaviour.  If a seed is not present in the
+    /// current or historical window seed maps, it is simply "not found," the
+    /// same result Java produces.
+    fn extend_seed_positions_from_shared_reference(&self, _seed: &[u8], _positions: &mut Vec<i64>) {
+        // Intentionally a no-op — see doc comment above.
     }
 }
 
@@ -4094,6 +4268,7 @@ mod tests {
     use super::*;
     use crate::data::shared_reference::{ChromosomeData, SharedReference};
     use crate::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE};
+    use std::fs;
 
     #[test]
     fn test_processor_creation() {
@@ -4273,7 +4448,10 @@ mod tests {
         let seed = b"ACGTACGTACGA";
         let positions = processor.seed_positions(seed, true);
 
-        assert_eq!(positions, vec![21]);
+        // Java never scans the full chromosome for seeds — only bounded window
+        // HashMap lookups.  Seed at position 21 is outside all loaded windows,
+        // so it remains unfound (empty).
+        assert_eq!(positions, vec![]);
     }
 
     #[test]
@@ -4352,7 +4530,10 @@ mod tests {
         let seed = b"ACGTACGTACGA";
         let positions = processor.seed_positions(seed, true);
 
-        assert_eq!(positions, vec![21]);
+        // Java never scans the full chromosome for seeds.  Seed at position 21
+        // is outside the historical window [1,20] and the current window [41+],
+        // so it remains unfound.
+        assert_eq!(positions, vec![]);
     }
 
     #[test]
@@ -4403,9 +4584,12 @@ mod tests {
             processor.seed_positions_with_scope(seed, true, false),
             vec![21]
         );
+        // With the shared-reference fallback disabled (matching Java), only
+        // seeds found in loaded windows are returned — position 53 from the
+        // full-chromosome scan is no longer produced.
         assert_eq!(
             processor.seed_positions_with_scope(seed, true, true),
-            vec![21, 53]
+            vec![21]
         );
     }
 
@@ -4524,6 +4708,62 @@ mod tests {
         assert_eq!(data.sv_counts.get(&300).map(|sv| sv.pairs), Some(10));
         assert_eq!(data.sv_counts.get(&300).map(|sv| sv.splits), Some(1));
         assert!(data.svfdel[0].used());
+    }
+
+    #[test]
+    fn test_find_match_rev_findsv_can_use_shared_reference_fallback() {
+        let chrom = "testchr".to_string();
+        let target = b"ACGTACGTACGA";
+        let mut soft_seq = target.to_vec();
+        soft_seq.reverse();
+        for base in &mut soft_seq {
+            *base = StructuralVariantsProcessor::complement_base_u8(*base);
+        }
+
+        let mut full_sequence = vec![b'A'; 120];
+        full_sequence[52..52 + target.len()].copy_from_slice(target);
+
+        let mut original_reference = Reference::new_with_start(full_sequence[..20].to_vec(), 1);
+        original_reference.build_seed_map(20, Some(full_sequence.len()));
+
+        let mut current_reference = Reference::new_with_start(full_sequence[40..80].to_vec(), 41);
+        current_reference.build_seed_map(full_sequence.len() as i64, Some(full_sequence.len()));
+
+        let mut chromosomes: HashMap<String, ChromosomeData, LibDefaultHasher> = Default::default();
+        chromosomes.insert(
+            chrom.clone(),
+            ChromosomeData {
+                sequence: Arc::new(full_sequence),
+                length: 120,
+            },
+        );
+
+        let shared_reference = Arc::new(SharedReference {
+            chromosomes,
+            chromosome_names: vec![chrom.clone()],
+            total_size: 120,
+        });
+
+        let mut processor = StructuralVariantsProcessor::new_with_context(
+            Arc::clone(&original_reference.ref_seq),
+            Arc::clone(&original_reference.seed),
+            1,
+            Some(chrom),
+            Vec::new(),
+            Some(shared_reference),
+        );
+
+        processor.reference_seq = Arc::clone(&current_reference.ref_seq);
+        processor.reference_seed = Arc::clone(&current_reference.seed);
+        processor.ref_start = 41;
+
+        assert_eq!(
+            processor
+                .find_match_rev(&soft_seq, 45, 1, Configuration::SEED_1 as usize, 3)
+                .base_position,
+            0
+        );
+        assert_eq!(processor.find_match_rev_findsv(&soft_seq, 45, 1).base_position, 64);
     }
 
     #[test]

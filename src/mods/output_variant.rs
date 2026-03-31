@@ -141,39 +141,8 @@ impl SimpleOutputVariant {
     pub fn from_variant(variant: &Variant, region: &Region, sample: &str, sv: &str) -> Self {
         let var_type_str = format_output_var_type(variant);
 
-        // Detect reference call (ref == alt)
-        let is_ref_call = variant.refallele == variant.varallele;
-
         // Bias is "ref_bias;var_bias" format for all calls (Java uses variant.strandBiasFlag)
         let bias = format_strand_bias(variant.strand_bias_flag);
-
-        // For reference calls, counts go to ref_fwd/ref_rev, not var_fwd/var_rev
-        let (variant_coverage, ref_fwd, ref_rev, var_fwd, var_rev, frequency) = if is_ref_call {
-            (
-                0, // variant_coverage = 0 for ref calls
-                variant.ref_forward_count,
-                variant.ref_reverse_count,
-                0, // var counts = 0
-                0,
-                0.0, // frequency = 0 for ref calls
-            )
-        } else {
-            (
-                variant.position_coverage,
-                variant.ref_forward_count, // Reference forward counts from same position
-                variant.ref_reverse_count, // Reference reverse counts from same position
-                variant.vars_count_on_forward,
-                variant.vars_count_on_reverse,
-                variant.frequency,
-            )
-        };
-
-        // For reference calls, vartype should be empty
-        let final_var_type = if is_ref_call {
-            String::new()
-        } else {
-            var_type_str
-        };
 
         let chr = normalize_chr_for_output(&region.chr);
         SimpleOutputVariant {
@@ -186,14 +155,14 @@ impl SimpleOutputVariant {
             var_allele: variant.varallele.clone(),
 
             total_coverage: variant.total_pos_coverage,
-            variant_coverage,
-            reference_forward_count: ref_fwd,
-            reference_reverse_count: ref_rev,
-            variant_forward_count: var_fwd,
-            variant_reverse_count: var_rev,
+            variant_coverage: variant.position_coverage,
+            reference_forward_count: variant.ref_forward_count,
+            reference_reverse_count: variant.ref_reverse_count,
+            variant_forward_count: variant.vars_count_on_forward,
+            variant_reverse_count: variant.vars_count_on_reverse,
 
             genotype: variant.genotype.clone(),
-            frequency,
+            frequency: variant.frequency,
             bias,
 
             pmean: variant.mean_position,
@@ -240,7 +209,7 @@ impl SimpleOutputVariant {
                 variant.rightseq.clone()
             },
             region: format!("{}:{}-{}", chr, region.display_start, region.end),
-            var_type: final_var_type,
+            var_type: var_type_str,
             duprate: variant.duprate,
             crispr: variant.crispr,
             sv: if sv.is_empty() {
@@ -1999,10 +1968,6 @@ fn format_var_type(var_type: &VarType) -> String {
 }
 
 fn format_output_var_type(variant: &Variant) -> String {
-    if variant.refallele == variant.varallele {
-        return String::new();
-    }
-
     if variant.varallele.starts_with('<')
         && variant.varallele.ends_with('>')
         && variant.varallele.len() >= 5
@@ -2010,7 +1975,10 @@ fn format_output_var_type(variant: &Variant) -> String {
         return var_type_string(&variant.refallele, &variant.varallele);
     }
 
-    format_var_type(&variant.vartype)
+    match &variant.vartype {
+        VarType::SNV(base) if *base == 'N' => String::new(),
+        _ => format_var_type(&variant.vartype),
+    }
 }
 
 /// Get column headers for 36-column format
@@ -2358,6 +2326,58 @@ mod tests {
 
         let output = SimpleOutputVariant::from_variant(&variant, &region, "sample", "0");
 
+        assert_eq!(output.var_type, "Complex");
+    }
+
+    #[test]
+    fn test_simple_output_variant_from_variant_preserves_complex_counts_when_ref_equals_alt() {
+        let region = Region::new("3", 60_000_000, 61_000_000, "3");
+        let variant = Variant {
+            description_string: "AAR".to_string(),
+            refallele: "A".to_string(),
+            varallele: "A".to_string(),
+            vartype: VarType::Complex {
+                insertion: "AR".to_string(),
+                deletion: 0,
+            },
+            start_position: 60_830_764,
+            end_position: 60_830_764,
+            vars_count_on_forward: 4,
+            vars_count_on_reverse: 4,
+            position_coverage: 8,
+            total_pos_coverage: 8,
+            frequency: 1.0,
+            threshold_frequency: 1.0,
+            high_quality_reads_frequency: 1.0,
+            extra_frequency: 0.0,
+            mean_position: 20.0,
+            mean_quality: 30.0,
+            mean_mapping_quality: 40.0,
+            strand_bias_flag: StrandBiasFlag::default(),
+            is_at_least_at_2_positions: true,
+            has_at_least_2_diff_qualities: true,
+            leftseq: "AACCGGTT".to_string(),
+            rightseq: "TTGGCCAA".to_string(),
+            msi: 0.0,
+            msint: 0.0,
+            shift3: 0,
+            nm: 0.0,
+            high_qual_read_cnt: 4,
+            low_qual_read_cnt: 0,
+            hicov: 4,
+            ref_forward_count: 0,
+            ref_reverse_count: 0,
+            genotype: "AAR/AA".to_string(),
+            duprate: 0.0,
+            crispr: 0,
+        };
+
+        let output = SimpleOutputVariant::from_variant(&variant, &region, "sample", "0");
+
+        assert_eq!(output.variant_coverage, 8);
+        assert_eq!(output.variant_forward_count, 4);
+        assert_eq!(output.variant_reverse_count, 4);
+        assert_eq!(output.frequency, 1.0);
         assert_eq!(output.var_type, "Complex");
     }
 
