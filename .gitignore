@@ -18,3 +18,9 @@ note.md
 testdata
 
 copilot-directions/
+
+# Public release prep artifacts
+memories/
+perf.data*
+dhat-heap.json
+*.flamegraph

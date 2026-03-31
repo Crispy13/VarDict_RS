@@ -72,7 +72,7 @@ After the code-reviewer produces a Performance Verdict (using the `change-impact
 **PERF_REGRESSION escalation options**:
 1. **Redesign** — Ask `rust-implementer` for an alternative implementation that preserves parity without the regression
 2. **Deep profile** — Invoke the `perf-optimization` skill to identify root cause and targeted fix
-3. **User decision** — Present the trade-off (correctness gain vs performance cost) and let the user decide
+3. **User decision** — Use `vscode_askQuestions`: Present the trade-off (correctness gain vs performance cost) and let the user decide
 
 ## Module Priority Order
 

@@ -7476,8 +7476,14 @@ mod tests {
         use std::fs;
         use std::io::{BufRead, BufReader, Write};
 
-        let bam_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/input/NA12878.chrom20.ILLUMINA.bwa.CEU.exome.20121211.bam";
-        let bed_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/input/20120518.consensus.annotation.bed.chr20";
+        let bam_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/VarDictJava/tests/integration/input/NA12878.chrom20.ILLUMINA.bwa.CEU.exome.20121211.bam"
+        );
+        let bed_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/VarDictJava/tests/integration/input/20120518.consensus.annotation.bed.chr20"
+        );
 
         let file = fs::File::open(bed_path).expect("Failed to open BED file");
         let mut reader = BufReader::new(file);
@@ -7487,8 +7493,8 @@ mod tests {
         let pipeline = VarDictPipeline::new("test");
         let sam_filter = 0x504u32;
 
-        let out_dir = "/home/eck/workspace/vardict_rs/tmp_compare";
-        let out_path = "/home/eck/workspace/vardict_rs/tmp_compare/rust.preproc.all.txt";
+        let out_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tmp_compare");
+        let out_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tmp_compare/rust.preproc.all.txt");
         fs::create_dir_all(out_dir).expect("Failed to create tmp_compare");
         let out_file = fs::File::create(out_path).expect("Failed to create rust preproc dump");
         let mut writer = std::io::BufWriter::new(out_file);

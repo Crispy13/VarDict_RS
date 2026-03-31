@@ -4710,8 +4710,14 @@ mod tests {
             ..Default::default()
         });
 
-        let bam_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/input/NA12878.chrom20.ILLUMINA.bwa.CEU.exome.20121211.bam";
-        let bed_path = "/home/eck/workspace/vardict_rs/VarDictJava/tests/integration/input/20120518.consensus.annotation.bed.chr20";
+        let bam_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/VarDictJava/tests/integration/input/NA12878.chrom20.ILLUMINA.bwa.CEU.exome.20121211.bam"
+        );
+        let bed_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/VarDictJava/tests/integration/input/20120518.consensus.annotation.bed.chr20"
+        );
         let fasta_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/hs37d5.fa");
 
         let file = File::open(bed_path).expect("Failed to open BED file");
@@ -4835,8 +4841,11 @@ mod tests {
             }
         }
 
-        let reads_out_path = "/home/eck/workspace/vardict_rs/tmp_compare/rust.cigarparser.non_insertion.pos68352.reads.txt";
-        std::fs::create_dir_all("/home/eck/workspace/vardict_rs/tmp_compare")
+        let reads_out_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tmp_compare/rust.cigarparser.non_insertion.pos68352.reads.txt"
+        );
+        std::fs::create_dir_all(concat!(env!("CARGO_MANIFEST_DIR"), "/tmp_compare"))
             .expect("Failed to create tmp_compare");
         let mut reads_writer = std::io::BufWriter::new(
             std::fs::File::create(reads_out_path).expect("Failed to create rust read dump"),
@@ -4845,7 +4854,10 @@ mod tests {
             writeln!(reads_writer, "{}", name).expect("Failed to write read name");
         }
 
-        let extra_debug_path = "/home/eck/workspace/vardict_rs/tmp_compare/rust.cigarparser.non_insertion.pos68352.extra_reads.detail.txt";
+        let extra_debug_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tmp_compare/rust.cigarparser.non_insertion.pos68352.extra_reads.detail.txt"
+        );
         let mut extra_writer = std::io::BufWriter::new(
             std::fs::File::create(extra_debug_path)
                 .expect("Failed to create rust extra read debug"),
@@ -4854,9 +4866,11 @@ mod tests {
             writeln!(extra_writer, "{}", line).expect("Failed to write extra debug line");
         }
 
-        let out_dir = "/home/eck/workspace/vardict_rs/tmp_compare";
-        let out_path =
-            "/home/eck/workspace/vardict_rs/tmp_compare/rust.cigarparser.non_insertion.txt";
+        let out_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tmp_compare");
+        let out_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tmp_compare/rust.cigarparser.non_insertion.txt"
+        );
         std::fs::create_dir_all(out_dir).expect("Failed to create tmp_compare");
         let out_file =
             std::fs::File::create(out_path).expect("Failed to create rust cigarparser dump");
