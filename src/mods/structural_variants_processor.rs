@@ -1474,7 +1474,14 @@ impl StructuralVariantsProcessor {
                 continue;
             }
 
-            let m = self.find_match(&seq, p5, -1, Configuration::SEED_1 as usize, 3);
+            // NOTE: findsv uses include_historical_windows=false to match Java's
+            // REF.seed scope. Java's reference object accumulates seeds from findDEL/
+            // findINV extensions, but those extensions often don't overlap with the
+            // historical windows Rust tracks. Using historical windows causes spurious
+            // seed matches at far positions that Java's REF.seed doesn't contain,
+            // which blocks the find_match_rev INV path (A2 parity) or creates
+            // extra INVs (A3 parity).
+            let m = self.find_match_internal(&seq, p5, -1, Configuration::SEED_1 as usize, 3, false, false);
             let mut bp = m.base_position;
             if Self::should_trace_findsv_candidate(p5, Some(bp)) {
                 event!(
@@ -1564,7 +1571,8 @@ impl StructuralVariantsProcessor {
                 }
             } else {
                 // Java: StructuralVariantsProcessor.java ~L978 — single findMatchRev with SEED_1/MM=3
-                let m_rev = self.find_match_rev(&seq, p5, -1, Configuration::SEED_1 as usize, 3);
+                // NOTE: findsv uses include_historical_windows=false — see note on find_match above.
+                let m_rev = self.find_match_rev_internal(&seq, p5, -1, Configuration::SEED_1 as usize, 3, false, false, false);
                 bp = m_rev.base_position;
                 let extra = m_rev.matched_sequence;
                 if Self::should_trace_findsv_candidate(p5, Some(bp)) {
@@ -1748,7 +1756,8 @@ impl StructuralVariantsProcessor {
                 continue;
             }
 
-            let m = self.find_match(&seq, p3, 1, Configuration::SEED_1 as usize, 3);
+            // NOTE: findsv uses include_historical_windows=false — see note in 5' path above.
+            let m = self.find_match_internal(&seq, p3, 1, Configuration::SEED_1 as usize, 3, false, false);
             let mut bp = m.base_position;
             if Self::should_trace_findsv_candidate(p3, Some(bp)) {
                 event!(
@@ -1849,7 +1858,8 @@ impl StructuralVariantsProcessor {
                 }
             } else {
                 // Java: StructuralVariantsProcessor.java ~L1114 — single findMatchRev with SEED_1/MM=3
-                let m_rev = self.find_match_rev(&seq, p3, 1, Configuration::SEED_1 as usize, 3);
+                // NOTE: findsv uses include_historical_windows=false — see note in 5' path above.
+                let m_rev = self.find_match_rev_internal(&seq, p3, 1, Configuration::SEED_1 as usize, 3, false, false, false);
                 bp = m_rev.base_position;
                 let extra = m_rev.matched_sequence;
                 if Self::should_trace_findsv_candidate(p3, Some(bp)) {
