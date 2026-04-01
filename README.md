@@ -4,6 +4,8 @@ VarDictRust is a Rust port of VarDictJava targeting improved performance while g
 
 This repository is being released as a public beta. It is useful for experimentation, benchmarking, and parity work, but it is not yet 100% byte-identical to VarDictJava.
 
+This repository has been written heavily by VS Code Copilot, with human review and editing.
+
 ## Quick start
 
 1. Install Rust
