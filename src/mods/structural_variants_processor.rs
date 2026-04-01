@@ -996,13 +996,24 @@ impl StructuralVariantsProcessor {
         region: Option<&Region>,
     ) {
         let min_cluster_dist = (Configuration::MINSVCDIST * data.max_read_length as f64) as i64;
+        let diag = std::env::var("VARDICT_DIAG_INV_SUB").is_ok();
 
         for idx in 0..Self::inv_cluster_len(data, kind) {
             let Some(inv) = Self::inv_cluster_snapshot(data, kind, idx) else {
                 continue;
             };
 
+            if diag {
+                eprintln!(
+                    "[DIAG find_inv_sub] idx={} kind={:?} dir={} side={:?} used={} vars_count={} start={} end={} mstart={} mend={} mlen={} primary_softp={:?}",
+                    idx, kind, dir, side, inv.used, inv.vars_count, inv.start, inv.end, inv.mstart, inv.mend, inv.mlen, inv.primary_softp
+                );
+            }
+
             if inv.used || inv.vars_count < instance().conf.minr {
+                if diag {
+                    eprintln!("[DIAG find_inv_sub]   SKIP: used={} vars_count={} minr={}", inv.used, inv.vars_count, instance().conf.minr);
+                }
                 continue;
             }
 
@@ -1033,21 +1044,30 @@ impl StructuralVariantsProcessor {
             let mut scv_var: Option<Variant> = None;
             let mut source_softp = 0i64;
 
+            if diag {
+                eprintln!("[DIAG find_inv_sub]   softp={}", softp);
+            }
+
             if softp != 0 {
                 if dir == 1 {
                     let Some(scv) = data.soft_clips_3end.get_mut(&softp) else {
+                        if diag { eprintln!("[DIAG find_inv_sub]   softp={} NOT in soft_clips_3end -> continue", softp); }
                         continue;
                     };
                     if scv.used() {
+                        if diag { eprintln!("[DIAG find_inv_sub]   softp={} scv.used=true -> continue", softp); }
                         continue;
                     }
                     source_softp = softp;
                     let scv_seq = self.ensure_conseq(scv);
+                    if diag { eprintln!("[DIAG find_inv_sub]   softp={} conseq_len={} seq={}", softp, scv_seq.len(), String::from_utf8_lossy(&scv_seq[..scv_seq.len().min(30)])); }
                     if scv_seq.is_empty() {
+                        if diag { eprintln!("[DIAG find_inv_sub]   softp={} empty conseq -> continue", softp); }
                         continue;
                     }
                     let mut m =
                         self.find_match_rev(scv_seq, softp, dir, Configuration::SEED_1 as usize, 3);
+                    if diag { eprintln!("[DIAG find_inv_sub]   find_match_rev(SEED1) bp={}", m.base_position); }
                     if m.base_position == 0 {
                         m = self.find_match_rev(
                             scv_seq,
@@ -1056,8 +1076,10 @@ impl StructuralVariantsProcessor {
                             Configuration::SEED_2 as usize,
                             0,
                         );
+                        if diag { eprintln!("[DIAG find_inv_sub]   find_match_rev(SEED2) bp={}", m.base_position); }
                     }
                     if m.base_position == 0 {
+                        if diag { eprintln!("[DIAG find_inv_sub]   bp=0 after both seeds -> continue"); }
                         continue;
                     }
                     bp = m.base_position;
@@ -1065,18 +1087,23 @@ impl StructuralVariantsProcessor {
                     scv_var = Some(scv.var.clone());
                 } else {
                     let Some(scv) = data.soft_clips_5end.get_mut(&softp) else {
+                        if diag { eprintln!("[DIAG find_inv_sub]   softp={} NOT in soft_clips_5end -> continue", softp); }
                         continue;
                     };
                     if scv.used() {
+                        if diag { eprintln!("[DIAG find_inv_sub]   softp={} scv.used=true (5end) -> continue", softp); }
                         continue;
                     }
                     source_softp = softp;
                     let scv_seq = self.ensure_conseq(scv);
+                    if diag { eprintln!("[DIAG find_inv_sub]   softp={} 5end conseq_len={}", softp, scv_seq.len()); }
                     if scv_seq.is_empty() {
+                        if diag { eprintln!("[DIAG find_inv_sub]   softp={} empty conseq (5end) -> continue", softp); }
                         continue;
                     }
                     let mut m =
                         self.find_match_rev(scv_seq, softp, dir, Configuration::SEED_1 as usize, 3);
+                    if diag { eprintln!("[DIAG find_inv_sub]   5end find_match_rev(SEED1) bp={}", m.base_position); }
                     if m.base_position == 0 {
                         m = self.find_match_rev(
                             scv_seq,
@@ -1085,8 +1112,10 @@ impl StructuralVariantsProcessor {
                             Configuration::SEED_2 as usize,
                             0,
                         );
+                        if diag { eprintln!("[DIAG find_inv_sub]   5end find_match_rev(SEED2) bp={}", m.base_position); }
                     }
                     if m.base_position == 0 {
+                        if diag { eprintln!("[DIAG find_inv_sub]   5end bp=0 -> continue"); }
                         continue;
                     }
                     bp = m.base_position;
@@ -1103,10 +1132,12 @@ impl StructuralVariantsProcessor {
                             continue;
                         };
                         if scv.used() {
+                            if diag { eprintln!("[DIAG find_inv_sub]   search cp={} used=true(3end) -> skip", cp); }
                             continue;
                         }
                         source_softp = cp;
                         let scv_seq = self.ensure_conseq(scv);
+                        if diag { eprintln!("[DIAG find_inv_sub]   search cp={} conseq_len={} seq={}", cp, scv_seq.len(), String::from_utf8_lossy(&scv_seq[..scv_seq.len().min(30)])); }
                         if scv_seq.is_empty() {
                             continue;
                         }
@@ -1117,7 +1148,14 @@ impl StructuralVariantsProcessor {
                             Configuration::SEED_1 as usize,
                             3,
                         );
-                        if m.base_position == 0 {
+                        if diag { eprintln!("[DIAG find_inv_sub]   search cp={} find_match_rev(SEED1) bp={}", cp, m.base_position); }
+                        // NOTE: Preserving Java's behavior where bp/extra are always
+                        // overwritten before the bp==0 check. A later failed match must
+                        // reset bp to 0 so the post-loop `if bp == 0` guard fires.
+                        // Java: StructuralVariantsProcessor.java:L779-L786
+                        bp = m.base_position;
+                        extra = m.matched_sequence;
+                        if bp == 0 {
                             m = self.find_match_rev(
                                 scv_seq,
                                 cp,
@@ -1125,12 +1163,13 @@ impl StructuralVariantsProcessor {
                                 Configuration::SEED_2 as usize,
                                 0,
                             );
+                            if diag { eprintln!("[DIAG find_inv_sub]   search cp={} find_match_rev(SEED2) bp={}", cp, m.base_position); }
+                            bp = m.base_position;
+                            extra = m.matched_sequence;
                         }
-                        if m.base_position == 0 {
+                        if bp == 0 {
                             continue;
                         }
-                        bp = m.base_position;
-                        extra = m.matched_sequence;
                         scv_var = Some(scv.var.clone());
                     } else {
                         let Some(scv) = data.soft_clips_5end.get_mut(&cp) else {
@@ -1151,7 +1190,11 @@ impl StructuralVariantsProcessor {
                             Configuration::SEED_1 as usize,
                             3,
                         );
-                        if m.base_position == 0 {
+                        // NOTE: Preserving Java's behavior where bp/extra are always
+                        // overwritten before the bp==0 check. See StructuralVariantsProcessor.java:L779-L786
+                        bp = m.base_position;
+                        extra = m.matched_sequence;
+                        if bp == 0 {
                             m = self.find_match_rev(
                                 scv_seq,
                                 cp,
@@ -1159,12 +1202,12 @@ impl StructuralVariantsProcessor {
                                 Configuration::SEED_2 as usize,
                                 0,
                             );
+                            bp = m.base_position;
+                            extra = m.matched_sequence;
                         }
-                        if m.base_position == 0 {
+                        if bp == 0 {
                             continue;
                         }
-                        bp = m.base_position;
-                        extra = m.matched_sequence;
                         scv_var = Some(scv.var.clone());
                     }
 
@@ -1235,8 +1278,21 @@ impl StructuralVariantsProcessor {
                 (bp - softp) as f64 / mlen_abs
             };
 
+            if diag {
+                eprintln!(
+                    "[DIAG find_inv_sub]   FINAL CHECK: bp={} softp={} diff={} mlen={} ratio={:.4} check=(bp>softp={} diff>150={} ratio<1.5={})",
+                    bp, softp, bp - softp, inv.mlen, ratio,
+                    bp > softp, bp - softp > 150, ratio < 1.5
+                );
+            }
+
             if !(bp > softp && bp - softp > 150 && ratio < 1.5) {
+                if diag { eprintln!("[DIAG find_inv_sub]   FAILED final check -> continue"); }
                 continue;
+            }
+
+            if diag {
+                eprintln!("[DIAG find_inv_sub]   SUCCESS: creating INV at softp={} bp={}", softp, bp);
             }
 
             let len = bp - softp + 1;
@@ -2213,6 +2269,7 @@ impl StructuralVariantsProcessor {
     fn find_inv_disc(&mut self, data: &mut RealignedVariationData, region: Option<&Region>) {
         let minr = instance().conf.minr;
         let mut rev_complementor = RevComplementor::new();
+        let diag = std::env::var("VARDICT_DIAG_INV_SUB").is_ok();
 
         append_rss_stage_log_if_enabled(region, "sv_find_inv_disc_enter");
 
@@ -2232,6 +2289,10 @@ impl StructuralVariantsProcessor {
                     invf5.var.mean_mapq,
                 )
             };
+
+            if diag {
+                eprintln!("[DIAG find_inv_disc] f_idx={} f_used={} cnt={} end={} me={} ms={} start={}", f_idx, f_used, cnt, end, me, ms, start);
+            }
 
             if f_used || cnt == 0 {
                 continue;
@@ -2254,6 +2315,10 @@ impl StructuralVariantsProcessor {
                         invr5.var.mean_mapq,
                     )
                 };
+
+                if diag {
+                    eprintln!("[DIAG find_inv_disc]   r_idx={} r_used={} rcnt={} rstart={} rms={}", r_idx, r_used, rcnt, rstart, rms);
+                }
 
                 if r_used || rcnt == 0 {
                     continue;
@@ -2301,6 +2366,11 @@ impl StructuralVariantsProcessor {
                 append_rss_stage_log_if_enabled(region, "sv_find_inv_disc_5_after_ref_fetch");
 
                 let inv_key = format!("-{}^{}", len, ins);
+
+                if diag {
+                    eprintln!("[DIAG find_inv_disc]   CREATING INV5: f_idx={} r_idx={} bp={} pe={} len={} cnt={} rcnt={}", f_idx, r_idx, bp, pe, len, cnt, rcnt);
+                }
+
                 let vref =
                     Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &inv_key);
                 vref.pstd = true;
@@ -2375,6 +2445,10 @@ impl StructuralVariantsProcessor {
                     invf3.var.mean_mapq,
                 )
             };
+
+            if diag {
+                eprintln!("[DIAG find_inv_disc] INV3 f_idx={} f_used={} cnt={} end={} me={}", f_idx, f_used, cnt, end, me);
+            }
 
             if f_used || cnt == 0 {
                 continue;
@@ -2958,6 +3032,7 @@ impl StructuralVariantsProcessor {
         include_shared_reference_fallback: bool,
         force_shared_reference_fallback: bool,
     ) -> MatchResult {
+        let diag = std::env::var("VARDICT_DIAG_INV_SUB").is_ok();
         let mut seq_work = seq.to_vec();
         if dir == 1 {
             seq_work.reverse();
@@ -2972,6 +3047,9 @@ impl StructuralVariantsProcessor {
         }
 
         let mut persistent_extra: Vec<u8> = Vec::new();
+        let mut diag_seeds_checked = 0u32;
+        let mut diag_seeds_skip_multi = 0u32;
+        let mut diag_seeds_skip_zero = 0u32;
 
         for i in (0..=seq_work.len() - seed_len).rev() {
             let seed = &seq_work[i..i + seed_len];
@@ -2988,7 +3066,9 @@ impl StructuralVariantsProcessor {
                     include_shared_reference_fallback,
                 )
             };
+            diag_seeds_checked += 1;
             if seeds.len() != 1 {
+                if seeds.is_empty() { diag_seeds_skip_zero += 1; } else { diag_seeds_skip_multi += 1; }
                 continue;
             }
 
@@ -3000,6 +3080,14 @@ impl StructuralVariantsProcessor {
             };
 
             let initial_match = self.is_match_ref(&seq_work, bp, -dir, mm);
+            if diag {
+                eprintln!(
+                    "[DIAG find_match_rev] SEED HIT: i={} seed={} first_seed={} bp={} match={} pos={} dir={} checked={} skip_zero={} skip_multi={} hist={}",
+                    i, String::from_utf8_lossy(seed), first_seed, bp, initial_match, _position, dir,
+                    diag_seeds_checked, diag_seeds_skip_zero, diag_seeds_skip_multi,
+                    include_historical_windows
+                );
+            }
             if initial_match {
                 return MatchResult {
                     base_position: bp,
