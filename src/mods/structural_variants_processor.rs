@@ -1507,7 +1507,8 @@ impl StructuralVariantsProcessor {
                     // candidate duplication
                 }
             } else {
-                let m_rev = self.find_match_rev_findsv(&seq, p5, -1);
+                // Java: StructuralVariantsProcessor.java ~L978 — single findMatchRev with SEED_1/MM=3
+                let m_rev = self.find_match_rev(&seq, p5, -1, Configuration::SEED_1 as usize, 3);
                 bp = m_rev.base_position;
                 let extra = m_rev.matched_sequence;
                 if Self::should_trace_findsv_candidate(p5, Some(bp)) {
@@ -1791,7 +1792,8 @@ impl StructuralVariantsProcessor {
                     // candidate duplication
                 }
             } else {
-                let m_rev = self.find_match_rev_findsv(&seq, p3, 1);
+                // Java: StructuralVariantsProcessor.java ~L1114 — single findMatchRev with SEED_1/MM=3
+                let m_rev = self.find_match_rev(&seq, p3, 1, Configuration::SEED_1 as usize, 3);
                 bp = m_rev.base_position;
                 let extra = m_rev.matched_sequence;
                 if Self::should_trace_findsv_candidate(p3, Some(bp)) {
