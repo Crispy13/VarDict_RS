@@ -22,7 +22,6 @@ Classifies risk, runs benchmarks when needed, and produces a binding verdict.
 - Documentation-only changes (`.md`, comments with no logic change)
 - Test-only changes (`#[cfg(test)]` modules, `tests/` directory)
 - CI/build configuration changes (`Cargo.toml` dependency bumps without feature changes)
-
 ---
 
 ## Step 1: Classify Risk

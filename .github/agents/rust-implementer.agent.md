@@ -22,8 +22,21 @@ You receive structured Java analysis from the java-analyst and translate it into
 - ALWAYS run `cargo test --profile debug-release` for the affected module to verify no regressions
 - ALWAYS use `--profile debug-release` for builds and tests (optimized + debug info)
 - ALWAYS follow `rust.instructions.md` and parity rules from `rust-parity.instructions.md`
+- ALWAYS load `shard-diagnosis` skill before diagnosing a failing shard (shard failure, parity mismatch, column diff, output divergence)
+- ALWAYS load `change-impact-review` skill after implementing a fix to any hot-path module, and include the Performance Verdict in your report
 
 ## Implementation Procedure
+
+### Step 0: Load Domain Skills
+
+Before any work, check whether domain skills apply:
+
+| Situation | Skill to load | When |
+|-----------|---------------|------|
+| Task involves a failing shard, parity mismatch, or output divergence | `shard-diagnosis` | Before any investigation |
+| Task involves fixing a hot-path module (`CigarParser`, `VariationRealigner`, `StructuralVariantsProcessor`, `ToVarsBuilder`, `pipeline`) | `change-impact-review` | After implementing the fix, before reporting |
+
+If a relevant skill applies, load it with `read_file` on its `SKILL.md` and follow its procedure. Do not reproduce the skill steps from memory.
 
 ### Step 1: Read Existing Rust Code
 Before writing anything, read the existing Rust module to understand:
@@ -80,8 +93,10 @@ desc.push('+');
 desc.push_str(&seq); // insertion description
 ```
 
-### Step 5: Verify Compilation
-Run `cargo check` to ensure the code compiles without errors. Then run `cargo test --profile debug-release` for the affected module to catch regressions. Fix any compilation or test issues before reporting completion.
+### Step 5: Verify Compilation and Performance
+Run `cargo check` to ensure the code compiles without errors. Then run `cargo test --profile debug-release -- --include-ignored` for the affected module to catch regressions. Fix any compilation or test issues before reporting completion.
+
+If the changed code touches a hot-path module, load the `change-impact-review` skill and include a Performance Verdict in your report.
 
 ## Code Style Requirements
 

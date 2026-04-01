@@ -70,5 +70,9 @@ cargo fmt --check
 - Thread model: `rayon` for data parallelism (replaces Java `CompletableFuture` + `ExecutorService`)
 - BAM I/O: `rust-htslib` or `noodles` — document which is used and why
 
+
+## Announce skill name when you use skills
+Announce "Using <skill-name>" in chat when you start skills.
+
 ## Constraints
 1. ~~Don't use `mimalloc`~~ — Fixed: The SIGSEGV was caused by `reallocate_c_vec` calling `System.dealloc` (libc free) on buffers allocated by mimalloc. Resolved by removing the C-malloc workaround after upgrading rust-htslib to v1.0.0c3. mimalloc is now the default allocator.
