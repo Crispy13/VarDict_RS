@@ -186,6 +186,19 @@ pub struct StructuralVariantsProcessor {
     loaded_regions: Vec<(i64, i64)>,
     /// Remote windows whose BAM-derived coverage has already been merged into the live data.
     loaded_reference_coverage_windows: Vec<ReferenceWindow>,
+    /// Indices of historical windows created by find_inv_sub for low-support
+    /// clusters (vars_count <= minr).  When `findsv_active` is true, these are
+    /// excluded from the historical window scan because Rust may create
+    /// low-support INV clusters that Java doesn't (cluster detection parity gap),
+    /// producing spurious seed matches (e.g., chr13/054).
+    suspect_hist_windows: HashSet<usize, LibDefaultHasher>,
+    /// Set to `true` during `find_svs_del_candidates` to activate filtering
+    /// of suspect historical windows.
+    findsv_active: bool,
+    /// Tracks whether the last ensure_reference_span in find_inv_sub was for a
+    /// low-support cluster.  Used to mark the window saved by the post-find_inv
+    /// restore as suspect.
+    last_inv_extension_suspect: bool,
 }
 
 impl StructuralVariantsProcessor {
@@ -207,6 +220,9 @@ impl StructuralVariantsProcessor {
             historical_del_rightseq_variants: Default::default(),
             loaded_regions: Vec::new(),
             loaded_reference_coverage_windows: Vec::new(),
+            suspect_hist_windows: Default::default(),
+            findsv_active: false,
+            last_inv_extension_suspect: false,
         }
     }
 
@@ -233,6 +249,9 @@ impl StructuralVariantsProcessor {
             historical_del_rightseq_variants: Default::default(),
             loaded_regions: Vec::new(),
             loaded_reference_coverage_windows: Vec::new(),
+            suspect_hist_windows: Default::default(),
+            findsv_active: false,
+            last_inv_extension_suspect: false,
         }
     }
 
@@ -303,8 +322,19 @@ impl StructuralVariantsProcessor {
         append_rss_stage_log_if_enabled(region, "sv_find_del_complete");
         self.find_inv(data, region);
         append_rss_stage_log_if_enabled(region, "sv_find_inv_complete");
+        // The restore saves the last active reference (from find_inv's last
+        // ensure_reference_span) as a historical window. If that last extension
+        // was from a 3' cluster, mark the new window as an End3 window too.
+        let hw_before_restore = self.historical_reference_windows.len();
         self.restore_original_reference_window_preserving_history();
+        if self.last_inv_extension_suspect {
+            for idx in hw_before_restore..self.historical_reference_windows.len() {
+                self.suspect_hist_windows.insert(idx);
+            }
+        }
+        self.findsv_active = true;
         self.find_svs_del_candidates(data, region);
+        self.findsv_active = false;
         append_rss_stage_log_if_enabled(region, "sv_find_svs_del_candidates_complete");
         self.find_del_disc(data);
         append_rss_stage_log_if_enabled(region, "sv_find_del_disc_complete");
@@ -996,32 +1026,35 @@ impl StructuralVariantsProcessor {
         region: Option<&Region>,
     ) {
         let min_cluster_dist = (Configuration::MINSVCDIST * data.max_read_length as f64) as i64;
-        let diag = std::env::var("VARDICT_DIAG_INV_SUB").is_ok();
 
         for idx in 0..Self::inv_cluster_len(data, kind) {
             let Some(inv) = Self::inv_cluster_snapshot(data, kind, idx) else {
                 continue;
             };
 
-            if diag {
-                eprintln!(
-                    "[DIAG find_inv_sub] idx={} kind={:?} dir={} side={:?} used={} vars_count={} start={} end={} mstart={} mend={} mlen={} primary_softp={:?}",
-                    idx, kind, dir, side, inv.used, inv.vars_count, inv.start, inv.end, inv.mstart, inv.mend, inv.mlen, inv.primary_softp
-                );
-            }
-
             if inv.used || inv.vars_count < instance().conf.minr {
-                if diag {
-                    eprintln!("[DIAG find_inv_sub]   SKIP: used={} vars_count={} minr={}", inv.used, inv.vars_count, instance().conf.minr);
-                }
                 continue;
             }
 
             let region_was_loaded = self.is_region_loaded(inv.mstart, inv.mend);
             let inv_span_preloaded = self.is_span_loaded(inv.mstart, inv.mend);
+            let hw_count_before = self.historical_reference_windows.len();
             append_rss_stage_log_if_enabled(region, "sv_find_inv_before_ensure_reference_span");
             self.ensure_reference_span(inv.mstart - 500, inv.mend + 500);
             append_rss_stage_log_if_enabled(region, "sv_find_inv_after_ensure_reference_span");
+            let hw_count_after = self.historical_reference_windows.len();
+            // Mark windows from the 3' pass (End3) so that findsv's historical
+            // window scanning can limit their role to masking existing seeds
+            // (preventing spurious INVs from Rust-only clusters) rather than
+            // providing new unique seed positions.
+            if side == InversionSide::End3 {
+                for idx in hw_count_before..hw_count_after {
+                    self.suspect_hist_windows.insert(idx);
+                }
+                if hw_count_after > hw_count_before {
+                    self.last_inv_extension_suspect = true;
+                }
+            }
             if !region_was_loaded {
                 self.loaded_regions.push((inv.mstart - 500, inv.mend + 500));
             }
@@ -1044,30 +1077,21 @@ impl StructuralVariantsProcessor {
             let mut scv_var: Option<Variant> = None;
             let mut source_softp = 0i64;
 
-            if diag {
-                eprintln!("[DIAG find_inv_sub]   softp={}", softp);
-            }
-
             if softp != 0 {
                 if dir == 1 {
                     let Some(scv) = data.soft_clips_3end.get_mut(&softp) else {
-                        if diag { eprintln!("[DIAG find_inv_sub]   softp={} NOT in soft_clips_3end -> continue", softp); }
                         continue;
                     };
                     if scv.used() {
-                        if diag { eprintln!("[DIAG find_inv_sub]   softp={} scv.used=true -> continue", softp); }
                         continue;
                     }
                     source_softp = softp;
                     let scv_seq = self.ensure_conseq(scv);
-                    if diag { eprintln!("[DIAG find_inv_sub]   softp={} conseq_len={} seq={}", softp, scv_seq.len(), String::from_utf8_lossy(&scv_seq[..scv_seq.len().min(30)])); }
                     if scv_seq.is_empty() {
-                        if diag { eprintln!("[DIAG find_inv_sub]   softp={} empty conseq -> continue", softp); }
                         continue;
                     }
                     let mut m =
                         self.find_match_rev(scv_seq, softp, dir, Configuration::SEED_1 as usize, 3);
-                    if diag { eprintln!("[DIAG find_inv_sub]   find_match_rev(SEED1) bp={}", m.base_position); }
                     if m.base_position == 0 {
                         m = self.find_match_rev(
                             scv_seq,
@@ -1076,10 +1100,8 @@ impl StructuralVariantsProcessor {
                             Configuration::SEED_2 as usize,
                             0,
                         );
-                        if diag { eprintln!("[DIAG find_inv_sub]   find_match_rev(SEED2) bp={}", m.base_position); }
                     }
                     if m.base_position == 0 {
-                        if diag { eprintln!("[DIAG find_inv_sub]   bp=0 after both seeds -> continue"); }
                         continue;
                     }
                     bp = m.base_position;
@@ -1087,23 +1109,18 @@ impl StructuralVariantsProcessor {
                     scv_var = Some(scv.var.clone());
                 } else {
                     let Some(scv) = data.soft_clips_5end.get_mut(&softp) else {
-                        if diag { eprintln!("[DIAG find_inv_sub]   softp={} NOT in soft_clips_5end -> continue", softp); }
                         continue;
                     };
                     if scv.used() {
-                        if diag { eprintln!("[DIAG find_inv_sub]   softp={} scv.used=true (5end) -> continue", softp); }
                         continue;
                     }
                     source_softp = softp;
                     let scv_seq = self.ensure_conseq(scv);
-                    if diag { eprintln!("[DIAG find_inv_sub]   softp={} 5end conseq_len={}", softp, scv_seq.len()); }
                     if scv_seq.is_empty() {
-                        if diag { eprintln!("[DIAG find_inv_sub]   softp={} empty conseq (5end) -> continue", softp); }
                         continue;
                     }
                     let mut m =
                         self.find_match_rev(scv_seq, softp, dir, Configuration::SEED_1 as usize, 3);
-                    if diag { eprintln!("[DIAG find_inv_sub]   5end find_match_rev(SEED1) bp={}", m.base_position); }
                     if m.base_position == 0 {
                         m = self.find_match_rev(
                             scv_seq,
@@ -1112,10 +1129,8 @@ impl StructuralVariantsProcessor {
                             Configuration::SEED_2 as usize,
                             0,
                         );
-                        if diag { eprintln!("[DIAG find_inv_sub]   5end find_match_rev(SEED2) bp={}", m.base_position); }
                     }
                     if m.base_position == 0 {
-                        if diag { eprintln!("[DIAG find_inv_sub]   5end bp=0 -> continue"); }
                         continue;
                     }
                     bp = m.base_position;
@@ -1132,12 +1147,10 @@ impl StructuralVariantsProcessor {
                             continue;
                         };
                         if scv.used() {
-                            if diag { eprintln!("[DIAG find_inv_sub]   search cp={} used=true(3end) -> skip", cp); }
                             continue;
                         }
                         source_softp = cp;
                         let scv_seq = self.ensure_conseq(scv);
-                        if diag { eprintln!("[DIAG find_inv_sub]   search cp={} conseq_len={} seq={}", cp, scv_seq.len(), String::from_utf8_lossy(&scv_seq[..scv_seq.len().min(30)])); }
                         if scv_seq.is_empty() {
                             continue;
                         }
@@ -1148,7 +1161,6 @@ impl StructuralVariantsProcessor {
                             Configuration::SEED_1 as usize,
                             3,
                         );
-                        if diag { eprintln!("[DIAG find_inv_sub]   search cp={} find_match_rev(SEED1) bp={}", cp, m.base_position); }
                         // NOTE: Preserving Java's behavior where bp/extra are always
                         // overwritten before the bp==0 check. A later failed match must
                         // reset bp to 0 so the post-loop `if bp == 0` guard fires.
@@ -1163,7 +1175,6 @@ impl StructuralVariantsProcessor {
                                 Configuration::SEED_2 as usize,
                                 0,
                             );
-                            if diag { eprintln!("[DIAG find_inv_sub]   search cp={} find_match_rev(SEED2) bp={}", cp, m.base_position); }
                             bp = m.base_position;
                             extra = m.matched_sequence;
                         }
@@ -1278,21 +1289,8 @@ impl StructuralVariantsProcessor {
                 (bp - softp) as f64 / mlen_abs
             };
 
-            if diag {
-                eprintln!(
-                    "[DIAG find_inv_sub]   FINAL CHECK: bp={} softp={} diff={} mlen={} ratio={:.4} check=(bp>softp={} diff>150={} ratio<1.5={})",
-                    bp, softp, bp - softp, inv.mlen, ratio,
-                    bp > softp, bp - softp > 150, ratio < 1.5
-                );
-            }
-
             if !(bp > softp && bp - softp > 150 && ratio < 1.5) {
-                if diag { eprintln!("[DIAG find_inv_sub]   FAILED final check -> continue"); }
                 continue;
-            }
-
-            if diag {
-                eprintln!("[DIAG find_inv_sub]   SUCCESS: creating INV at softp={} bp={}", softp, bp);
             }
 
             let len = bp - softp + 1;
@@ -1474,13 +1472,10 @@ impl StructuralVariantsProcessor {
                 continue;
             }
 
-            // NOTE: findsv uses include_historical_windows=false to match Java's
-            // REF.seed scope. Java's reference object accumulates seeds from findDEL/
-            // findINV extensions, but those extensions often don't overlap with the
-            // historical windows Rust tracks. Using historical windows causes spurious
-            // seed matches at far positions that Java's REF.seed doesn't contain,
-            // which blocks the find_match_rev INV path (A2 parity) or creates
-            // extra INVs (A3 parity).
+            // NOTE: findsv forward match keeps include_historical_windows=false.
+            // Historical windows are only needed for find_match_rev (INV path).
+            // Enabling them for forward matches causes spurious DEL/INV candidates
+            // from seed matches in far-away historical windows (e.g., chr13/054).
             let m = self.find_match_internal(&seq, p5, -1, Configuration::SEED_1 as usize, 3, false, false);
             let mut bp = m.base_position;
             if Self::should_trace_findsv_candidate(p5, Some(bp)) {
@@ -1571,8 +1566,8 @@ impl StructuralVariantsProcessor {
                 }
             } else {
                 // Java: StructuralVariantsProcessor.java ~L978 — single findMatchRev with SEED_1/MM=3
-                // NOTE: findsv uses include_historical_windows=false — see note on find_match above.
-                let m_rev = self.find_match_rev_internal(&seq, p5, -1, Configuration::SEED_1 as usize, 3, false, false, false);
+                // NOTE: Historical windows re-enabled — see note on find_match above.
+                let m_rev = self.find_match_rev_internal(&seq, p5, -1, Configuration::SEED_1 as usize, 3, true, false, false);
                 bp = m_rev.base_position;
                 let extra = m_rev.matched_sequence;
                 if Self::should_trace_findsv_candidate(p5, Some(bp)) {
@@ -1756,7 +1751,7 @@ impl StructuralVariantsProcessor {
                 continue;
             }
 
-            // NOTE: findsv uses include_historical_windows=false — see note in 5' path above.
+            // NOTE: findsv forward match keeps include_historical_windows=false — see note in 5' path.
             let m = self.find_match_internal(&seq, p3, 1, Configuration::SEED_1 as usize, 3, false, false);
             let mut bp = m.base_position;
             if Self::should_trace_findsv_candidate(p3, Some(bp)) {
@@ -1858,8 +1853,8 @@ impl StructuralVariantsProcessor {
                 }
             } else {
                 // Java: StructuralVariantsProcessor.java ~L1114 — single findMatchRev with SEED_1/MM=3
-                // NOTE: findsv uses include_historical_windows=false — see note in 5' path above.
-                let m_rev = self.find_match_rev_internal(&seq, p3, 1, Configuration::SEED_1 as usize, 3, false, false, false);
+                // NOTE: Historical windows re-enabled — see note in 5' path above.
+                let m_rev = self.find_match_rev_internal(&seq, p3, 1, Configuration::SEED_1 as usize, 3, true, false, false);
                 bp = m_rev.base_position;
                 let extra = m_rev.matched_sequence;
                 if Self::should_trace_findsv_candidate(p3, Some(bp)) {
@@ -2279,8 +2274,6 @@ impl StructuralVariantsProcessor {
     fn find_inv_disc(&mut self, data: &mut RealignedVariationData, region: Option<&Region>) {
         let minr = instance().conf.minr;
         let mut rev_complementor = RevComplementor::new();
-        let diag = std::env::var("VARDICT_DIAG_INV_SUB").is_ok();
-
         append_rss_stage_log_if_enabled(region, "sv_find_inv_disc_enter");
 
         for f_idx in 0..data.svfinv5.len() {
@@ -2299,10 +2292,6 @@ impl StructuralVariantsProcessor {
                     invf5.var.mean_mapq,
                 )
             };
-
-            if diag {
-                eprintln!("[DIAG find_inv_disc] f_idx={} f_used={} cnt={} end={} me={} ms={} start={}", f_idx, f_used, cnt, end, me, ms, start);
-            }
 
             if f_used || cnt == 0 {
                 continue;
@@ -2325,10 +2314,6 @@ impl StructuralVariantsProcessor {
                         invr5.var.mean_mapq,
                     )
                 };
-
-                if diag {
-                    eprintln!("[DIAG find_inv_disc]   r_idx={} r_used={} rcnt={} rstart={} rms={}", r_idx, r_used, rcnt, rstart, rms);
-                }
 
                 if r_used || rcnt == 0 {
                     continue;
@@ -2376,10 +2361,6 @@ impl StructuralVariantsProcessor {
                 append_rss_stage_log_if_enabled(region, "sv_find_inv_disc_5_after_ref_fetch");
 
                 let inv_key = format!("-{}^{}", len, ins);
-
-                if diag {
-                    eprintln!("[DIAG find_inv_disc]   CREATING INV5: f_idx={} r_idx={} bp={} pe={} len={} cnt={} rcnt={}", f_idx, r_idx, bp, pe, len, cnt, rcnt);
-                }
 
                 let vref =
                     Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &inv_key);
@@ -2455,10 +2436,6 @@ impl StructuralVariantsProcessor {
                     invf3.var.mean_mapq,
                 )
             };
-
-            if diag {
-                eprintln!("[DIAG find_inv_disc] INV3 f_idx={} f_used={} cnt={} end={} me={}", f_idx, f_used, cnt, end, me);
-            }
 
             if f_used || cnt == 0 {
                 continue;
@@ -3042,7 +3019,6 @@ impl StructuralVariantsProcessor {
         include_shared_reference_fallback: bool,
         force_shared_reference_fallback: bool,
     ) -> MatchResult {
-        let diag = std::env::var("VARDICT_DIAG_INV_SUB").is_ok();
         let mut seq_work = seq.to_vec();
         if dir == 1 {
             seq_work.reverse();
@@ -3057,9 +3033,6 @@ impl StructuralVariantsProcessor {
         }
 
         let mut persistent_extra: Vec<u8> = Vec::new();
-        let mut diag_seeds_checked = 0u32;
-        let mut diag_seeds_skip_multi = 0u32;
-        let mut diag_seeds_skip_zero = 0u32;
 
         for i in (0..=seq_work.len() - seed_len).rev() {
             let seed = &seq_work[i..i + seed_len];
@@ -3076,9 +3049,7 @@ impl StructuralVariantsProcessor {
                     include_shared_reference_fallback,
                 )
             };
-            diag_seeds_checked += 1;
             if seeds.len() != 1 {
-                if seeds.is_empty() { diag_seeds_skip_zero += 1; } else { diag_seeds_skip_multi += 1; }
                 continue;
             }
 
@@ -3090,14 +3061,6 @@ impl StructuralVariantsProcessor {
             };
 
             let initial_match = self.is_match_ref(&seq_work, bp, -dir, mm);
-            if diag {
-                eprintln!(
-                    "[DIAG find_match_rev] SEED HIT: i={} seed={} first_seed={} bp={} match={} pos={} dir={} checked={} skip_zero={} skip_multi={} hist={}",
-                    i, String::from_utf8_lossy(seed), first_seed, bp, initial_match, _position, dir,
-                    diag_seeds_checked, diag_seeds_skip_zero, diag_seeds_skip_multi,
-                    include_historical_windows
-                );
-            }
             if initial_match {
                 return MatchResult {
                     base_position: bp,
@@ -4221,7 +4184,53 @@ impl StructuralVariantsProcessor {
             return;
         };
 
-        for window in &self.historical_reference_windows {
+        // Java: ReferenceResource.getReference() skips positions already in
+        // ref.referenceSequences via containsKey(i + sequenceStart).  This means
+        // positions covered by the initial load or any earlier extension are never
+        // re-seeded.  Build the set of "already-covered" ranges to replicate this.
+        //
+        // Covered ranges:
+        //   1. Current (possibly extended) reference window
+        //   2. Original reference window
+        //   3. Earlier historical windows (processed in order)
+        let cur_start = self.ref_start;
+        let cur_end = self.ref_start + self.reference_seq.len() as i64 - 1;
+        let orig_start = self.original_ref_start;
+        let orig_end = self.original_ref_start + self.original_reference_seq.len() as i64 - 1;
+
+        let is_position_covered = |pos: i64, window_idx: usize| -> bool {
+            // Covered by current or original reference window
+            if pos >= cur_start && pos <= cur_end {
+                return true;
+            }
+            if pos >= orig_start && pos <= orig_end {
+                return true;
+            }
+            // Covered by a preceding historical window (Java's incremental containsKey)
+            for (idx, hw) in self.historical_reference_windows.iter().enumerate() {
+                if idx >= window_idx {
+                    break;
+                }
+                if pos >= hw.start && pos <= hw.end {
+                    return true;
+                }
+            }
+            false
+        };
+
+        for (window_idx, window) in self.historical_reference_windows.iter().enumerate() {
+            // During findsv, End3 (3' pass) windows only contribute masking
+            // duplicates—they never provide new unique seed positions.
+            // This prevents spurious INVs from Rust-only clusters (chr13/054)
+            // while preserving the duplication masking needed by chr1/199.
+            // End5 (5' pass) windows contribute both new seeds and masking.
+            if self.findsv_active
+                && self.suspect_hist_windows.contains(&window_idx)
+                && positions.is_empty()
+            {
+                continue;
+            }
+
             let Some(sequence) =
                 shared_reference.get_subseq(chromosome, window.start as usize, window.end as usize)
             else {
@@ -4232,12 +4241,24 @@ impl StructuralVariantsProcessor {
                 continue;
             }
 
-            for offset in 0..=sequence.len() - seed.len() {
+            // Java: ReferenceResource.getReference() uses siteEnd = exon.length() - SEED_1
+            // for building seeds, regardless of whether we're doing a SEED_1 or SEED_2 lookup.
+            // This means Java never creates seeds from the last SEED_1 (17) bases of each
+            // loaded region. Match that boundary here to avoid spurious seed positions.
+            let site_end = sequence.len().saturating_sub(Configuration::SEED_1 as usize);
+            for offset in 0..site_end {
+                if offset + seed.len() > sequence.len() {
+                    break;
+                }
                 if &sequence[offset..offset + seed.len()] != seed {
                     continue;
                 }
 
                 let pos = window.start + offset as i64;
+                // Java: containsKey(i + sequenceStart) — skip if already loaded
+                if is_position_covered(pos, window_idx) {
+                    continue;
+                }
                 if !positions.contains(&pos) {
                     positions.push(pos);
                 }
