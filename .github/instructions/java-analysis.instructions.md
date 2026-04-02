@@ -76,3 +76,11 @@ Analyze in this order (by parity risk):
 4. `modules/ToVarsBuilder.java` — variant building and filtering
 5. `printers/*OutputVariant.java` — output formatting
 6. `modes/SimpleMode.java`, `SomaticMode.java`, `AmpliconMode.java`
+
+## Codebase Cache
+
+A progressive Java codebase cache is maintained at `copilot-office/codebase/java/VarDictJava-CODEBASE.md`. Before doing a full source analysis of a Java method:
+
+1. **Check the cache first**: Read the relevant module section in `VarDictJava-CODEBASE.md`. If the method has already been analyzed, verify the cached analysis against the actual Java source (spot-check key logic, don't re-read everything). Use the cached version if it's accurate.
+2. **Analyze from source if missing**: If the method is not cached or the cache is incomplete for your needs, perform a full analysis from the Java source code.
+3. **Update the cache after analysis**: Add your findings to the cache file following the Per-Module Template defined in the index. This is a secondary task — always return analysis results to the caller first.

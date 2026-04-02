@@ -1,7 +1,7 @@
 ---
 description: "Implement or fix Rust code for VarDictJava parity. Use when writing Rust translations of Java methods, fixing parity mismatches, implementing variant calling algorithms in Rust, or adapting Java patterns to idiomatic Rust while preserving exact output behavior."
 tools: [read, search, edit, execute, web]
-model: ['Claude Opus 4.6 (fast mode) (Preview) (copilot)','Claude Opus 4.6 (copilot)','GPT-5.4 (copilot)']
+model: ['GPT-5.4 (copilot)', 'Claude Opus 4.6 (fast mode) (Preview) (copilot)','Claude Opus 4.6 (copilot)',]
 user-invocable: false
 ---
 

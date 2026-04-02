@@ -1,7 +1,7 @@
 ---
 description: "Test and validate output parity between VarDictJava and Rust port. Use when comparing outputs, creating parity test cases, debugging output mismatches, running diff analysis, or verifying byte-identical results across Simple, Somatic, and Amplicon modes."
 tools: [read, search, edit, execute]
-model: ['Claude Opus 4.6 (fast mode) (Preview) (copilot)','Claude Opus 4.6 (copilot)','GPT-5.4 (copilot)']
+model: ['GPT-5.4 (copilot)', 'Claude Opus 4.6 (fast mode) (Preview) (copilot)','Claude Opus 4.6 (copilot)',]
 user-invocable: false
 ---
 
