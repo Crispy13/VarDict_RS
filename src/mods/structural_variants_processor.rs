@@ -530,7 +530,13 @@ impl StructuralVariantsProcessor {
             } else {
                 let mut candidate_positions: Vec<i64> =
                     data.soft_clips_3end.keys().copied().collect();
-                candidate_positions.sort_unstable();
+                // NOTE: Java iterates softClips3End (HashMap<Integer, Sclip>) in HashMap
+                // bucket order. For parity, sort by Java bucket index instead of ascending.
+                // Java source: StructuralVariantsProcessor.java:L451 — no softp 5' loop
+                Self::sort_java_hashmap_order(
+                    &mut candidate_positions,
+                    data.soft_clips_3end.len(),
+                );
 
                 for candidate in candidate_positions {
                     if !(candidate >= end - 3 && candidate - end < 3 * data.max_read_length as i64)
@@ -842,7 +848,13 @@ impl StructuralVariantsProcessor {
             } else {
                 let mut candidate_positions: Vec<i64> =
                     data.soft_clips_5end.keys().copied().collect();
-                candidate_positions.sort_unstable();
+                // NOTE: Java iterates softClips5End (HashMap<Integer, Sclip>) in HashMap
+                // bucket order. For parity, sort by Java bucket index instead of ascending.
+                // Java source: StructuralVariantsProcessor.java:L612 — no softp 3' loop
+                Self::sort_java_hashmap_order(
+                    &mut candidate_positions,
+                    data.soft_clips_5end.len(),
+                );
 
                 for candidate in candidate_positions {
                     if !(candidate <= start + 3
@@ -3206,6 +3218,33 @@ impl StructuralVariantsProcessor {
             }
         }
         best.map(|(pos, _)| pos)
+    }
+
+    /// Sorts positions in Java `HashMap<Integer, ...>` bucket-iteration order.
+    ///
+    /// Java's HashMap iterates buckets 0..capacity sequentially, and within a
+    /// bucket it walks the linked list in insertion order.  For parity with
+    /// VarDictJava, the "no softp" DEL candidate loops must visit entries in
+    /// the same order that Java's `HashMap.entrySet()` produces.
+    ///
+    /// Ported from: Java 8 `HashMap.hash()` + power-of-two capacity rule.
+    fn sort_java_hashmap_order(positions: &mut Vec<i64>, hashmap_len: usize) {
+        // Java HashMap capacity: smallest power-of-two >= ceil(size / 0.75),
+        // with a minimum of 16 (DEFAULT_INITIAL_CAPACITY).
+        let capacity = {
+            let min_cap = ((hashmap_len as f64 / 0.75).ceil()) as usize;
+            min_cap.max(16).next_power_of_two()
+        };
+        let mask = (capacity - 1) as u32;
+
+        // Java 8 HashMap.hash(Object key):
+        //   h = key.hashCode();  return h ^ (h >>> 16);
+        // For Integer keys, hashCode() == intValue().
+        positions.sort_by_key(|&pos| {
+            let k = pos as i32 as u32;
+            let h = k ^ (k >> 16);
+            h & mask
+        });
     }
 
     fn get_or_create_variation<'a>(
