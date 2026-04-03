@@ -550,9 +550,8 @@ fn run_variant_calling(
                 let (sender, receiver) = crossbeam_channel::bounded::<(usize, RegionResult)>(10);
                 let debug = args.debug;
 
-                let consumer_handle = std::thread::spawn(move || {
-                    OrderedStreamConsumer::new(receiver, debug).run()
-                });
+                let consumer_handle =
+                    std::thread::spawn(move || OrderedStreamConsumer::new(receiver, debug).run());
 
                 pipeline.process_regions_vardict_streaming(primary_bam_path, all_regions, sender);
 
@@ -1424,15 +1423,7 @@ mod tests {
 
     #[test]
     fn test_parse_standard_regions_applies_x_extension() {
-        let args = parse_args_for_test([
-            "vardict",
-            "-G",
-            "ref.fa",
-            "-b",
-            "reads.bam",
-            "-x",
-            "150",
-        ]);
+        let args = parse_args_for_test(["vardict", "-G", "ref.fa", "-b", "reads.bam", "-x", "150"]);
         let bed_lines = vec!["20\t0\t1000000\t20".to_string()];
 
         let regions = parse_standard_regions(&bed_lines, &args, None, true).unwrap();

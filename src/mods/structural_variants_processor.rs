@@ -21,6 +21,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use crate::conf::Configuration;
+use crate::data::RefCoverage;
 use crate::data::reference::{Reference, ReferenceSeedMap};
 use crate::data::region::Region;
 use crate::data::shared_reference::SharedReferenceHandle;
@@ -43,7 +44,7 @@ pub struct RealignedVariationData {
     /// 3' end soft clips by position  
     pub soft_clips_3end: HashMap<i64, SoftClip, LibDefaultHasher>,
     /// Reference coverage by position
-    pub ref_coverage: HashMap<i64, usize, LibDefaultHasher>,
+    pub ref_coverage: RefCoverage,
     /// Splice junction positions carried forward for RNA-seq-specific SV filtering.
     pub splice: HashSet<String>,
     /// Maximum read length seen
@@ -467,14 +468,14 @@ impl StructuralVariantsProcessor {
                     1,
                 );
 
-                let current_cov = data.ref_coverage.get(&p5).copied().unwrap_or(0);
+                let current_cov = data.ref_coverage.get(p5).unwrap_or(0);
                 if current_cov <= vars_count {
-                    data.ref_coverage.insert(p5, vars_count);
+                    data.ref_coverage.set(p5, vars_count);
                 }
-                if let Some(bp_cov) = data.ref_coverage.get(&bp).copied() {
-                    let p5_cov = data.ref_coverage.get(&p5).copied().unwrap_or(0);
+                if let Some(bp_cov) = data.ref_coverage.get(bp) {
+                    let p5_cov = data.ref_coverage.get(p5).unwrap_or(0);
                     if p5_cov < bp_cov {
-                        data.ref_coverage.insert(p5, bp_cov);
+                        data.ref_coverage.set(p5, bp_cov);
                     }
                 }
 
@@ -533,10 +534,7 @@ impl StructuralVariantsProcessor {
                 // NOTE: Java iterates softClips3End (HashMap<Integer, Sclip>) in HashMap
                 // bucket order. For parity, sort by Java bucket index instead of ascending.
                 // Java source: StructuralVariantsProcessor.java:L451 — no softp 5' loop
-                Self::sort_java_hashmap_order(
-                    &mut candidate_positions,
-                    data.soft_clips_3end.len(),
-                );
+                Self::sort_java_hashmap_order(&mut candidate_positions, data.soft_clips_3end.len());
 
                 for candidate in candidate_positions {
                     if !(candidate >= end - 3 && candidate - end < 3 * data.max_read_length as i64)
@@ -619,14 +617,14 @@ impl StructuralVariantsProcessor {
                         1,
                     );
 
-                    let current_cov = data.ref_coverage.get(&candidate).copied().unwrap_or(0);
+                    let current_cov = data.ref_coverage.get(candidate).unwrap_or(0);
                     if current_cov <= vars_count {
-                        data.ref_coverage.insert(candidate, vars_count);
+                        data.ref_coverage.set(candidate, vars_count);
                     }
-                    if let Some(bp_cov) = data.ref_coverage.get(&bp).copied() {
-                        let p5_cov = data.ref_coverage.get(&candidate).copied().unwrap_or(0);
+                    if let Some(bp_cov) = data.ref_coverage.get(bp) {
+                        let p5_cov = data.ref_coverage.get(candidate).unwrap_or(0);
                         if p5_cov < bp_cov {
-                            data.ref_coverage.insert(candidate, bp_cov);
+                            data.ref_coverage.set(candidate, bp_cov);
                         }
                     }
 
@@ -806,14 +804,14 @@ impl StructuralVariantsProcessor {
                     adj_cnt_from_variant(variation, &scv.var);
                 }
 
-                let current_cov = data.ref_coverage.get(&bp).copied().unwrap_or(0);
+                let current_cov = data.ref_coverage.get(bp).unwrap_or(0);
                 if current_cov <= vars_count {
-                    data.ref_coverage.insert(bp, vars_count);
+                    data.ref_coverage.set(bp, vars_count);
                 }
-                if let Some(p3_cov) = data.ref_coverage.get(&p3).copied() {
-                    let bp_cov = data.ref_coverage.get(&bp).copied().unwrap_or(0);
+                if let Some(p3_cov) = data.ref_coverage.get(p3) {
+                    let bp_cov = data.ref_coverage.get(bp).unwrap_or(0);
                     if p3_cov > bp_cov {
-                        data.ref_coverage.insert(bp, p3_cov);
+                        data.ref_coverage.set(bp, p3_cov);
                     }
                 }
 
@@ -851,10 +849,7 @@ impl StructuralVariantsProcessor {
                 // NOTE: Java iterates softClips5End (HashMap<Integer, Sclip>) in HashMap
                 // bucket order. For parity, sort by Java bucket index instead of ascending.
                 // Java source: StructuralVariantsProcessor.java:L612 — no softp 3' loop
-                Self::sort_java_hashmap_order(
-                    &mut candidate_positions,
-                    data.soft_clips_5end.len(),
-                );
+                Self::sort_java_hashmap_order(&mut candidate_positions, data.soft_clips_5end.len());
 
                 for candidate in candidate_positions {
                     if !(candidate <= start + 3
@@ -949,13 +944,13 @@ impl StructuralVariantsProcessor {
                         adj_cnt_from_variant(variation, &scv.var);
                     }
 
-                    if !data.ref_coverage.contains_key(&bp) {
-                        data.ref_coverage.insert(bp, vars_count);
+                    if !data.ref_coverage.contains_key(bp) {
+                        data.ref_coverage.set(bp, vars_count);
                     }
-                    if let Some(p3_cov) = data.ref_coverage.get(&p3).copied() {
-                        let bp_cov = data.ref_coverage.get(&bp).copied().unwrap_or(0);
+                    if let Some(p3_cov) = data.ref_coverage.get(p3) {
+                        let bp_cov = data.ref_coverage.get(bp).unwrap_or(0);
                         if p3_cov > bp_cov {
-                            data.ref_coverage.insert(bp, p3_cov);
+                            data.ref_coverage.set(bp, p3_cov);
                         }
                     }
                     Self::inc_ref_coverage(&mut data.ref_coverage, bp, split_count);
@@ -1364,12 +1359,8 @@ impl StructuralVariantsProcessor {
                 }
             }
 
-            let cov = data
-                .ref_coverage
-                .get(&(softp - 1))
-                .copied()
-                .unwrap_or(inv.vars_count);
-            data.ref_coverage.insert(softp, cov);
+            let cov = data.ref_coverage.get(softp - 1).unwrap_or(inv.vars_count);
+            data.ref_coverage.set(softp, cov);
 
             Self::mark_inv_cluster_used(data, kind, idx);
 
@@ -1488,16 +1479,18 @@ impl StructuralVariantsProcessor {
             // Historical windows are only needed for find_match_rev (INV path).
             // Enabling them for forward matches causes spurious DEL/INV candidates
             // from seed matches in far-away historical windows (e.g., chr13/054).
-            let m = self.find_match_internal(&seq, p5, -1, Configuration::SEED_1 as usize, 3, false, false);
+            let m = self.find_match_internal(
+                &seq,
+                p5,
+                -1,
+                Configuration::SEED_1 as usize,
+                3,
+                false,
+                false,
+            );
             let mut bp = m.base_position;
             if Self::should_trace_findsv_candidate(p5, Some(bp)) {
-                event!(
-                    Level::TRACE,
-                    phase = "findsv_5_direct_match",
-                    p5,
-                    cnt5,
-                    bp,
-                );
+                event!(Level::TRACE, phase = "findsv_5_direct_match", p5, cnt5, bp,);
             }
             event!(Level::DEBUG, phase = "findsv_5_candidate", p5, cnt5, bp,);
             if bp != 0 {
@@ -1538,13 +1531,13 @@ impl StructuralVariantsProcessor {
                         1,
                     );
 
-                    if !data.ref_coverage.contains_key(&bp_adj) {
-                        data.ref_coverage.insert(bp_adj, pairs_data.pairs + cnt5);
+                    if !data.ref_coverage.contains_key(bp_adj) {
+                        data.ref_coverage.set(bp_adj, pairs_data.pairs + cnt5);
                     }
-                    if let Some(cov_p5) = data.ref_coverage.get(&(p5_adj + 1)).copied() {
-                        let cov_bp = data.ref_coverage.get(&bp_adj).copied().unwrap_or(0);
+                    if let Some(cov_p5) = data.ref_coverage.get(p5_adj + 1) {
+                        let cov_bp = data.ref_coverage.get(bp_adj).unwrap_or(0);
                         if cov_bp < cov_p5 {
-                            data.ref_coverage.insert(bp_adj, cov_p5);
+                            data.ref_coverage.set(bp_adj, cov_p5);
                         }
                     }
 
@@ -1579,7 +1572,16 @@ impl StructuralVariantsProcessor {
             } else {
                 // Java: StructuralVariantsProcessor.java ~L978 — single findMatchRev with SEED_1/MM=3
                 // NOTE: Historical windows re-enabled — see note on find_match above.
-                let m_rev = self.find_match_rev_internal(&seq, p5, -1, Configuration::SEED_1 as usize, 3, true, false, false);
+                let m_rev = self.find_match_rev_internal(
+                    &seq,
+                    p5,
+                    -1,
+                    Configuration::SEED_1 as usize,
+                    3,
+                    true,
+                    false,
+                    false,
+                );
                 bp = m_rev.base_position;
                 let extra = m_rev.matched_sequence;
                 if Self::should_trace_findsv_candidate(p5, Some(bp)) {
@@ -1686,10 +1688,10 @@ impl StructuralVariantsProcessor {
                 }
 
                 Self::inc_ref_coverage(&mut data.ref_coverage, p5_inv, cnt5);
-                if let Some(bp_cov) = data.ref_coverage.get(&bp).copied() {
-                    let p5_cov = data.ref_coverage.get(&p5_inv).copied().unwrap_or(0);
+                if let Some(bp_cov) = data.ref_coverage.get(bp) {
+                    let p5_cov = data.ref_coverage.get(p5_inv).unwrap_or(0);
                     if p5_cov < bp_cov {
-                        data.ref_coverage.insert(p5_inv, bp_cov);
+                        data.ref_coverage.set(p5_inv, bp_cov);
                     }
                 }
             }
@@ -1764,16 +1766,18 @@ impl StructuralVariantsProcessor {
             }
 
             // NOTE: findsv forward match keeps include_historical_windows=false — see note in 5' path.
-            let m = self.find_match_internal(&seq, p3, 1, Configuration::SEED_1 as usize, 3, false, false);
+            let m = self.find_match_internal(
+                &seq,
+                p3,
+                1,
+                Configuration::SEED_1 as usize,
+                3,
+                false,
+                false,
+            );
             let mut bp = m.base_position;
             if Self::should_trace_findsv_candidate(p3, Some(bp)) {
-                event!(
-                    Level::TRACE,
-                    phase = "findsv_3_direct_match",
-                    p3,
-                    cnt3,
-                    bp,
-                );
+                event!(Level::TRACE, phase = "findsv_3_direct_match", p3, cnt3, bp,);
             }
             event!(Level::DEBUG, phase = "findsv_3_candidate", p3, cnt3, bp,);
             if bp != 0 {
@@ -1824,13 +1828,13 @@ impl StructuralVariantsProcessor {
                         1,
                     );
 
-                    if !data.ref_coverage.contains_key(&p3) {
-                        data.ref_coverage.insert(p3, pairs_data.pairs + cnt3);
+                    if !data.ref_coverage.contains_key(p3) {
+                        data.ref_coverage.set(p3, pairs_data.pairs + cnt3);
                     }
-                    if let Some(cov_p3) = data.ref_coverage.get(&p3).copied() {
-                        if let Some(cov_bp) = data.ref_coverage.get(&bp).copied() {
+                    if let Some(cov_p3) = data.ref_coverage.get(p3) {
+                        if let Some(cov_bp) = data.ref_coverage.get(bp) {
                             if cov_bp < cov_p3 {
-                                data.ref_coverage.insert(bp, cov_p3);
+                                data.ref_coverage.set(bp, cov_p3);
                             }
                         }
                     }
@@ -1866,7 +1870,16 @@ impl StructuralVariantsProcessor {
             } else {
                 // Java: StructuralVariantsProcessor.java ~L1114 — single findMatchRev with SEED_1/MM=3
                 // NOTE: Historical windows re-enabled — see note in 5' path above.
-                let m_rev = self.find_match_rev_internal(&seq, p3, 1, Configuration::SEED_1 as usize, 3, true, false, false);
+                let m_rev = self.find_match_rev_internal(
+                    &seq,
+                    p3,
+                    1,
+                    Configuration::SEED_1 as usize,
+                    3,
+                    true,
+                    false,
+                    false,
+                );
                 bp = m_rev.base_position;
                 let extra = m_rev.matched_sequence;
                 if Self::should_trace_findsv_candidate(p3, Some(bp)) {
@@ -1970,10 +1983,10 @@ impl StructuralVariantsProcessor {
                 }
 
                 Self::inc_ref_coverage(&mut data.ref_coverage, p3, cnt3);
-                if let Some(bp_cov) = data.ref_coverage.get(&bp).copied() {
-                    let p3_cov = data.ref_coverage.get(&p3).copied().unwrap_or(0);
+                if let Some(bp_cov) = data.ref_coverage.get(bp) {
+                    let p3_cov = data.ref_coverage.get(p3).unwrap_or(0);
                     if p3_cov < bp_cov {
-                        data.ref_coverage.insert(p3, bp_cov);
+                        data.ref_coverage.set(p3, bp_cov);
                     }
                 }
             }
@@ -2152,8 +2165,8 @@ impl StructuralVariantsProcessor {
                 Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &del_key);
             adj_cnt_from_variant(variation, &tv);
 
-            if !data.ref_coverage.contains_key(&bp) {
-                data.ref_coverage.insert(bp, 2 * vars_count);
+            if !data.ref_coverage.contains_key(bp) {
+                data.ref_coverage.set(bp, 2 * vars_count);
             }
 
             if let Some(del) = data.svfdel.get_mut(idx) {
@@ -2259,13 +2272,13 @@ impl StructuralVariantsProcessor {
                 Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &del_key);
             adj_cnt_from_variant(variation, &tv);
 
-            if !data.ref_coverage.contains_key(&bp) {
-                data.ref_coverage.insert(bp, 2 * vars_count);
+            if !data.ref_coverage.contains_key(bp) {
+                data.ref_coverage.set(bp, 2 * vars_count);
             }
-            if let Some(start_cov) = data.ref_coverage.get(&start).copied() {
-                let bp_cov = data.ref_coverage.get(&bp).copied().unwrap_or(0);
+            if let Some(start_cov) = data.ref_coverage.get(start) {
+                let bp_cov = data.ref_coverage.get(bp).unwrap_or(0);
                 if bp_cov < start_cov {
-                    data.ref_coverage.insert(bp, start_cov);
+                    data.ref_coverage.set(bp, start_cov);
                 }
             }
 
@@ -2409,8 +2422,8 @@ impl StructuralVariantsProcessor {
                     1,
                 );
 
-                if !data.ref_coverage.contains_key(&bp) {
-                    data.ref_coverage.insert(bp, 2 * cnt);
+                if !data.ref_coverage.contains_key(bp) {
+                    data.ref_coverage.set(bp, 2 * cnt);
                 }
 
                 if let Some(invf5) = data.svfinv5.get_mut(f_idx) {
@@ -2549,8 +2562,8 @@ impl StructuralVariantsProcessor {
                     1,
                 );
 
-                if !data.ref_coverage.contains_key(&bp) {
-                    data.ref_coverage.insert(bp, 2 * cnt);
+                if !data.ref_coverage.contains_key(bp) {
+                    data.ref_coverage.set(bp, 2 * cnt);
                 }
 
                 if let Some(invf3) = data.svfinv3.get_mut(f_idx) {
@@ -2729,13 +2742,13 @@ impl StructuralVariantsProcessor {
                 dup.mark_used();
             }
 
-            if !data.ref_coverage.contains_key(&bp) {
-                data.ref_coverage.insert(bp, tcnt);
+            if !data.ref_coverage.contains_key(bp) {
+                data.ref_coverage.set(bp, tcnt);
             }
-            if let Some(end_cov) = data.ref_coverage.get(&end).copied() {
-                let bp_cov = data.ref_coverage.get(&bp).copied().unwrap_or(0);
+            if let Some(end_cov) = data.ref_coverage.get(end) {
+                let bp_cov = data.ref_coverage.get(bp).unwrap_or(0);
                 if bp_cov < end_cov {
-                    data.ref_coverage.insert(bp, end_cov);
+                    data.ref_coverage.set(bp, end_cov);
                 }
             }
 
@@ -2900,13 +2913,13 @@ impl StructuralVariantsProcessor {
                 dup.mark_used();
             }
 
-            if !data.ref_coverage.contains_key(&bp) {
-                data.ref_coverage.insert(bp, tcnt);
+            if !data.ref_coverage.contains_key(bp) {
+                data.ref_coverage.set(bp, tcnt);
             }
-            if let Some(me_cov) = data.ref_coverage.get(&me).copied() {
-                let bp_cov = data.ref_coverage.get(&bp).copied().unwrap_or(0);
+            if let Some(me_cov) = data.ref_coverage.get(me) {
+                let bp_cov = data.ref_coverage.get(bp).unwrap_or(0);
                 if bp_cov < me_cov {
-                    data.ref_coverage.insert(bp, me_cov);
+                    data.ref_coverage.set(bp, me_cov);
                 }
             }
 
@@ -3143,13 +3156,8 @@ impl StructuralVariantsProcessor {
         MatchResult::default()
     }
 
-    fn inc_ref_coverage(
-        ref_coverage: &mut HashMap<i64, usize, LibDefaultHasher>,
-        pos: i64,
-        cnt: usize,
-    ) {
-        let entry = ref_coverage.entry(pos).or_insert(0);
-        *entry += cnt;
+    fn inc_ref_coverage(ref_coverage: &mut RefCoverage, pos: i64, cnt: usize) {
+        ref_coverage.inc(pos, cnt);
     }
 
     fn check_pairs(
@@ -3255,7 +3263,7 @@ impl StructuralVariantsProcessor {
         let pos_map = map.entry(pos).or_default();
         let key = pos_map
             .keys()
-            .find(|k| k.to_key_string() == key_str)
+            .find(|k| k.key_equals(key_str))
             .cloned()
             .unwrap_or_else(|| VarDesc::Raw {
                 desc: key_str.as_bytes().to_vec().into(),
@@ -3267,10 +3275,7 @@ impl StructuralVariantsProcessor {
         pos_map: &'a mut InnerMap<VarDesc, Variant>,
         key_str: &str,
     ) -> Option<&'a mut Variant> {
-        let key = pos_map
-            .keys()
-            .find(|k| k.to_key_string() == key_str)
-            .cloned()?;
+        let key = pos_map.keys().find(|k| k.key_equals(key_str)).cloned()?;
         pos_map.get_mut(&key)
     }
 
@@ -3701,7 +3706,7 @@ impl StructuralVariantsProcessor {
                     }
 
                     // Increment reference coverage
-                    *data.ref_coverage.entry(prev_pos).or_insert(0) += vars_count;
+                    data.ref_coverage.inc(prev_pos, vars_count);
                 }
             }
         }
@@ -3786,7 +3791,7 @@ impl StructuralVariantsProcessor {
                     }
 
                     // Increment reference coverage
-                    *data.ref_coverage.entry(position).or_insert(0) += vars_count;
+                    data.ref_coverage.inc(position, vars_count);
                 }
             }
         }
@@ -4160,8 +4165,8 @@ impl StructuralVariantsProcessor {
         let mut candidates: Vec<(i64, String)> = Vec::new();
         for (&position, variations) in &data.non_insertion_variants {
             for key in variations.keys() {
-                let del_key = key.to_key_string();
-                if del_key.starts_with('-') {
+                if key.is_deletion() {
+                    let del_key = key.to_key_string();
                     candidates.push((position, del_key));
                 }
             }
@@ -4284,7 +4289,9 @@ impl StructuralVariantsProcessor {
             // for building seeds, regardless of whether we're doing a SEED_1 or SEED_2 lookup.
             // This means Java never creates seeds from the last SEED_1 (17) bases of each
             // loaded region. Match that boundary here to avoid spurious seed positions.
-            let site_end = sequence.len().saturating_sub(Configuration::SEED_1 as usize);
+            let site_end = sequence
+                .len()
+                .saturating_sub(Configuration::SEED_1 as usize);
             for offset in 0..site_end {
                 if offset + seed.len() > sequence.len() {
                     break;
@@ -4923,7 +4930,12 @@ mod tests {
                 .base_position,
             0
         );
-        assert_eq!(processor.find_match_rev_findsv(&soft_seq, 45, 1).base_position, 64);
+        assert_eq!(
+            processor
+                .find_match_rev_findsv(&soft_seq, 45, 1)
+                .base_position,
+            64
+        );
     }
 
     #[test]

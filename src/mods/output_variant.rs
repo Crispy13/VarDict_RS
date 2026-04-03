@@ -1633,12 +1633,8 @@ fn log_hypergeometric_probability(
         let p = sample_size as f64 / population_size as f64;
         let q = (population_size - sample_size) as f64 / population_size as f64;
         let p1 = log_binomial_probability(x, number_of_successes, p, q);
-        let p2 = log_binomial_probability(
-            sample_size - x,
-            population_size - number_of_successes,
-            p,
-            q,
-        );
+        let p2 =
+            log_binomial_probability(sample_size - x, population_size - number_of_successes, p, q);
         let p3 = log_binomial_probability(sample_size, population_size, p, q);
         p1 + p2 - p3
     }
@@ -3034,8 +3030,14 @@ mod tests {
         assert_eq!(fisher.format_odd_ratio_value(6.0), "6");
         assert_eq!(fisher.format_odd_ratio_value(5.999_999_999_999_999), "6.0");
         assert_eq!(fisher.format_odd_ratio_value(f64::INFINITY), "Inf");
-        assert_eq!(fisher.format_odd_ratio_value(2.449_494_999_999_999_7), "2.44949");
-        assert_eq!(fisher.format_odd_ratio_value(0.047_619_999_999_999_996), "0.04762");
+        assert_eq!(
+            fisher.format_odd_ratio_value(2.449_494_999_999_999_7),
+            "2.44949"
+        );
+        assert_eq!(
+            fisher.format_odd_ratio_value(0.047_619_999_999_999_996),
+            "0.04762"
+        );
         assert_eq!(fisher.format_odd_ratio_value(0.5), "0.5");
     }
 

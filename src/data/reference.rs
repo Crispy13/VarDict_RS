@@ -8,7 +8,50 @@ use bio::io::fasta::IndexedReader;
 
 use crate::conf::Configuration;
 use crate::prelude::LibDefaultHasher;
-pub type ReferenceSeedMap = HashMap<Vec<u8>, Vec<i64>, LibDefaultHasher>;
+
+#[derive(Default, Clone, Debug)]
+pub struct ReferenceSeedMap {
+    seed1: HashMap<[u8; 17], Vec<i64>, LibDefaultHasher>,
+    seed2: HashMap<[u8; 12], Vec<i64>, LibDefaultHasher>,
+}
+
+impl ReferenceSeedMap {
+    pub fn get(&self, key: &[u8]) -> Option<&Vec<i64>> {
+        match key.len() {
+            17 => self.seed1.get(<&[u8; 17]>::try_from(key).ok()?),
+            12 => self.seed2.get(<&[u8; 12]>::try_from(key).ok()?),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn insert_seed1(&mut self, key: [u8; 17], pos: i64) {
+        self.seed1.entry(key).or_default().push(pos);
+    }
+
+    pub(crate) fn insert_seed2(&mut self, key: [u8; 12], pos: i64) {
+        self.seed2.entry(key).or_default().push(pos);
+    }
+
+    pub(crate) fn reserve(&mut self, region_len: usize) {
+        let seed_capacity = region_len.saturating_mul(60) / 100;
+        self.seed1.reserve(seed_capacity);
+        self.seed2.reserve(seed_capacity);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.seed1.clear();
+        self.seed2.clear();
+    }
+
+    pub(crate) fn shrink_to_fit(&mut self) {
+        self.seed1.shrink_to_fit();
+        self.seed2.shrink_to_fit();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.seed1.is_empty() && self.seed2.is_empty()
+    }
+}
 
 /// Reference sequence data
 ///
@@ -71,6 +114,7 @@ impl Reference {
         let seed1 = Configuration::SEED_1 as usize;
         let seed2 = Configuration::SEED_2 as usize;
         let seq_len = self.ref_seq.len();
+        seed_map.reserve(seq_len);
         let at_end = chr_len.map_or(false, |len| region_end as usize == len);
         let site_end = if at_end {
             seq_len
@@ -84,19 +128,13 @@ impl Reference {
             }
 
             if i + seed1 <= seq_len {
-                let key = self.ref_seq[i..i + seed1].to_vec();
-                seed_map
-                    .entry(key)
-                    .or_insert_with(Vec::new)
-                    .push(self.region_start + i as i64);
+                let key: [u8; 17] = self.ref_seq[i..i + seed1].try_into().unwrap();
+                seed_map.insert_seed1(key, self.region_start + i as i64);
             }
 
             if i + seed2 <= seq_len {
-                let key = self.ref_seq[i..i + seed2].to_vec();
-                seed_map
-                    .entry(key)
-                    .or_insert_with(Vec::new)
-                    .push(self.region_start + i as i64);
+                let key: [u8; 12] = self.ref_seq[i..i + seed2].try_into().unwrap();
+                seed_map.insert_seed2(key, self.region_start + i as i64);
             }
         }
     }

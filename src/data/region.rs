@@ -131,13 +131,7 @@ mod tests {
 
     #[test]
     fn new_extended_preserves_negative_display_start() {
-        let region = Region::new_extended(
-            "20".to_string(),
-            1,
-            1_000_150,
-            "20".to_string(),
-            -149,
-        );
+        let region = Region::new_extended("20".to_string(), 1, 1_000_150, "20".to_string(), -149);
 
         assert_eq!(region.start(), 1);
         assert_eq!(region.display_start(), -149);

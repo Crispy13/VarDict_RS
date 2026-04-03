@@ -200,8 +200,8 @@ impl VariantRealigner {
         } else {
             for (pos, var_map) in data.non_insertion_variants.iter() {
                 for (desc, variant) in var_map {
-                    let desc_str = desc.to_key_string();
-                    if desc_str.starts_with('-') {
+                    if desc.is_deletion() {
+                        let desc_str = desc.to_key_string();
                         del_keys.push((*pos, desc.clone(), desc_str, variant.alt_depth));
                     }
                 }
@@ -244,7 +244,7 @@ impl VariantRealigner {
 
             let Some(base_key) = pos_map
                 .keys()
-                .find(|key| key.to_key_string() == base_del_desc)
+                .find(|key| key.key_equals(&base_del_desc))
                 .cloned()
             else {
                 continue;
@@ -273,9 +273,7 @@ impl VariantRealigner {
         var_map: &'a VariantMap,
         key_string: &str,
     ) -> Option<&'a VarDesc> {
-        var_map
-            .keys()
-            .find(|desc| desc.to_key_string() == key_string)
+        var_map.keys().find(|desc| desc.key_equals(key_string))
     }
 
     pub fn filter_all_sv_structures(&self, data: &mut RealignedVariationData) {
@@ -473,8 +471,8 @@ impl VariantRealigner {
     fn merge_duplicate_deletion_keys(pos_map: &mut VariantMap) {
         let mut grouped: HashMap<String, Vec<VarDesc>, LibDefaultHasher> = Default::default();
         for key in pos_map.keys() {
-            let key_str = key.to_key_string();
-            if key_str.starts_with('-') {
+            if key.is_deletion() {
+                let key_str = key.to_key_string();
                 grouped.entry(key_str).or_default().push(key.clone());
             }
         }
@@ -829,11 +827,7 @@ impl VariantRealigner {
     fn has_deletion_like_non_insertion_key(data: &RealignedVariationData, position: i64) -> bool {
         data.non_insertion_variants
             .get(&position)
-            .map(|variation_map| {
-                variation_map
-                    .keys()
-                    .any(|key| key.to_key_string().starts_with('-'))
-            })
+            .map(|variation_map| variation_map.keys().any(VarDesc::is_deletion))
             .unwrap_or(false)
     }
 
@@ -971,7 +965,7 @@ impl VariantRealigner {
 
         for (position, coverage) in extra.ref_coverage {
             Self::emit_refcov_inc_diag(data, position, coverage, "realigner_merge");
-            *data.ref_coverage.entry(position).or_insert(0) += coverage;
+            data.ref_coverage.inc(position, coverage);
         }
     }
 
@@ -1002,10 +996,7 @@ impl VariantRealigner {
         Some((left.to_string(), right.to_string()))
     }
 
-    fn merge_variant_maps(
-        dest: &mut VariantMapByPos,
-        src: VariantMapByPos,
-    ) {
+    fn merge_variant_maps(dest: &mut VariantMapByPos, src: VariantMapByPos) {
         for (position, src_map) in src {
             let dest_map = dest.entry(position).or_default();
             for (desc, src_var) in src_map {
@@ -1304,7 +1295,7 @@ impl VariantRealigner {
                         tv.alt_depth,
                         "realigner_process_insertions_mm_end5",
                     );
-                    *data.ref_coverage.entry(position).or_insert(0) += tv.alt_depth;
+                    data.ref_coverage.inc(position, tv.alt_depth);
                 }
 
                 let tv_owned = {
@@ -1380,7 +1371,7 @@ impl VariantRealigner {
 
             for sc5pp in r5.scp.iter().copied() {
                 let refcov_before = if position == 6970385 {
-                    data.ref_coverage.get(&6970385_i64).copied().unwrap_or(0)
+                    data.ref_coverage.get(6970385_i64).unwrap_or(0)
                 } else {
                     0
                 };
@@ -1400,7 +1391,7 @@ impl VariantRealigner {
                                 tv.var.alt_depth,
                                 "realigner_process_insertions_sc5",
                             );
-                            *data.ref_coverage.entry(position).or_insert(0) += tv.var.alt_depth;
+                            data.ref_coverage.inc(position, tv.var.alt_depth);
                         }
                         if let Some(vref) = data
                             .insertion_variants
@@ -1416,7 +1407,7 @@ impl VariantRealigner {
 
             for sc3pp in r3.scp.iter().copied() {
                 let refcov_before = if position == 6970385 {
-                    data.ref_coverage.get(&6970385_i64).copied().unwrap_or(0)
+                    data.ref_coverage.get(6970385_i64).unwrap_or(0)
                 } else {
                     0
                 };
@@ -1447,7 +1438,7 @@ impl VariantRealigner {
                                 tv.var.alt_depth,
                                 "realigner_process_insertions_sc3",
                             );
-                            *data.ref_coverage.entry(position).or_insert(0) += tv.var.alt_depth;
+                            data.ref_coverage.inc(position, tv.var.alt_depth);
                         }
 
                         let use_ref_var = sc3pp > position && !(insert.len() as f64 > mean_pos);
@@ -1854,7 +1845,7 @@ impl VariantRealigner {
                     sc5_var.alt_depth,
                     "realigner_softclip_bridge",
                 );
-                *data.ref_coverage.entry(bi).or_insert(0) += sc5_var.alt_depth;
+                data.ref_coverage.inc(bi, sc5_var.alt_depth);
 
                 let ins_starts_with_plus = ins_desc.first() == Some(&b'+');
                 let ins_starts_with_minus = ins_desc.first() == Some(&b'-');
@@ -2006,13 +1997,8 @@ impl VariantRealigner {
         let conf = &crate::scopedata::global_read_only_scope::instance().conf;
         let longmm = 3usize;
         let indel_size = 50i64;
-        let base_region_start = data.ref_coverage.keys().min().copied().unwrap_or(1);
-        let base_region_end = data
-            .ref_coverage
-            .keys()
-            .max()
-            .copied()
-            .unwrap_or(base_region_start);
+        let base_region_start = data.ref_coverage.min_key().unwrap_or(1);
+        let base_region_end = data.ref_coverage.max_key().unwrap_or(base_region_start);
 
         let mut tmp5: Vec<(i64, usize)> = data
             .soft_clips_5end
@@ -2211,9 +2197,9 @@ impl VariantRealigner {
                 sc5v.mark_used();
             }
 
-            if !data.ref_coverage.contains_key(&bp) {
-                if let Some(cov_p) = data.ref_coverage.get(&position).copied() {
-                    data.ref_coverage.insert(bp, cov_p);
+            if !data.ref_coverage.contains_key(bp) {
+                if let Some(cov_p) = data.ref_coverage.get(position) {
+                    data.ref_coverage.set(bp, cov_p);
                 }
             }
 
@@ -2225,7 +2211,7 @@ impl VariantRealigner {
                         sc5_contribution.alt_depth,
                         "realigner_lgdel_5_sc5_span",
                     );
-                    *data.ref_coverage.entry(tp).or_insert(0) += sc5_contribution.alt_depth;
+                    data.ref_coverage.inc(tp, sc5_contribution.alt_depth);
                 }
             }
 
@@ -2278,7 +2264,7 @@ impl VariantRealigner {
                             sc3_contribution.alt_depth,
                             "realigner_lgdel_5_sc3_span",
                         );
-                        *data.ref_coverage.entry(tp).or_insert(0) += sc3_contribution.alt_depth;
+                        data.ref_coverage.inc(tp, sc3_contribution.alt_depth);
                     }
                 }
 
@@ -2491,24 +2477,19 @@ impl VariantRealigner {
                 }
             }
 
-            if deleted_len >= indel_size && !data.ref_coverage.contains_key(&anchor_pos) {
-                if let Some(cov_prev) = data.ref_coverage.get(&(position - 1)).copied() {
-                    data.ref_coverage.insert(anchor_pos, cov_prev);
+            if deleted_len >= indel_size && !data.ref_coverage.contains_key(anchor_pos) {
+                if let Some(cov_prev) = data.ref_coverage.get(position - 1) {
+                    data.ref_coverage.set(anchor_pos, cov_prev);
                 } else {
-                    data.ref_coverage.insert(anchor_pos, cnt);
+                    data.ref_coverage.set(anchor_pos, cnt);
                 }
             }
 
             if deleted_len < indel_size {
                 let span = deleted_len + extra.len() as i64 + matched_extra.len() as i64;
                 for tp in anchor_pos..(anchor_pos + span) {
-                    Self::emit_refcov_inc_diag(
-                        data,
-                        tp,
-                        cnt,
-                        "realigner_lgdel_3_span",
-                    );
-                    *data.ref_coverage.entry(tp).or_insert(0) += cnt;
+                    Self::emit_refcov_inc_diag(data, tp, cnt, "realigner_lgdel_3_span");
+                    data.ref_coverage.inc(tp, cnt);
                 }
             }
 
@@ -2570,13 +2551,8 @@ impl VariantRealigner {
 
     pub fn realign_long_insertions(&self, data: &mut RealignedVariationData) {
         let conf = &crate::scopedata::global_read_only_scope::instance().conf;
-        let base_region_start = data.ref_coverage.keys().min().copied().unwrap_or(1);
-        let base_region_end = data
-            .ref_coverage
-            .keys()
-            .max()
-            .copied()
-            .unwrap_or(base_region_start);
+        let base_region_start = data.ref_coverage.min_key().unwrap_or(1);
+        let base_region_end = data.ref_coverage.max_key().unwrap_or(base_region_start);
 
         let mut tmp: Vec<(i64, usize)> = data
             .soft_clips_5end
@@ -2648,26 +2624,21 @@ impl VariantRealigner {
                 }
                 ins.extend_from_slice(&extra);
 
-                let ref_cov_bi = data.ref_coverage.get(&bi).copied();
-                let ref_cov_p1 = data.ref_coverage.get(&(p - 1)).copied();
+                let ref_cov_bi = data.ref_coverage.get(bi);
+                let ref_cov_p1 = data.ref_coverage.get(p - 1);
                 if ref_cov_p1.is_none()
                     || (ref_cov_bi.is_some()
                         && ref_cov_p1.is_some()
                         && ref_cov_p1.unwrap() < ref_cov_bi.unwrap())
                 {
                     if let Some(val) = ref_cov_bi {
-                        data.ref_coverage.insert(p - 1, val);
+                        data.ref_coverage.set(p - 1, val);
                     } else {
-                        data.ref_coverage.insert(p - 1, cnt);
+                        data.ref_coverage.set(p - 1, cnt);
                     }
                 } else if cnt > ref_cov_p1.unwrap_or(0) {
-                    Self::emit_refcov_inc_diag(
-                        data,
-                        p - 1,
-                        cnt,
-                        "realigner_lgins_5_prev_anchor",
-                    );
-                    *data.ref_coverage.entry(p - 1).or_insert(0) += cnt;
+                    Self::emit_refcov_inc_diag(data, p - 1, cnt, "realigner_lgins_5_prev_anchor");
+                    data.ref_coverage.inc(p - 1, cnt);
                 }
 
                 let (clusters_f, pairs_f) =
@@ -2709,7 +2680,7 @@ impl VariantRealigner {
                         sc5_var.alt_depth,
                         "realigner_lgins_5_anchor",
                     );
-                    *data.ref_coverage.entry(bi).or_insert(0) += sc5_var.alt_depth;
+                    data.ref_coverage.inc(bi, sc5_var.alt_depth);
                 }
             }
 
@@ -2739,7 +2710,7 @@ impl VariantRealigner {
                         tv.alt_depth,
                         "realigner_lgins_5_tail_snv",
                     );
-                    *data.ref_coverage.entry(pii).or_insert(0) += tv.alt_depth;
+                    data.ref_coverage.inc(pii, tv.alt_depth);
                 }
             }
 
@@ -2925,26 +2896,21 @@ impl VariantRealigner {
                 bi -= 1;
                 Self::add_sv_counts(data, bi, pairs, cnt, clusters);
 
-                let ref_cov_p = data.ref_coverage.get(&p).copied();
-                let ref_cov_bi = data.ref_coverage.get(&bi).copied();
+                let ref_cov_p = data.ref_coverage.get(p);
+                let ref_cov_bi = data.ref_coverage.get(bi);
                 if ref_cov_bi.is_none()
                     || (ref_cov_p.is_some()
                         && ref_cov_bi.is_some()
                         && ref_cov_bi.unwrap() < ref_cov_p.unwrap())
                 {
                     if let Some(val) = ref_cov_p {
-                        data.ref_coverage.insert(bi, val);
+                        data.ref_coverage.set(bi, val);
                     } else {
-                        data.ref_coverage.insert(bi, cnt);
+                        data.ref_coverage.set(bi, cnt);
                     }
                 } else if cnt > ref_cov_bi.unwrap_or(0) {
-                    Self::emit_refcov_inc_diag(
-                        data,
-                        bi,
-                        cnt,
-                        "realigner_lgins_3_anchor",
-                    );
-                    *data.ref_coverage.entry(bi).or_insert(0) += cnt;
+                    Self::emit_refcov_inc_diag(data, bi, cnt, "realigner_lgins_3_anchor");
+                    data.ref_coverage.inc(bi, cnt);
                 }
             }
 
@@ -3023,7 +2989,7 @@ impl VariantRealigner {
                     adj_cnt(vref, tv);
                     vref.pstd = true;
                     vref.qstd = true;
-                    *data.ref_coverage.entry(pii).or_insert(0) += tv.alt_depth;
+                    data.ref_coverage.inc(pii, tv.alt_depth);
                 }
             }
 
@@ -3116,11 +3082,7 @@ impl VariantRealigner {
     }
 
     /// Adjust MNPs (multi-nucleotide polymorphisms) when there are breakpoints within MNP
-    pub fn adjust_mnp(
-        &self,
-        data: &mut RealignedVariationData,
-        mnp: &CountMapByPos,
-    ) {
+    pub fn adjust_mnp(&self, data: &mut RealignedVariationData, mnp: &CountMapByPos) {
         let mut tmp: Vec<(i64, String, usize)> = Vec::new();
         for (pos, desc_map) in mnp {
             for (desc, count) in desc_map {
@@ -3235,7 +3197,7 @@ impl VariantRealigner {
                             tref.alt_depth,
                             "realigner_adjust_mnp_right",
                         );
-                        *data.ref_coverage.entry(position).or_insert(0) += tref.alt_depth;
+                        data.ref_coverage.inc(position, tref.alt_depth);
 
                         if let Some(vars_right) = data.non_insertion_variants.get_mut(&right_pos) {
                             vars_right.remove(&right_key);
@@ -3245,7 +3207,7 @@ impl VariantRealigner {
             }
 
             let refcov_before_sc3 = if position == 6970385 {
-                data.ref_coverage.get(&6970385_i64).copied().unwrap_or(0)
+                data.ref_coverage.get(6970385_i64).unwrap_or(0)
             } else {
                 0
             };
@@ -3271,7 +3233,7 @@ impl VariantRealigner {
                                 sc3v.var.alt_depth,
                                 "realigner_adjust_mnp_sc3",
                             );
-                            *data.ref_coverage.entry(position).or_insert(0) += sc3v.var.alt_depth;
+                            data.ref_coverage.inc(position, sc3v.var.alt_depth);
                             sc3v.mark_used();
                         }
                     }
@@ -3280,7 +3242,7 @@ impl VariantRealigner {
 
             let pos_5end = position + mnt.len() as i64;
             let refcov_before_sc5 = if position == 6970385 {
-                data.ref_coverage.get(&6970385_i64).copied().unwrap_or(0)
+                data.ref_coverage.get(6970385_i64).unwrap_or(0)
             } else {
                 0
             };
@@ -3307,8 +3269,7 @@ impl VariantRealigner {
                                     sc5v.var.alt_depth,
                                     "realigner_adjust_mnp_sc5",
                                 );
-                                *data.ref_coverage.entry(position).or_insert(0) +=
-                                    sc5v.var.alt_depth;
+                                data.ref_coverage.inc(position, sc5v.var.alt_depth);
                                 sc5v.mark_used();
                             }
                         }
@@ -3476,7 +3437,7 @@ impl VariantRealigner {
                 let f = f.clamp(0.0, 1.0);
                 let add = (tv.alt_depth as f64 * f) as usize;
                 Self::emit_refcov_inc_diag(data, pos, add, "realigner_del_mm_fraction");
-                *data.ref_coverage.entry(pos).or_insert(0) += add;
+                data.ref_coverage.inc(pos, add);
 
                 if let Some(ref_base) = self.get_ref_base(pos) {
                     if let Some(pos_map) = data.non_insertion_variants.get_mut(&pos) {
@@ -3554,7 +3515,7 @@ impl VariantRealigner {
 
         for sc5pp in r5.scp {
             let refcov_before = if pos == 6970385 {
-                data.ref_coverage.get(&6970385_i64).copied().unwrap_or(0)
+                data.ref_coverage.get(6970385_i64).unwrap_or(0)
             } else {
                 0
             };
@@ -3579,7 +3540,7 @@ impl VariantRealigner {
                             tv.var.alt_depth,
                             "realigner_del_sc5",
                         );
-                        *data.ref_coverage.entry(pos).or_insert(0) += tv.var.alt_depth;
+                        data.ref_coverage.inc(pos, tv.var.alt_depth);
                     }
                     if let Some(vref) = data
                         .non_insertion_variants
@@ -3595,7 +3556,7 @@ impl VariantRealigner {
 
         for sc3pp in r3.scp {
             let refcov_before = if pos == 6970385 {
-                data.ref_coverage.get(&6970385_i64).copied().unwrap_or(0)
+                data.ref_coverage.get(6970385_i64).unwrap_or(0)
             } else {
                 0
             };
@@ -3621,7 +3582,7 @@ impl VariantRealigner {
                             tv.var.alt_depth,
                             "realigner_del_sc3",
                         );
-                        *data.ref_coverage.entry(pos).or_insert(0) += tv.var.alt_depth;
+                        data.ref_coverage.inc(pos, tv.var.alt_depth);
                     }
 
                     let ref_key = if sc3pp > pos {
@@ -3703,7 +3664,7 @@ impl VariantRealigner {
         let positions: Vec<i64> = data.soft_clips_5end.keys().cloned().collect();
         for sc_pos in positions {
             let refcov_before = if pos == 6970385 {
-                data.ref_coverage.get(&6970385_i64).copied().unwrap_or(0)
+                data.ref_coverage.get(6970385_i64).unwrap_or(0)
             } else {
                 0
             };
@@ -3736,7 +3697,7 @@ impl VariantRealigner {
                     sclip.var.alt_depth,
                     "realigner_softclips_5end",
                 );
-                *data.ref_coverage.entry(pos).or_insert(0) += sclip.var.alt_depth;
+                data.ref_coverage.inc(pos, sclip.var.alt_depth);
             }
             sclip.mark_used();
         }
@@ -3752,7 +3713,7 @@ impl VariantRealigner {
         let positions: Vec<i64> = data.soft_clips_3end.keys().cloned().collect();
         for sc_pos in positions {
             let refcov_before = if pos == 6970385 {
-                data.ref_coverage.get(&6970385_i64).copied().unwrap_or(0)
+                data.ref_coverage.get(6970385_i64).unwrap_or(0)
             } else {
                 0
             };
@@ -3780,7 +3741,7 @@ impl VariantRealigner {
                     sclip.var.alt_depth,
                     "realigner_softclips_3end",
                 );
-                *data.ref_coverage.entry(pos).or_insert(0) += sclip.var.alt_depth;
+                data.ref_coverage.inc(pos, sclip.var.alt_depth);
             }
             if let Some(var_map) = data.non_insertion_variants.get_mut(&pos) {
                 if let Some(variant) = var_map.get_mut(desc) {
@@ -5190,7 +5151,7 @@ mod tests {
             .entry(1)
             .or_default()
             .insert(key.clone(), existing);
-        data.ref_coverage.insert(1, 350);
+        data.ref_coverage.set(1, 350);
 
         realigner.load_partial_ref_coverage(&mut data, -199, 0);
 
@@ -5202,7 +5163,7 @@ mod tests {
         assert_eq!(variant.alt_depth, 350);
         assert_eq!(variant.alt_depth_fwd, 347);
         assert_eq!(variant.alt_depth_rev, 3);
-        assert_eq!(data.ref_coverage.get(&1), Some(&350));
+        assert_eq!(data.ref_coverage.get(1), Some(350));
     }
 
     #[test]

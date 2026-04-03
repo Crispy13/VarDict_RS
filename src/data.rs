@@ -7,9 +7,12 @@ use crate::variants::variants::Variant;
 
 pub mod bam_reader;
 pub(crate) mod patterns;
+pub mod ref_coverage;
 pub mod reference;
 pub mod region;
 pub mod shared_reference;
+
+pub use ref_coverage::RefCoverage;
 
 pub(crate) type VariantMap = HashMap<String, Variant, LibDefaultHasher>;
 

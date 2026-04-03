@@ -29,8 +29,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::Result;
-use crossbeam_channel::{Receiver, Sender};
 use crackle_kit::tracing::{Level, event};
+use crossbeam_channel::{Receiver, Sender};
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use rust_htslib::bam::{HeaderView, Record, ext::BamRecordExtensions};
 
@@ -302,9 +302,7 @@ impl ParallelPipeline {
 
     /// Process regions using the VarDict pipeline with streaming output through a bounded
     /// channel, matching Java's BlockingQueue(10) backpressure semantics.
-    pub fn process_regions_vardict_streaming<
-        P: AsRef<Path> + Send + Sync + Clone + 'static,
-    >(
+    pub fn process_regions_vardict_streaming<P: AsRef<Path> + Send + Sync + Clone + 'static>(
         &self,
         bam_path: P,
         regions: Vec<Region>,

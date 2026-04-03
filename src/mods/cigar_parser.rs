@@ -3,10 +3,11 @@ use smallvec::SmallVec;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
-    ops::AddAssign,
-    panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
 };
+
+#[cfg(feature = "catch-panics")]
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use anyhow::{Error, anyhow};
 use crackle_kit::{
@@ -23,6 +24,7 @@ use rust_htslib::bam::{
 use crate::{
     conf::Configuration,
     data::{
+        RefCoverage,
         patterns::{SA_CIGAR_D_S_3CLIP, SA_CIGAR_D_S_5CLIP},
         reference::Reference,
         region::Region,
@@ -82,7 +84,7 @@ pub struct CigarParser {
     /// Track deletion counts by position and description string (Java: positionToDeletionCount)
     position_to_deletions_count: HashMap<i64, InnerMap<String, usize>, LibDefaultHasher>,
 
-    ref_coverage: HashMap<i64, usize, LibDefaultHasher>,
+    ref_coverage: RefCoverage,
 
     soft_clips5_end: HashMap<i64, SoftClip, LibDefaultHasher>,
     soft_clips3_end: HashMap<i64, SoftClip, LibDefaultHasher>,
@@ -224,6 +226,10 @@ impl CigarParser {
 
     /// Create a new CigarParser for processing a region
     pub fn new(region: Region, reference: Reference, instance: Arc<GlobalReadOnlyScope>) -> Self {
+        let region_len = region.len();
+        let region_start = region.start();
+        let region_end = region.end();
+
         Self {
             query_seq_buf: Some(Vec::with_capacity(512)),
             query_qual_buf: Some(Vec::with_capacity(512)),
@@ -241,14 +247,23 @@ impl CigarParser {
             start: 0,
             offset: 0,
             cigar_len: 0,
-            non_insertion_vars: Default::default(),
-            non_insertion_vars_insert_index: Default::default(),
+            non_insertion_vars: HashMap::with_capacity_and_hasher(
+                region_len,
+                LibDefaultHasher::default(),
+            ),
+            non_insertion_vars_insert_index: HashMap::with_capacity_and_hasher(
+                region_len,
+                LibDefaultHasher::default(),
+            ),
             next_non_insertion_vars_insert_index: 0,
-            insertion_vars: Default::default(),
+            insertion_vars: HashMap::with_capacity_and_hasher(
+                region_len / 4,
+                LibDefaultHasher::default(),
+            ),
             mnp: Default::default(),
             position_to_insertion_count: Default::default(),
             position_to_deletions_count: Default::default(),
-            ref_coverage: Default::default(),
+            ref_coverage: RefCoverage::new(region_start, region_end),
             soft_clips5_end: Default::default(),
             soft_clips3_end: Default::default(),
             svdelfend: 0,
@@ -298,17 +313,38 @@ impl CigarParser {
 
     /// Process a single BAM record (streaming)
     pub fn process_record(&mut self, record: &mut Record) -> Result<(), Error> {
-        let record_name = String::from_utf8_lossy(record.qname()).to_string();
+        #[cfg(not(feature = "catch-panics"))]
+        {
+            match self.parse_cigar(record) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let record_name = String::from_utf8_lossy(record.qname()).to_string();
+                    crate::utils::print_exception_and_continue(
+                        &error,
+                        "record",
+                        &record_name,
+                        Some(&self.region),
+                        &self.instance.conf,
+                    )
+                }
+            }
+        }
+
+        #[cfg(feature = "catch-panics")]
         match catch_unwind(AssertUnwindSafe(|| self.parse_cigar(record))) {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => crate::utils::print_exception_and_continue(
-                &error,
-                "record",
-                &record_name,
-                Some(&self.region),
-                &self.instance.conf,
-            ),
+            Ok(Err(error)) => {
+                let record_name = String::from_utf8_lossy(record.qname()).to_string();
+                crate::utils::print_exception_and_continue(
+                    &error,
+                    "record",
+                    &record_name,
+                    Some(&self.region),
+                    &self.instance.conf,
+                )
+            }
             Err(payload) => {
+                let record_name = String::from_utf8_lossy(record.qname()).to_string();
                 let panic_message = if let Some(message) = payload.downcast_ref::<&str>() {
                     (*message).to_string()
                 } else if let Some(message) = payload.downcast_ref::<String>() {
@@ -359,7 +395,7 @@ impl CigarParser {
                 self.non_insertion_vars_insert_index
                     .insert(pos, self.next_non_insertion_vars_insert_index);
                 self.next_non_insertion_vars_insert_index += 1;
-                entry.insert(Default::default())
+                entry.insert(InnerMap::with_capacity(4))
             }
         };
 
@@ -380,9 +416,7 @@ impl CigarParser {
         std::mem::take(&mut self.insertion_vars)
     }
 
-    pub fn take_mnp(
-        &mut self,
-    ) -> HashMap<i64, InnerMap<String, usize>, LibDefaultHasher> {
+    pub fn take_mnp(&mut self) -> HashMap<i64, InnerMap<String, usize>, LibDefaultHasher> {
         std::mem::take(&mut self.mnp)
     }
 
@@ -399,12 +433,12 @@ impl CigarParser {
     }
 
     /// Get the reference coverage map
-    pub fn get_ref_coverage(&self) -> &HashMap<i64, usize, LibDefaultHasher> {
+    pub fn get_ref_coverage(&self) -> &RefCoverage {
         &self.ref_coverage
     }
 
     /// Take ownership of the reference coverage map
-    pub fn take_ref_coverage(&mut self) -> HashMap<i64, usize, LibDefaultHasher> {
+    pub fn take_ref_coverage(&mut self) -> RefCoverage {
         std::mem::take(&mut self.ref_coverage)
     }
 
@@ -1570,7 +1604,7 @@ impl CigarParser {
 
                         if ch1 == b'N' {
                             if instance().conf.include_n_in_total_depth {
-                                inc_cnt(&mut self.ref_coverage, self.start, 1);
+                                self.ref_coverage.inc(self.start, 1);
                             }
                             self.start += 1;
                             self.read_pos_including_softclip += 1;
@@ -1781,7 +1815,6 @@ impl CigarParser {
                                     }
                                 }
                             }
-
                         } else if self.is_closer_then_vext_and_good_base(
                             query_seq,
                             query_qual,
@@ -2058,7 +2091,7 @@ impl CigarParser {
                     );
                 }
                 //increase coverage
-                inc_cnt(&mut self.ref_coverage, self.start - 1, 1);
+                self.ref_coverage.inc(self.start - 1, 1);
 
                 self.start -= 1;
                 cigar_len -= 1;
@@ -2214,7 +2247,7 @@ impl CigarParser {
                     );
                 }
                 // Add coverage
-                inc_cnt(&mut self.ref_coverage, self.start, 1);
+                self.ref_coverage.inc(self.start, 1);
                 self.read_pos_including_softclip += 1;
                 self.read_pos_excluding_softclip += 1;
                 self.start += 1;
@@ -2611,7 +2644,7 @@ impl CigarParser {
 
         // Increase coverage count for reference bases missing from the read
         for i in 0..self.cigar_len as i64 {
-            inc_cnt(&mut self.ref_coverage, self.start + i, 1);
+            self.ref_coverage.inc(self.start + i, 1);
         }
     }
 
@@ -2728,7 +2761,7 @@ impl CigarParser {
             seq_to_append.extend_from_slice(query_seq.get_or_err(tn..(tn + offset))?);
             qual_to_append.extend_from_slice(query_qual.get_or_err(tn..(tn + offset))?);
             for osi in 0..offset {
-                inc_cnt(&mut self.ref_coverage, (ts + osi) as i64, 1);
+                self.ref_coverage.inc((ts + osi) as i64, 1);
             }
             Ok(Some((offset, nmoff, seq_to_append, qual_to_append)))
         } else {
@@ -2893,7 +2926,7 @@ impl CigarParser {
                 qual_seg
                     .extend_from_slice(query_qual.get_or_err(start_idx..start_idx + self.offset)?);
                 for osi in 0..self.offset {
-                    inc_cnt(&mut self.ref_coverage, self.start + osi as i64, 1);
+                    self.ref_coverage.inc(self.start + osi as i64, 1);
                 }
             }
         }
@@ -3021,7 +3054,7 @@ impl CigarParser {
                     ref_var.pp = tp;
                     ref_var.pq = tmpq;
                     ref_var.nm += (nm - nmoff as i32) as f64;
-                    inc_cnt(&mut self.ref_coverage, insertion_pos, 1);
+                    self.ref_coverage.inc(insertion_pos, 1);
                 }
             }
         }
@@ -3171,7 +3204,7 @@ impl CigarParser {
                         "[add_variation_for_matching_part] SNV at pos {} not in reference",
                         pos
                     );
-                        b'?'
+                    b'?'
                 }
             };
 
@@ -3217,7 +3250,7 @@ impl CigarParser {
             let covered_bases = qbases.saturating_sub(shift);
             for qi in 1..=covered_bases {
                 let coverage_pos = self.start - qi as i64 + 1;
-                inc_cnt(&mut self.ref_coverage, coverage_pos, 1);
+                self.ref_coverage.inc(coverage_pos, 1);
             }
 
             if start_with_deletion {
@@ -3225,7 +3258,7 @@ impl CigarParser {
                 Self::increment_position_count(&mut self.position_to_deletions_count, pos, &s_str);
                 for qi in 1..ddlen {
                     let coverage_pos = self.start + qi as i64;
-                    inc_cnt(&mut self.ref_coverage, coverage_pos, 1);
+                    self.ref_coverage.inc(coverage_pos, 1);
                 }
             }
         }
@@ -4015,15 +4048,6 @@ fn format_splice_count(map: &HashMap<(i64, i64), Vec<usize>, LibDefaultHasher>) 
     out
 }
 
-/// Increase count for given key
-#[inline]
-fn inc_cnt(coverage_map: &mut HashMap<i64, usize, LibDefaultHasher>, pos: i64, depth: usize) {
-    coverage_map
-        .entry(pos)
-        .and_modify(|v| v.add_assign(depth))
-        .or_insert_with(|| depth);
-}
-
 fn cleanup_cigar_view(cigar: &CigarStringView, pos: i64) -> CigarStringView {
     let mut elems: Vec<Cigar> = cigar.iter().copied().collect();
 
@@ -4260,16 +4284,7 @@ fn scan_insertion_offset_extension(
 ) -> Result<(usize, usize), Error> {
     // NOTE: Java treats reference 'N' as a mismatch in insertion look-ahead.
     scan_offset_extension(
-        reference,
-        ts,
-        tn,
-        seg_len,
-        query_seq,
-        query_qual,
-        goodq,
-        vext,
-        false,
-        false,
+        reference, ts, tn, seg_len, query_seq, query_qual, goodq, vext, false, false,
     )
 }
 
@@ -4608,7 +4623,9 @@ mod tests {
     fn test_cigar_parser_mapped_read_ref_loaded_no_indels() {
         use crate::data::reference::FastaReader;
         use crate::data::region::Region;
-        use crate::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE, instance_arc};
+        use crate::scopedata::global_read_only_scope::{
+            GlobalReadOnlyScope, INSTANCE, instance_arc,
+        };
         use rust_htslib::bam::{Read, Reader};
         use std::sync::Arc;
 
@@ -4692,7 +4709,9 @@ mod tests {
         use crate::data::reference::FastaReader;
         use crate::data::region::Region;
         use crate::mods::vardict_pipeline::VarDictPipeline;
-        use crate::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE, instance_arc};
+        use crate::scopedata::global_read_only_scope::{
+            GlobalReadOnlyScope, INSTANCE, instance_arc,
+        };
         use crate::variants::variants::VarDesc;
         use std::collections::HashMap;
         use std::fs::File;

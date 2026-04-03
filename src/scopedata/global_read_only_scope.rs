@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::{Arc, OnceLock}};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 
 use crate::conf::Configuration;
 use crate::prelude::LibDefaultHasher;

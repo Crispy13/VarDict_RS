@@ -38,6 +38,7 @@ default = ["mimalloc-global"]
 mimalloc-global = ["dep:mimalloc"]
 jemalloc-global = ["dep:tikv-jemallocator"]
 dhat-heap = ["dep:dhat"]
+catch-panics = []
 # bio=["dep:bio"]
 # needletail=["dep:needletail"]
 
@@ -69,6 +70,7 @@ debug = true
 
 [profile.deploy]
 inherits = "release"
+panic = "abort"
 lto = true
 codegen-units = 1
 debug = false

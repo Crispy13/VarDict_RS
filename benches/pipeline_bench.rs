@@ -39,8 +39,7 @@ fn build_pipeline_bench_input() -> Result<PipelineBenchInput> {
     ensure_exists(&bam_path)?;
 
     let region = Region::new("20".to_string(), 168600, 168800, String::new());
-    let shared_reference =
-        load_shared_reference_chroms(reference_path.as_path(), &["20"])?;
+    let shared_reference = load_shared_reference_chroms(reference_path.as_path(), &["20"])?;
     let scope = initialize_scope(&shared_reference, &bam_path, false);
     let (records, target_names) = load_cached_records(&bam_path, &region)?;
     let pipeline = VarDictPipeline::new("bench_sample")
@@ -89,7 +88,10 @@ fn ensure_exists(path: &Path) -> Result<()> {
     if path.exists() {
         Ok(())
     } else {
-        Err(anyhow!("required benchmark input is missing: {}", path.display()))
+        Err(anyhow!(
+            "required benchmark input is missing: {}",
+            path.display()
+        ))
     }
 }
 
@@ -125,9 +127,7 @@ fn bench_pipeline(c: &mut Criterion) {
                             &input.target_names,
                             Arc::clone(&input.instance),
                         )
-                        .unwrap_or_else(|error| {
-                            panic!("pipeline benchmark failed: {error}")
-                        });
+                        .unwrap_or_else(|error| panic!("pipeline benchmark failed: {error}"));
                     black_box(output_lines.len());
                 },
                 BatchSize::LargeInput,

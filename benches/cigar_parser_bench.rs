@@ -38,8 +38,7 @@ fn build_cigar_parser_bench_input() -> Result<CigarParserBenchInput> {
     ensure_exists(&bam_path)?;
 
     let region = Region::new("20".to_string(), 168600, 168800, String::new());
-    let shared_reference =
-        load_shared_reference_chroms(reference_path.as_path(), &["20"])?;
+    let shared_reference = load_shared_reference_chroms(reference_path.as_path(), &["20"])?;
     let scope = initialize_scope(&shared_reference, &bam_path, true);
     let reference = build_reference(&region, &shared_reference, &scope)?;
     let (records, _) = load_cached_records(&bam_path, &region)?;
@@ -82,7 +81,10 @@ fn ensure_exists(path: &Path) -> Result<()> {
     if path.exists() {
         Ok(())
     } else {
-        Err(anyhow!("required benchmark input is missing: {}", path.display()))
+        Err(anyhow!(
+            "required benchmark input is missing: {}",
+            path.display()
+        ))
     }
 }
 
@@ -149,9 +151,9 @@ fn bench_cigar_parser(c: &mut Criterion) {
                     input.reference.clone(),
                     Arc::clone(&input.instance),
                 );
-                parser.process_records(records.iter_mut()).unwrap_or_else(|error| {
-                    panic!("cigar parser benchmark failed: {error}")
-                });
+                parser
+                    .process_records(records.iter_mut())
+                    .unwrap_or_else(|error| panic!("cigar parser benchmark failed: {error}"));
                 black_box(parser.get_non_insertion_vars().len());
             },
             BatchSize::LargeInput,

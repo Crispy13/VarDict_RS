@@ -1,10 +1,4 @@
-use std::{
-    fmt,
-    iter::FusedIterator,
-    mem,
-    slice,
-    vec,
-};
+use std::{fmt, iter::FusedIterator, mem, slice, vec};
 
 /// Compact map backed by a `Vec<(K, V)>` for tiny key sets.
 ///
@@ -39,7 +33,9 @@ pub struct VecMap<K, V> {
 impl<K, V> VecMap<K, V> {
     /// Creates an empty map.
     pub const fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// Creates an empty map with capacity for at least `capacity` entries.
@@ -535,7 +531,10 @@ mod tests {
         assert_eq!(map.keys().copied().collect::<Vec<_>>(), vec!["a", "b", "c"]);
         assert_eq!(map.values().copied().collect::<Vec<_>>(), vec![12, 13, 14]);
 
-        let borrowed_pairs: Vec<_> = (&map).into_iter().map(|(key, value)| (*key, *value)).collect();
+        let borrowed_pairs: Vec<_> = (&map)
+            .into_iter()
+            .map(|(key, value)| (*key, *value))
+            .collect();
         assert_eq!(borrowed_pairs, vec![("a", 12), ("b", 13), ("c", 14)]);
 
         let consumed_pairs: Vec<_> = map.clone().into_iter().collect();

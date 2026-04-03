@@ -14,7 +14,9 @@ pub(crate) fn get_variants_from_map<'a>(
     start: i64,
     var_desc: &VarDesc,
 ) -> &'a mut Variant {
-    let pos_map = var_map.entry(start).or_insert_with(Default::default);
+    let pos_map = var_map
+        .entry(start)
+        .or_insert_with(|| InnerMap::with_capacity(4));
 
     get_variant_from_pos_map(pos_map, var_desc)
 }

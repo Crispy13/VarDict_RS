@@ -140,7 +140,9 @@ fn bench_get_hit(c: &mut Criterion) {
 /// Benchmark: look up a key that does NOT exist (miss)
 fn bench_get_miss(c: &mut Criterion) {
     let mut group = c.benchmark_group("get_miss");
-    let miss_key = VarDesc::Raw { desc: SmallVec::from_slice(b"NONEXISTENT") };
+    let miss_key = VarDesc::Raw {
+        desc: SmallVec::from_slice(b"NONEXISTENT"),
+    };
 
     for &n in SIZES {
         let keys = make_keys(n);
@@ -177,7 +179,9 @@ fn bench_entry_or_default(c: &mut Criterion) {
                         let v = m.entry(k.clone()).or_default();
                         v.alt_depth += 1;
                     }
-                    let new_key = VarDesc::Raw { desc: SmallVec::from_slice(b"NEW") };
+                    let new_key = VarDesc::Raw {
+                        desc: SmallVec::from_slice(b"NEW"),
+                    };
                     m.entry(new_key).or_default();
                     black_box(&m);
                 },
@@ -193,7 +197,9 @@ fn bench_entry_or_default(c: &mut Criterion) {
                         let v = m.entry(k.clone()).or_default();
                         v.alt_depth += 1;
                     }
-                    let new_key = VarDesc::Raw { desc: SmallVec::from_slice(b"NEW") };
+                    let new_key = VarDesc::Raw {
+                        desc: SmallVec::from_slice(b"NEW"),
+                    };
                     m.entry(new_key).or_default();
                     black_box(&m);
                 },
@@ -269,11 +275,10 @@ fn bench_mem_size(c: &mut Criterion) {
         let vm = prefill_vecmap(&keys);
         let hm = prefill_hashmap(&keys);
 
-        let vm_size = std::mem::size_of_val(&vm)
-            + vm.len() * std::mem::size_of::<(VarDesc, RawVariant)>();
+        let vm_size =
+            std::mem::size_of_val(&vm) + vm.len() * std::mem::size_of::<(VarDesc, RawVariant)>();
         let hm_size = std::mem::size_of_val(&hm)
-            + hm.capacity()
-                * (std::mem::size_of::<(VarDesc, RawVariant)>() + 1); // +1 for control byte
+            + hm.capacity() * (std::mem::size_of::<(VarDesc, RawVariant)>() + 1); // +1 for control byte
 
         // Print sizes as a side effect so they show up in bench output
         eprintln!(

@@ -21,6 +21,7 @@ use anyhow::{Error, Result};
 use crackle_kit::tracing::{Level, event};
 use rust_htslib::bam::{Record, ext::BamRecordExtensions};
 
+use crate::data::RefCoverage;
 use crate::data::bam_reader::BamReader;
 use crate::data::reference::Reference;
 use crate::data::region::Region;
@@ -52,7 +53,7 @@ type RawVarMap = InnerMap<VarDesc, RawVariant>;
 type RawVarByPos = HashMap<i64, RawVarMap, LibDefaultHasher>;
 type CountMap = InnerMap<String, usize>;
 type CountByPos = HashMap<i64, CountMap, LibDefaultHasher>;
-type RefCovMap = HashMap<i64, usize, LibDefaultHasher>;
+type RefCovMap = RefCoverage;
 type VarsByPos = HashMap<i64, Vars, LibDefaultHasher>;
 type HistoricalDelRightseqMap = HashMap<i64, HashSet<String, LibDefaultHasher>, LibDefaultHasher>;
 
@@ -180,7 +181,7 @@ pub struct CigarParserOutput {
     /// Reverse inter-chromosomal fusion clusters used by Java SOFTP2SV gating.
     pub svrfus: HashMap<i32, Vec<SoftClip>, LibDefaultHasher>,
     /// Reference coverage by position
-    pub ref_coverage: HashMap<i64, usize, LibDefaultHasher>,
+    pub ref_coverage: RefCovMap,
     /// MNP map (position -> description -> count)
     pub mnp: CountByPos,
     /// Insertion counts by position and description (Java: positionToInsertionCount)
@@ -460,7 +461,7 @@ fn write_variant_map<W: Write>(writer: &mut W, line_type: &str, map: &RawVarByPo
     for pos in positions {
         if let Some(vars) = map.get(&pos) {
             let mut keys: Vec<&VarDesc> = vars.keys().collect();
-            keys.sort_by_cached_key(|desc| desc.to_key_string());
+            keys.sort_by(|a, b| a.cmp_as_key_string(b));
             for key in keys {
                 let var = vars.get(key).expect("variant missing for key");
                 let key_str = key.to_key_string();
@@ -498,10 +499,7 @@ fn write_tovars_variants<W: Write>(writer: &mut W, map: &VarsByPos) -> Result<()
 }
 
 fn write_ref_cov<W: Write>(writer: &mut W, map: &RefCovMap) -> Result<()> {
-    let mut positions: Vec<i64> = map.keys().copied().collect();
-    positions.sort_unstable();
-    for pos in positions {
-        let count = map.get(&pos).copied().unwrap_or(0);
+    for (pos, count) in map.iter_sorted() {
         let data = format!("{{\"count\":{}}}", count);
         write_json_line(writer, "REFCOV", pos, "-", &data)?;
     }
@@ -807,7 +805,7 @@ pub struct RealignedOutput {
     /// Insertion variants
     pub insertion_vars: RawVarByPos,
     /// Reference coverage by position
-    pub ref_coverage: HashMap<i64, usize, LibDefaultHasher>,
+    pub ref_coverage: RefCovMap,
     /// Duplication rate
     pub duprate: f64,
     /// Maximum read length
@@ -830,7 +828,7 @@ pub struct AlignedVarsData {
     /// Simulated Java HashMap capacity for aligned_variants (tracks growth, never shrinks)
     pub aligned_variants_java_capacity: usize,
     /// Reference coverage by position
-    pub ref_coverage: HashMap<i64, usize, LibDefaultHasher>,
+    pub ref_coverage: RefCovMap,
 }
 
 impl Default for AlignedVarsData {
@@ -2661,7 +2659,7 @@ impl VarDictPipeline {
                 debug_pos = pos,
                 nonins_has_pos = non_insertion_vars.contains_key(&pos),
                 ins_has_pos = insertion_vars.contains_key(&pos),
-                refcov_has_pos = ref_coverage.contains_key(&pos),
+                refcov_has_pos = ref_coverage.contains_key(pos),
                 nonins_len = non_insertion_vars.len(),
                 ins_len = insertion_vars.len(),
                 "to_vars_builder: debug position presence before iteration"
@@ -2693,7 +2691,7 @@ impl VarDictPipeline {
                     position,
                     nonins_count = vars_at_pos.len(),
                     has_insertion = ins_at_pos.is_some(),
-                    has_refcov = ref_coverage.contains_key(&position),
+                    has_refcov = ref_coverage.contains_key(position),
                     "to_vars_builder: position encountered"
                 );
             }
@@ -2728,7 +2726,7 @@ impl VarDictPipeline {
                 continue;
             }
 
-            if !ref_coverage.contains_key(&position) {
+            if !ref_coverage.contains_key(position) {
                 if trace_this_pos {
                     event!(
                         Level::DEBUG,
@@ -2739,12 +2737,8 @@ impl VarDictPipeline {
                 continue;
             }
 
-            if self.is_same_variation_on_ref(
-                position,
-                &vars_at_pos,
-                ins_at_pos.as_ref(),
-                reference,
-            ) {
+            if self.is_same_variation_on_ref(position, &vars_at_pos, ins_at_pos.as_ref(), reference)
+            {
                 if trace_this_pos {
                     event!(
                         Level::DEBUG,
@@ -2755,8 +2749,8 @@ impl VarDictPipeline {
                 continue;
             }
 
-            let mut total_pos_coverage = match ref_coverage.get(&position) {
-                Some(coverage) if *coverage > 0 => *coverage,
+            let mut total_pos_coverage = match ref_coverage.get(position) {
+                Some(coverage) if coverage > 0 => coverage,
                 _ => {
                     continue;
                 }
@@ -2767,7 +2761,7 @@ impl VarDictPipeline {
                     Level::DEBUG,
                     position,
                     ref_cov_at_pos = total_pos_coverage,
-                    ref_cov_next = ref_coverage.get(&(position + 1)).copied().unwrap_or(0),
+                    ref_cov_next = ref_coverage.get(position + 1).unwrap_or(0),
                     "to_vars_builder: reference coverage snapshot"
                 );
             }
@@ -2778,7 +2772,7 @@ impl VarDictPipeline {
             let mut debug_lines: Vec<String> = Vec::new();
 
             let mut keys: Vec<&VarDesc> = vars_at_pos.keys().collect();
-            keys.sort_by_cached_key(|desc| desc.to_key_string());
+            keys.sort_by(|a, b| a.cmp_as_key_string(b));
 
             let sv_string = self.create_variant_records(
                 position,
@@ -2959,28 +2953,28 @@ impl VarDictPipeline {
         insertion_vars: Option<&RawVarMap>,
         reference: &Reference,
     ) -> bool {
-        let mut keys = HashSet::new();
-        for desc in vars_at_pos.keys() {
-            keys.insert(desc.to_key_string());
-        }
-
         if insertion_vars.is_some() {
-            keys.insert("I".to_string());
+            return false;
         }
 
-        if keys.len() == 1 {
-            if let Some(ref_base) = reference.get(position).map(|b| (b as char).to_string()) {
-                if keys.contains(&ref_base)
-                    && !self.do_pileup
-                    && instance().bam_paths.len() < 2
-                    && instance().amplicon_based_calling.is_none()
-                {
-                    return true;
-                }
-            }
+        if vars_at_pos.is_empty() {
+            return false;
         }
 
-        false
+        let Some(ref_byte) = reference.get(position) else {
+            return false;
+        };
+
+        if !vars_at_pos
+            .keys()
+            .all(|desc| desc.key_matches_byte(ref_byte))
+        {
+            return false;
+        }
+
+        !self.do_pileup
+            && instance().bam_paths.len() < 2
+            && instance().amplicon_based_calling.is_none()
     }
 
     fn calc_hicov(
@@ -3014,10 +3008,9 @@ impl VarDictPipeline {
         duprate: f64,
     ) -> Option<String> {
         use crate::mods::to_vars_builder::{StrandBiasFlag, StrandBiasValue};
-        use std::collections::BTreeMap;
 
         let mut sv_string: Option<String> = None;
-        let mut merged: BTreeMap<String, RawVariant> = BTreeMap::new();
+        let mut merged: Vec<(String, RawVariant)> = Vec::with_capacity(keys.len());
 
         for desc in keys {
             if matches!(desc, VarDesc::Raw { desc } if desc.as_slice() == b"SV") {
@@ -3032,11 +3025,15 @@ impl VarDictPipeline {
             let Some(raw_var) = vars_at_pos.get(desc) else {
                 continue;
             };
-            let desc_str = desc.to_key_string();
-            merged
-                .entry(desc_str)
-                .and_modify(|acc| Self::merge_raw_variant(acc, raw_var))
-                .or_insert_with(|| raw_var.clone());
+
+            if let Some((last_desc_str, last_raw_var)) = merged.last_mut() {
+                if desc.key_equals(last_desc_str) {
+                    Self::merge_raw_variant(last_raw_var, raw_var);
+                    continue;
+                }
+            }
+
+            merged.push((desc.to_key_string(), raw_var.clone()));
         }
 
         for (desc_str, raw_var) in merged {
@@ -3125,7 +3122,6 @@ impl VarDictPipeline {
         duprate: f64,
     ) -> usize {
         use crate::mods::to_vars_builder::{StrandBiasFlag, StrandBiasValue};
-        use std::collections::BTreeMap;
 
         let Some(insertion_variations) = insertion_vars else {
             return total_pos_coverage;
@@ -3133,23 +3129,27 @@ impl VarDictPipeline {
 
         let mut running_hicov = hicov;
 
-        let mut merged: BTreeMap<String, RawVariant> = BTreeMap::new();
+        let mut merged: Vec<(String, RawVariant)> = Vec::with_capacity(insertion_variations.len());
         let mut keys: Vec<&VarDesc> = insertion_variations.keys().collect();
-        keys.sort_by_cached_key(|desc| desc.to_key_string());
+        keys.sort_by(|a, b| a.cmp_as_key_string(b));
         for desc in keys {
-            let desc_str = desc.to_key_string();
             let Some(cnt) = insertion_variations.get(desc) else {
                 continue;
             };
-            merged
-                .entry(desc_str)
-                .and_modify(|acc| Self::merge_raw_variant(acc, cnt))
-                .or_insert_with(|| cnt.clone());
+
+            if let Some((last_desc_str, last_cnt)) = merged.last_mut() {
+                if desc.key_equals(last_desc_str) {
+                    Self::merge_raw_variant(last_cnt, cnt);
+                    continue;
+                }
+            }
+
+            merged.push((desc.to_key_string(), cnt.clone()));
         }
 
         for (desc_str, cnt) in merged {
             if desc_str.contains('&') {
-                if let Some(&coverage) = ref_coverage.get(&(position + 1)) {
+                if let Some(coverage) = ref_coverage.get(position + 1) {
                     total_pos_coverage = coverage;
                 }
             }
@@ -3180,7 +3180,7 @@ impl VarDictPipeline {
 
             if ttcov < total_count {
                 ttcov = total_count;
-                if let Some(&next_cov) = ref_coverage.get(&(position + 1)) {
+                if let Some(next_cov) = ref_coverage.get(position + 1) {
                     if ttcov < next_cov.saturating_sub(total_count) {
                         ttcov = next_cov;
                         if let Some(next_map) = non_insertion_vars.get_mut(&(position + 1)) {
@@ -3365,7 +3365,7 @@ impl VarDictPipeline {
             }
         }
 
-        if let Some(&ref_cov_at_pos) = ref_coverage.get(&position) {
+        if let Some(ref_cov_at_pos) = ref_coverage.get(position) {
             if total_pos_coverage > ref_cov_at_pos {
                 if let Some(next_map) = non_insertion_vars.get(&(position + 1)) {
                     if let Some(ref_base) = reference.get(position + 1) {
@@ -3630,7 +3630,7 @@ impl VarDictPipeline {
                                 )
                                 .map(|b| (b as char).to_string())
                                 .unwrap_or_default();
-                            if let Some(&coverage) = ref_coverage.get(&(start_position - 1)) {
+                            if let Some(coverage) = ref_coverage.get(start_position - 1) {
                                 total_pos_coverage = coverage;
                             }
                             if vref.position_coverage > total_pos_coverage {
@@ -3928,10 +3928,8 @@ impl VarDictPipeline {
         );
         reference_variant.is_at_least_at_2_positions = false;
         reference_variant.has_at_least_2_diff_qualities = false;
-        reference_variant.nm = round_half_even(
-            "0.0",
-            raw_ref_variant.nm / raw_ref_variant.alt_depth as f64,
-        );
+        reference_variant.nm =
+            round_half_even("0.0", raw_ref_variant.nm / raw_ref_variant.alt_depth as f64);
         reference_variant.high_qual_read_cnt = raw_ref_variant.high_qual_read_cnt;
         reference_variant.low_qual_read_cnt = raw_ref_variant.low_qual_read_cnt;
         reference_variant.hicov = raw_ref_variant.high_qual_read_cnt;
@@ -3982,10 +3980,8 @@ impl VarDictPipeline {
         vref.rightseq.clear();
         vref.duprate = duprate;
         vref.crispr = 0;
-        vref.strand_bias_flag = StrandBiasFlag::new(
-            vref.strand_bias_flag.var_bias,
-            StrandBiasValue::CantAssess,
-        );
+        vref.strand_bias_flag =
+            StrandBiasFlag::new(vref.strand_bias_flag.var_bias, StrandBiasValue::CantAssess);
     }
 
     fn validate_refallele(&self, refallele: &str) -> String {
@@ -4070,9 +4066,9 @@ impl VarDictPipeline {
     ) -> Vars {
         use crate::mods::to_vars_builder::{StrandBiasFlag, StrandBiasValue, check_strand_bias};
 
-        let mut total_coverage = ref_coverage.get(&position).copied().unwrap_or(0);
+        let mut total_coverage = ref_coverage.get(position).unwrap_or(0);
         let actual_ref_base = reference.get(position).unwrap_or(b'N');
-        let position_hicov = hicov_by_pos.get(&position).copied().unwrap_or(0);
+        let position_hicov = hicov_by_pos.get(position).unwrap_or(0);
 
         let has_amp_insertion = var_map.iter().any(|(desc, _)| match desc {
             VarDesc::Ins { seq } => seq.iter().any(|&b| b == b'&'),
@@ -4081,7 +4077,7 @@ impl VarDictPipeline {
         });
 
         if has_amp_insertion {
-            if let Some(&coverage) = ref_coverage.get(&(position + 1)) {
+            if let Some(coverage) = ref_coverage.get(position + 1) {
                 total_coverage = coverage;
             }
         }
@@ -4114,7 +4110,7 @@ impl VarDictPipeline {
 
         // Java logic: if total coverage exceeds ref coverage at this position and
         // there is a reference variant at position+1, use its strand counts.
-        let ref_cov_at_pos = ref_coverage.get(&position).copied().unwrap_or(0);
+        let ref_cov_at_pos = ref_coverage.get(position).unwrap_or(0);
         if total_coverage > ref_cov_at_pos {
             if let Some(&(fwd, rev)) = ref_counts_by_pos.get(&(position + 1)) {
                 ref_fwd_count = fwd;
@@ -4148,7 +4144,7 @@ impl VarDictPipeline {
 
             if is_insertion && ttcov < total_count {
                 ttcov = total_count;
-                if let Some(&next_cov) = ref_coverage.get(&(position + 1)) {
+                if let Some(next_cov) = ref_coverage.get(position + 1) {
                     if next_cov > total_count && ttcov < next_cov - total_count {
                         ttcov = next_cov;
                         if let Some((ref_fwd, ref_rev)) = ref_counts_by_pos.get_mut(&(position + 1))
@@ -6684,7 +6680,7 @@ mod tests {
         variant.hicov = total_coverage;
         variant.high_quality_reads_frequency = frequency;
         variant.genotype = format!("{}/{}", ref_allele, var_allele);
-            variant.threshold_frequency = frequency;
+        variant.threshold_frequency = frequency;
         variant
     }
 
@@ -6854,7 +6850,7 @@ mod tests {
         });
 
         let mut ref_coverage: RefCovMap = Default::default();
-        ref_coverage.insert(105, 8);
+        ref_coverage.set(105, 8);
         let mut non_insertion_vars: RawVarByPos = Default::default();
         let mut debug_lines = Vec::new();
 
@@ -6945,7 +6941,7 @@ mod tests {
         });
 
         let mut ref_coverage: RefCovMap = Default::default();
-        ref_coverage.insert(105, 8);
+        ref_coverage.set(105, 8);
         let mut non_insertion_vars: RawVarByPos = Default::default();
         let mut historical_del_rightseq_variants: HistoricalDelRightseqMap = Default::default();
         historical_del_rightseq_variants
@@ -7113,7 +7109,7 @@ mod tests {
         let mut var_list = Vec::new();
         let mut debug_lines = Vec::new();
         let mut keys: Vec<&VarDesc> = vars_at_pos.keys().collect();
-        keys.sort_by_cached_key(|desc| desc.to_key_string());
+        keys.sort_by(|a, b| a.cmp_as_key_string(b));
 
         let _ = pipeline.create_variant_records(
             position,
@@ -7173,7 +7169,7 @@ mod tests {
         insertion_vars.insert(position, insertion_variations);
 
         let mut non_insertion_vars: RawVarByPos = Default::default();
-        let ref_coverage: HashMap<i64, usize, LibDefaultHasher> = Default::default();
+        let ref_coverage: RefCovMap = Default::default();
         let reference = Reference::from_seq_with_start(b"A", 1);
 
         let mut var_list = Vec::new();
@@ -7210,6 +7206,119 @@ mod tests {
         assert_eq!(v.hicov, 44);
         assert!((v.high_quality_reads_frequency - 1.0).abs() < 0.001);
         assert!((v.extra_frequency - 0.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_create_variant_records_merges_equal_key_strings() {
+        use crate::prelude::SmallVecBytes;
+        use crate::variants::variants::Variant as RawVariant;
+
+        let pipeline = VarDictPipeline::new("test");
+        let position = 123i64;
+
+        let mut typed_raw = RawVariant::default();
+        typed_raw.alt_depth = 2;
+        typed_raw.alt_depth_fwd = 1;
+        typed_raw.alt_depth_rev = 1;
+        typed_raw.high_qual_read_cnt = 2;
+
+        let mut raw_raw = RawVariant::default();
+        raw_raw.alt_depth = 3;
+        raw_raw.alt_depth_fwd = 2;
+        raw_raw.alt_depth_rev = 1;
+        raw_raw.high_qual_read_cnt = 3;
+
+        let mut vars_at_pos: RawVarMap = Default::default();
+        vars_at_pos.insert(VarDesc::snv_key(b'A'), typed_raw);
+        vars_at_pos.insert(
+            VarDesc::Raw {
+                desc: SmallVecBytes::from_slice(b"A"),
+            },
+            raw_raw,
+        );
+
+        let mut keys: Vec<&VarDesc> = vars_at_pos.keys().collect();
+        keys.sort_by(|a, b| a.cmp_as_key_string(b));
+
+        let mut var_list = Vec::new();
+        let mut debug_lines = Vec::new();
+        let _ = pipeline.create_variant_records(
+            position,
+            &vars_at_pos,
+            None,
+            10,
+            &mut var_list,
+            &mut debug_lines,
+            &keys,
+            5,
+            0.0,
+        );
+
+        assert_eq!(var_list.len(), 1);
+        let variant = &var_list[0];
+        assert_eq!(variant.description_string, "A");
+        assert_eq!(variant.position_coverage, 5);
+        assert_eq!(variant.vars_count_on_forward, 3);
+        assert_eq!(variant.vars_count_on_reverse, 2);
+        assert_eq!(variant.high_qual_read_cnt, 5);
+    }
+
+    #[test]
+    fn test_create_insertion_records_merges_equal_key_strings() {
+        use crate::prelude::SmallVecBytes;
+        use crate::variants::variants::Variant as RawVariant;
+
+        let pipeline = VarDictPipeline::new("test");
+        let position = 123i64;
+
+        let mut typed_raw = RawVariant::default();
+        typed_raw.alt_depth = 2;
+        typed_raw.alt_depth_fwd = 1;
+        typed_raw.alt_depth_rev = 1;
+        typed_raw.high_qual_read_cnt = 2;
+
+        let mut raw_raw = RawVariant::default();
+        raw_raw.alt_depth = 3;
+        raw_raw.alt_depth_fwd = 2;
+        raw_raw.alt_depth_rev = 1;
+        raw_raw.high_qual_read_cnt = 3;
+
+        let mut insertion_variations: RawVarMap = Default::default();
+        insertion_variations.insert(VarDesc::insertion(b"TT"), typed_raw);
+        insertion_variations.insert(
+            VarDesc::Raw {
+                desc: SmallVecBytes::from_slice(b"+TT"),
+            },
+            raw_raw,
+        );
+
+        let mut non_insertion_vars: RawVarByPos = Default::default();
+        let ref_coverage: RefCovMap = Default::default();
+        let reference = Reference::from_seq_with_start(b"A", 1);
+        let mut var_list = Vec::new();
+        let mut debug_lines = Vec::new();
+
+        let updated_tcov = pipeline.create_insertion_records(
+            position,
+            10,
+            Some(&insertion_variations),
+            &mut non_insertion_vars,
+            &ref_coverage,
+            &reference,
+            &mut var_list,
+            &mut debug_lines,
+            5,
+            0.0,
+        );
+
+        assert_eq!(updated_tcov, 10);
+        assert_eq!(var_list.len(), 1);
+        let variant = &var_list[0];
+        assert_eq!(variant.description_string, "+TT");
+        assert_eq!(variant.position_coverage, 5);
+        assert_eq!(variant.vars_count_on_forward, 3);
+        assert_eq!(variant.vars_count_on_reverse, 2);
+        assert_eq!(variant.high_qual_read_cnt, 5);
     }
 
     #[test]
@@ -7258,7 +7367,7 @@ mod tests {
             },
             ref_coverage: {
                 let mut map: RefCovMap = Default::default();
-                map.insert(position, 6usize);
+                map.set(position, 6usize);
                 map
             },
             duprate: 0.0,
@@ -7307,7 +7416,7 @@ mod tests {
             },
             ref_coverage: {
                 let mut map: RefCovMap = Default::default();
-                map.insert(position, 6usize);
+                map.set(position, 6usize);
                 map
             },
             duprate: 0.0,
@@ -7366,7 +7475,7 @@ mod tests {
         good_var.is_at_least_at_2_positions = true;
         good_var.has_at_least_2_diff_qualities = true;
         good_var.frequency = 0.3;
-            good_var.threshold_frequency = 0.3;
+        good_var.threshold_frequency = 0.3;
         good_var.high_qual_read_cnt = 5;
         good_var.mean_position = 10.0;
         good_var.mean_quality = 30.0;
@@ -7381,7 +7490,7 @@ mod tests {
         bad_var.is_at_least_at_2_positions = true;
         bad_var.has_at_least_2_diff_qualities = true;
         bad_var.frequency = 0.05; // Low frequency + "2;1" pattern = bad
-            bad_var.threshold_frequency = 0.05;
+        bad_var.threshold_frequency = 0.05;
         bad_var.high_qual_read_cnt = 5;
         bad_var.mean_position = 10.0;
         bad_var.mean_quality = 30.0;
@@ -7396,7 +7505,7 @@ mod tests {
         high_freq_bias.is_at_least_at_2_positions = true;
         high_freq_bias.has_at_least_2_diff_qualities = true;
         high_freq_bias.frequency = 0.5; // High enough to pass despite 2;1 pattern
-            high_freq_bias.threshold_frequency = 0.5;
+        high_freq_bias.threshold_frequency = 0.5;
         high_freq_bias.high_qual_read_cnt = 5;
         high_freq_bias.mean_position = 10.0;
         high_freq_bias.mean_quality = 30.0;
@@ -7494,7 +7603,10 @@ mod tests {
         let sam_filter = 0x504u32;
 
         let out_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tmp_compare");
-        let out_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tmp_compare/rust.preproc.all.txt");
+        let out_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tmp_compare/rust.preproc.all.txt"
+        );
         fs::create_dir_all(out_dir).expect("Failed to create tmp_compare");
         let out_file = fs::File::create(out_path).expect("Failed to create rust preproc dump");
         let mut writer = std::io::BufWriter::new(out_file);

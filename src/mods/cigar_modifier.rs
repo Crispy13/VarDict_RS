@@ -263,7 +263,8 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
             _ => {}
         }
 
-        let modified_cigar_text = CigarString(cigar_vec.iter().copied().collect::<Vec<_>>()).to_string();
+        let modified_cigar_text =
+            CigarString(cigar_vec.iter().copied().collect::<Vec<_>>()).to_string();
 
         let mc = ModifiedCigar::new(
             ref_start_pos as i64,
@@ -272,8 +273,7 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
             self.query_quality,
         );
 
-        if debug_pos_55286157
-            && original_global_align_start == DEBUG_CIGAR_MOD_ALIGN_START_55286090
+        if debug_pos_55286157 && original_global_align_start == DEBUG_CIGAR_MOD_ALIGN_START_55286090
         {
             eprintln!(
                 "[DEBUG-55286157] CIGAR_MOD align_start={} original_cigar={} modified_align_start={} modified_cigar={}",
