@@ -148,7 +148,7 @@ Measure actual RSS improvement on the same region as Phase 1.
 
 20. **Run all cargo tests**:
     ```bash
-    cargo test
+    cargo test -- --include-ignored
     ```
 
 21. **Run parity check** on the measurement region:

@@ -106,5 +106,5 @@ A module passes parity check when:
 - [ ] All edge cases from the analysis are tested
 - [ ] Code review has no blocking issues
 - [ ] Performance Verdict is `PERF_SAFE` or `PERF_RISK` (with documented justification)
-- [ ] `cargo test` passes for the module
+- [ ] `cargo test -- --include-ignored` passes for the module
 - [ ] `cargo clippy` has no warnings for the module

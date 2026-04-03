@@ -54,7 +54,7 @@ Examples:
 ### 1.3 — Identify constraints
 
 - **Parity**: Output must remain byte-identical to Java. Non-negotiable.
-- **Correctness**: All `cargo test` must pass.
+- **Correctness**: All `cargo test -- --include-ignored` must pass.
 - **Maintenance**: Prefer simple changes. Exotic optimizations need justification.
 - **Java execution order**: Preserved unless user explicitly approves deviation.
 

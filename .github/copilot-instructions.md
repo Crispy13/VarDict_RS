@@ -48,8 +48,8 @@ You MUST use `debug-release` profile instead of `release` for all development ta
 # Build
 cargo build --profile debug-release
 
-# Run tests
-cargo test
+# Run tests (always include ignored — prev parity failures live there)
+cargo test -- --include-ignored
 
 # Run parity test against Java output
 # (compare Rust output with reference Java output for test regions)
@@ -59,6 +59,12 @@ diff <(./target/debug-release/vardict -G ref.fa -b test.bam -N sample regions.be
 cargo clippy -- -D warnings
 cargo fmt --check
 ```
+
+## Parity Sweep Rule
+
+**NEVER use `--no-stop` for multi-config parity sweeps.** The workflow is run → find first failure → stop → fix → re-run. Continuing past a failure wastes hours because any code fix requires re-running the sweep anyway.
+- `--no-stop` is only acceptable for **single-config, single-chromosome** runs where you want to collect all failing shards in that one cell.
+- For any preset sweep or multi-config run, omit `--no-stop` entirely.
 
 ## Conventions
 

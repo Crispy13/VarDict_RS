@@ -69,35 +69,44 @@ Discovery guidance:
 
 Use the discovered harness path in the commands below.
 
+## Stop-on-Fail Rule
+
+**NEVER use `--no-stop` for multi-config sweeps.**
+
+The workflow is: **run → find first failure → stop → fix → re-run**. Continuing past a failure wastes time because any subsequent fix will require re-running the sweep anyway.
+
+- `--no-stop` is only appropriate for **single-config, single-chromosome** post-fix verification where you want to see all failing shards in that one cell.
+- For any run spanning **more than one config**, omit `--no-stop` entirely. Let the harness stop on the first failing config.
+
 Common execution patterns:
 
-**Post-fix verification** (most common):
+**Post-fix verification** (most common — single config, single chr, collect all failing shards):
 
 ```bash
 # Clear stale Rust cache first
 rm -rf tmp/na12878_parity/<label>/<chr>/rust/
 rm -rf tmp/na12878_parity/<label>/<chr>/diff/
 
-# Run with existing Java cache
+# Run with existing Java cache; --no-stop is OK here (single config)
 <harness> --chr <N> --rust-only --no-stop --parallel 5
 ```
 
-**Single config test**:
+**Single config test** (single config — --no-stop OK to collect all shard failures):
 
 ```bash
 <harness> --config-id <ID> --chr <N> --no-stop --parallel 5
 ```
 
-**Preset sweep**:
+**Preset sweep** (multi-config — NO --no-stop; stop on first failure and fix):
 
 ```bash
-<harness> --preset <smoke|dev|release> --rust-only --no-stop
+<harness> --preset <smoke|dev|release> --rust-only
 ```
 
-**Release validation**:
+**Release validation** (multi-config — NO --no-stop):
 
 ```bash
-<harness> --preset release --rust-only --no-build --no-stop
+<harness> --preset release --rust-only --no-build
 ```
 
 Parallelism rules:

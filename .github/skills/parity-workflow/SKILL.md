@@ -61,6 +61,7 @@ Operational guidance:
 - After a Rust code change, remove `rust/` and `diff/` before trusting a re-run.
 - Preserve `java/` unless the Java cache is corrupt, incomplete, or intentionally being rebuilt.
 - Treat empty Java shard files as broken cache, not successful prior work.
+- **Do NOT use `--no-stop` for multi-config sweeps.** Stop on first failing config, diagnose and fix it, then re-run. Continuing past failures wastes time because a code fix always requires re-running anyway.
 
 ## Shard Runner Execution Model
 
@@ -175,7 +176,7 @@ Interpretation rule:
 
 Before declaring a parity fix complete:
 
-- [ ] `cargo test` reports 0 failures.
+- [ ] `cargo test -- --include-ignored` reports 0 failures.
 - [ ] The target config passes on the target chromosome.
 - [ ] A default non-pileup regression check still passes.
 - [ ] Stale Rust cache was cleared before the validation run.

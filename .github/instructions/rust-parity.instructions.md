@@ -116,12 +116,20 @@ When output differs from Java:
 
 ## Find → Fix → Test Rule
 
-Every parity bug fix **must** include a regression test that locks in the fix. The workflow:
+**One parity failure = one new named `#[test]` function.** Every parity bug fix must include a regression test that locks in the fix. The workflow:
 
 1. **Find**: Identify the output diff (expected Java vs actual Rust)
 2. **Minimize**: Reduce to the smallest input (region, reads, options) that reproduces the diff
 3. **Fix**: Correct the Rust code to match Java behavior
-4. **Test**: Add a test — unit or integration — that fails without the fix and passes with it
+4. **Test**: Add exactly one new `#[test]` function in `tests/integration_test.rs` (or the relevant fixture test file) that:
+   - Fails without the fix and passes with it
+   - Is `#[ignore]`d with a descriptive reason string
+   - Is named following this convention:
+     - For NA12878 BAM parity: `test_target_bam_{bam_slug}_{chr}_{description}_parity`
+       - Example: `test_target_bam_na12878_low_coverage_chr11_raw_parity`
+     - For integration testcase files: `test_parity_{mode}_{case_slug}`
+     - For unit-level module bugs: `test_{module}_{description}_parity`
+       - Example: `test_cigar_parser_insertion_at_position_42_parity`
 5. **Run tests including ignored**: After any code modification, run `cargo test -- --include-ignored` locally to confirm that `#[ignore]`d tests (which require extra data) still compile and pass — they must not be silently broken by the change
 6. **Commit**: Fix and test go in the same commit
 
@@ -157,3 +165,11 @@ When sweeping multiple configs per chromosome, run them in this order (cheapest/
 5. **Most expensive** (pileup — high memory, longest runtime): pileup (`-p`) and variants
 
 This order is encoded in the `TEST_MATRIX` array in `na12878_option_parity_v2.sh`. The harness iterates configs in array order, so reordering the array changes execution priority.
+
+## Codebase Cache
+
+A progressive Rust codebase cache is maintained at `copilot-office/codebase/rust/VarDict-rs-CODEBASE.md`. Before deeply analyzing a Rust module:
+
+1. **Check the cache first**: Read the relevant module file linked from the index. If architecture, Java correspondence, and parity traps are documented, use them to orient quickly. Verify key facts against actual source if critical.
+2. **Analyze from source if missing**: If the module file doesn't exist or lacks the information you need, analyze the Rust source directly.
+3. **Update the cache after significant work**: If you gained architectural insight (new parity traps, divergences, dependency maps), update the module's cache file. This is a secondary task — always complete your primary work first.

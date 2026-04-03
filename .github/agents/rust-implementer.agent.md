@@ -19,11 +19,13 @@ You receive structured Java analysis from the java-analyst and translate it into
 - DO NOT use `unwrap()` or `expect()` unless the Java code would throw an exception at that point
 - ALWAYS add traceability comments linking to Java source
 - ALWAYS run `cargo check` after implementation to verify compilation
-- ALWAYS run `cargo test --profile debug-release` for the affected module to verify no regressions
+- ALWAYS run `cargo test --profile debug-release -- --include-ignored` for the affected module to verify no regressions
 - ALWAYS use `--profile debug-release` for builds and tests (optimized + debug info)
 - ALWAYS follow `rust.instructions.md` and parity rules from `rust-parity.instructions.md`
 - ALWAYS load `shard-diagnosis` skill before diagnosing a failing shard (shard failure, parity mismatch, column diff, output divergence)
 - ALWAYS load `change-impact-review` skill after implementing a fix to any hot-path module, and include the Performance Verdict in your report
+- DO NOT edit files under `copilot-office/codebase/` — the `codebase-librarian` handles all doc cache updates
+- DO NOT edit any non-Rust source files
 
 ## Implementation Procedure
 
@@ -35,15 +37,12 @@ Before any work, check whether domain skills apply:
 |-----------|---------------|------|
 | Task involves a failing shard, parity mismatch, or output divergence | `shard-diagnosis` | Before any investigation |
 | Task involves fixing a hot-path module (`CigarParser`, `VariationRealigner`, `StructuralVariantsProcessor`, `ToVarsBuilder`, `pipeline`) | `change-impact-review` | After implementing the fix, before reporting |
+| Starting any task on a new or unfamiliar module | `codebase-doc-manage` | Before reading source files |
 
 If a relevant skill applies, load it with `read_file` on its `SKILL.md` and follow its procedure. Do not reproduce the skill steps from memory.
 
 ### Step 1: Read Existing Rust Code
-Before writing anything, read the existing Rust module to understand:
-- Current struct and type definitions
-- Naming conventions already in use
-- How other methods in the same module are structured
-- Available helper functions
+Before writing anything, load the `codebase-doc-manage` skill and execute **Phase 1 (Orient)** for the target Rust module. Then read the actual Rust source to verify current struct definitions, naming conventions, and available helper functions.
 
 ### Step 2: Translate Structure
 Map the Java analysis to Rust:
@@ -126,3 +125,5 @@ After implementation, report:
 - Any deviations from the analysis (with justification)
 - Compilation status (`cargo check` result)
 - Known limitations or areas needing parity testing
+
+**Note**: Your report will be forwarded to the `codebase-librarian` agent for cache updates. Include all parity-critical findings — Java↔Rust correspondence, divergences, new parity traps, and architectural insights — so the librarian can extract them into the documentation cache.

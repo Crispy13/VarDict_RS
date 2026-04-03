@@ -137,6 +137,7 @@ File: src/mods/<file>.rs
 ### Recommended Next Step
 - Delegate to java-analyst to trace column {N} logic
 - Or: Delegate to rust-implementer to fix <specific function>
+- **After the fix**: rust-implementer MUST add one new `#[test]` function in `tests/integration_test.rs` named `test_target_bam_{bam_slug}_{chr}_{description}_parity` (or `test_{module}_{description}_parity` for unit-level bugs). One parity failure = one regression test. No exceptions.
 ```
 
 ## Diagnostic Checklist
