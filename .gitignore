@@ -10,7 +10,10 @@ tmp/
 
 copilot-chat-logs/
 copilot-desk/
-copilot-office/
+copilot-office/missions
+copilot-office/m*
+copilot-office/parity*
+copilot-office/*.md
 copilot_current_plan.md
 full_parity_plan1.md
 note.md

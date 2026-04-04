@@ -1,6 +1,6 @@
 ---
 description: "Update the codebase documentation cache under copilot-office/codebase/. Use when: update codebase docs, write module cache, doc cache update, audit cache completeness, codebase librarian, documentation write-back."
-tools: [read, edit, search, web]
+tools: [read, edit, search, web, vscode/memory, vscode/resolveMemoryFileUri]
 model: ['Claude Opus 4.6 (fast mode) (Preview) (copilot)', 'Claude Opus 4.6 (copilot)', 'Claude Sonnet 4.6 (copilot)']
 user-invocable: false
 ---
