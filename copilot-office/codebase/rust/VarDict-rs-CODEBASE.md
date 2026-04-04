@@ -33,20 +33,20 @@ CLI (bin/vardict.rs)
 
 | Module | Rust File | LOC | Risk | Java Counterpart | Cache File | Status |
 |--------|-----------|-----|------|------------------|------------|--------|
-| VarDictPipeline | `src/mods/vardict_pipeline.rs` | 7,447 | HIGH | `modes/*`, `SAMFileParser` | [vardict_pipeline.md](vardict_pipeline.md) | partial |
-| VariantRealigner | `src/mods/variant_realigner.rs` | 5,271 | HIGH | `VariationRealigner.java` | [variant_realigner.md](variant_realigner.md) | not started |
-| CigarParser | `src/mods/cigar_parser.rs` | 5,004 | HIGH | `CigarParser.java` | [cigar_parser.md](cigar_parser.md) | not started |
-| StructuralVariants | `src/mods/structural_variants_processor.rs` | 4,702 | HIGH | `StructuralVariantsProcessor.java` | [structural_variants_processor.md](structural_variants_processor.md) | partial |
-| OutputVariant | `src/mods/output_variant.rs` | 2,677 | MEDIUM | `printers/*.java` | [output_variant.md](output_variant.md) | not started |
-| CigarModifier | `src/mods/cigar_modifier.rs` | 1,984 | MEDIUM | `CigarModifier.java` | [cigar_modifier.md](cigar_modifier.md) | not started |
-| CLI | `src/bin/vardict.rs` | 1,721 | LOW | `CmdParser.java` | [cli.md](cli.md) | not started |
-| ToVarsBuilder | `src/mods/to_vars_builder.rs` | 1,414 | MEDIUM | `ToVarsBuilder.java` | [to_vars_builder.md](to_vars_builder.md) | not started |
-| ParallelPipeline | `src/mods/parallel_pipeline.rs` | 1,057 | LOW | threading model | [parallel_pipeline.md](parallel_pipeline.md) | not started |
-| Configuration | `src/conf.rs` | — | LOW | `Configuration.java` | [configuration.md](configuration.md) | not started |
-| Data Types | `src/data.rs`, `src/data/` | — | MEDIUM | `data/*.java` | [data_types.md](data_types.md) | not started |
-| ScopeData | `src/scopedata/` | — | LOW | `scopedata/*.java` | [scopedata.md](scopedata.md) | not started |
-| Variants | `src/variants/` | — | MEDIUM | `variations/*.java` | [variants.md](variants.md) | not started |
-| Utils / VecMap | `src/utils/` | — | MEDIUM | `Utils.java`, `VariationMap.java` | [utils.md](utils.md) | not started |
+| VarDictPipeline | `src/mods/vardict_pipeline.rs` | 7,447 | HIGH | `modes/*`, `SAMFileParser` | [vardict_pipeline.md](vardict_pipeline.md) | complete |
+| VariantRealigner | `src/mods/variant_realigner.rs` | 5,271 | HIGH | `VariationRealigner.java` | [variant_realigner.md](variant_realigner.md) | complete |
+| CigarParser | `src/mods/cigar_parser.rs` | 5,004 | HIGH | `CigarParser.java` | [cigar_parser.md](cigar_parser.md) | complete |
+| StructuralVariants | `src/mods/structural_variants_processor.rs` | 4,702 | HIGH | `StructuralVariantsProcessor.java` | [structural_variants_processor.md](structural_variants_processor.md) | complete |
+| OutputVariant | `src/mods/output_variant.rs` | 2,677 | MEDIUM | `printers/*.java` | [output_variant.md](output_variant.md) | complete |
+| CigarModifier | `src/mods/cigar_modifier.rs` | 1,984 | MEDIUM | `CigarModifier.java` | [cigar_modifier.md](cigar_modifier.md) | complete |
+| CLI | `src/bin/vardict.rs` | 1,721 | LOW | `CmdParser.java` | [cli.md](cli.md) | complete |
+| ToVarsBuilder | `src/mods/to_vars_builder.rs` | 1,414 | MEDIUM | `ToVarsBuilder.java` | [to_vars_builder.md](to_vars_builder.md) | complete |
+| ParallelPipeline | `src/mods/parallel_pipeline.rs` | 1,057 | LOW | threading model | [parallel_pipeline.md](parallel_pipeline.md) | complete |
+| Configuration | `src/conf.rs` | — | LOW | `Configuration.java` | [configuration.md](configuration.md) | complete |
+| Data Types | `src/data.rs`, `src/data/` | — | MEDIUM | `data/*.java` | [data_types.md](data_types.md) | complete |
+| ScopeData | `src/scopedata/` | — | LOW | `scopedata/*.java` | [scopedata.md](scopedata.md) | complete |
+| Variants | `src/variants/` | — | MEDIUM | `variations/*.java` | [variants.md](variants.md) | complete |
+| Utils / VecMap | `src/utils/` | — | MEDIUM | `Utils.java`, `VariationMap.java` | [utils.md](utils.md) | complete |
 
 ## Cross-Cutting Concerns
 

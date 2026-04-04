@@ -17,8 +17,7 @@ This repository is being released as a public beta. It is useful for experimenta
 - Treat the project as beta/experimental for now.
 - For critical comparisons, validate Rust output against VarDictJava.
 
-## Current parity progress
+## Parity Status
 
-- Testing the NA12878 mapped low-coverage BAM against the hs37d5 reference as the main parity dataset.
-- Parity sweeps are still in progress, so the repository should be treated as a public beta.
+- Parity test with WES bam data is in progress.
 - See [Parity workflow](docs/PARITY_WORKFLOW.md) for the current test flow and BAM status.
