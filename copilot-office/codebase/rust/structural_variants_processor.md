@@ -4,7 +4,7 @@
 **LOC**: ~4,702
 **Java counterpart**: `StructuralVariantsProcessor.java` → [Java cache](../java/StructuralVariantsProcessor.md)
 **Status**: complete
-**Last verified**: 2026-04-04
+**Last verified**: 2026-04-05
 
 ## Overview
 
@@ -48,11 +48,12 @@ Detects structural variants (deletions, inversions, duplications) from assembled
 
 ## Known Parity Traps
 
-### Trap 1: Forward match in findsv must NOT use historical windows
-- Java's `findsv()` forward match can see historical-window seeds only by accident of Java's monotonic REF growth
-- Rust forward matches call `find_match_internal(..., include_historical_windows=false, ...)`
-- Reverse matches re-enable historical windows for INV fallback path
-- Enabling historical windows globally reintroduces chr13/054 spurious INV candidates
+### Trap 1: Forward match in findsv MUST use historical windows (reversed 2026-04-05)
+- Java's `findsv()` forward match sees all prior reference loads via its cumulative seed map (Java trap 23)
+- Rust forward matches now call `find_match_internal(..., include_historical_windows=true, ...)`
+- Previous restriction (`include_historical_windows=false`) caused missed DELs that Java finds
+- Spurious INV candidates (e.g. chr13/054) are suppressed by the suspect-window retry mechanism instead
+- See also: `findsv_suspect_end3_forward_del_pair_gated_rescue_20260405.md`
 
 ### Trap 2: Synthetic pre-INV forward probe gate
 - Java accumulates SV buckets into `SOFTP2SV{softp}` map sorted by count, checks `[0].used`
@@ -67,10 +68,11 @@ Detects structural variants (deletions, inversions, duplications) from assembled
 - Java keeps all prior loads in one growing mutable hash; Rust replaces active window
 - Prior windows saved as coordinate snapshots for later shared-reference lookup
 
-### Trap 5: findsv INV fallback must avoid redundant probe
-- Rust's findsv forward path is historical-window-blind, but Java finds DELs via historical windows
-- Rust runs synthetic forward probe within INV reverse-match path
-- Probe checks historical windows to detect whether Java would have found DEL, suppresses INV if so
+### Trap 5: findsv suspect-window retry replaces redundant probe (updated 2026-04-05)
+- `should_skip_inv_after_historical_forward_probe()` is removed
+- Replaced by `find_match_findsv_allow_suspect_windows()`: a suspect-window retry gated by `check_pairs()`
+- When forward match returns no hit, retry allows suspect 3' historical windows; result accepted only if discordant pairs confirm
+- This is Rust-only logic not present in Java; validated by 250/250 full parity but should be monitored for novel datasets
 
 ### Trap 6: Double-strand-flip INV boundaries
 - Left-alignment after INV walks backward checking `ref[softp] == complement(ref[bp])`
@@ -140,7 +142,8 @@ None identified. All SV algorithms ported faithfully.
 | `find_del_disc()`, `find_inv_disc()`, `find_dup_disc()` | Discordant-pair-only SV discovery |
 | `adj_snv_5end()`, `adj_snv_3end()` | Short soft-clip SNV rescue |
 | `find_match_internal()`, `find_match_rev_internal()` | Core seed-based alignment with configurable window scoping |
-| `should_skip_inv_after_historical_forward_probe()` | Synthetic forward probe to suppress spurious INVs |
+| `find_match_findsv_allow_suspect_windows()` | Suspect-window retry for forward match; gated by `check_pairs()` |
+| `get_ref_base_from_historical_windows()` | Window-bounds-gated reference base lookup from historical snapshots |
 | `is_softp2sv_first_used()` | Reconstruct SOFTP2SV used-state by scanning all SV vectors |
 | `check_pairs()`, `peek_pairs()` | Discordant pair overlap scanning |
 | `mark_sv()`, `mark_dup_sv()` | Overlap-based cluster marking |

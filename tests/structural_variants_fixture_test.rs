@@ -203,3 +203,165 @@ fn test_find_match_rev_persistent_extra_across_seeds() {
         debug_column
     );
 }
+
+#[test]
+#[ignore = "requires full NA12878 BAM + hs37d5 reference"]
+fn test_structural_variants_chr2_spurious_inv_parity() {
+    let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let bam_path =
+        manifest_dir.join("testdata/NA12878.mapped.ILLUMINA.bwa.CEU.low_coverage.20121211.bam");
+    let ref_path = manifest_dir.join("testdata/hs37d5.fa");
+
+    assert!(bam_path.exists(), "Missing BAM: {:?}", bam_path);
+    assert!(ref_path.exists(), "Missing reference: {:?}", ref_path);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_vardict"))
+        .current_dir(&manifest_dir)
+        .args([
+            "-G",
+            ref_path.to_str().expect("reference path"),
+            "-b",
+            bam_path.to_str().expect("bam path"),
+            "-N",
+            "NA12878",
+            "-f",
+            "0.01",
+            "-R",
+            "2:210000001-211000000",
+        ])
+        .output()
+        .expect("failed to run vardict binary");
+
+    assert!(
+        output.status.success(),
+        "vardict failed with status {:?}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("vardict stdout was not UTF-8");
+
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| line.starts_with("NA12878\t2\t2\t210260753\t210418036\tT\t<INV>\t")),
+        "Unexpected spurious chr2 INV row present in freq-low output:\n{}",
+        stdout
+            .lines()
+            .find(|line| line.starts_with("NA12878\t2\t2\t210260753\t210418036\tT\t<INV>\t"))
+            .unwrap_or("<missing row extract>")
+    );
+}
+
+#[test]
+#[ignore = "requires full NA12878 BAM + hs37d5 reference"]
+fn test_structural_variants_chr2_pileup_missing_del_rows_parity() {
+    let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let bam_path =
+        manifest_dir.join("testdata/NA12878.mapped.ILLUMINA.bwa.CEU.low_coverage.20121211.bam");
+    let ref_path = manifest_dir.join("testdata/hs37d5.fa");
+
+    assert!(bam_path.exists(), "Missing BAM: {:?}", bam_path);
+    assert!(ref_path.exists(), "Missing reference: {:?}", ref_path);
+
+    for (region, expected_prefix) in [
+        (
+            "2:157000001-158000000",
+            "NA12878\t2\t2\t92157247\t157968382\tC\t<DEL>\t",
+        ),
+        (
+            "2:205000001-206000000",
+            "NA12878\t2\t2\t126570493\t205101063\tC\t<DEL>\t",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_vardict"))
+            .current_dir(&manifest_dir)
+            .args([
+                "-G",
+                ref_path.to_str().expect("reference path"),
+                "-b",
+                bam_path.to_str().expect("bam path"),
+                "-N",
+                "NA12878",
+                "-f",
+                "0.01",
+                "-p",
+                "-R",
+                region,
+            ])
+            .output()
+            .expect("failed to run vardict binary");
+
+        assert!(
+            output.status.success(),
+            "vardict failed for region {} with status {:?}\nstderr:\n{}",
+            region,
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8(output.stdout).expect("vardict stdout was not UTF-8");
+
+        assert!(
+            stdout.lines().any(|line| line.starts_with(expected_prefix)),
+            "Missing expected chr2 pileup DEL row for region {}. Expected prefix: {}\nstdout:\n{}",
+            region,
+            expected_prefix,
+            stdout
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires full NA12878 BAM + hs37d5 reference"]
+fn test_structural_variants_chr3_pileup_missing_inv_row_parity() {
+    let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let bam_path =
+        manifest_dir.join("testdata/NA12878.mapped.ILLUMINA.bwa.CEU.low_coverage.20121211.bam");
+    let ref_path = manifest_dir.join("testdata/hs37d5.fa");
+
+    assert!(bam_path.exists(), "Missing BAM: {:?}", bam_path);
+    assert!(ref_path.exists(), "Missing reference: {:?}", ref_path);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_vardict"))
+        .current_dir(&manifest_dir)
+        .args([
+            "-G",
+            ref_path.to_str().expect("reference path"),
+            "-b",
+            bam_path.to_str().expect("bam path"),
+            "-N",
+            "NA12878",
+            "-f",
+            "0.01",
+            "-p",
+            "-R",
+            "3:98000001-99000000",
+        ])
+        .output()
+        .expect("failed to run vardict binary");
+
+    assert!(
+        output.status.success(),
+        "vardict failed with status {:?}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("vardict stdout was not UTF-8");
+
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("NA12878\t3\t3\t98373242\t98579491\tA\t<INV>\t")),
+        "Missing expected chr3 pileup INV row in output:\n{}",
+        stdout
+    );
+}
+

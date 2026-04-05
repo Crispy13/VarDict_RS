@@ -1475,20 +1475,28 @@ impl StructuralVariantsProcessor {
                 continue;
             }
 
-            // NOTE: findsv forward match keeps include_historical_windows=false.
-            // Historical windows are only needed for find_match_rev (INV path).
-            // Enabling them for forward matches causes spurious DEL/INV candidates
-            // from seed matches in far-away historical windows (e.g., chr13/054).
+            // NOTE: Java's cumulative REF seed map lets the forward findMatch()
+            // see seeds loaded by prior getReference() calls. Rust must include
+            // historical windows here to preserve that visibility.
             let m = self.find_match_internal(
                 &seq,
                 p5,
                 -1,
                 Configuration::SEED_1 as usize,
                 3,
+                true,
                 false,
                 false,
             );
             let mut bp = m.base_position;
+            let mut used_suspect_forward_match = false;
+            if bp == 0 {
+                let suspect_match = self.find_match_findsv_allow_suspect_windows(&seq, p5, -1);
+                if suspect_match.base_position != 0 {
+                    bp = suspect_match.base_position;
+                    used_suspect_forward_match = true;
+                }
+            }
             if Self::should_trace_findsv_candidate(p5, Some(bp)) {
                 event!(Level::TRACE, phase = "findsv_5_direct_match", p5, cnt5, bp,);
             }
@@ -1503,85 +1511,97 @@ impl StructuralVariantsProcessor {
                         data.max_read_length as i64,
                     );
                     if pairs_data.pairs == 0 {
-                        event!(Level::DEBUG, phase = "findsv_5_pairs_zero", p5, bp,);
-                        continue;
-                    }
-
-                    let p5_adj = p5 - 1;
-                    let bp_adj = bp + 1;
-                    let dellen = p5_adj - bp_adj + 1;
-                    if dellen <= 0 {
-                        continue;
-                    }
-
-                    let del_key = format!("-{}", dellen);
-                    let vref = Self::get_or_create_variation(
-                        &mut data.non_insertion_variants,
-                        bp_adj,
-                        &del_key,
-                    );
-                    vref.alt_depth = 0;
-
-                    Self::add_sv_counts(
-                        &mut data.non_insertion_variants,
-                        &mut data.sv_counts,
-                        bp_adj,
-                        pairs_data.pairs,
-                        cnt5,
-                        1,
-                    );
-
-                    if !data.ref_coverage.contains_key(bp_adj) {
-                        data.ref_coverage.set(bp_adj, pairs_data.pairs + cnt5);
-                    }
-                    if let Some(cov_p5) = data.ref_coverage.get(p5_adj + 1) {
-                        let cov_bp = data.ref_coverage.get(bp_adj).unwrap_or(0);
-                        if cov_bp < cov_p5 {
-                            data.ref_coverage.set(bp_adj, cov_p5);
+                        if used_suspect_forward_match {
+                            bp = 0;
+                        } else {
+                            // Java: StructuralVariantsProcessor.java:L943 - zero supporting pairs
+                            // abandons the soft-clip entirely instead of falling through to INV.
+                            event!(Level::DEBUG, phase = "findsv_5_pairs_zero_skip", p5, bp,);
+                            continue;
                         }
                     }
 
-                    if let Some(sc5v) = data.soft_clips_5end.get(&p5) {
+                    if bp != 0 {
+                        let p5_adj = p5 - 1;
+                        let bp_adj = bp + 1;
+                        let dellen = p5_adj - bp_adj + 1;
+                        if dellen <= 0 {
+                            continue;
+                        }
+
+                        let del_key = format!("-{}", dellen);
+                        let vref = Self::get_or_create_variation(
+                            &mut data.non_insertion_variants,
+                            bp_adj,
+                            &del_key,
+                        );
+                        vref.alt_depth = 0;
+
+                        Self::add_sv_counts(
+                            &mut data.non_insertion_variants,
+                            &mut data.sv_counts,
+                            bp_adj,
+                            pairs_data.pairs,
+                            cnt5,
+                            1,
+                        );
+
+                        if !data.ref_coverage.contains_key(bp_adj) {
+                            data.ref_coverage.set(bp_adj, pairs_data.pairs + cnt5);
+                        }
+                        if let Some(cov_p5) = data.ref_coverage.get(p5_adj + 1) {
+                            let cov_bp = data.ref_coverage.get(bp_adj).unwrap_or(0);
+                            if cov_bp < cov_p5 {
+                                data.ref_coverage.set(bp_adj, cov_p5);
+                            }
+                        }
+
+                        if let Some(sc5v) = data.soft_clips_5end.get(&p5) {
+                            let variation = Self::get_or_create_variation(
+                                &mut data.non_insertion_variants,
+                                bp_adj,
+                                &del_key,
+                            );
+                            adj_cnt_from_variant(variation, &sc5v.var);
+                        }
+
+                        let mut tmp = Variant::default();
+                        tmp.alt_depth = pairs_data.pairs;
+                        tmp.high_qual_read_cnt = pairs_data.pairs;
+                        tmp.alt_depth_fwd = pairs_data.pairs / 2;
+                        tmp.alt_depth_rev = pairs_data.pairs - pairs_data.pairs / 2;
+                        tmp.mean_pos = pairs_data.pmean;
+                        tmp.mean_qual = pairs_data.qmean;
+                        tmp.mean_mapq = pairs_data.q_mean;
+                        tmp.nm = pairs_data.nm;
+
                         let variation = Self::get_or_create_variation(
                             &mut data.non_insertion_variants,
                             bp_adj,
                             &del_key,
                         );
-                        adj_cnt_from_variant(variation, &sc5v.var);
+                        adj_cnt_from_variant(variation, &tmp);
                     }
-
-                    let mut tmp = Variant::default();
-                    tmp.alt_depth = pairs_data.pairs;
-                    tmp.high_qual_read_cnt = pairs_data.pairs;
-                    tmp.alt_depth_fwd = pairs_data.pairs / 2;
-                    tmp.alt_depth_rev = pairs_data.pairs - pairs_data.pairs / 2;
-                    tmp.mean_pos = pairs_data.pmean;
-                    tmp.mean_qual = pairs_data.qmean;
-                    tmp.mean_mapq = pairs_data.q_mean;
-                    tmp.nm = pairs_data.nm;
-
-                    let variation = Self::get_or_create_variation(
-                        &mut data.non_insertion_variants,
-                        bp_adj,
-                        &del_key,
-                    );
-                    adj_cnt_from_variant(variation, &tmp);
                 } else {
                     // candidate duplication
                 }
-            } else {
-                // Java: StructuralVariantsProcessor.java ~L978 — single findMatchRev with SEED_1/MM=3
-                // NOTE: Historical windows re-enabled — see note on find_match above.
-                let m_rev = self.find_match_rev_internal(
+            }
+            if bp == 0 {
+                // Java: StructuralVariantsProcessor.java ~L978 — single findMatchRev with SEED_1/MM=3.
+                // If that misses, allow a second pass that can see suspect historical windows.
+                // Those windows stay masked by default to avoid extra INV rows from Rust-only
+                // low-support End3 clusters, but pileup still needs legitimate Java low-support
+                // INVs that otherwise die here with bp=0.
+                let mut m_rev = self.find_match_rev(
                     &seq,
                     p5,
                     -1,
                     Configuration::SEED_1 as usize,
                     3,
-                    true,
-                    false,
-                    false,
                 );
+                if m_rev.base_position == 0 {
+                    m_rev = self.find_match_rev_findsv_allow_suspect_windows(&seq, p5, -1);
+                }
                 bp = m_rev.base_position;
                 let extra = m_rev.matched_sequence;
                 if Self::should_trace_findsv_candidate(p5, Some(bp)) {
@@ -1765,17 +1785,25 @@ impl StructuralVariantsProcessor {
                 continue;
             }
 
-            // NOTE: findsv forward match keeps include_historical_windows=false — see note in 5' path.
             let m = self.find_match_internal(
                 &seq,
                 p3,
                 1,
                 Configuration::SEED_1 as usize,
                 3,
+                true,
                 false,
                 false,
             );
             let mut bp = m.base_position;
+            let mut used_suspect_forward_match = false;
+            if bp == 0 {
+                let suspect_match = self.find_match_findsv_allow_suspect_windows(&seq, p3, 1);
+                if suspect_match.base_position != 0 {
+                    bp = suspect_match.base_position;
+                    used_suspect_forward_match = true;
+                }
+            }
             if Self::should_trace_findsv_candidate(p3, Some(bp)) {
                 event!(Level::TRACE, phase = "findsv_3_direct_match", p3, cnt3, bp,);
             }
@@ -1790,96 +1818,105 @@ impl StructuralVariantsProcessor {
                         data.max_read_length as i64,
                     );
                     if pairs_data.pairs == 0 {
-                        event!(Level::DEBUG, phase = "findsv_3_pairs_zero", p3, bp,);
-                        continue;
-                    }
-
-                    let dellen = bp - p3;
-                    bp -= 1;
-
-                    while self.get_ref_base(bp).is_some()
-                        && self.get_ref_base(p3 - 1).is_some()
-                        && self.get_ref_base(bp) == self.get_ref_base(p3 - 1)
-                    {
-                        bp -= 1;
-                        if bp != 0 {
-                            p3 -= 1;
+                        if used_suspect_forward_match {
+                            bp = 0;
+                        } else {
+                            // Java: StructuralVariantsProcessor.java:L1055 - zero supporting pairs
+                            // abandons the soft-clip entirely instead of falling through to INV.
+                            event!(Level::DEBUG, phase = "findsv_3_pairs_zero_skip", p3, bp,);
+                            continue;
                         }
                     }
 
-                    if dellen <= 0 {
-                        continue;
-                    }
+                    if bp != 0 {
+                        let dellen = bp - p3;
+                        bp -= 1;
 
-                    let del_key = format!("-{}", dellen);
-                    let vref = Self::get_or_create_variation(
-                        &mut data.non_insertion_variants,
-                        p3,
-                        &del_key,
-                    );
-                    vref.alt_depth = 0;
-
-                    Self::add_sv_counts(
-                        &mut data.non_insertion_variants,
-                        &mut data.sv_counts,
-                        p3,
-                        pairs_data.pairs,
-                        cnt3,
-                        1,
-                    );
-
-                    if !data.ref_coverage.contains_key(p3) {
-                        data.ref_coverage.set(p3, pairs_data.pairs + cnt3);
-                    }
-                    if let Some(cov_p3) = data.ref_coverage.get(p3) {
-                        if let Some(cov_bp) = data.ref_coverage.get(bp) {
-                            if cov_bp < cov_p3 {
-                                data.ref_coverage.set(bp, cov_p3);
+                        while self.get_ref_base(bp).is_some()
+                            && self.get_ref_base(p3 - 1).is_some()
+                            && self.get_ref_base(bp) == self.get_ref_base(p3 - 1)
+                        {
+                            bp -= 1;
+                            if bp != 0 {
+                                p3 -= 1;
                             }
                         }
-                    }
 
-                    if let Some(sc3v) = data.soft_clips_3end.get(&tuple3.position) {
+                        if dellen <= 0 {
+                            continue;
+                        }
+
+                        let del_key = format!("-{}", dellen);
+                        let vref = Self::get_or_create_variation(
+                            &mut data.non_insertion_variants,
+                            p3,
+                            &del_key,
+                        );
+                        vref.alt_depth = 0;
+
+                        Self::add_sv_counts(
+                            &mut data.non_insertion_variants,
+                            &mut data.sv_counts,
+                            p3,
+                            pairs_data.pairs,
+                            cnt3,
+                            1,
+                        );
+
+                        if !data.ref_coverage.contains_key(p3) {
+                            data.ref_coverage.set(p3, pairs_data.pairs + cnt3);
+                        }
+                        if let Some(cov_p3) = data.ref_coverage.get(p3) {
+                            if let Some(cov_bp) = data.ref_coverage.get(bp) {
+                                if cov_bp < cov_p3 {
+                                    data.ref_coverage.set(bp, cov_p3);
+                                }
+                            }
+                        }
+
+                        if let Some(sc3v) = data.soft_clips_3end.get(&tuple3.position) {
+                            let variation = Self::get_or_create_variation(
+                                &mut data.non_insertion_variants,
+                                p3,
+                                &del_key,
+                            );
+                            adj_cnt_from_variant(variation, &sc3v.var);
+                        }
+
+                        let mut tmp = Variant::default();
+                        tmp.alt_depth = pairs_data.pairs;
+                        tmp.high_qual_read_cnt = pairs_data.pairs;
+                        tmp.alt_depth_fwd = pairs_data.pairs / 2;
+                        tmp.alt_depth_rev = pairs_data.pairs - pairs_data.pairs / 2;
+                        tmp.mean_pos = pairs_data.pmean;
+                        tmp.mean_qual = pairs_data.qmean;
+                        tmp.mean_mapq = pairs_data.q_mean;
+                        tmp.nm = pairs_data.nm;
+
                         let variation = Self::get_or_create_variation(
                             &mut data.non_insertion_variants,
                             p3,
                             &del_key,
                         );
-                        adj_cnt_from_variant(variation, &sc3v.var);
+                        adj_cnt_from_variant(variation, &tmp);
                     }
-
-                    let mut tmp = Variant::default();
-                    tmp.alt_depth = pairs_data.pairs;
-                    tmp.high_qual_read_cnt = pairs_data.pairs;
-                    tmp.alt_depth_fwd = pairs_data.pairs / 2;
-                    tmp.alt_depth_rev = pairs_data.pairs - pairs_data.pairs / 2;
-                    tmp.mean_pos = pairs_data.pmean;
-                    tmp.mean_qual = pairs_data.qmean;
-                    tmp.mean_mapq = pairs_data.q_mean;
-                    tmp.nm = pairs_data.nm;
-
-                    let variation = Self::get_or_create_variation(
-                        &mut data.non_insertion_variants,
-                        p3,
-                        &del_key,
-                    );
-                    adj_cnt_from_variant(variation, &tmp);
                 } else {
                     // candidate duplication
                 }
-            } else {
-                // Java: StructuralVariantsProcessor.java ~L1114 — single findMatchRev with SEED_1/MM=3
-                // NOTE: Historical windows re-enabled — see note in 5' path above.
-                let m_rev = self.find_match_rev_internal(
+            }
+            if bp == 0 {
+                // Java: StructuralVariantsProcessor.java ~L1114 — single findMatchRev with SEED_1/MM=3.
+                // If that misses, allow a second pass that can see suspect historical windows.
+                let mut m_rev = self.find_match_rev(
                     &seq,
                     p3,
                     1,
                     Configuration::SEED_1 as usize,
                     3,
-                    true,
-                    false,
-                    false,
                 );
+                if m_rev.base_position == 0 {
+                    m_rev = self.find_match_rev_findsv_allow_suspect_windows(&seq, p3, 1);
+                }
                 bp = m_rev.base_position;
                 let extra = m_rev.matched_sequence;
                 if Self::should_trace_findsv_candidate(p3, Some(bp)) {
@@ -2049,10 +2086,10 @@ impl StructuralVariantsProcessor {
     }
 
     fn should_trace_findsv_candidate(softp: i64, bp: Option<i64>) -> bool {
-        let Ok(raw_target) = env::var("VARDICT_TRACE_FINDSV_POS") else {
-            return false;
-        };
-        let Ok(target) = raw_target.parse::<i64>() else {
+        let Some(target) = env::var("VARDICT_TRACE_FINDSV_POS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+        else {
             return false;
         };
         let radius = env::var("VARDICT_TRACE_FINDSV_RADIUS")
@@ -3005,7 +3042,7 @@ impl StructuralVariantsProcessor {
         seed_len: usize,
         mm: usize,
     ) -> MatchResult {
-        self.find_match_rev_internal(seq, position, dir, seed_len, mm, true, false, false)
+        self.find_match_rev_internal(seq, position, dir, seed_len, mm, true, false, false, false)
     }
 
     fn find_match_rev_findsv(&self, seq: &[u8], position: i64, dir: i64) -> MatchResult {
@@ -3024,6 +3061,7 @@ impl StructuralVariantsProcessor {
                 true,
                 include_shared_reference_fallback,
                 include_shared_reference_fallback,
+                false,
             );
             if result.base_position != 0 {
                 return result;
@@ -3031,6 +3069,43 @@ impl StructuralVariantsProcessor {
         }
 
         MatchResult::default()
+    }
+
+    fn find_match_rev_findsv_allow_suspect_windows(
+        &self,
+        seq: &[u8],
+        position: i64,
+        dir: i64,
+    ) -> MatchResult {
+        self.find_match_rev_internal(
+            seq,
+            position,
+            dir,
+            Configuration::SEED_1 as usize,
+            3,
+            true,
+            false,
+            false,
+            true,
+        )
+    }
+
+    fn find_match_findsv_allow_suspect_windows(
+        &self,
+        seq: &[u8],
+        position: i64,
+        dir: i64,
+    ) -> MatchResult {
+        self.find_match_internal(
+            seq,
+            position,
+            dir,
+            Configuration::SEED_1 as usize,
+            3,
+            true,
+            false,
+            true,
+        )
     }
 
     fn find_match_rev_internal(
@@ -3043,6 +3118,7 @@ impl StructuralVariantsProcessor {
         include_historical_windows: bool,
         include_shared_reference_fallback: bool,
         force_shared_reference_fallback: bool,
+        allow_suspect_hist_windows: bool,
     ) -> MatchResult {
         let mut seq_work = seq.to_vec();
         if dir == 1 {
@@ -3066,12 +3142,14 @@ impl StructuralVariantsProcessor {
                     seed,
                     include_historical_windows,
                     include_shared_reference_fallback,
+                    allow_suspect_hist_windows,
                 )
             } else {
                 self.seed_positions_with_scope(
                     seed,
                     include_historical_windows,
                     include_shared_reference_fallback,
+                    allow_suspect_hist_windows,
                 )
             };
             if seeds.len() != 1 {
@@ -3085,8 +3163,7 @@ impl StructuralVariantsProcessor {
                 first_seed - i as i64
             };
 
-            let initial_match = self.is_match_ref(&seq_work, bp, -dir, mm);
-            if initial_match {
+            if self.is_match_ref(&seq_work, bp, -dir, mm) {
                 return MatchResult {
                     base_position: bp,
                     matched_sequence: persistent_extra,
@@ -3143,8 +3220,7 @@ impl StructuralVariantsProcessor {
                     break;
                 }
 
-                let retry_match = self.is_match_ref(&sseq, bp, -dir, 1);
-                if retry_match {
+                if self.is_match_ref(&sseq, bp, -dir, 1) {
                     return MatchResult {
                         base_position: bp,
                         matched_sequence: extra.to_vec(),
@@ -3401,7 +3477,7 @@ impl StructuralVariantsProcessor {
         seed_len: usize,
         mm: usize,
     ) -> MatchResult {
-        self.find_match_internal(seq, position, dir, seed_len, mm, true, false)
+        self.find_match_internal(seq, position, dir, seed_len, mm, true, false, false)
     }
 
     fn find_match_internal(
@@ -3413,6 +3489,7 @@ impl StructuralVariantsProcessor {
         mm: usize,
         include_historical_windows: bool,
         include_shared_reference_fallback: bool,
+        allow_suspect_hist_windows: bool,
     ) -> MatchResult {
         let mut seq_work = seq.to_vec();
         if dir == -1 {
@@ -3431,6 +3508,7 @@ impl StructuralVariantsProcessor {
                 seed,
                 include_historical_windows,
                 include_shared_reference_fallback,
+                allow_suspect_hist_windows,
             );
             if seeds.len() != 1 {
                 continue;
@@ -3817,16 +3895,28 @@ impl StructuralVariantsProcessor {
             if self.original_ref_start == self.ref_start
                 && Arc::ptr_eq(&self.original_reference_seq, &self.reference_seq)
             {
-                self.shared_reference_base(pos)
+                self.get_ref_base_from_historical_windows(pos)
             } else {
                 Self::get_ref_base_from_window(
                     &self.original_reference_seq,
                     self.original_ref_start,
                     pos,
                 )
-                .or_else(|| self.shared_reference_base(pos))
+                .or_else(|| self.get_ref_base_from_historical_windows(pos))
             }
         })
+    }
+
+    fn get_ref_base_from_historical_windows(&self, pos: i64) -> Option<u8> {
+        for window in &self.historical_reference_windows {
+            if pos < window.start || pos > window.end {
+                continue;
+            }
+            if let Some(base) = self.shared_reference_base(pos) {
+                return Some(base);
+            }
+        }
+        None
     }
 
     fn get_ref_base_from_window(reference_seq: &[u8], ref_start: i64, pos: i64) -> Option<u8> {
@@ -3838,7 +3928,7 @@ impl StructuralVariantsProcessor {
     }
 
     fn seed_positions(&self, seed: &[u8], include_historical_windows: bool) -> Vec<i64> {
-        self.seed_positions_with_scope(seed, include_historical_windows, true)
+        self.seed_positions_with_scope(seed, include_historical_windows, true, false)
     }
 
     fn seed_positions_with_scope(
@@ -3846,6 +3936,7 @@ impl StructuralVariantsProcessor {
         seed: &[u8],
         include_historical_windows: bool,
         include_shared_reference_fallback: bool,
+        allow_suspect_hist_windows: bool,
     ) -> Vec<i64> {
         let mut positions = Vec::new();
         let reference_window_shifted = !(self.original_ref_start == self.ref_start
@@ -3868,7 +3959,11 @@ impl StructuralVariantsProcessor {
         }
 
         if include_historical_windows {
-            self.extend_seed_positions_from_historical_windows(seed, &mut positions);
+            self.extend_seed_positions_from_historical_windows(
+                seed,
+                &mut positions,
+                allow_suspect_hist_windows,
+            );
 
             // The plain candidate-creation reverse matcher should stay aligned
             // with Java's mutable REF hash: current plus previously loaded
@@ -3891,8 +3986,14 @@ impl StructuralVariantsProcessor {
         seed: &[u8],
         include_historical_windows: bool,
         include_shared_reference_fallback: bool,
+        allow_suspect_hist_windows: bool,
     ) -> Vec<i64> {
-        let mut positions = self.seed_positions_with_scope(seed, include_historical_windows, false);
+        let mut positions = self.seed_positions_with_scope(
+            seed,
+            include_historical_windows,
+            false,
+            allow_suspect_hist_windows,
+        );
 
         if include_historical_windows && include_shared_reference_fallback && positions.len() <= 1 {
             self.extend_seed_positions_from_shared_reference(seed, &mut positions);
@@ -4216,7 +4317,12 @@ impl StructuralVariantsProcessor {
         self.loaded_reference_coverage_windows = merged_windows;
     }
 
-    fn extend_seed_positions_from_historical_windows(&self, seed: &[u8], positions: &mut Vec<i64>) {
+    fn extend_seed_positions_from_historical_windows(
+        &self,
+        seed: &[u8],
+        positions: &mut Vec<i64>,
+        allow_suspect_hist_windows: bool,
+    ) {
         if seed.is_empty() {
             return;
         }
@@ -4269,6 +4375,7 @@ impl StructuralVariantsProcessor {
             // while preserving the duplication masking needed by chr1/199.
             // End5 (5' pass) windows contribute both new seeds and masking.
             if self.findsv_active
+                && !allow_suspect_hist_windows
                 && self.suspect_hist_windows.contains(&window_idx)
                 && positions.is_empty()
             {
@@ -4435,7 +4542,6 @@ mod tests {
     use super::*;
     use crate::data::shared_reference::{ChromosomeData, SharedReference};
     use crate::scopedata::global_read_only_scope::{GlobalReadOnlyScope, INSTANCE};
-    use std::fs;
 
     #[test]
     fn test_processor_creation() {
@@ -4748,14 +4854,14 @@ mod tests {
         let seed = b"ACGTACGTACGA";
 
         assert_eq!(
-            processor.seed_positions_with_scope(seed, true, false),
+            processor.seed_positions_with_scope(seed, true, false, false),
             vec![21]
         );
         // With the shared-reference fallback disabled (matching Java), only
         // seeds found in loaded windows are returned — position 53 from the
         // full-chromosome scan is no longer produced.
         assert_eq!(
-            processor.seed_positions_with_scope(seed, true, true),
+            processor.seed_positions_with_scope(seed, true, true, false),
             vec![21]
         );
     }

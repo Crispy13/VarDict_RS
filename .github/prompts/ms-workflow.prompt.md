@@ -49,7 +49,8 @@ Run at the start of every session.
    - `copilot-active-plan.md`
    - `copilot-stage-plan.md` (if exists)
    - `copilot-office/codebase/CODEBASE.md`
-3. **Determine entry point:**
+3. **Recall recent activity.** Read the last portion of the current session's log to recover context about recent actions referring to "troubleshoot" skill. Start with the tail; read more if needed.
+4. **Determine entry point:**
    - Stage plan is in-progress → **Phase 2** (resume execution).
    - Stage plan is complete or missing → **Phase 1** (planning).
    - Active goal is complete → **Phase 3** (goal advancement).
@@ -83,7 +84,7 @@ Run at the start of every session.
 
 **Execute the stage using your own agent's implementation and review process.** This prompt does not define how you implement — your agent instructions do. What this prompt requires:
 
-- The stage plan (`copilot-stage-plan.md`) defines the scope.
+- The stage plan file path (`<mission>/copilot-stage-plan.md`) defines the scope. When delegating to subagents, pass the **file path** — do not paste stage plan content inline. Subagents must read the file themselves.
 - When execution completes (your process approves the work):
 
 1. Mark `copilot-stage-plan.md` as `STATUS: COMPLETE`.

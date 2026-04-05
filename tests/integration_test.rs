@@ -16,6 +16,7 @@ use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use crackle_kit::tracing::level_filters::LevelFilter;
 use vardict_rs::prelude::LibDefaultHasher;
@@ -63,6 +64,14 @@ fn env_flag(name: &str) -> bool {
         .ok()
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+static TEST_SCOPE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn lock_test_scope() -> MutexGuard<'static, ()> {
+    TEST_SCOPE_LOCK
+        .lock()
+        .expect("test scope mutex poisoned")
 }
 
 fn resolve_run_now_simple_limit(default_limit: usize) -> Option<usize> {
@@ -1222,6 +1231,8 @@ fn run_vardict_pipeline_simple_raw_case_with_sv_default(
     use vardict_rs::data::shared_reference::{ChromosomeData, SharedReference};
     use vardict_rs::mods::vardict_pipeline::VarDictPipeline;
 
+    let _scope_lock = lock_test_scope();
+
     let fasta_csv_path = testdata_dir
         .join("fastas")
         .join(format!("{}.csv", config.reference));
@@ -1317,11 +1328,12 @@ fn run_vardict_pipeline_simple_raw_case_with_sv_default(
         ));
     }
 
-    let region = Region::new(
+    let region = Region::new_extended(
         resolved_ref_chrom.clone(),
         start,
         end,
-        "testbed".to_string(),
+        config.chrom.clone(),
+        config.start,
     );
 
     let mut scope = GlobalReadOnlyScope::default();
@@ -1484,6 +1496,8 @@ fn run_vardict_pipeline_amplicon_raw_case(
     use vardict_rs::data::region::Region;
     use vardict_rs::data::shared_reference::{ChromosomeData, SharedReference};
     use vardict_rs::mods::vardict_pipeline::VarDictPipeline;
+
+    let _scope_lock = lock_test_scope();
 
     let fasta_csv_path = testdata_dir
         .join("fastas")
@@ -1767,6 +1781,8 @@ fn run_vardict_pipeline_somatic_raw_case(
     use vardict_rs::data::region::Region;
     use vardict_rs::data::shared_reference::{ChromosomeData, SharedReference};
     use vardict_rs::mods::vardict_pipeline::{SomaticCombineLookupResult, VarDictPipeline};
+
+    let _scope_lock = lock_test_scope();
 
     let fasta_csv_path = testdata_dir
         .join("fastas")
@@ -4354,6 +4370,8 @@ fn test_vardict_pipeline_hard_clip() {
     use vardict_rs::data::region::Region;
     use vardict_rs::mods::vardict_pipeline::VarDictPipeline;
 
+    let _scope_lock = lock_test_scope();
+
     let testdata_dir = get_testdata_dir();
 
     // Use the hard_clip test case
@@ -4525,6 +4543,8 @@ fn test_rust_vs_java_output_comparison() {
     use vardict_rs::data::reference::Reference;
     use vardict_rs::data::region::Region;
     use vardict_rs::mods::vardict_pipeline::VarDictPipeline;
+
+    let _scope_lock = lock_test_scope();
 
     let _ = crackle_kit::tracing_kit::setup_logging_stderr_only_verbose(test_log_level());
 
