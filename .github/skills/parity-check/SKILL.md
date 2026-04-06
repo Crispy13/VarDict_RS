@@ -83,12 +83,13 @@ End-to-end workflow for achieving and verifying 100% output parity between a Var
 
 1. **Reproduce**: Capture the specific output difference (expected vs actual).
 2. **Trace**: Delegate to `java-analyst` to trace the mismatching field or behavior back to the source logic.
-3. **Fix**: Delegate to `rust-implementer` with the exact Java logic and mismatch details.
-4. **Doc Gate**: Save the producer reports, then follow `codebase-doc-manage` Phase 2 and `Documentation Gate Protocol` for cache updates.
-5. **Pre-Fix Review**: Delegate to `code-reviewer` for Parity Correctness only. If changes are requested, loop back to step 3.
-6. **Validate**: Delegate to `parity-tester` to confirm the fix on the affected case or shard.
-7. **Post-Fix Review**: Delegate to `code-reviewer` for the full review (all four sections, including the binding Performance Verdict).
-8. **Performance Gate**: Act on the verdict: `PERF_SAFE` → proceed, `PERF_RISK` → log and notify, `PERF_REGRESSION` → block and escalate.
+3. **Write failing test**: Extract the fixture from Java output (never from Rust). Add a `#[test]` in the appropriate fixture test file that is `#[ignore]`d and fails before the fix. See the **Find → Fix → Test** rule in `rust-parity.instructions.md` for naming conventions and fixture requirements. This test is the acceptance gate for the fix.
+4. **Fix**: Delegate to `rust-implementer` with the exact Java logic, mismatch details, and the test from step 3 as the acceptance gate.
+5. **Doc Gate**: Save the producer reports, then follow `codebase-doc-manage` Phase 2 and `Documentation Gate Protocol` for cache updates.
+6. **Pre-Fix Review**: Delegate to `code-reviewer` for Parity Correctness only — verify the test from step 3 exists, was failing before the fix, and now passes. If changes are requested, loop back to step 4.
+7. **Validate**: Delegate to `parity-tester` to confirm the fix on the affected case or shard.
+8. **Post-Fix Review**: Delegate to `code-reviewer` for the full review (all four sections, including the binding Performance Verdict).
+9. **Performance Gate**: Act on the verdict: `PERF_SAFE` → proceed, `PERF_RISK` → log and notify, `PERF_REGRESSION` → block and escalate.
 
 ## Iteration Protocol
 
