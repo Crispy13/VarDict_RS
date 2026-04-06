@@ -120,9 +120,8 @@ When output differs from Java:
 
 1. **Find**: Identify the output diff (expected Java vs actual Rust)
 2. **Minimize**: Reduce to the smallest input (region, reads, options) that reproduces the diff
-3. **Fix**: Correct the Rust code to match Java behavior
-4. **Test**: Add exactly one new `#[test]` function in `tests/integration_test.rs` (or the relevant fixture test file) that:
-   - Fails without the fix and passes with it
+3. **Fixture**: Extract the expected output **from Java** and save it as the test fixture (`.tsv` / `.tsv.gz` under `tests/fixtures/` or inline in the test). **Never generate reference output from Rust** — that locks in Rust bugs instead of catching them.
+4. **Test first**: Add exactly one new `#[test]` function in `tests/integration_test.rs` (or the relevant fixture test file) that compares Rust output against the Java fixture. The test **must fail before the fix** and pass after it. Requirements:
    - Is `#[ignore]`d with a descriptive reason string
    - Is named following this convention:
      - For NA12878 BAM parity: `test_target_bam_{bam_slug}_{chr}_{description}_parity`
@@ -130,8 +129,9 @@ When output differs from Java:
      - For integration testcase files: `test_parity_{mode}_{case_slug}`
      - For unit-level module bugs: `test_{module}_{description}_parity`
        - Example: `test_cigar_parser_insertion_at_position_42_parity`
-5. **Run tests including ignored**: After any code modification, run `cargo test -- --include-ignored` locally to confirm that `#[ignore]`d tests (which require extra data) still compile and pass — they must not be silently broken by the change
-6. **Commit**: Fix and test go in the same commit
+5. **Fix**: Correct the Rust code to match Java behavior — the test from step 4 is your acceptance gate
+6. **Verify**: Run `cargo test --profile debug-release -- --include-ignored` to confirm the new test passes and no existing tests broke
+7. **Commit**: Fix, fixture, and test go in the same commit
 
 This prevents regressions where fixing one parity issue silently re-breaks another.
 

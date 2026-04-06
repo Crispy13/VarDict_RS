@@ -46,6 +46,11 @@ End-to-end workflow for achieving and verifying 100% output parity between a Var
    - Every branch from the analysis implemented
    - `cargo check` verification
 7. **Verify compilation**: Ensure the code compiles cleanly
+7.5. **Pre-test structural review**: Before running the parity sweep, verify:
+    - Every Java branch from the analysis has a corresponding Rust branch (no TODO/unimplemented stubs)
+    - All output-affecting maps use `IndexMap` (not `HashMap`) where Java uses `LinkedHashMap`
+    - Float formatting helpers match Java `DecimalFormat` precision rules
+    If any check fails, loop back to Phase 2 before spending time on the expensive parity sweep.
 
 ### Phase 3: Testing
 

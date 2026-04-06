@@ -16,6 +16,7 @@ Classifies risk, runs benchmarks when needed, and produces a binding verdict.
 - Before approving any code change to Rust source files
 - After the code reviewer completes correctness and style checks
 - When the parity orchestrator requests a performance verdict
+- See **Caller Context** below for how the verdict is treated depending on who invokes this skill
 
 ## When NOT to Use
 
@@ -23,6 +24,24 @@ Classifies risk, runs benchmarks when needed, and produces a binding verdict.
 - Test-only changes (`#[cfg(test)]` modules, `tests/` directory)
 - CI/build configuration changes (`Cargo.toml` dependency bumps without feature changes)
 ---
+
+## Caller Context
+
+This skill is used by two agents in different modes. The mode affects how the verdict is treated.
+
+### Self-Assessment Mode (rust-implementer)
+When the `rust-implementer` loads this skill during Step 5 (Verify Compilation and Performance):
+- Classify risk using the decision tree
+- Benchmark only for MEDIUM or HIGH risk
+- Include the verdict in your implementation report as **advisory**
+- The code-reviewer's independent verdict takes precedence
+
+### Independent Gate Mode (code-reviewer)
+When the `code-reviewer` loads this skill during Section 3 (Performance Impact):
+- Benchmark is **mandatory** for MEDIUM or HIGH risk — do not skip
+- Your verdict is **binding** — it determines whether the change is approved
+- `PERF_REGRESSION` **blocks approval** and must be escalated via the orchestrator
+- If the rust-implementer already included an advisory verdict, review it but produce your own independent classification
 
 ## Step 1: Classify Risk
 

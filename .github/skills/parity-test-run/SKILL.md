@@ -51,7 +51,7 @@ Search the workspace for parity test harness scripts instead of assuming a fixed
 Typical discovery targets:
 
 - `tests/`
-- `copilot-office/*/copilot-desk/scripts/`
+- `tests/parity/`
 
 Look for scripts that:
 

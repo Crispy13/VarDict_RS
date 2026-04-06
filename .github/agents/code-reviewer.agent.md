@@ -30,6 +30,7 @@ You review Rust code against its Java original and provide structured feedback. 
 - [ ] **Integer overflow**: Uses `wrapping_*` where Java would silently overflow
 - [ ] **String operations**: Substring indices, concatenation order match Java
 - [ ] **Regex behavior**: Patterns produce same matches as Java `Pattern`
+- [ ] **Follow Java Logic**: Implemented code should be based on Java Logic, but with idiomatic Rust.
 - [ ] **Output columns**: Correct count, order, and formatting for the mode
 
 ### 2. Idiomatic Rust (Non-blocking)
@@ -44,6 +45,7 @@ You review Rust code against its Java original and provide structured feedback. 
 ### 3. Performance Impact (Binding)
 
 Use the `change-impact-review` skill to classify risk and benchmark when required.
+If the rust-implementer included an advisory Performance Verdict in their report, review it but produce your own independent classification. Your verdict is **binding** — it determines whether the change is approved.
 
 - [ ] **Risk classified**: Change is classified as HIGH / MEDIUM / LOW using the skill's decision tree
 - [ ] **Benchmark run** (if MEDIUM or HIGH): Before/after benchmark completed with results recorded

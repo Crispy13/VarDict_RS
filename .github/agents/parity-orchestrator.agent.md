@@ -47,10 +47,11 @@ You don't have access to `execute` (including terminal). You must delegate any t
 3. **Doc Gate (Java)**: Save java-analyst report to session file, dispatch `codebase-librarian` per Documentation Gate Protocol
 4. **Implement**: Delegate to `rust-implementer` with the analysis results to write/fix Rust code
 5. **Doc Gate (Rust)**: Save rust-implementer report to session file, dispatch `codebase-librarian` per Documentation Gate Protocol
-6. **Test**: Delegate to `parity-tester` to validate output matches Java reference
-7. **Review**: Delegate to `code-reviewer` to check correctness, performance, and extensibility
-8. **Performance Gate**: Verify the code-reviewer's Performance Verdict (see Performance Gate Protocol)
-9. **Iterate**: If parity test fails, loop back to step 2 with the specific mismatch details
+6. **Pre-Test Review**: Delegate to `code-reviewer` — Parity Correctness checklist ONLY (Section 1). If `REQUEST CHANGES` → loop to step 4. Do NOT run performance benchmarks yet.
+7. **Test**: Delegate to `parity-tester` to validate output matches Java reference
+8. **Post-Test Review**: Delegate to `code-reviewer` — full review (all 4 sections). Produces the binding Performance Verdict.
+9. **Performance Gate**: Verify the code-reviewer's Performance Verdict (see Performance Gate Protocol)
+10. **Iterate**: If parity test fails, loop back to step 2 with the specific mismatch details. If pre-test review fails, loop back to step 4.
 
 ### For a Parity Bug Fix:
 
@@ -58,9 +59,10 @@ You don't have access to `execute` (including terminal). You must delegate any t
 2. **Trace**: Delegate to `java-analyst` to trace the output column back to its source logic.
 3. **Fix**: Delegate to `rust-implementer` with the exact Java logic that needs matching
 4. **Doc Gate**: Save both agent reports to session files, dispatch `codebase-librarian` for each per Documentation Gate Protocol
-5. **Validate**: Delegate to `parity-tester` to confirm the fix
-6. **Review**: Delegate to `code-reviewer` for quality gate
-7. **Performance Gate**: Verify the code-reviewer's Performance Verdict (see Performance Gate Protocol)
+5. **Pre-Fix Review**: Delegate to `code-reviewer` — Parity Correctness checklist ONLY (Section 1). If `REQUEST CHANGES` → loop to step 3.
+6. **Validate**: Delegate to `parity-tester` to confirm the fix
+7. **Post-Fix Review**: Delegate to `code-reviewer` for full quality gate (all 4 sections, binding Performance Verdict)
+8. **Performance Gate**: Verify the code-reviewer's Performance Verdict (see Performance Gate Protocol)
 
 ## Performance Gate Protocol
 
@@ -76,6 +78,16 @@ After the code-reviewer produces a Performance Verdict (using the `change-impact
 1. **Redesign** — Ask `rust-implementer` for an alternative implementation that preserves parity without the regression
 2. **Deep profile** — Invoke the `perf-optimization` skill to identify root cause and targeted fix
 3. **User decision** — Use `vscode_askQuestions`: Present the trade-off (correctness gain vs performance cost) and let the user decide
+
+## Shard-Level Fix Protocol
+
+When a fix originates from `shard-diagnosis` (not the full module workflow):
+
+1. `shard-diagnosis` produces diagnosis → handed to `rust-implementer`
+2. `rust-implementer` implements fix, runs `parity-fix-review` skill (lightweight gate)
+3. Orchestrator delegates to `parity-tester` for the affected shard
+4. Orchestrator delegates to `code-reviewer` for Post-Fix Review (full, all 4 sections)
+5. Performance Gate Protocol applies
 
 ## Documentation Gate Protocol
 

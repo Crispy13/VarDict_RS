@@ -38,6 +38,7 @@ Before any work, check whether domain skills apply:
 | Task involves a failing shard, parity mismatch, or output divergence | `shard-diagnosis` | Before any investigation |
 | Task involves fixing a hot-path module (`CigarParser`, `VariationRealigner`, `StructuralVariantsProcessor`, `ToVarsBuilder`, `pipeline`) | `change-impact-review` | After implementing the fix, before reporting |
 | Starting any task on a new or unfamiliar module | `codebase-doc-manage` | Before reading source files |
+| Fix is complete and tests pass for a shard-level parity fix | `parity-fix-review` | After fix, before reporting |
 
 If a relevant skill applies, load it with `read_file` on its `SKILL.md` and follow its procedure. Do not reproduce the skill steps from memory.
 
@@ -95,7 +96,7 @@ desc.push_str(&seq); // insertion description
 ### Step 5: Verify Compilation and Performance
 Run `cargo check` to ensure the code compiles without errors. Then run `cargo test --profile debug-release -- --include-ignored` for the affected module to catch regressions. Fix any compilation or test issues before reporting completion.
 
-If the changed code touches a hot-path module, load the `change-impact-review` skill and include a Performance Verdict in your report.
+If the changed code touches a hot-path module, load the `change-impact-review` skill in **Self-Assessment Mode** and include an advisory Performance Verdict in your report. The code-reviewer's independent verdict is authoritative.
 
 ## Code Style Requirements
 

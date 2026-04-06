@@ -31,7 +31,7 @@ Core script roles:
 Script locations are not fixed forever. Discover current entrypoints under:
 
 - `tests/`
-- `copilot-office/*/copilot-desk/scripts/`
+- `tests/parity/`
 
 Do not hardcode a single path when executing the harness in automation or instructions.
 

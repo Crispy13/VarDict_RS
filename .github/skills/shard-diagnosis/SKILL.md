@@ -135,9 +135,15 @@ Module: <module_name>
 File: src/mods/<file>.rs
 
 ### Recommended Next Step
-- Delegate to java-analyst to trace column {N} logic
-- Or: Delegate to rust-implementer to fix <specific function>
-- **After the fix**: rust-implementer MUST add one new `#[test]` function in `tests/integration_test.rs` named `test_target_bam_{bam_slug}_{chr}_{description}_parity` (or `test_{module}_{description}_parity` for unit-level bugs). One parity failure = one regression test. No exceptions.
+
+Follow this sequence — **test-first, Java-fixture-only**:
+
+1. Delegate to java-analyst to trace column {N} logic (if root cause is unclear)
+2. **Extract Java fixture**: Save the Java shard output as the expected reference (from `tmp/na12878_parity/<label>/<chr>/java/shard_NNN.tsv.gz` or by running Java). **Never use Rust output as the fixture** — that locks in Rust bugs.
+3. **Write a failing test**: Add one new `#[test]` function in `tests/integration_test.rs` named `test_target_bam_{bam_slug}_{chr}_{description}_parity` (or `test_{module}_{description}_parity` for unit-level bugs). The test compares Rust output against the Java fixture. It must **fail before the fix**.
+4. **Implement the fix**: Delegate to rust-implementer to fix the specific function.
+5. **Verify the test passes**: `cargo test --profile debug-release -- --include-ignored`
+6. **Run parity-fix-review**: Load `parity-fix-review` skill and run the review gate before reporting completion.
 ```
 
 ## Diagnostic Checklist
