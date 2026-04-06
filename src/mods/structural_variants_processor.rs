@@ -2659,8 +2659,11 @@ impl StructuralVariantsProcessor {
             let mut bp = ms - read_len_adj / 2;
             let mut pe = end;
 
+            let span_preloaded = self.is_span_loaded(ms, me);
             self.ensure_reference_span(bp - 150, bp + 150);
-            self.load_uncovered_reference_coverage(data, ms - 200, me + 200);
+            if !span_preloaded {
+                self.load_uncovered_reference_coverage(data, ms - 200, me + 200);
+            }
 
             let mut cntf = cnt;
             let mut cntr = cnt;
@@ -2834,8 +2837,11 @@ impl StructuralVariantsProcessor {
             let mut pe = mlen + bp - 1;
             let mut tpe = pe;
 
+            let span_preloaded = self.is_span_loaded(ms, me);
             self.ensure_reference_span(pe - 150, pe + 150);
-            self.load_uncovered_reference_coverage(data, ms - 200, me + 200);
+            if !span_preloaded {
+                self.load_uncovered_reference_coverage(data, ms - 200, me + 200);
+            }
 
             let mut cntf = cnt;
             let mut cntr = cnt;

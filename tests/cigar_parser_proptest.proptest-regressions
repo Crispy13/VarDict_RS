@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc deae68cc219113a203fb5467fc42ef744b677354197bc5f8ef4f33c89d40b45c # shrinks to case = ParserCase { ops: [('M', 1), ('M', 1), ('S', 2)], query_seq: [65, 65, 65, 65], is_reverse: false }
