@@ -42,61 +42,10 @@ Before any work, check whether domain skills apply:
 
 If a relevant skill applies, load it with `read_file` on its `SKILL.md` and follow its procedure. Do not reproduce the skill steps from memory.
 
-### Step 1: Read Existing Rust Code
-Before writing anything, load the `codebase-doc-manage` skill and execute **Phase 1 (Orient)** for the target Rust module. Then read the actual Rust source to verify current struct definitions, naming conventions, and available helper functions.
+### Step 1: Follow `parity-check` Phase 2
+Treat `parity-check` Phase 2 as the canonical implementation workflow. Use it to orient on the module, map the Java analysis to Rust structures, implement every required branch, run `cargo check`, and run `cargo test --profile debug-release -- --include-ignored` for the affected module.
 
-### Step 2: Translate Structure
-Map the Java analysis to Rust:
-- Java class → Rust module or struct with `impl` block
-- Java method → Rust function (standalone or method)
-- Java fields → Rust struct fields
-- Use the type mapping from `rust-parity.instructions.md`
-
-### Step 3: Implement Logic
-Follow the analysis step-by-step:
-```rust
-/// Ported from: `com.astrazeneca.vardict.modules.ClassName.methodName()`
-/// Java source: ClassName.java:L{start}-L{end}
-fn method_name(/* params */) -> Result<ReturnType, Error> {
-    // Step 1 from analysis: {description}
-    // ...
-    // Step 2 from analysis: {description}
-    // ...
-}
-```
-
-### Step 4: Handle Parity-Critical Patterns
-
-**Float Formatting**: Match Java `DecimalFormat` exactly. Use helper functions for non-trivial formatting.
-
-**Collection Ordering**: Use `IndexMap` for any map that was `LinkedHashMap` in Java.
-
-**Null → Option**: Every Java null check becomes an `Option` check:
-```rust
-// Java: if (value == null) { return defaultVal; }
-// Rust:
-let result = match value {
-    Some(v) => v,
-    None => default_val,
-};
-```
-
-**Integer Overflow**: Use `wrapping_*` methods where Java arithmetic could overflow:
-```rust
-let sum = a.wrapping_add(b); // matches Java's silent overflow
-```
-
-**String Building**: Match Java's `StringBuilder` concatenation order exactly:
-```rust
-let mut desc = String::new();
-desc.push('+');
-desc.push_str(&seq); // insertion description
-```
-
-### Step 5: Verify Compilation and Performance
-Run `cargo check` to ensure the code compiles without errors. Then run `cargo test --profile debug-release -- --include-ignored` for the affected module to catch regressions. Fix any compilation or test issues before reporting completion.
-
-If the changed code touches a hot-path module, load the `change-impact-review` skill in **Self-Assessment Mode** and include an advisory Performance Verdict in your report. The code-reviewer's independent verdict is authoritative.
+If the changed code touches a hot-path module, still load `change-impact-review` in self-assessment mode after the fix and include the advisory Performance Verdict in your report. The code-reviewer's independent verdict remains authoritative.
 
 ## Code Style Requirements
 

@@ -22,7 +22,7 @@ End-to-end workflow for achieving and verifying 100% output parity between a Var
 - Test BAM/BED fixtures (or ability to create minimal fixtures)
 - Reference Java output for comparison (or ability to run Java version)
 
-## Procedure
+## New Module Track
 
 ### Phase 1: Analysis
 
@@ -78,6 +78,17 @@ End-to-end workflow for achieving and verifying 100% output parity between a Var
     - Blocking issues → loop back to Phase 2
     - Non-blocking suggestions → create follow-up tasks
 14. **Mark module as verified**: Update tracking with parity status
+
+## Bug Fix Track
+
+1. **Reproduce**: Capture the specific output difference (expected vs actual).
+2. **Trace**: Delegate to `java-analyst` to trace the mismatching field or behavior back to the source logic.
+3. **Fix**: Delegate to `rust-implementer` with the exact Java logic and mismatch details.
+4. **Doc Gate**: Save the producer reports, then follow `codebase-doc-manage` Phase 2 and `Documentation Gate Protocol` for cache updates.
+5. **Pre-Fix Review**: Delegate to `code-reviewer` for Parity Correctness only. If changes are requested, loop back to step 3.
+6. **Validate**: Delegate to `parity-tester` to confirm the fix on the affected case or shard.
+7. **Post-Fix Review**: Delegate to `code-reviewer` for the full review (all four sections, including the binding Performance Verdict).
+8. **Performance Gate**: Act on the verdict: `PERF_SAFE` → proceed, `PERF_RISK` → log and notify, `PERF_REGRESSION` → block and escalate.
 
 ## Iteration Protocol
 

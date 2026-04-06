@@ -135,36 +135,7 @@ When output differs from Java:
 
 This prevents regressions where fixing one parity issue silently re-breaks another.
 
-## Stop-on-Mismatch Sweep Strategy
-
-When running parity sweeps across chromosomes and configs:
-
-1. **One config × one chromosome at a time.** Do not fire-and-forget a full 250-cell sweep.
-2. **On any mismatch: STOP.** Do not continue to the next chromosome or config.
-3. **Fix the bug immediately.** Follow the Find → Fix → Test workflow above.
-4. **Rebuild the binary** with the fix compiled in.
-5. **Re-run the failed cell** to confirm the fix.
-6. **Then resume** the sweep from where it stopped.
-
-This ensures:
-- The binary under test is always the latest and best
-- No fix ever ships without its regression test
-- Failures don't accumulate, blurring signal
-- Monitoring time is replaced by fixing time
-
-**Exception**: If a failure is classified as **not a Rust bug** (e.g., Java heap OOM), document it and continue. Only stop for real parity mismatches.
-
-## Tiered Config Test Order
-
-When sweeping multiple configs per chromosome, run them in this order (cheapest/highest-signal first):
-
-1. **Core pipeline** (fast, catch most bugs): nosv (`-U`), freq-low (`-f 0.001`), fisher (`--fisher`)
-2. **Filter / variant options** (mid-cost): filter-0x700, chimeric, etc.
-3. **Combo configs**: clinical-wgs, inssize-small, etc.
-4. **Edge-case / expensive** (known failure-prone, run last): no-realign (`-k 0`), debug (`-D`)
-5. **Most expensive** (pileup — high memory, longest runtime): pileup (`-p`) and variants
-
-This order is encoded in the `TEST_MATRIX` array in `na12878_option_parity_v2.sh`. The harness iterates configs in array order, so reordering the array changes execution priority.
+See `.github/instructions/ops-policy.instructions.md` for sweep strategy and tiered config test order.
 
 ## Codebase Cache
 

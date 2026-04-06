@@ -35,7 +35,15 @@ Preset tiers:
 
 Before running anything, restate the requested scope in `config x chromosome` form so the run is unambiguous.
 
-### Step 2: Build
+### Step 2: Start Dashboard
+
+Start the parity dashboard before the test run so live results are available while shards execute.
+
+- Run `python -m tests.parity serve --results-dir tmp/<results-dir> --port 7777` in the background.
+- Use the same `<results-dir>` label that the harness will write for this run.
+- Leave the server running until reporting is complete.
+
+### Step 3: Build
 
 Build the Rust binary before testing.
 
@@ -44,7 +52,7 @@ Build the Rust binary before testing.
 
 Record which binary profile was built and which binary will be exercised by the harness.
 
-### Step 3: Discover Harness
+### Step 4: Discover Harness
 
 Search the workspace for parity test harness scripts instead of assuming a fixed script name.
 
@@ -65,7 +73,7 @@ Discovery guidance:
 - Confirm the script supports the requested scope before using it
 - Prefer the harness that matches the current mission or parity workflow, but verify behavior from the script help text or source first
 
-### Step 4: Execute
+### Step 5: Execute
 
 Use the discovered harness path in the commands below.
 
@@ -119,7 +127,7 @@ Mode guidance:
 - Use **cold** mode when Java artifacts must be regenerated
 - Use **rust-only** mode when validating a Rust-only code change against existing Java cache
 
-### Step 5: Collect Results
+### Step 6: Collect Results
 
 - Check the harness exit code. `0` means all requested cells passed.
 - Look for `results.json` in `tmp/na12878_parity/<label>/<chr>/`
@@ -128,7 +136,7 @@ Mode guidance:
 
 If the harness spans multiple chromosomes or presets, aggregate results across all returned result directories before reporting.
 
-### Step 6: Report
+### Step 7: Report
 
 Use this report format:
 

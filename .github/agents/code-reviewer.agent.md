@@ -1,6 +1,6 @@
 ---
 description: "Review Rust code for parity correctness, performance, extensibility, and idiomatic style. Use when reviewing ported VarDict methods, auditing parity-critical logic, checking for common porting mistakes, or validating code quality before merge."
-tools: [read, search, execute, edit, web, vscode/memory, vscode/resolveMemoryFileUri]
+tools: [read, search, execute, web, vscode/memory, vscode/resolveMemoryFileUri]
 model: ['Claude Opus 4.6 (fast mode) (Preview) (copilot)','Claude Opus 4.6 (copilot)',]
 user-invocable: false
 ---

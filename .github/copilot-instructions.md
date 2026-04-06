@@ -26,59 +26,8 @@ SAMFileParser → RecordPreprocessor → CigarParser → VariationRealigner
 | FisherExact | ~200 | LOW | Strand bias statistics |
 | Configuration/CLI | ~300 | LOW | Argument mapping |
 
-## Parity Rules
+## References
 
-1. **Output must be byte-identical** to Java for the same inputs — this is the non-negotiable standard
-2. **Floating-point formatting**: Java uses `DecimalFormat("0.0000")`; Rust must match exactly, including trailing zeros and rounding behavior
-3. **Collection ordering**: Use `IndexMap` instead of `HashMap` wherever Java uses `LinkedHashMap`
-4. **Integer arithmetic**: Match Java's signed 32/64-bit overflow semantics using `wrapping_add`, `wrapping_mul` etc. where Java would silently overflow
-5. **Null mapping**: Java `null` → Rust `Option::None`; every null-check branch in Java must have an equivalent `Option` match in Rust
-6. **String handling**: Use `String`/`&str` with UTF-8; genomic data is ASCII-safe but validate at boundaries
-7. **Tab-delimited output**: Columns must match exactly — count, order, and content
-
-## Environment
-- **Python / Build Environment:** You MUST ALWAYS prioritize using the `rust_build_env` conda environment (`conda activate rust_build_env`). There is no need to source `conda.sh` unless you invoke a new shell. 
-- **LIBCLANG_PATH env var:** set `LIBCLANG_PATH=$CONDA_PREFIX/lib` after activating the conda environment.
-- **Conda/venv Fallback:** If the `rust_build_env` Conda environment does not work, DO NOT guess or fail silently. IMMEDIATELY stop, report the exact problem to the user, and explicitly ask whether you should continue using Conda or switch to a Python `venv`.
-- **Temporary Files:** You MUST ALWAYS use `./tmp` for creating any temporary or intermediate files. NEVER use the system `/tmp` directory.
-
-## Build and Test
-You MUST use `debug-release` profile instead of `release` for all development task.
-```bash
-# Build
-cargo build --profile debug-release
-
-# Run tests (always include ignored — prev parity failures live there)
-cargo test -- --include-ignored
-
-# Run parity test against Java output
-# (compare Rust output with reference Java output for test regions)
-diff <(./target/debug-release/vardict -G ref.fa -b test.bam -N sample regions.bed) expected_java_output.tsv
-
-# Lint
-cargo clippy -- -D warnings
-cargo fmt --check
-```
-
-## Parity Sweep Rule
-
-**NEVER use `--no-stop` for multi-config parity sweeps.** The workflow is run → find first failure → stop → fix → re-run. Continuing past a failure wastes hours because any code fix requires re-running the sweep anyway.
-- `--no-stop` is only acceptable for **single-config, single-chromosome** runs where you want to collect all failing shards in that one cell.
-- For any preset sweep or multi-config run, omit `--no-stop` entirely.
-
-## Conventions
-
-- Follow `rust.instructions.md` for general Rust style
-- Every Rust function porting a Java method must reference the original Java class and method name in a doc comment
-- When Java logic is intentionally complex or subtle, preserve the algorithmic structure even if it looks non-idiomatic — correctness over style
-- Test each module independently against Java reference output before integration
-- Use `#[cfg(test)]` modules co-located with implementation
-- Thread model: `rayon` for data parallelism (replaces Java `CompletableFuture` + `ExecutorService`)
-- BAM I/O: `rust-htslib` or `noodles` — document which is used and why
-
-
-## Announce skill name when you use skills
-Announce "Using <skill-name>" in chat when you start skills.
-
-## Constraints
-1. ~~Don't use `mimalloc`~~ — Fixed: The SIGSEGV was caused by `reallocate_c_vec` calling `System.dealloc` (libc free) on buffers allocated by mimalloc. Resolved by removing the C-malloc workaround after upgrading rust-htslib to v1.0.0c3. mimalloc is now the default allocator.
+- Operational policies (build, env, test, sweep): see `.github/instructions/ops-policy.instructions.md`
+- Parity rules (type mapping, float formatting, ordering): see `.github/instructions/rust-parity.instructions.md`
+- Rust coding conventions: see `.github/instructions/rust.instructions.md`

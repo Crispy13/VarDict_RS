@@ -172,6 +172,17 @@ Interpretation rule:
 
 - Check whether a mismatch is a true logic difference or a boundary-sensitive manifestation of fetch extension and shard partitioning.
 
+## TDD Rule For Parity Fixes
+
+Follow the Find -> Fix -> Test workflow in `.github/instructions/rust-parity.instructions.md` once a parity failure is localized.
+
+Core requirements:
+
+- One parity failure means one new named `#[test]` function.
+- The new test must fail before the fix and pass after it.
+- Extract the expected fixture from Java output, never from Rust output.
+- Land the fix, fixture, and regression test in the same commit.
+
 ## Verification Checklist
 
 Before declaring a parity fix complete:

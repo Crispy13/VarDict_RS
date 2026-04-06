@@ -2,9 +2,12 @@
 name: somatic-parity
 description: "Scaffold and eventually run somatic-mode parity checks for VarDict-rs against VarDictJava. Use when working with tumor/normal paired mode, somatic fixture planning, or somatic parity smoke tests."
 argument-hint: "Describe the somatic parity task, e.g. 'add tumor/normal smoke fixture' or 'diagnose somatic output mismatch'."
+deprecated: true
 ---
 
 # Somatic Parity
+
+Deprecated: This skill has been superseded by `pending-modes`. Use `pending-modes` for new somatic-mode parity work.
 
 Placeholder skill for future somatic-mode parity work.
 

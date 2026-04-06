@@ -108,6 +108,23 @@ Run when asked to check cache health or before a large parity sweep.
 1. {module} — {risk} risk, {reason to document first}
 ```
 
+## Documentation Gate Protocol
+
+Use this after receiving a report from `java-analyst` or `rust-implementer`.
+
+1. Save the report to a session file: `/memories/session/{agent}-{module}-report.md`.
+2. Dispatch `codebase-librarian` with `report_path`, `module`, `language`, and `mode: update`.
+3. Verify the librarian response contains a `Cache Update:` footer before you treat the doc task as complete.
+
+| Footer Value | Action |
+|--------------|--------|
+| `Cache Update: wrote ...` | Proceed — cache populated |
+| `Cache Update: updated ...` | Proceed — cache extended |
+| `Cache Update: no actionable content ...` | Acceptable — log and proceed |
+| Footer absent or error | Re-dispatch the librarian once. If it fails twice, log the gap and continue; do not block parity work on doc failures. |
+
+Before switching to a new module, run a module-transition audit by dispatching `codebase-librarian` in `audit` mode for modules touched in the current session.
+
 ## Constraints
 
 - Only edit files under `copilot-office/codebase/java/` and `copilot-office/codebase/rust/`.

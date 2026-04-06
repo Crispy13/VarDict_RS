@@ -2,9 +2,12 @@
 name: amplicon-parity
 description: "Scaffold and eventually run amplicon-mode parity checks for VarDict-rs against VarDictJava. Use when working with amplicon BED inputs, targeted-mode fixtures, or amplicon parity smoke tests."
 argument-hint: "Describe the amplicon parity task, e.g. 'add amplicon BED fixture' or 'investigate amplicon boundary mismatch'."
+deprecated: true
 ---
 
 # Amplicon Parity
+
+Deprecated: This skill has been superseded by `pending-modes`. Use `pending-modes` for new amplicon-mode parity work.
 
 Placeholder skill for future amplicon-mode parity work.
 

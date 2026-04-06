@@ -1,3 +1,5 @@
+![CI](https://github.com/OWNER/REPO/actions/workflows/parity.yml/badge.svg)
+
 # VarDictRust
 
 VarDictRust is a Rust port of VarDictJava targeting improved performance while giving the same output.

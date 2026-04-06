@@ -108,20 +108,6 @@ List external calls: htsjdk methods, Apache Commons, other VarDict classes. Note
 
 **Note**: Your report will be forwarded to the `codebase-librarian` agent for cache updates. Include all parity-critical findings - method analyses, null/edge cases, parity warnings, collection ordering dependencies, and float formatting details - so the librarian can extract them into the documentation cache.
 
-## VarDict Module Knowledge
+## Module Orientation
 
-### Variant Description Encoding
-- `+{seq}` = insertion
-- `-{n}` = deletion of n bases
-- `#{seq1}>{seq2}` = complex (MNV)
-- Strings are built incrementally — order of concatenation matters
-
-### Key Data Structures
-- `Variation`: mutable counters (varsCount, fwd, rev, quality, position sums)
-- `Sclip extends Variation`: soft-clip consensus + SV fields
-- `Variant`: final immutable-ish output with alleles, frequency, genotype
-- `Vars`: per-position container with reference variant + variant list
-- `VariationMap<K,V>`: LinkedHashMap + embedded SV struct
-
-### GlobalReadOnlyScope
-Accessed as `instance()` or through `Scope` — every access is a configuration read. Document which config fields are used.
+Use `codebase-doc-manage` Phase 1 (`Orient`) as the canonical source for module summaries, prior method inventories, Java↔Rust correspondence, and known parity traps before reading raw source. Treat the cache as authoritative unless the current task requires verifying a specific source path.

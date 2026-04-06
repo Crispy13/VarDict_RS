@@ -40,29 +40,16 @@ You don't have access to `execute` (including terminal). You must delegate any t
 
 ## Workflow
 
-### For a New Module/Method Parity Task:
+For detailed step-by-step procedures, load the relevant skill:
 
-1. **Scope**: Identify which Java method/module needs parity work
-2. **Analyze**: Delegate to `java-analyst` to extract algorithm logic, edge cases, and data flow
-3. **Doc Gate (Java)**: Save java-analyst report to session file, dispatch `codebase-librarian` per Documentation Gate Protocol
-4. **Implement**: Delegate to `rust-implementer` with the analysis results to write/fix Rust code
-5. **Doc Gate (Rust)**: Save rust-implementer report to session file, dispatch `codebase-librarian` per Documentation Gate Protocol
-6. **Pre-Test Review**: Delegate to `code-reviewer` — Parity Correctness checklist ONLY (Section 1). If `REQUEST CHANGES` → loop to step 4. Do NOT run performance benchmarks yet.
-7. **Test**: Delegate to `parity-tester` to validate output matches Java reference
-8. **Post-Test Review**: Delegate to `code-reviewer` — full review (all 4 sections). Produces the binding Performance Verdict.
-9. **Performance Gate**: Verify the code-reviewer's Performance Verdict (see Performance Gate Protocol)
-10. **Iterate**: If parity test fails, loop back to step 2 with the specific mismatch details. If pre-test review fails, loop back to step 4.
+| Task Type | Skill | Track |
+|-----------|-------|-------|
+| New module parity | `parity-check` | New Module Track |
+| Bug fix | `parity-check` | Bug Fix Track |
+| Documentation update | `codebase-doc-manage` | Phase 2 |
 
-### For a Parity Bug Fix:
-
-1. **Reproduce**: Get the specific output difference (expected vs actual)
-2. **Trace**: Delegate to `java-analyst` to trace the output column back to its source logic.
-3. **Fix**: Delegate to `rust-implementer` with the exact Java logic that needs matching
-4. **Doc Gate**: Save both agent reports to session files, dispatch `codebase-librarian` for each per Documentation Gate Protocol
-5. **Pre-Fix Review**: Delegate to `code-reviewer` — Parity Correctness checklist ONLY (Section 1). If `REQUEST CHANGES` → loop to step 3.
-6. **Validate**: Delegate to `parity-tester` to confirm the fix
-7. **Post-Fix Review**: Delegate to `code-reviewer` for full quality gate (all 4 sections, binding Performance Verdict)
-8. **Performance Gate**: Verify the code-reviewer's Performance Verdict (see Performance Gate Protocol)
+Documentation gate protocol: see `codebase-doc-manage` skill, `Documentation Gate Protocol`.
+Module priority order: see `parity-check` skill's Module Priority table.
 
 ## Performance Gate Protocol
 
@@ -88,35 +75,6 @@ When a fix originates from `shard-diagnosis` (not the full module workflow):
 3. Orchestrator delegates to `parity-tester` for the affected shard
 4. Orchestrator delegates to `code-reviewer` for Post-Fix Review (full, all 4 sections)
 5. Performance Gate Protocol applies
-
-## Documentation Gate Protocol
-
-After receiving a report from `java-analyst` or `rust-implementer`:
-
-1. **Save the report** to a session file: `/memories/session/{agent}-{module}-report.md`
-2. **Dispatch `codebase-librarian`** with: `report_path` (session file), `module` (module name), `language` (`java` or `rust`).
-3. **Verify the librarian's response** contains a `Cache Update:` footer line.
-
-| Footer Value | Action |
-|-------------|--------|
-| `Cache Update: wrote ...` | Proceed — cache populated |
-| `Cache Update: updated ...` | Proceed — cache extended |
-| `Cache Update: no actionable content ...` | Acceptable — log and proceed |
-| Footer absent or error | Re-dispatch librarian. If it fails twice, log the gap and proceed (do not block parity work on doc failures). |
-
-**Module-transition audit**: Before starting a new module, dispatch the librarian in `audit` mode to verify cache consistency for modules touched in the current session.
-
-## Module Priority Order
-
-Process modules by parity risk (highest first):
-
-1. `CigarParser` — core variant detection (~2,400 LOC)
-2. `VariationRealigner` — local realignment
-3. `StructuralVariantsProcessor` — SV detection (~2,100 LOC)
-4. `ToVarsBuilder` — variant building and filtering
-5. `*OutputVariant` printers — output formatting
-6. Mode classes (Simple, Somatic, Amplicon)
-7. Supporting modules (FisherExact, Configuration, Region)
 
 ## Delegation Format
 

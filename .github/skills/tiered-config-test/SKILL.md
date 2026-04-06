@@ -36,6 +36,8 @@ Composite preset:
 |--------|--------|----------|-----|
 | `full-gate` | `smoke` -> `tier1` -> `config-spread` -> `core-wide` | Early-exit on the first failing gate | Standard promotion path before pairwise or release |
 
+Canonical rule: multi-config parity sweeps stop on the first failure, so preset runs should preserve that default behavior.
+
 ## Gate Criteria
 
 - Tiers `0` through `3` require 100% `PASS` for all non-blocked configs. Any `FAIL` blocks promotion.
@@ -69,25 +71,25 @@ Discover the harness path before execution. Use `<harness>` as a placeholder for
 
 ```bash
 # Tier 0: Smoke
-bash <harness> --preset smoke --rust-only --no-stop
+bash <harness> --preset smoke --rust-only
 
 # Tier 1: All T1
-bash <harness> --preset tier1 --rust-only --no-stop
+bash <harness> --preset tier1 --rust-only
 
 # Tier 2: Config spread (all 44, 3 chrs)
-bash <harness> --preset config-spread --rust-only --no-stop
+bash <harness> --preset config-spread --rust-only
 
 # Tier 3: Core wide (T1, all chrs)
-bash <harness> --preset core-wide --rust-only --no-stop --parallel 5
+bash <harness> --preset core-wide --rust-only --parallel 5
 
 # Tier 4: Pairwise (20 PW configs, 10 chrs)
-bash <harness> --preset pairwise --rust-only --no-stop --parallel 5
+bash <harness> --preset pairwise --rust-only --parallel 5
 
 # Tier 5: Release
-bash <harness> --preset release --rust-only --no-stop --no-build
+bash <harness> --preset release --rust-only --no-build
 
 # Full gate (tiers 0 -> 1 -> 2 -> 3)
-bash <harness> --preset full-gate --rust-only --no-stop
+bash <harness> --preset full-gate --rust-only
 ```
 
 ### Manual Equivalents
@@ -96,13 +98,13 @@ The presets above are the standard entry points. For targeted debugging or custo
 
 ```bash
 # Tier 1 interim: all Tier 1 configs on 20, 22, MT
-bash <harness> --tier 1 --chr 20 --chr 22 --chr MT --rust-only --no-stop
+bash <harness> --tier 1 --chr 20 --chr 22 --chr MT --rust-only
 
 # Config-spread interim: all 44 configs on 20, 22, MT
-bash <harness> --chr 20 --chr 22 --chr MT --rust-only --no-stop
+bash <harness> --chr 20 --chr 22 --chr MT --rust-only
 
 # Core-wide interim: all Tier 1 configs on all chromosomes
-bash <harness> --tier 1 --all-chr --rust-only --no-stop --parallel 5
+bash <harness> --tier 1 --all-chr --rust-only --parallel 5
 ```
 
 - Pairwise: use `--preset pairwise` so the harness loads `tests/pairwise_configs.tsv` directly.

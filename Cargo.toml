@@ -44,6 +44,7 @@ catch-panics = []
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1.6"
 
 [[bench]]
 name = "cigar_parser_bench"
