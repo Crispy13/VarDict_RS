@@ -35,6 +35,10 @@ use crate::variants::variants::{SoftClip, StructuralVariantCounts, VarDesc, Vari
 pub struct RealignedVariationData {
     /// Non-insertion variants by position
     pub non_insertion_variants: HashMap<i64, InnerMap<VarDesc, Variant>, LibDefaultHasher>,
+    /// First-insertion order for outer nonInsertionVariants positions.
+    pub non_insertion_variants_insert_index: HashMap<i64, usize, LibDefaultHasher>,
+    /// Next monotonically increasing insertion-order slot for newly seen positions.
+    pub next_non_insertion_variants_insert_index: usize,
     /// Java VariationMap.sv equivalent counts by position.
     pub sv_counts: HashMap<i64, StructuralVariantCounts, LibDefaultHasher>,
     /// Insertion variants by position
@@ -77,6 +81,28 @@ pub struct RealignedVariationData {
 
 /// Output data from StructuralVariantsProcessor (same structure, possibly modified)
 pub type ProcessedVariationData = RealignedVariationData;
+
+impl RealignedVariationData {
+    /// Preserve Java HashMap.put first-insertion order for outer nonInsertionVariants positions.
+    /// Java: CigarParser.java / VariationRealigner.java / StructuralVariantsProcessor.java
+    pub(crate) fn get_or_insert_non_insertion_variants(
+        &mut self,
+        pos: i64,
+    ) -> &mut InnerMap<VarDesc, Variant> {
+        match self.non_insertion_variants.entry(pos) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                if let std::collections::hash_map::Entry::Vacant(insert_order_entry) =
+                    self.non_insertion_variants_insert_index.entry(pos)
+                {
+                    insert_order_entry.insert(self.next_non_insertion_variants_insert_index);
+                    self.next_non_insertion_variants_insert_index += 1;
+                }
+                entry.insert(InnerMap::with_capacity(4))
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct ProcessMemorySnapshot {
@@ -450,8 +476,7 @@ impl StructuralVariantsProcessor {
                 }
 
                 let del_key = format!("-{}", dellen);
-                let vref =
-                    Self::get_or_create_variation(&mut data.non_insertion_variants, p5, &del_key);
+                let vref = Self::get_or_create_variation(data, p5, &del_key);
                 vref.alt_depth = 0;
 
                 let split_count = data
@@ -459,14 +484,7 @@ impl StructuralVariantsProcessor {
                     .get(&softp)
                     .map(|s| s.var.alt_depth)
                     .unwrap_or(0);
-                Self::add_sv_counts(
-                    &mut data.non_insertion_variants,
-                    &mut data.sv_counts,
-                    p5,
-                    vars_count,
-                    split_count,
-                    1,
-                );
+                Self::add_sv_counts(data, p5, vars_count, split_count, 1);
 
                 let current_cov = data.ref_coverage.get(p5).unwrap_or(0);
                 if current_cov <= vars_count {
@@ -481,11 +499,7 @@ impl StructuralVariantsProcessor {
 
                 if let Some(scv) = data.soft_clips_3end.get(&softp) {
                     let scv_var = scv.var.clone();
-                    let variation = Self::get_or_create_variation(
-                        &mut data.non_insertion_variants,
-                        p5,
-                        &del_key,
-                    );
+                    let variation = Self::get_or_create_variation(data, p5, &del_key);
                     adj_cnt_from_variant(variation, &scv_var);
 
                     if let Some(ref_base) = self.get_ref_base(p5) {
@@ -510,8 +524,7 @@ impl StructuralVariantsProcessor {
                 tv.mean_mapq = mean_mapq * vars_count as f64 / vars_count as f64;
                 tv.nm = nm * vars_count as f64 / vars_count as f64;
 
-                let variation =
-                    Self::get_or_create_variation(&mut data.non_insertion_variants, p5, &del_key);
+                let variation = Self::get_or_create_variation(data, p5, &del_key);
                 adj_cnt_from_variant(variation, &tv);
 
                 if let Some(del) = data.svfdel.get_mut(idx) {
@@ -596,11 +609,7 @@ impl StructuralVariantsProcessor {
                     }
 
                     let del_key = format!("-{}", dellen);
-                    let vref = Self::get_or_create_variation(
-                        &mut data.non_insertion_variants,
-                        candidate,
-                        &del_key,
-                    );
+                    let vref = Self::get_or_create_variation(data, candidate, &del_key);
                     vref.alt_depth = 0;
 
                     let split_count = data
@@ -608,14 +617,7 @@ impl StructuralVariantsProcessor {
                         .get(&candidate)
                         .map(|s| s.var.alt_depth)
                         .unwrap_or(0);
-                    Self::add_sv_counts(
-                        &mut data.non_insertion_variants,
-                        &mut data.sv_counts,
-                        candidate,
-                        vars_count,
-                        split_count,
-                        1,
-                    );
+                    Self::add_sv_counts(data, candidate, vars_count, split_count, 1);
 
                     let current_cov = data.ref_coverage.get(candidate).unwrap_or(0);
                     if current_cov <= vars_count {
@@ -628,13 +630,13 @@ impl StructuralVariantsProcessor {
                         }
                     }
 
-                    if let Some(scv) = data.soft_clips_3end.get(&candidate) {
-                        let variation = Self::get_or_create_variation(
-                            &mut data.non_insertion_variants,
-                            candidate,
-                            &del_key,
-                        );
-                        adj_cnt_from_variant(variation, &scv.var);
+                    if let Some(scv_var) = data
+                        .soft_clips_3end
+                        .get(&candidate)
+                        .map(|scv| scv.var.clone())
+                    {
+                        let variation = Self::get_or_create_variation(data, candidate, &del_key);
+                        adj_cnt_from_variant(variation, &scv_var);
                     }
 
                     let mut tv = Variant::default();
@@ -647,11 +649,7 @@ impl StructuralVariantsProcessor {
                     tv.mean_mapq = mean_mapq * vars_count as f64 / vars_count as f64;
                     tv.nm = nm * vars_count as f64 / vars_count as f64;
 
-                    let variation = Self::get_or_create_variation(
-                        &mut data.non_insertion_variants,
-                        candidate,
-                        &del_key,
-                    );
+                    let variation = Self::get_or_create_variation(data, candidate, &del_key);
                     adj_cnt_from_variant(variation, &tv);
 
                     if let Some(del) = data.svfdel.get_mut(idx) {
@@ -777,8 +775,7 @@ impl StructuralVariantsProcessor {
                 }
 
                 let del_key = format!("-{}", dellen);
-                let vref =
-                    Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &del_key);
+                let vref = Self::get_or_create_variation(data, bp, &del_key);
                 vref.alt_depth = 0;
 
                 let split_count = data
@@ -786,22 +783,11 @@ impl StructuralVariantsProcessor {
                     .get(&softp)
                     .map(|s| s.var.alt_depth)
                     .unwrap_or(0);
-                Self::add_sv_counts(
-                    &mut data.non_insertion_variants,
-                    &mut data.sv_counts,
-                    bp,
-                    vars_count,
-                    split_count,
-                    1,
-                );
+                Self::add_sv_counts(data, bp, vars_count, split_count, 1);
 
-                if let Some(scv) = data.soft_clips_5end.get(&softp) {
-                    let variation = Self::get_or_create_variation(
-                        &mut data.non_insertion_variants,
-                        bp,
-                        &del_key,
-                    );
-                    adj_cnt_from_variant(variation, &scv.var);
+                if let Some(scv_var) = data.soft_clips_5end.get(&softp).map(|scv| scv.var.clone()) {
+                    let variation = Self::get_or_create_variation(data, bp, &del_key);
+                    adj_cnt_from_variant(variation, &scv_var);
                 }
 
                 let current_cov = data.ref_coverage.get(bp).unwrap_or(0);
@@ -825,8 +811,7 @@ impl StructuralVariantsProcessor {
                 tv.mean_mapq = mean_mapq * vars_count as f64 / vars_count as f64;
                 tv.nm = nm * vars_count as f64 / vars_count as f64;
 
-                let variation =
-                    Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &del_key);
+                let variation = Self::get_or_create_variation(data, bp, &del_key);
                 adj_cnt_from_variant(variation, &tv);
 
                 if let Some(del) = data.svrdel.get_mut(idx) {
@@ -914,11 +899,7 @@ impl StructuralVariantsProcessor {
                     }
 
                     let del_key = format!("-{}", dellen);
-                    let vref = Self::get_or_create_variation(
-                        &mut data.non_insertion_variants,
-                        bp,
-                        &del_key,
-                    );
+                    let vref = Self::get_or_create_variation(data, bp, &del_key);
                     vref.alt_depth = 0;
 
                     let split_count = data
@@ -926,22 +907,15 @@ impl StructuralVariantsProcessor {
                         .get(&candidate)
                         .map(|s| s.var.alt_depth)
                         .unwrap_or(0);
-                    Self::add_sv_counts(
-                        &mut data.non_insertion_variants,
-                        &mut data.sv_counts,
-                        bp,
-                        vars_count,
-                        split_count,
-                        1,
-                    );
+                    Self::add_sv_counts(data, bp, vars_count, split_count, 1);
 
-                    if let Some(scv) = data.soft_clips_5end.get(&candidate) {
-                        let variation = Self::get_or_create_variation(
-                            &mut data.non_insertion_variants,
-                            bp,
-                            &del_key,
-                        );
-                        adj_cnt_from_variant(variation, &scv.var);
+                    if let Some(scv_var) = data
+                        .soft_clips_5end
+                        .get(&candidate)
+                        .map(|scv| scv.var.clone())
+                    {
+                        let variation = Self::get_or_create_variation(data, bp, &del_key);
+                        adj_cnt_from_variant(variation, &scv_var);
                     }
 
                     if !data.ref_coverage.contains_key(bp) {
@@ -965,11 +939,7 @@ impl StructuralVariantsProcessor {
                     tv.mean_mapq = mean_mapq * vars_count as f64 / vars_count as f64;
                     tv.nm = nm * vars_count as f64 / vars_count as f64;
 
-                    let variation = Self::get_or_create_variation(
-                        &mut data.non_insertion_variants,
-                        bp,
-                        &del_key,
-                    );
+                    let variation = Self::get_or_create_variation(data, bp, &del_key);
                     adj_cnt_from_variant(variation, &tv);
 
                     if let Some(del) = data.svrdel.get_mut(idx) {
@@ -1046,20 +1016,22 @@ impl StructuralVariantsProcessor {
             let region_was_loaded = self.is_region_loaded(inv.mstart, inv.mend);
             let inv_span_preloaded = self.is_span_loaded(inv.mstart, inv.mend);
             let hw_count_before = self.historical_reference_windows.len();
-            append_rss_stage_log_if_enabled(region, "sv_find_inv_before_ensure_reference_span");
-            self.ensure_reference_span(inv.mstart - 500, inv.mend + 500);
-            append_rss_stage_log_if_enabled(region, "sv_find_inv_after_ensure_reference_span");
-            let hw_count_after = self.historical_reference_windows.len();
-            // Mark windows from the 3' pass (End3) so that findsv's historical
-            // window scanning can limit their role to masking existing seeds
-            // (preventing spurious INVs from Rust-only clusters) rather than
-            // providing new unique seed positions.
-            if side == InversionSide::End3 {
-                for idx in hw_count_before..hw_count_after {
-                    self.suspect_hist_windows.insert(idx);
-                }
-                if hw_count_after > hw_count_before {
-                    self.last_inv_extension_suspect = true;
+            if !region_was_loaded {
+                append_rss_stage_log_if_enabled(region, "sv_find_inv_before_ensure_reference_span");
+                self.ensure_reference_span(inv.mstart - 500, inv.mend + 500);
+                append_rss_stage_log_if_enabled(region, "sv_find_inv_after_ensure_reference_span");
+                let hw_count_after = self.historical_reference_windows.len();
+                // NOTE: Match Java's ReferenceResource.isLoaded() gate.
+                // Java only extends REF when the mate span is new; reloading an already-loaded
+                // span in Rust creates extra historical windows that can later overfill INV flanks.
+                // Java: StructuralVariantsProcessor.java:L729-L731
+                if side == InversionSide::End3 {
+                    for idx in hw_count_before..hw_count_after {
+                        self.suspect_hist_windows.insert(idx);
+                    }
+                    if hw_count_after > hw_count_before {
+                        self.last_inv_extension_suspect = true;
+                    }
                 }
             }
             if !region_was_loaded {
@@ -1331,16 +1303,9 @@ impl StructuralVariantsProcessor {
             }
 
             let gt = format!("-{}^{}", len, ins_final);
-            Self::add_sv_counts(
-                &mut data.non_insertion_variants,
-                &mut data.sv_counts,
-                softp,
-                inv.vars_count,
-                scv_var.alt_depth,
-                1,
-            );
+            Self::add_sv_counts(data, softp, inv.vars_count, scv_var.alt_depth, 1);
 
-            let vref = Self::get_or_create_variation(&mut data.non_insertion_variants, softp, &gt);
+            let vref = Self::get_or_create_variation(data, softp, &gt);
             vref.pstd = true;
             vref.qstd = true;
 
@@ -1530,21 +1495,10 @@ impl StructuralVariantsProcessor {
                         }
 
                         let del_key = format!("-{}", dellen);
-                        let vref = Self::get_or_create_variation(
-                            &mut data.non_insertion_variants,
-                            bp_adj,
-                            &del_key,
-                        );
+                        let vref = Self::get_or_create_variation(data, bp_adj, &del_key);
                         vref.alt_depth = 0;
 
-                        Self::add_sv_counts(
-                            &mut data.non_insertion_variants,
-                            &mut data.sv_counts,
-                            bp_adj,
-                            pairs_data.pairs,
-                            cnt5,
-                            1,
-                        );
+                        Self::add_sv_counts(data, bp_adj, pairs_data.pairs, cnt5, 1);
 
                         if !data.ref_coverage.contains_key(bp_adj) {
                             data.ref_coverage.set(bp_adj, pairs_data.pairs + cnt5);
@@ -1556,13 +1510,11 @@ impl StructuralVariantsProcessor {
                             }
                         }
 
-                        if let Some(sc5v) = data.soft_clips_5end.get(&p5) {
-                            let variation = Self::get_or_create_variation(
-                                &mut data.non_insertion_variants,
-                                bp_adj,
-                                &del_key,
-                            );
-                            adj_cnt_from_variant(variation, &sc5v.var);
+                        if let Some(sc5v_var) =
+                            data.soft_clips_5end.get(&p5).map(|sc5v| sc5v.var.clone())
+                        {
+                            let variation = Self::get_or_create_variation(data, bp_adj, &del_key);
+                            adj_cnt_from_variant(variation, &sc5v_var);
                         }
 
                         let mut tmp = Variant::default();
@@ -1575,11 +1527,7 @@ impl StructuralVariantsProcessor {
                         tmp.mean_mapq = pairs_data.q_mean;
                         tmp.nm = pairs_data.nm;
 
-                        let variation = Self::get_or_create_variation(
-                            &mut data.non_insertion_variants,
-                            bp_adj,
-                            &del_key,
-                        );
+                        let variation = Self::get_or_create_variation(data, bp_adj, &del_key);
                         adj_cnt_from_variant(variation, &tmp);
                     }
                 } else {
@@ -1592,13 +1540,8 @@ impl StructuralVariantsProcessor {
                 // Those windows stay masked by default to avoid extra INV rows from Rust-only
                 // low-support End3 clusters, but pileup still needs legitimate Java low-support
                 // INVs that otherwise die here with bp=0.
-                let mut m_rev = self.find_match_rev(
-                    &seq,
-                    p5,
-                    -1,
-                    Configuration::SEED_1 as usize,
-                    3,
-                );
+                let mut m_rev =
+                    self.find_match_rev(&seq, p5, -1, Configuration::SEED_1 as usize, 3);
                 if m_rev.base_position == 0 {
                     m_rev = self.find_match_rev_findsv_allow_suspect_windows(&seq, p5, -1);
                 }
@@ -1683,29 +1626,17 @@ impl StructuralVariantsProcessor {
                         String::from_utf8_lossy(&extra),
                     );
                 }
-                let _ =
-                    Self::get_or_create_variation(&mut data.non_insertion_variants, p5_inv, &vn);
-                Self::add_sv_counts(
-                    &mut data.non_insertion_variants,
-                    &mut data.sv_counts,
-                    p5_inv,
-                    0,
-                    cnt5,
-                    0,
-                );
+                let _ = Self::get_or_create_variation(data, p5_inv, &vn);
+                Self::add_sv_counts(data, p5_inv, 0, cnt5, 0);
 
                 if let Some(sc5_var) = sc5_var {
-                    let variation = Self::get_or_create_variation(
-                        &mut data.non_insertion_variants,
-                        p5_inv,
-                        &vn,
-                    );
+                    let variation = Self::get_or_create_variation(data, p5_inv, &vn);
                     adj_cnt_from_variant(variation, &sc5_var);
                 }
 
-                if let Some(sc5v) = data.soft_clips_5end.get_mut(&p5) {
-                    sc5v.mark_used();
-                }
+                // NOTE: Java leaves the source soft clip available for adjSNV after
+                // emitting the findsv() inversion candidate.
+                // Java: StructuralVariantsProcessor.java:L1012-L1026
 
                 Self::inc_ref_coverage(&mut data.ref_coverage, p5_inv, cnt5);
                 if let Some(bp_cov) = data.ref_coverage.get(bp) {
@@ -1847,21 +1778,10 @@ impl StructuralVariantsProcessor {
                         }
 
                         let del_key = format!("-{}", dellen);
-                        let vref = Self::get_or_create_variation(
-                            &mut data.non_insertion_variants,
-                            p3,
-                            &del_key,
-                        );
+                        let vref = Self::get_or_create_variation(data, p3, &del_key);
                         vref.alt_depth = 0;
 
-                        Self::add_sv_counts(
-                            &mut data.non_insertion_variants,
-                            &mut data.sv_counts,
-                            p3,
-                            pairs_data.pairs,
-                            cnt3,
-                            1,
-                        );
+                        Self::add_sv_counts(data, p3, pairs_data.pairs, cnt3, 1);
 
                         if !data.ref_coverage.contains_key(p3) {
                             data.ref_coverage.set(p3, pairs_data.pairs + cnt3);
@@ -1874,13 +1794,13 @@ impl StructuralVariantsProcessor {
                             }
                         }
 
-                        if let Some(sc3v) = data.soft_clips_3end.get(&tuple3.position) {
-                            let variation = Self::get_or_create_variation(
-                                &mut data.non_insertion_variants,
-                                p3,
-                                &del_key,
-                            );
-                            adj_cnt_from_variant(variation, &sc3v.var);
+                        if let Some(sc3v_var) = data
+                            .soft_clips_3end
+                            .get(&tuple3.position)
+                            .map(|sc3v| sc3v.var.clone())
+                        {
+                            let variation = Self::get_or_create_variation(data, p3, &del_key);
+                            adj_cnt_from_variant(variation, &sc3v_var);
                         }
 
                         let mut tmp = Variant::default();
@@ -1893,11 +1813,7 @@ impl StructuralVariantsProcessor {
                         tmp.mean_mapq = pairs_data.q_mean;
                         tmp.nm = pairs_data.nm;
 
-                        let variation = Self::get_or_create_variation(
-                            &mut data.non_insertion_variants,
-                            p3,
-                            &del_key,
-                        );
+                        let variation = Self::get_or_create_variation(data, p3, &del_key);
                         adj_cnt_from_variant(variation, &tmp);
                     }
                 } else {
@@ -1907,13 +1823,7 @@ impl StructuralVariantsProcessor {
             if bp == 0 {
                 // Java: StructuralVariantsProcessor.java ~L1114 — single findMatchRev with SEED_1/MM=3.
                 // If that misses, allow a second pass that can see suspect historical windows.
-                let mut m_rev = self.find_match_rev(
-                    &seq,
-                    p3,
-                    1,
-                    Configuration::SEED_1 as usize,
-                    3,
-                );
+                let mut m_rev = self.find_match_rev(&seq, p3, 1, Configuration::SEED_1 as usize, 3);
                 if m_rev.base_position == 0 {
                     m_rev = self.find_match_rev_findsv_allow_suspect_windows(&seq, p3, 1);
                 }
@@ -1999,25 +1909,17 @@ impl StructuralVariantsProcessor {
                     );
                 }
 
-                let _ = Self::get_or_create_variation(&mut data.non_insertion_variants, p3, &vn);
-                Self::add_sv_counts(
-                    &mut data.non_insertion_variants,
-                    &mut data.sv_counts,
-                    p3,
-                    0,
-                    cnt3,
-                    0,
-                );
+                let _ = Self::get_or_create_variation(data, p3, &vn);
+                Self::add_sv_counts(data, p3, 0, cnt3, 0);
 
                 if let Some(sc3_var) = sc3_var {
-                    let variation =
-                        Self::get_or_create_variation(&mut data.non_insertion_variants, p3, &vn);
+                    let variation = Self::get_or_create_variation(data, p3, &vn);
                     adj_cnt_from_variant(variation, &sc3_var);
                 }
 
-                if let Some(sc3v) = data.soft_clips_3end.get_mut(&p3) {
-                    sc3v.mark_used();
-                }
+                // NOTE: Java leaves the source soft clip available for adjSNV after
+                // emitting the findsv() inversion candidate.
+                // Java: StructuralVariantsProcessor.java:L1151-L1166
 
                 Self::inc_ref_coverage(&mut data.ref_coverage, p3, cnt3);
                 if let Some(bp_cov) = data.ref_coverage.get(bp) {
@@ -2036,8 +1938,12 @@ impl StructuralVariantsProcessor {
     /// then skips candidate processing when the first item is already used.
     /// Rust computes the same check on demand from SV cluster vectors.
     fn is_softp2sv_first_used(data: &RealignedVariationData, softp: i64) -> bool {
-        if let Some(is_used) = data.softp2sv_first_used.get(&softp) {
-            return *is_used;
+        // NOTE: Preserve Java's live SOFTP2SV first-entry used-state check.
+        // Java: VariationRealigner.java filterAllSVStructures()/filterSV() build SOFTP2SV,
+        // and StructuralVariantsProcessor.java findsv() consults SOFTP2SV.get(p).get(0).used
+        // after earlier structural steps may already have marked that cluster used.
+        if matches!(data.softp2sv_first_used.get(&softp), Some(true)) {
+            return true;
         }
 
         let mut best: Option<(usize, bool)> = None;
@@ -2080,6 +1986,16 @@ impl StructuralVariantsProcessor {
         }
         for sv in &data.svrdup {
             consider(sv);
+        }
+        for sv_list in data.svffus.values() {
+            for sv in sv_list {
+                consider(sv);
+            }
+        }
+        for sv_list in data.svrfus.values() {
+            for sv in sv_list {
+                consider(sv);
+            }
         }
 
         best.map(|(_, used)| used).unwrap_or(false)
@@ -2166,8 +2082,7 @@ impl StructuralVariantsProcessor {
             self.loaded_regions.push((bp - 150 - ext, bp + 150 + ext));
 
             let del_key = format!("-{}", mlen);
-            let vref =
-                Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &del_key);
+            let vref = Self::get_or_create_variation(data, bp, &del_key);
             vref.alt_depth = 0;
 
             let splits = data
@@ -2180,14 +2095,7 @@ impl StructuralVariantsProcessor {
                     .get(&mstart)
                     .map(|s| s.var.alt_depth)
                     .unwrap_or(0);
-            Self::add_sv_counts(
-                &mut data.non_insertion_variants,
-                &mut data.sv_counts,
-                bp,
-                vars_count,
-                splits,
-                1,
-            );
+            Self::add_sv_counts(data, bp, vars_count, splits, 1);
 
             let mut tv = Variant::default();
             tv.alt_depth = 2 * vars_count;
@@ -2198,8 +2106,7 @@ impl StructuralVariantsProcessor {
             tv.mean_pos = 2.0 * mean_pos;
             tv.mean_mapq = 2.0 * mean_mapq;
             tv.nm = 2.0 * nm;
-            let variation =
-                Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &del_key);
+            let variation = Self::get_or_create_variation(data, bp, &del_key);
             adj_cnt_from_variant(variation, &tv);
 
             if !data.ref_coverage.contains_key(bp) {
@@ -2267,8 +2174,7 @@ impl StructuralVariantsProcessor {
             self.loaded_regions.push((bp - 150 - ext, bp + 150 + ext));
 
             let del_key = format!("-{}", mlen);
-            let vref =
-                Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &del_key);
+            let vref = Self::get_or_create_variation(data, bp, &del_key);
             vref.alt_depth = 0;
 
             let splits = data
@@ -2281,14 +2187,7 @@ impl StructuralVariantsProcessor {
                     .get(&start)
                     .map(|s| s.var.alt_depth)
                     .unwrap_or(0);
-            Self::add_sv_counts(
-                &mut data.non_insertion_variants,
-                &mut data.sv_counts,
-                bp,
-                vars_count,
-                splits,
-                1,
-            );
+            Self::add_sv_counts(data, bp, vars_count, splits, 1);
 
             if softp != 0 {
                 if let Some(sc) = data.soft_clips_5end.get_mut(&(softp as i64)) {
@@ -2305,8 +2204,7 @@ impl StructuralVariantsProcessor {
             tv.mean_pos = 2.0 * mean_pos;
             tv.mean_mapq = 2.0 * mean_mapq;
             tv.nm = 2.0 * nm;
-            let variation =
-                Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &del_key);
+            let variation = Self::get_or_create_variation(data, bp, &del_key);
             adj_cnt_from_variant(variation, &tv);
 
             if !data.ref_coverage.contains_key(bp) {
@@ -2397,6 +2295,15 @@ impl StructuralVariantsProcessor {
                 }
                 append_rss_stage_log_if_enabled(region, "sv_find_inv_disc_5_before_ref_fetch");
 
+                // NOTE: Preserve Java's bounded remote REF fetch for discordant-pair INVs.
+                // Java checks only the far breakpoint (`pe`) here and reloads a 300bp window
+                // when that coordinate is absent from REF before calling joinRef(). Without
+                // this reload, Rust builds a truncated left flank for long-distance INV rows.
+                // Java: StructuralVariantsProcessor.java:L1387-L1390
+                if self.get_ref_base(pe).is_none() {
+                    self.ensure_reference_span(pe - 150, pe + 150);
+                }
+
                 let len = pe - bp + 1;
                 if len <= 0 {
                     continue;
@@ -2424,8 +2331,7 @@ impl StructuralVariantsProcessor {
 
                 let inv_key = format!("-{}^{}", len, ins);
 
-                let vref =
-                    Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &inv_key);
+                let vref = Self::get_or_create_variation(data, bp, &inv_key);
                 vref.pstd = true;
                 vref.qstd = true;
 
@@ -2450,14 +2356,7 @@ impl StructuralVariantsProcessor {
                         .get(&ms)
                         .map(|s| s.var.alt_depth)
                         .unwrap_or(0);
-                Self::add_sv_counts(
-                    &mut data.non_insertion_variants,
-                    &mut data.sv_counts,
-                    bp,
-                    cnt,
-                    splits,
-                    1,
-                );
+                Self::add_sv_counts(data, bp, cnt, splits, 1);
 
                 if !data.ref_coverage.contains_key(bp) {
                     data.ref_coverage.set(bp, 2 * cnt);
@@ -2538,6 +2437,14 @@ impl StructuralVariantsProcessor {
                 }
                 append_rss_stage_log_if_enabled(region, "sv_find_inv_disc_3_before_ref_fetch");
 
+                // NOTE: Preserve Java's bounded remote REF fetch for discordant-pair INVs.
+                // The 3' branch reloads around the near breakpoint (`bp`) when REF does not
+                // currently contain that coordinate; later joinRef() depends on those bases.
+                // Java: StructuralVariantsProcessor.java:L1473-L1476
+                if self.get_ref_base(bp).is_none() {
+                    self.ensure_reference_span(bp - 150, bp + 150);
+                }
+
                 let len = pe - bp + 1;
                 if len <= 0 {
                     continue;
@@ -2564,8 +2471,7 @@ impl StructuralVariantsProcessor {
                 append_rss_stage_log_if_enabled(region, "sv_find_inv_disc_3_after_ref_fetch");
 
                 let inv_key = format!("-{}^{}", len, ins);
-                let vref =
-                    Self::get_or_create_variation(&mut data.non_insertion_variants, bp, &inv_key);
+                let vref = Self::get_or_create_variation(data, bp, &inv_key);
                 vref.pstd = true;
                 vref.qstd = true;
 
@@ -2590,14 +2496,7 @@ impl StructuralVariantsProcessor {
                         .get(&(me + 1))
                         .map(|s| s.var.alt_depth)
                         .unwrap_or(0);
-                Self::add_sv_counts(
-                    &mut data.non_insertion_variants,
-                    &mut data.sv_counts,
-                    bp,
-                    cnt,
-                    splits,
-                    1,
-                );
+                Self::add_sv_counts(data, bp, cnt, splits, 1);
 
                 if !data.ref_coverage.contains_key(bp) {
                     data.ref_coverage.set(bp, 2 * cnt);
@@ -2746,14 +2645,7 @@ impl StructuralVariantsProcessor {
             } else {
                 0
             };
-            Self::add_sv_counts(
-                &mut data.non_insertion_variants,
-                &mut data.sv_counts,
-                bp,
-                cnt,
-                splits,
-                1,
-            );
+            Self::add_sv_counts(data, bp, cnt, splits, 1);
 
             let tcnt = cntr + cntf;
             let mut tmp = Variant::default();
@@ -2795,14 +2687,7 @@ impl StructuralVariantsProcessor {
             let (clusters, _) =
                 Self::mark_dup_sv(bp, pe, &mut data.svrdup, data.max_read_length as i64);
             if clusters != 0 {
-                Self::add_sv_counts(
-                    &mut data.non_insertion_variants,
-                    &mut data.sv_counts,
-                    bp,
-                    0,
-                    0,
-                    clusters,
-                );
+                Self::add_sv_counts(data, bp, 0, 0, clusters);
             }
         }
 
@@ -2920,14 +2805,7 @@ impl StructuralVariantsProcessor {
                 .get(&tpe)
                 .map(|s| s.var.alt_depth)
                 .unwrap_or(0);
-            Self::add_sv_counts(
-                &mut data.non_insertion_variants,
-                &mut data.sv_counts,
-                bp,
-                cnt,
-                splits,
-                1,
-            );
+            Self::add_sv_counts(data, bp, cnt, splits, 1);
 
             let tcnt = cntr + cntf;
             let mut tmp = Variant::default();
@@ -2969,14 +2847,7 @@ impl StructuralVariantsProcessor {
             let (clusters, _) =
                 Self::mark_dup_sv(bp, pe, &mut data.svfdup, data.max_read_length as i64);
             if clusters != 0 {
-                Self::add_sv_counts(
-                    &mut data.non_insertion_variants,
-                    &mut data.sv_counts,
-                    bp,
-                    0,
-                    0,
-                    clusters,
-                );
+                Self::add_sv_counts(data, bp, 0, 0, clusters);
             }
         }
     }
@@ -3170,9 +3041,13 @@ impl StructuralVariantsProcessor {
             };
 
             if self.is_match_ref(&seq_work, bp, -dir, mm) {
+                // NOTE: Preserve Java's method-scoped `extra` reuse in findMatchRev().
+                // Java leaves `extra` outside the seed loop, so a direct full match can still
+                // return the most recent trimmed payload from an earlier failed seed attempt.
+                // Java: StructuralVariantsProcessor.java:L2025-L2040 and L2057-L2070
                 return MatchResult {
                     base_position: bp,
-                    matched_sequence: persistent_extra,
+                    matched_sequence: persistent_extra.clone(),
                 };
             }
 
@@ -3220,8 +3095,8 @@ impl StructuralVariantsProcessor {
                     &seq_work[seq_work.len() - j..]
                 };
 
-                persistent_extra = extra.to_vec();
-
+                persistent_extra.clear();
+                persistent_extra.extend_from_slice(extra);
                 if eqcnt >= 3 && (eqcnt as f64 / j as f64) > 0.5 {
                     break;
                 }
@@ -3338,11 +3213,11 @@ impl StructuralVariantsProcessor {
     }
 
     fn get_or_create_variation<'a>(
-        map: &'a mut HashMap<i64, InnerMap<VarDesc, Variant>, LibDefaultHasher>,
+        data: &'a mut RealignedVariationData,
         pos: i64,
         key_str: &str,
     ) -> &'a mut Variant {
-        let pos_map = map.entry(pos).or_default();
+        let pos_map = data.get_or_insert_non_insertion_variants(pos);
         let key = pos_map
             .keys()
             .find(|k| k.key_equals(key_str))
@@ -3362,14 +3237,13 @@ impl StructuralVariantsProcessor {
     }
 
     fn add_sv_counts(
-        map: &mut HashMap<i64, InnerMap<VarDesc, Variant>, LibDefaultHasher>,
-        sv_counts: &mut HashMap<i64, StructuralVariantCounts, LibDefaultHasher>,
+        data: &mut RealignedVariationData,
         pos: i64,
         pairs: usize,
         splits: usize,
         clusters: usize,
     ) {
-        let pos_map = map.entry(pos).or_default();
+        let pos_map = data.get_or_insert_non_insertion_variants(pos);
         let key = pos_map
             .keys()
             .find(|k| matches!(k, VarDesc::Raw { desc } if desc.as_slice() == b"SV"))
@@ -3378,7 +3252,7 @@ impl StructuralVariantsProcessor {
                 desc: b"SV".to_vec().into(),
             });
         pos_map.entry(key).or_default();
-        let sv = sv_counts.entry(pos).or_default();
+        let sv = data.sv_counts.entry(pos).or_default();
         sv.pairs += pairs;
         sv.splits += splits;
         sv.clusters += clusters;
@@ -3425,32 +3299,16 @@ impl StructuralVariantsProcessor {
         let requested_start = start.max(1);
         let requested_end = end.max(requested_start);
 
-        if !self.reference_seq.is_empty() {
-            let current_end = self.ref_start + self.reference_seq.len() as i64 - 1;
-            if requested_start >= self.ref_start && requested_end <= current_end {
-                let start_idx = (requested_start - self.ref_start) as usize;
-                let end_idx = (requested_end - self.ref_start + 1) as usize;
-                return self.reference_seq[start_idx..end_idx].to_vec();
-            }
-        }
-
-        if let (Some(shared_reference), Some(chromosome)) =
-            (self.shared_reference.as_ref(), self.chromosome.as_deref())
-        {
-            if let Some(sequence) = shared_reference
-                .get_subseq(chromosome, requested_start as usize, requested_end as usize)
-                .map(|seq| seq.to_vec())
-            {
-                return sequence;
-            }
-        }
-
+        // NOTE: Preserve Java's accumulated REF map semantics for joinRef().
+        // Java: VariationUtils.joinRef(...) appends only bases present in the mutable REF map,
+        // which includes the current window plus previously loaded windows, but not arbitrary
+        // chromosome-wide fallback. Rust mirrors that by routing through get_ref_base(), whose
+        // scope is current/original windows plus recorded historical windows only.
         let mut out = Vec::with_capacity((requested_end - requested_start + 1) as usize);
         for pos in requested_start..=requested_end {
-            let Some(base) = self.get_ref_base(pos) else {
-                break;
-            };
-            out.push(base);
+            if let Some(base) = self.get_ref_base(pos) {
+                out.push(base);
+            }
         }
         out
     }
@@ -3469,6 +3327,9 @@ impl StructuralVariantsProcessor {
             && (ins as f64 / (end1 - start1) as f64) > 0.75
             && (ins as f64 / (end2 - start2) as f64) > 0.75
         {
+            // NOTE: Preserving Java's DUP overlap heuristic.
+            // Java: StructuralVariantsProcessor.java:L1908-L1911 returns true here,
+            // treating large interior gaps as overlapping mate clusters.
             return true;
         }
 
@@ -4220,17 +4081,34 @@ impl StructuralVariantsProcessor {
         start: i64,
         end: i64,
     ) {
-        for window in self.uncovered_reference_coverage_spans(start, end) {
-            let realigner = VariantRealigner::new_with_context(
-                Arc::clone(&self.reference_seq),
-                Arc::clone(&self.reference_seed),
-                self.ref_start,
-                self.chromosome.clone(),
-                self.bam_paths.clone(),
-            );
-            realigner.load_partial_ref_coverage(data, window.start, window.end);
-            self.remember_reference_coverage_window(window.start, window.end);
+        if self
+            .uncovered_reference_coverage_spans(start, end)
+            .is_empty()
+        {
+            return;
         }
+
+        // NOTE: Preserving Java's partialPipeline replay for partially loaded SV spans.
+        // Java: StructuralVariantsProcessor.java:L382-L385 and L1572-L1575 reruns the full
+        // modified region whenever `isLoaded(ms, me)` is false, even if only the tail is
+        // outside the currently loaded reference. Replaying the overlap is required for
+        // chrMT end-of-contig parity because Java double-materializes the covered suffix.
+        let realigner = VariantRealigner::new_with_context(
+            Arc::clone(&self.reference_seq),
+            Arc::clone(&self.reference_seed),
+            self.ref_start,
+            self.chromosome.clone(),
+            self.bam_paths.clone(),
+        );
+        realigner.load_partial_ref_coverage(data, start, end);
+
+        if end < 1 {
+            return;
+        }
+
+        let normalized_start = start.max(1);
+        let normalized_end = end.max(normalized_start);
+        self.remember_reference_coverage_window(normalized_start, normalized_end);
     }
 
     fn shared_reference_base(&self, pos: i64) -> Option<u8> {
@@ -4569,6 +4447,58 @@ mod tests {
     }
 
     #[test]
+    fn test_structural_variants_processor_find_inv_sub_skips_reload_for_loaded_span_parity() {
+        INSTANCE.get_or_init(GlobalReadOnlyScope::default);
+
+        let chromosome = "testchr".to_string();
+        let mut chromosomes: HashMap<String, ChromosomeData, LibDefaultHasher> = Default::default();
+        chromosomes.insert(
+            chromosome.clone(),
+            ChromosomeData {
+                sequence: Arc::new(vec![b'A'; 2048]),
+                length: 2048,
+            },
+        );
+        let shared_reference = Arc::new(SharedReference {
+            chromosomes,
+            chromosome_names: vec![chromosome.clone()],
+            total_size: 2048,
+        });
+
+        let mut processor = StructuralVariantsProcessor::new_with_context(
+            Arc::new(vec![b'A'; 256]),
+            Arc::new(Default::default()),
+            1,
+            Some(chromosome),
+            Vec::new(),
+            Some(shared_reference),
+        );
+        processor.loaded_regions.push((500, 600));
+
+        let mut data = RealignedVariationData {
+            max_read_length: 0,
+            ..Default::default()
+        };
+        let mut cluster = SoftClip::default();
+        cluster.start = 100;
+        cluster.end = 120;
+        cluster.mstart = 500;
+        cluster.mend = 600;
+        cluster.var.alt_depth = instance().conf.minr + 1;
+        data.svfinv5.push(cluster);
+
+        processor.find_inv_sub(
+            &mut data,
+            InversionClusterKind::Forward5,
+            1,
+            InversionSide::End5,
+            None,
+        );
+
+        assert!(processor.historical_reference_windows.is_empty());
+    }
+
+    #[test]
     fn test_into_reference_preserves_original_region_reference() {
         let mut processor =
             StructuralVariantsProcessor::new(b"ACGTACGT".to_vec(), Default::default(), 100);
@@ -4730,7 +4660,7 @@ mod tests {
         // Java never scans the full chromosome for seeds — only bounded window
         // HashMap lookups.  Seed at position 21 is outside all loaded windows,
         // so it remains unfound (empty).
-        assert_eq!(positions, vec![]);
+        assert_eq!(positions, Vec::<i64>::new());
     }
 
     #[test]
@@ -4812,7 +4742,7 @@ mod tests {
         // Java never scans the full chromosome for seeds.  Seed at position 21
         // is outside the historical window [1,20] and the current window [41+],
         // so it remains unfound.
-        assert_eq!(positions, vec![]);
+        assert_eq!(positions, Vec::<i64>::new());
     }
 
     #[test]
@@ -4990,6 +4920,23 @@ mod tests {
     }
 
     #[test]
+    fn test_is_softp2sv_first_used_recomputes_after_cluster_marked_used() {
+        let mut data = RealignedVariationData::default();
+
+        let mut cluster = SoftClip::default();
+        cluster.softp = 106351894;
+        cluster.var.alt_depth = 21;
+        data.svrdel.push(cluster);
+        data.softp2sv_first_used.insert(106351894, false);
+
+        data.svrdel[0].mark_used();
+
+        assert!(StructuralVariantsProcessor::is_softp2sv_first_used(
+            &data, 106351894,
+        ));
+    }
+
+    #[test]
     fn test_find_match_rev_findsv_can_use_shared_reference_fallback() {
         let chrom = "testchr".to_string();
         let target = b"ACGTACGTACGA";
@@ -5100,11 +5047,7 @@ mod tests {
         processor.loaded_regions.push((210, 229));
 
         let mut data = RealignedVariationData::default();
-        let variation = StructuralVariantsProcessor::get_or_create_variation(
-            &mut data.non_insertion_variants,
-            200,
-            "-10",
-        );
+        let variation = StructuralVariantsProcessor::get_or_create_variation(&mut data, 200, "-10");
         variation.alt_depth = 1;
 
         processor.record_del_rightseq_from_loaded_regions(&data);
@@ -5123,11 +5066,7 @@ mod tests {
             StructuralVariantsProcessor::new(b"ACGTACGT".to_vec(), Default::default(), 100);
 
         let mut data = RealignedVariationData::default();
-        let variation = StructuralVariantsProcessor::get_or_create_variation(
-            &mut data.non_insertion_variants,
-            200,
-            "-10",
-        );
+        let variation = StructuralVariantsProcessor::get_or_create_variation(&mut data, 200, "-10");
         variation.alt_depth = 1;
 
         processor.record_del_rightseq_from_loaded_regions(&data);
@@ -5148,7 +5087,7 @@ mod tests {
 
         let mut data = RealignedVariationData::default();
         let variation = StructuralVariantsProcessor::get_or_create_variation(
-            &mut data.non_insertion_variants,
+            &mut data,
             200,
             "-1725#TTGTGAAGATATTT^-1713&AGGCCTATTTAGG",
         );

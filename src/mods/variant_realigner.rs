@@ -617,7 +617,9 @@ impl VariantRealigner {
     }
 
     fn ensure_sv_marker(data: &mut RealignedVariationData, position: i64) {
-        let variation_map = data.non_insertion_variants.entry(position).or_default();
+        // NOTE: Preserve Java's first HashMap.put order for outer nonInsertionVariants keys.
+        // Java: VariationRealigner.java mutates the same nonInsertionVariants map in-place.
+        let variation_map = data.get_or_insert_non_insertion_variants(position);
         variation_map
             .entry(VarDesc::Raw {
                 desc: b"SV".to_vec().into(),
@@ -709,7 +711,7 @@ impl VariantRealigner {
             return;
         };
 
-        let to_map = data.non_insertion_variants.entry(to).or_default();
+        let to_map = data.get_or_insert_non_insertion_variants(to);
         to_map.insert(key, from_sv);
         if let Some(from_counts) = from_counts {
             data.sv_counts.insert(to, from_counts);
@@ -969,6 +971,40 @@ impl VariantRealigner {
         }
     }
 
+    fn merge_partial_variant(dest: &mut Variant, src: &Variant) {
+        let previous_dest_pstd = dest.pstd;
+        let previous_dest_qstd = dest.qstd;
+        let previous_dest_pp = dest.pp;
+        let previous_dest_pq = dest.pq;
+
+        dest.alt_depth += src.alt_depth;
+        dest.alt_depth_fwd += src.alt_depth_fwd;
+        dest.alt_depth_rev += src.alt_depth_rev;
+        // NOTE: Preserve Java partialPipeline semantics for overlapping replay windows.
+        // Java mutates the live Variation map via CigarParser(true), so plain replayed SNVs
+        // keep extracnt at 0 unless the partial parse itself set it.
+        // Java: AbstractMode.java:L79-L83, StructuralVariantsProcessor.java:L382-L385.
+        dest.extra_cnt += src.extra_cnt;
+        dest.mean_pos += src.mean_pos;
+        dest.mean_qual += src.mean_qual;
+        dest.mean_mapq += src.mean_mapq;
+        dest.nm += src.nm;
+        dest.low_qual_read_cnt += src.low_qual_read_cnt;
+        dest.high_qual_read_cnt += src.high_qual_read_cnt;
+        dest.pstd = previous_dest_pstd
+            || src.pstd
+            || (previous_dest_pp > 0 && src.pp > 0 && previous_dest_pp != src.pp);
+        dest.qstd = previous_dest_qstd
+            || src.qstd
+            || (previous_dest_pq > 0.0 && src.pq > 0.0 && previous_dest_pq != src.pq);
+        if src.pp > 0 {
+            dest.pp = src.pp;
+        }
+        if src.pq > 0.0 {
+            dest.pq = src.pq;
+        }
+    }
+
     fn extract_inv_flanks(desc_str: &str) -> Option<(String, String)> {
         let caret_idx = desc_str.find('^')?;
         let tail = &desc_str[caret_idx + 1..];
@@ -1001,7 +1037,9 @@ impl VariantRealigner {
             let dest_map = dest.entry(position).or_default();
             for (desc, src_var) in src_map {
                 match dest_map.entry(desc) {
-                    InnerMapEntry::Occupied(mut occupied) => adj_cnt(occupied.get_mut(), &src_var),
+                    InnerMapEntry::Occupied(mut occupied) => {
+                        Self::merge_partial_variant(occupied.get_mut(), &src_var)
+                    }
                     InnerMapEntry::Vacant(vacant) => {
                         vacant.insert(src_var);
                     }
@@ -5115,6 +5153,63 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_variant_maps_keeps_existing_snv_extra_count_zero() {
+        let key = VarDesc::snv_key(b'A');
+        let mut dest: VariantMapByPos = Default::default();
+        let mut src: VariantMapByPos = Default::default();
+
+        let mut existing_variant = Variant::default();
+        existing_variant.alt_depth = 10;
+        existing_variant.extra_cnt = 0;
+        existing_variant.high_qual_read_cnt = 9;
+        existing_variant.low_qual_read_cnt = 1;
+        existing_variant.mean_pos = 120.0;
+        existing_variant.mean_qual = 330.0;
+        existing_variant.mean_mapq = 600.0;
+        existing_variant.nm = 4.0;
+        existing_variant.alt_depth_fwd = 6;
+        existing_variant.alt_depth_rev = 4;
+        existing_variant.pp = 10;
+        existing_variant.pq = 30.0;
+
+        let mut replayed_variant = Variant::default();
+        replayed_variant.alt_depth = 5;
+        replayed_variant.extra_cnt = 0;
+        replayed_variant.high_qual_read_cnt = 5;
+        replayed_variant.mean_pos = 65.0;
+        replayed_variant.mean_qual = 170.0;
+        replayed_variant.mean_mapq = 300.0;
+        replayed_variant.nm = 2.0;
+        replayed_variant.alt_depth_fwd = 2;
+        replayed_variant.alt_depth_rev = 3;
+        replayed_variant.pp = 12;
+        replayed_variant.pq = 31.0;
+
+        dest.entry(2550194)
+            .or_default()
+            .insert(key.clone(), existing_variant);
+        src.entry(2550194)
+            .or_default()
+            .insert(key.clone(), replayed_variant);
+
+        VariantRealigner::merge_variant_maps(&mut dest, src);
+
+        let merged = dest
+            .get(&2550194)
+            .and_then(|vars| vars.get(&key))
+            .expect("merged variant");
+        assert_eq!(merged.alt_depth, 15);
+        assert_eq!(merged.extra_cnt, 0);
+        assert_eq!(merged.high_qual_read_cnt, 14);
+        assert_eq!(merged.alt_depth_fwd, 8);
+        assert_eq!(merged.alt_depth_rev, 7);
+        assert!(merged.pstd);
+        assert!(merged.qstd);
+        assert_eq!(merged.pp, 12);
+        assert_eq!(merged.pq, 31.0);
+    }
+
+    #[test]
     fn test_get_ref_base_falls_back_to_original_window() {
         let realigner = VariantRealigner::new_with_context(
             Arc::new(b"TTTT".to_vec()),
@@ -5392,8 +5487,18 @@ mod tests {
 
         let position_to_deletions_count = parser.take_position_to_deletions_count();
 
+        let non_insertion_variants = parser.take_non_insertion_vars();
+        let non_insertion_variants_insert_index = parser.take_non_insertion_vars_insert_index();
+        let next_non_insertion_variants_insert_index = non_insertion_variants_insert_index
+            .values()
+            .copied()
+            .max()
+            .map_or(0, |index| index + 1);
+
         let mut sv_input = crate::mods::structural_variants_processor::RealignedVariationData {
-            non_insertion_variants: parser.take_non_insertion_vars(),
+            non_insertion_variants,
+            non_insertion_variants_insert_index,
+            next_non_insertion_variants_insert_index,
             sv_counts: Default::default(),
             insertion_variants: parser.take_insertion_vars(),
             soft_clips_5end: parser.take_soft_clips_5end(),

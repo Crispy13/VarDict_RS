@@ -973,6 +973,19 @@ where
     entries.into_iter().map(|(key, _, _)| key).collect()
 }
 
+fn ordered_aligned_variant_positions(data: &AlignedVarsData) -> Vec<i64> {
+    let mut aligned_order_index: HashMap<i64, usize, LibDefaultHasher> = Default::default();
+    for (idx, pos) in data.aligned_variants_order.iter().enumerate() {
+        aligned_order_index.insert(*pos, idx);
+    }
+
+    java_hashmap_iteration_order_with_capacity(
+        data.aligned_variants.keys().copied(),
+        data.aligned_variants_java_capacity.max(16),
+        Some(&aligned_order_index),
+    )
+}
+
 /// Main VarDict pipeline configuration
 pub struct VarDictPipeline {
     pub sample_name: String,
@@ -2515,9 +2528,17 @@ impl VarDictPipeline {
             ..
         } = input;
 
+        let next_non_insertion_variants_insert_index = non_insertion_vars_insert_index
+            .values()
+            .copied()
+            .max()
+            .map_or(0, |index| index + 1);
+
         // Convert CigarParserOutput to RealignedVariationData for SV processor
         let mut sv_input = RealignedVariationData {
             non_insertion_variants: non_insertion_vars,
+            non_insertion_variants_insert_index: non_insertion_vars_insert_index,
+            next_non_insertion_variants_insert_index,
             sv_counts,
             insertion_variants: insertion_vars,
             soft_clips_5end,
@@ -2605,16 +2626,28 @@ impl VarDictPipeline {
         write_structural_variants_jsonl_snapshot_if_enabled(&processed, region)?;
 
         // Convert back to RealignedOutput
+        let RealignedVariationData {
+            non_insertion_variants,
+            non_insertion_variants_insert_index,
+            sv_counts,
+            insertion_variants,
+            ref_coverage,
+            splice,
+            max_read_length,
+            duprate,
+            ..
+        } = processed;
+
         Ok((
             RealignedOutput {
-                non_insertion_vars: processed.non_insertion_variants,
-                sv_counts: processed.sv_counts,
-                non_insertion_vars_insert_index,
-                insertion_vars: processed.insertion_variants,
-                ref_coverage: processed.ref_coverage,
-                duprate: processed.duprate,
-                max_read_len: processed.max_read_length,
-                splice: processed.splice,
+                non_insertion_vars: non_insertion_variants,
+                sv_counts,
+                non_insertion_vars_insert_index: non_insertion_variants_insert_index,
+                insertion_vars: insertion_variants,
+                ref_coverage,
+                duprate,
+                max_read_len: max_read_length,
+                splice,
                 historical_reference_windows,
                 historical_del_rightseq_variants,
             },
@@ -5993,16 +6026,11 @@ impl VarDictPipeline {
             gene: region.gene().to_string(),
         };
 
-        let mut aligned_order_index: HashMap<i64, usize, LibDefaultHasher> = Default::default();
-        for (idx, pos) in data.aligned_variants_order.iter().enumerate() {
-            aligned_order_index.insert(*pos, idx);
-        }
-
-        let ordered_positions = java_hashmap_iteration_order_with_capacity(
-            data.aligned_variants.keys().copied(),
-            data.aligned_variants_java_capacity.max(16),
-            Some(&aligned_order_index),
-        );
+        // NOTE: Preserve Java's observed alignedVariants HashMap output order for plain deletions
+        // that share a raw bucket with another locus but render one base earlier in output.
+        // Java: ToVarsBuilder.java:L99-L178 populates HashMap<Integer, Vars>, and
+        // SimplePostProcessModule.java:L35 iterates entrySet() directly.
+        let ordered_positions = ordered_aligned_variant_positions(&data);
 
         for position in ordered_positions {
             let Some(vars) = data.aligned_variants.remove(&position) else {
@@ -6162,7 +6190,8 @@ impl VarDictPipeline {
                 if instance().conf.debug {
                     output.debug = shared_debug.clone();
                 }
-                output_lines.push(output.to_string());
+                let output_line = output.to_string();
+                output_lines.push(output_line);
             }
         }
 
@@ -6187,16 +6216,11 @@ impl VarDictPipeline {
             gene: region.gene().to_string(),
         };
 
-        let mut aligned_order_index: HashMap<i64, usize, LibDefaultHasher> = Default::default();
-        for (idx, pos) in data.aligned_variants_order.iter().enumerate() {
-            aligned_order_index.insert(*pos, idx);
-        }
-
-        let ordered_positions = java_hashmap_iteration_order_with_capacity(
-            data.aligned_variants.keys().copied(),
-            data.aligned_variants_java_capacity.max(16),
-            Some(&aligned_order_index),
-        );
+        // NOTE: Preserve Java's observed alignedVariants HashMap output order for plain deletions
+        // that share a raw bucket with another locus but render one base earlier in output.
+        // Java: ToVarsBuilder.java:L99-L178 populates HashMap<Integer, Vars>, and
+        // SimplePostProcessModule.java:L35 iterates entrySet() directly.
+        let ordered_positions = ordered_aligned_variant_positions(&data);
 
         for position in ordered_positions {
             let Some(vars) = data.aligned_variants.remove(&position) else {

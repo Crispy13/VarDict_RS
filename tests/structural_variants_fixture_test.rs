@@ -364,4 +364,3 @@ fn test_structural_variants_chr3_pileup_missing_inv_row_parity() {
         stdout
     );
 }
-

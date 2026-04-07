@@ -57,7 +57,11 @@ fn run_smoke(config: &str, chrom: &str, start: u32, end: u32, expected_fixture: 
     let bam_path =
         manifest_dir.join("testdata/NA12878.mapped.ILLUMINA.bwa.CEU.low_coverage.20121211.bam");
 
-    assert!(ref_path.exists(), "missing reference: {}", ref_path.display());
+    assert!(
+        ref_path.exists(),
+        "missing reference: {}",
+        ref_path.display()
+    );
     assert!(bam_path.exists(), "missing BAM: {}", bam_path.display());
     let region = format!("{chrom}:{start}-{end}");
 
@@ -76,9 +80,7 @@ fn run_smoke(config: &str, chrom: &str, start: u32, end: u32, expected_fixture: 
         other => panic!("unsupported smoke config: {other}"),
     }
 
-    let output = command
-        .output()
-        .expect("failed to run vardict binary");
+    let output = command.output().expect("failed to run vardict binary");
 
     assert!(
         output.status.success(),

@@ -4,6 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const HG002_BAM: &str = "testdata/151002_7001448_0359_AC7F6GANXX_Sample_HG002-EEogPU_v02-KIT-Av5_AGATGTAC_L008.posiSrt.markDup.bam";
 const REFERENCE: &str = "testdata/hs37d5.fa";
@@ -71,7 +72,7 @@ const RC3_FREQ_LOW_CHR15: Hg002ParityCase = Hg002ParityCase {
     shard: "067",
     region: "15:66000001-67000000",
     extra_args: &["-f", "0.001"],
-    expected_failure: "RC3 off-by-one depth mismatch: Rust depth=354 vs Java depth=355 on the complex variant",
+    expected_failure: "RC3 follow-on chr15 SNV mismatch: Rust mean quality 41.0 vs Java 40.9 at 66929574 after fixing the complex depth",
 };
 
 const RC4_NOREALIGN_CHR14: Hg002ParityCase = Hg002ParityCase {
@@ -98,7 +99,16 @@ const RC5B_NOREALIGN_CHR15: Hg002ParityCase = Hg002ParityCase {
     shard: "042",
     region: "15:41000001-42000000",
     extra_args: &["-k", "0"],
-    expected_failure: "RC5b INV genotype inflation: Rust genotype string contains extra sequence",
+    expected_failure: "RC5b no-realign missing INV cluster: Java has 834 lines but Rust emits 829 and drops the first INV at 41862380",
+};
+
+const RC6_FREQ_LOW_CHR2: Hg002ParityCase = Hg002ParityCase {
+    label: "freq-low",
+    chrom: "2",
+    shard: "242",
+    region: "2:241000001-242000000",
+    extra_args: &["-f", "0.001"],
+    expected_failure: "RC6 INV descriptor truncation: Rust drops the Java TTAT prefix on the chr2 inversion genotype in shard 242",
 };
 
 fn manifest_dir() -> PathBuf {
@@ -170,7 +180,10 @@ fn run_rust_case(case: Hg002ParityCase) -> Result<Vec<String>, String> {
     let reference_path = manifest_dir.join(REFERENCE);
 
     if !reference_path.exists() {
-        return Err(format!("Missing reference FASTA: {}", reference_path.display()));
+        return Err(format!(
+            "Missing reference FASTA: {}",
+            reference_path.display()
+        ));
     }
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_vardict"));
@@ -206,9 +219,96 @@ fn run_rust_case(case: Hg002ParityCase) -> Result<Vec<String>, String> {
         ));
     }
 
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|error| format!("vardict stdout was not UTF-8 for {}: {}", case.region, error))?;
+    let stdout = String::from_utf8(output.stdout).map_err(|error| {
+        format!(
+            "vardict stdout was not UTF-8 for {}: {}",
+            case.region, error
+        )
+    })?;
     Ok(normalize_newlines(&stdout)
+        .lines()
+        .map(|line| line.to_string())
+        .collect())
+}
+
+fn run_rust_structural_snapshot(case: Hg002ParityCase) -> Result<Vec<String>, String> {
+    let manifest_dir = manifest_dir();
+    let bam_path = prepare_hg002_bam_with_index()?;
+    let reference_path = manifest_dir.join(REFERENCE);
+
+    if !reference_path.exists() {
+        return Err(format!(
+            "Missing reference FASTA: {}",
+            reference_path.display()
+        ));
+    }
+
+    let snapshot_dir = manifest_dir.join("tmp");
+    fs::create_dir_all(&snapshot_dir).map_err(|error| {
+        format!(
+            "Failed to create structural snapshot dir {}: {}",
+            snapshot_dir.display(),
+            error
+        )
+    })?;
+
+    let snapshot_path = snapshot_dir.join(format!(
+        "hg002_rc3_sv_snapshot_{}_{}.jsonl",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("system time error: {}", error))?
+            .as_nanos()
+    ));
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vardict"));
+    command
+        .current_dir(&manifest_dir)
+        .env("VARDICT_STRUCTURAL_VARIANTS_JSONL", &snapshot_path)
+        .arg("-G")
+        .arg(&reference_path)
+        .arg("-b")
+        .arg(&bam_path)
+        .arg("-N")
+        .arg(SAMPLE)
+        .arg("-R")
+        .arg(case.region);
+
+    for arg in case.extra_args {
+        command.arg(arg);
+    }
+
+    let output = command.output().map_err(|error| {
+        format!(
+            "Failed to run vardict structural snapshot for {}: {}",
+            case.region, error
+        )
+    })?;
+
+    if !output.status.success() {
+        let _ = fs::remove_file(&snapshot_path);
+        return Err(format!(
+            "vardict failed for {} [{} {} shard {}]\nstatus: {}\nstderr:\n{}\nstdout:\n{}",
+            case.region,
+            case.label,
+            case.chrom,
+            case.shard,
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout),
+        ));
+    }
+
+    let snapshot = fs::read_to_string(&snapshot_path).map_err(|error| {
+        format!(
+            "Failed to read structural snapshot {}: {}",
+            snapshot_path.display(),
+            error
+        )
+    })?;
+    let _ = fs::remove_file(&snapshot_path);
+
+    Ok(normalize_newlines(&snapshot)
         .lines()
         .map(|line| line.to_string())
         .collect())
@@ -345,8 +445,56 @@ fn test_hg002_rc2_sv_alt_depth_chrmt_norealign() {
 #[test]
 #[ignore = "known HG002 parity regression; requires full HG002 BAM + cached tmp/hg002_parity Java shards"]
 fn test_hg002_rc3_depth_offbyone_chr15_freq_low() {
-    // Expected failure until the chr15 complex-variant depth matches Java exactly.
+    // The original chr15 complex-variant depth bug is fixed; this shard now fails later on a
+    // smaller SNV formatting/parity delta at 66929574.
     assert_case_matches_java(RC3_FREQ_LOW_CHR15);
+}
+
+#[test]
+#[ignore = "requires full HG002 BAM fixture"]
+fn test_target_bam_hg002_chr15_findsv_inv_candidate_keeps_softclip_for_adjsnv_parity() {
+    // Java structural snapshot source: tmp/java_rc3_sv_f001_direct.jsonl for
+    // RC3_FREQ_LOW_CHR15. The findsv() inversion candidate must not consume the
+    // single-base 3' soft clip at 66202153 before adjSNV rescues it.
+    let snapshot = run_rust_structural_snapshot(RC3_FREQ_LOW_CHR15)
+        .expect("failed to capture RC3 structural snapshot");
+
+    let rescued_g = snapshot
+        .iter()
+        .find(|line| line.starts_with("{\"type\":\"NONINS\",\"pos\":66202153,\"key\":\"G\","))
+        .unwrap_or_else(|| panic!("Missing RC3 rescued G structural row"));
+    assert!(
+        rescued_g.contains("\"varsCount\":2")
+            && rescued_g.contains("\"varsCountOnForward\":2")
+            && rescued_g.contains("\"extracnt\":1")
+            && rescued_g.contains("\"meanPosition\":\"39.000\"")
+            && rescued_g.contains("\"meanQuality\":\"27.000\""),
+        "RC3 rescued G structural row diverged from Java fixture:\n{}",
+        rescued_g
+    );
+
+    let refcov = snapshot
+        .iter()
+        .find(|line| {
+            line
+                == &&"{\"type\":\"REFCOV\",\"pos\":66202153,\"key\":\"-\",\"data\":{\"count\":355}}"
+                    .to_string()
+        })
+        .unwrap_or_else(|| panic!("Missing Java-parity ref coverage row at 66202153"));
+    assert_eq!(
+        refcov,
+        "{\"type\":\"REFCOV\",\"pos\":66202153,\"key\":\"-\",\"data\":{\"count\":355}}"
+    );
+
+    let softclip = snapshot
+        .iter()
+        .find(|line| line.starts_with("{\"type\":\"SCLIP3\",\"pos\":66202153,\"key\":\"-\","))
+        .unwrap_or_else(|| panic!("Missing RC3 3' soft clip row at 66202153"));
+    assert!(
+        softclip.contains("\"sequence\":\"G\"") && softclip.contains("\"used\":false"),
+        "RC3 3' soft clip should remain unused for adjSNV rescue:\n{}",
+        softclip
+    );
 }
 
 #[test]
@@ -366,6 +514,13 @@ fn test_hg002_rc5a_variant_order_chr13_norealign() {
 #[test]
 #[ignore = "known HG002 parity regression; requires full HG002 BAM + cached tmp/hg002_parity Java shards"]
 fn test_hg002_rc5b_inv_genotype_chr15_norealign() {
-    // Expected failure until the chr15 INV genotype string stops inflating in Rust.
+    // Expected failure until Rust emits the missing chr15 INV cluster, starting with the
+    // Java-only INV at 41862380 in shard 042.
     assert_case_matches_java(RC5B_NOREALIGN_CHR15);
+}
+
+#[test]
+#[ignore = "known HG002 parity regression; requires full HG002 BAM + cached tmp/hg002_parity Java shards"]
+fn test_target_bam_hg002_chr2_freq_low_inv_descriptor_truncation_parity() {
+    assert_case_matches_java(RC6_FREQ_LOW_CHR2);
 }

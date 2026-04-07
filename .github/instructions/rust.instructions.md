@@ -140,5 +140,4 @@ Before publishing or reviewing Rust code, ensure:
 2. Prefer `tracing` and `tracing-subscriber` for logging over `println!` or `eprintln!`.
 	- Dev subscriber: include `.with_file(true).with_line_number(true).with_target(true)`.
 	- Production subscriber: use `.with_file(false).with_line_number(false).with_target(false)`.
-3. Use `debug-release` profile for testing and debugging. If `Cargo.toml` does not have it, ask the user to add it.
-4. Prefer enums or generic code over dynamic dispatch (trait objects) for better performance and compile-time checks.
+3. Prefer enums or generic code over dynamic dispatch (trait objects) for better performance and compile-time checks.

@@ -148,7 +148,11 @@ impl RefCoverage {
 
     /// Return the number of stored positions.
     pub fn len(&self) -> usize {
-        self.dense.iter().filter(|&&value| value != SENTINEL).count() + self.overflow.len()
+        self.dense
+            .iter()
+            .filter(|&&value| value != SENTINEL)
+            .count()
+            + self.overflow.len()
     }
 
     /// Return true when no positions are stored.

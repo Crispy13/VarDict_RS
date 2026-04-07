@@ -626,6 +626,7 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
         // capture_mis_softly3_mismatches
         let ref_seq = &self.ref_data.ref_seq;
         let query_sequence = self.query_sequence;
+        let query_quality = self.query_quality;
         let mut mch = ml as i32;
         let TerminalCigarOffsets {
             ref_offset: refoff,
@@ -664,6 +665,8 @@ impl<'a, 'b> CigarModifier<'a, 'b> {
         }
 
         mch -= rn;
+        // NOTE: Preserve Java's unconditional 1-3 base trailing-mismatch clipping.
+        // Java: CigarModifier.java:L358-L387 clips any rn in 1..=3 here.
         if rn > 0 && rn <= 3 {
             *cigar_vd.get_mut(cigar_vd.len() - 1).unwrap() = Cigar::Match(mch as u32);
             cigar_vd.push_back(Cigar::SoftClip(rn as u32));
@@ -1783,6 +1786,66 @@ mod tests {
             2,
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_modify_cigar_keeps_single_match_with_trailing_mismatch() {
+        INSTANCE.get_or_init(GlobalReadOnlyScope::default);
+
+        let reference = Reference::new_with_start(vec![b'A', b'A', b'A', b'A'], 0);
+        let region = Region::new("chr1".to_string(), 1, 4, "test".to_string());
+        let mut rev_complementor = RevComplementor::new();
+
+        let cigar = CigarString(vec![Cigar::Match(4)]).into_view(0);
+        let query_sequence = vec![b'A', b'A', b'A', b'G'];
+        let query_quality = vec![30, 30, 30, 13];
+
+        let mut modifier = CigarModifier::new(
+            0,
+            &cigar,
+            &query_sequence,
+            &query_quality,
+            &reference,
+            0,
+            query_sequence.len(),
+            &region,
+            &mut rev_complementor,
+        );
+
+        let modified = modifier.modify_cigar().expect("modify_cigar failed");
+        let modified_cigar = CigarString(modified.cigar.into_iter().collect()).into_view(0);
+
+        assert_eq!(cigar_to_string(&modified_cigar), "4M");
+    }
+
+    #[test]
+    fn test_modify_cigar_softclips_high_quality_single_trailing_mismatch() {
+        INSTANCE.get_or_init(GlobalReadOnlyScope::default);
+
+        let reference = Reference::new_with_start(vec![b'A', b'A', b'A', b'A'], 0);
+        let region = Region::new("chr1".to_string(), 1, 4, "test".to_string());
+        let mut rev_complementor = RevComplementor::new();
+
+        let cigar = CigarString(vec![Cigar::Match(4)]).into_view(0);
+        let query_sequence = vec![b'A', b'A', b'A', b'G'];
+        let query_quality = vec![30, 30, 30, 34];
+
+        let mut modifier = CigarModifier::new(
+            0,
+            &cigar,
+            &query_sequence,
+            &query_quality,
+            &reference,
+            0,
+            query_sequence.len(),
+            &region,
+            &mut rev_complementor,
+        );
+
+        let modified = modifier.modify_cigar().expect("modify_cigar failed");
+        let modified_cigar = CigarString(modified.cigar.into_iter().collect()).into_view(0);
+
+        assert_eq!(cigar_to_string(&modified_cigar), "3M1S");
     }
 
     #[test]

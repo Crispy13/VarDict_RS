@@ -24,9 +24,7 @@ struct ParserCase {
 }
 
 fn lock_test_scope() -> MutexGuard<'static, ()> {
-    TEST_SCOPE_LOCK
-        .lock()
-        .expect("test scope mutex poisoned")
+    TEST_SCOPE_LOCK.lock().expect("test scope mutex poisoned")
 }
 
 #[allow(invalid_reference_casting)]
@@ -142,7 +140,10 @@ fn arb_var_desc() -> impl Strategy<Value = VarDesc> {
             prop::collection::vec(arb_base(), 1..=8),
             prop::collection::vec(arb_base(), 1..=8),
         )
-            .prop_filter("complex ref and alt must differ", |(ref_seq, alt_seq)| ref_seq != alt_seq)
+            .prop_filter(
+                "complex ref and alt must differ",
+                |(ref_seq, alt_seq)| ref_seq != alt_seq
+            )
             .prop_map(|(ref_seq, alt_seq)| VarDesc::complex(&ref_seq, &alt_seq)),
         prop::collection::vec(prop_oneof![Just(b'-'), arb_base()], 1..=16).prop_map(|desc| {
             VarDesc::Raw {
@@ -302,7 +303,12 @@ fn run_parser_case(case: &ParserCase) -> anyhow::Result<(CigarParser, Region, i6
 
     let reference = Reference::new_with_start(reference_seq, region_start as i64);
     let mut parser = CigarParser::new(region.clone(), reference, Arc::new(scope));
-    let mut record = build_record(&case.ops, &case.query_seq, case.is_reverse, alignment_start - 1);
+    let mut record = build_record(
+        &case.ops,
+        &case.query_seq,
+        case.is_reverse,
+        alignment_start - 1,
+    );
 
     parser.process_record(&mut record)?;
 

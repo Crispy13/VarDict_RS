@@ -69,9 +69,7 @@ fn env_flag(name: &str) -> bool {
 static TEST_SCOPE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn lock_test_scope() -> MutexGuard<'static, ()> {
-    TEST_SCOPE_LOCK
-        .lock()
-        .expect("test scope mutex poisoned")
+    TEST_SCOPE_LOCK.lock().expect("test scope mutex poisoned")
 }
 
 fn resolve_run_now_simple_limit(default_limit: usize) -> Option<usize> {

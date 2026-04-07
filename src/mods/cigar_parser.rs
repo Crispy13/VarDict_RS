@@ -43,6 +43,7 @@ use crate::{
 };
 
 type SplicingKey = (i64, i64);
+
 pub struct CigarParser {
     query_seq_buf: Option<Vec<u8>>,
     query_qual_buf: Option<Vec<u8>>,
@@ -1496,6 +1497,7 @@ impl CigarParser {
                 let mut ci = 0;
                 while ci < self.cigar.len() {
                     if self.skip_overlapping_reads(
+                        self.cigar.0.as_slice(),
                         record,
                         self.start,
                         alignment_start,
@@ -1924,6 +1926,7 @@ impl CigarParser {
 
                         // Check for overlapping reads
                         if self.skip_overlapping_reads(
+                            self.cigar.0.as_slice(),
                             record,
                             self.start,
                             alignment_start,
@@ -2754,7 +2757,7 @@ impl CigarParser {
             instance().conf.goodq,
             instance().conf.vext as usize,
             false,
-            true,
+            false,
         )?;
 
         if offset != 0 {
@@ -3387,6 +3390,7 @@ impl CigarParser {
     /// Skip overlapping reads to avoid double counts for coverage (alignment or second in pair flag is used)
     fn skip_overlapping_reads(
         &self,
+        current_cigar: &[Cigar],
         record: &Record,
         current_start: i64,
         pos: i64,
@@ -3405,7 +3409,12 @@ impl CigarParser {
         if instance().conf.unique_mode_second_in_pair_enabled
             && is_second_in_pair
             && is_paired_and_same_chromosome(record)
-            && are_reads_overlap(record, current_start, pos, mate_pos)
+            && are_reads_overlap(
+                current_start,
+                pos,
+                mate_pos,
+                overlap_reference_length(current_cigar),
+            )
         {
             return true;
         }
@@ -3661,23 +3670,26 @@ fn is_paired_and_same_chromosome(record: &Record) -> bool {
 }
 
 /// Check if reads are overlapping. Two cases are considered: if position after mate start and if before.
-fn are_reads_overlap(record: &Record, current_start: i64, pos: i64, mate_pos: i64) -> bool {
+fn are_reads_overlap(current_start: i64, pos: i64, mate_pos: i64, ref_len: i64) -> bool {
     if pos >= mate_pos {
-        let ref_len = record
-            .cigar()
-            .iter()
-            .map(|c| {
-                if c.consumes_reference_bases() {
-                    c.len()
-                } else {
-                    0
-                }
-            })
-            .sum::<u32>() as i64;
         current_start >= mate_pos && current_start <= mate_pos + ref_len - 1
     } else {
-        current_start >= mate_pos && record.mpos() + 1 <= record.reference_end()
+        current_start >= mate_pos && mate_pos <= pos + ref_len - 1
     }
+}
+
+#[inline]
+fn overlap_reference_length(cigars: &[Cigar]) -> i64 {
+    cigars
+        .iter()
+        .map(|cigar| {
+            if cigar.consumes_reference_bases() {
+                cigar.len() as i64
+            } else {
+                0
+            }
+        })
+        .sum()
 }
 
 /// Check if read is chimeric and contains SA tag
@@ -4617,6 +4629,30 @@ mod tests {
         .expect("scan should succeed");
 
         assert_eq!(result, (1, 1));
+    }
+
+    #[test]
+    fn test_overlap_reference_length_counts_only_reference_consuming_ops() {
+        let cigar = vec![
+            Cigar::SoftClip(3),
+            Cigar::Match(10),
+            Cigar::Ins(2),
+            Cigar::Del(4),
+            Cigar::RefSkip(6),
+            Cigar::Equal(5),
+            Cigar::Diff(1),
+            Cigar::HardClip(7),
+        ];
+
+        assert_eq!(overlap_reference_length(&cigar), 26);
+    }
+
+    #[test]
+    fn test_are_reads_overlap_uses_modified_reference_span_math() {
+        assert!(!are_reads_overlap(109, 100, 105, 4));
+        assert!(are_reads_overlap(108, 100, 105, 4));
+        assert!(!are_reads_overlap(105, 100, 106, 5));
+        assert!(are_reads_overlap(106, 100, 104, 5));
     }
 
     #[test]
